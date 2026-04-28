@@ -180,3 +180,10 @@ TODO.local.md
 .claude/settings.local.json
 .claude/.session/
 .claude/cache/
+
+# ---------- Project rules / agent instructions (local-only per Shahbaz) ----------
+# CLAUDE.md is the project-scoped rules file Claude Code auto-loads each session.
+# Shahbaz's preference (2026-04-28): never commit this file — keep it per-machine.
+# See HANDOFF.md ADR-004.
+CLAUDE.md
+.claude/CLAUDE.md

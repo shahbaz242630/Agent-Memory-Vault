@@ -3,17 +3,17 @@
 **Last updated:** 2026-04-28
 **Updated by:** Claude (Opus 4.7)
 **Current version:** V0.1 — Internal Alpha
-**Current phase:** V0.1 in progress — workspace bootstrapped, ready for vault-core
+**Current phase:** V0.1 in progress — vault-core complete, vault-storage up next
 
 ---
 
 ## Current Status
 
-**Active task:** T0.1.2 — vault-core (not started)
+**Active task:** T0.1.3 — vault-storage: SQLite + SQLCipher (not started)
 **Started:** —
-**Last test run:** 2026-04-28 — `cargo build/test/clippy/fmt --workspace` all green on the empty skeleton
+**Last test run:** 2026-04-28 — `cargo test -p vault-core` 42 passing + 1 doc test, all four gates green workspace-wide
 
-The Cargo workspace is bootstrapped with all 11 crate skeletons. CI workflow is in place. The four-gate Definition of Done check (build / test / clippy / fmt) passes locally on the no-op skeleton. Awaiting first push to verify CI runs green on GitHub.
+T0.1.2 — vault-core is complete. All domain types (`Memory`, `MemoryId`, `MemoryType`, `Entity`, `EntityId`, `EntityType`, `Relationship`, `RelationshipId`, `Boundary`, `NewMemory`) and the workspace-wide error catalogue (`VaultError`, `VaultResult`) are implemented with validation, serde round-trip support, and property tests. Awaiting commit/push approval.
 
 ---
 
@@ -22,20 +22,20 @@ The Cargo workspace is bootstrapped with all 11 crate skeletons. CI workflow is 
 | Task ID | Name | Completed | Tests | Notes |
 |---|---|---|---|---|
 | Foundation | CLAUDE.md, HANDOFF.md, project memory files | 2026-04-28 | n/a | Pre-kickoff scaffolding (project rules + cross-session memory). Comprehensive `.gitignore` covers secrets, model files, encrypted vault data, ML binaries, Claude Code per-machine state. |
-| T0.1.1 | Workspace Setup | 2026-04-28 | ✅ build/test/clippy/fmt all green on Windows local | 11 crate skeletons under `crates/`. Workspace `Cargo.toml` pins all BRD §4 deps in `[workspace.dependencies]` (lazy — no transitive fetches yet). `rust-toolchain.toml` pins stable. CI: 3-job parallel matrix (fmt, clippy, build+test) on ubuntu-latest. `git init` + remote connected to `https://github.com/shahbaz242630/Agent-Memory-Vault.git`. README.md from remote preserved as base. |
+| T0.1.1 | Workspace Setup | 2026-04-28 | ✅ build/test/clippy/fmt all green on Windows local; CI green on push (39s) | 11 crate skeletons under `crates/`. Workspace `Cargo.toml` pins all BRD §4 deps in `[workspace.dependencies]`. `rust-toolchain.toml` pins stable. CI: 3-job parallel matrix (fmt, clippy, build+test) on ubuntu-latest. `git init` + remote connected to `https://github.com/shahbaz242630/Agent-Memory-Vault.git`. |
+| T0.1.2 | vault-core | 2026-04-28 | ✅ 42 unit + 1 doc test passing; clippy clean; fmt clean | All BRD §5.1 types implemented across `error.rs` / `boundary.rs` / `memory.rs` / `entity.rs` with `lib.rs` re-exports. Validation enforced at construction (`try_new` constructors) AND at storage-write boundary (`validate()` method) per BRD §11.7.1. ID types use UUID v7 (time-ordered, good DB index locality). `Boundary` uses validated newtype with private field (deviation from BRD `pub String` — see ADR-005). |
 
 ---
 
 ## In Progress
 
-_(none — paused before T0.1.2 kickoff for partner review)_
+_(none — T0.1.2 ready for commit, awaiting partner approval)_
 
 ---
 
 ## Pending — V0.1 (Internal Alpha)
 
-- [ ] **T0.1.2** — vault-core (Memory, Entity, Relationship, Boundary, error types — BRD §5.1)
-- [ ] **T0.1.3** — vault-storage: SQLite + SQLCipher (encrypted metadata store, migrations)
+- [ ] **T0.1.3** — vault-storage: SQLite + SQLCipher (encrypted metadata store, migrations) — BRD §5.2
 - [ ] **T0.1.4** — vault-storage: LanceDB (vector store with boundary filtering)
 - [ ] **T0.1.5** — vault-storage: DuckDB (graph store with bi-temporal columns)
 - [ ] **T0.1.6** — vault-storage: Cascading Backend (StorageBackend orchestrator + retry queue)
@@ -76,13 +76,27 @@ _(none)_
 - **Decision:** `vault-tauri` is a library skeleton (`src/lib.rs`) until T0.1.11. T0.1.11 swaps the crate to a binary with `src/main.rs` and a `tauri.conf.json`.
 - **Reasoning:** Skeleton uniformity simplifies T0.1.1. Binary conversion is mechanical and belongs to the task that actually uses it.
 
+### ADR-004 — 2026-04-28 — `CLAUDE.md` is gitignored and never committed
+- **Context:** The first T0.1.1 commit (`d105f68`) included `CLAUDE.md`, the project-scoped Claude Code rules file. After review, Shahbaz directed: "claude.md shouldnt be committed .. never commit." He treats project rules / agent instructions as per-machine configuration, not shared repo content.
+- **Decision:** `CLAUDE.md` is added to `.gitignore` and untracked from the repo via `git rm --cached CLAUDE.md`. The working-tree file is preserved on Shahbaz's machine and continues to auto-load each Claude Code session. Future edits remain local-only.
+- **Reasoning:** Honour Shahbaz's explicit preference. The previous commit's tree contains `CLAUDE.md` but the file has no secrets, so history rewrite (force-push, `git filter-repo`) is unnecessary and would be destructive.
+- **Alternatives considered:** History rewrite to scrub the file from `d105f68` (rejected: destructive, no security need). Move CLAUDE.md content into a tracked `docs/agent-rules.md` (rejected: defeats the purpose of being per-machine).
+- **Mirrored in cross-session memory:** `feedback_never_commit_claude_md.md`.
+
+### ADR-005 — 2026-04-28 — `Boundary` uses a validated newtype with a private field
+- **Context:** BRD §5.1 sketches `pub struct Boundary(pub String)`, but BRD §11.7.1 requires that boundary names be validated (≤ 64 bytes, no control characters) at every public API boundary.
+- **Decision:** `Boundary` wraps a private `String` and exposes `Boundary::new(...)` / `TryFrom<String>` / `FromStr` constructors that validate, plus `as_str()` / `into_inner()` / `Display` accessors. Serde uses `try_from = "String"` so deserialisation also runs validation.
+- **Reasoning:** The §11.7.1 invariant is security-critical (boundary names feed into mandatory access control). A `pub String` field would let any caller bypass validation, making invariants depend on caller discipline rather than the type system. The BRD §5.1 sketch is illustrative; matching the spirit (a boundary type that storage and retrieval can trust) is more important than matching the literal `pub` field.
+- **Alternatives considered:** `pub String` field with a separate `validate()` method (rejected: footgun — easy to forget). `Boundary(String)` private without constructors (rejected: no clean way to construct from caller code).
+
 ---
 
 ## Tech Debt Backlog
 
 Items noticed but not addressed in their originating task — picked up explicitly when scheduled, never as drive-by work.
 
-- [ ] **`llama-cpp-2 = "0.1"` is not yet declared in `[workspace.dependencies]`** — BRD §4.3 flags it for verification at the start of vault-llm work (T0.2.1). Do crate-name-and-version verification on docs.rs at that point and add to workspace deps then. (Noted 2026-04-28, file: `Cargo.toml`)
+- [ ] **`llama-cpp-2 = "0.1"` not yet declared in `[workspace.dependencies]`** — BRD §4.3 flags it for verification at the start of vault-llm work (T0.2.1). Do crate-name-and-version verification on docs.rs at that point and add to workspace deps then. (Noted 2026-04-28, file: `Cargo.toml`)
+- [ ] **`.gitattributes` for line-ending normalisation** — currently relying on git's default `core.autocrlf=true` on Windows. Adding `* text=auto eol=lf` plus binary markers for known binary file types would silence the CRLF warnings on commit and make cross-platform behaviour deterministic. Quick win when convenient. (Noted 2026-04-28)
 
 ---
 
@@ -94,35 +108,33 @@ _(populated once V0.1 ships)_
 
 ## Notes for Next Session
 
-**T0.1.2 — vault-core (BRD §5.1) is up next.** Implement these public types in this crate, with serde derives, doc comments on every public item, and round-trip serde tests:
+**T0.1.3 — vault-storage: SQLite + SQLCipher (BRD §5.2) is up next.** Implementation plan:
 
-- `Memory`, `MemoryId`, `MemoryType` (Episodic / Semantic / Procedural)
-- `Entity`, `EntityId`, `EntityType`
-- `Relationship`, `RelationshipId`
-- `Boundary`
-- `VaultError` (one variant per failure category) + `VaultResult<T>` alias
+- Add SQLite/SQLCipher deps to `crates/vault-storage/Cargo.toml`:
+  ```toml
+  [dependencies]
+  vault-core = { path = "../vault-core" }
+  rusqlite = { workspace = true }   # already pinned with bundled-sqlcipher feature
+  tokio = { workspace = true }
+  async-trait = { workspace = true }
+  thiserror = { workspace = true }
+  tracing = { workspace = true }
+  serde_json = { workspace = true }
+  chrono = { workspace = true }
+  ```
+- Implement `MetadataStore` (the SQLite-backed store) with these tables:
+  - `memories` — flat metadata per memory (id, content, type, boundary, timestamps, confidence, access_count, superseded_by, metadata_json)
+  - `audit_log` — tamper-evident hash chain (BRD §11.9.2)
+  - `review_queue` — proposed memories from connectors (BRD §5.9)
+  - `sync_state` — pointers for the sync engine
+  - `retry_queue` — partial-failure recovery for cascading writes (BRD §5.2)
+- Schema migrations via a simple incremental migration runner (track `schema_version` in a one-row table)
+- SQLCipher: open with `PRAGMA key = '<derived-from-master-key>'` immediately after open. For T0.1.3, accept the key as a parameter; key derivation lives in vault-sync.
 
-Files (per BRD §5.1):
-- `src/lib.rs` — re-exports
-- `src/memory.rs`
-- `src/entity.rs`
-- `src/boundary.rs`
-- `src/error.rs`
+Test level **Heavy** (BRD §7.1): every CRUD path needs a happy-path + error-path test, encrypted DB cannot open with wrong key, schema migrations are idempotent, audit-log hash chain is verifiable, property tests for round-trip integrity.
 
-Test level for vault-core is **Medium** (BRD §7.1): unit tests for type construction + serialization, round-trip serde tests, property tests for `MemoryId` / `EntityId` uniqueness.
+**Acceptance** (BRD §6 V0.1.3): Encrypted SQLite database is created, all CRUD tests pass, can be opened only with correct passphrase. CI green.
 
-Workspace deps to wire into `crates/vault-core/Cargo.toml`:
-```toml
-[dependencies]
-serde = { workspace = true }
-serde_json = { workspace = true }
-chrono = { workspace = true }
-uuid = { workspace = true }
-thiserror = { workspace = true }
-
-[dev-dependencies]
-proptest = { workspace = true }
-serde_json = { workspace = true }
-```
-
-Acceptance: All types compile, all unit tests pass, doc comments on every public item, `cargo build/test/clippy/fmt --workspace` all green.
+**Working-tree state at end of session 2026-04-28:** Two logical concerns ready for commit, batched into one because they share a HANDOFF.md update:
+1. Housekeeping — untrack CLAUDE.md, .gitignore update, ADR-004
+2. T0.1.2 implementation — vault-core source + tests + Cargo.toml deps + ADR-005 + recently-completed entry
