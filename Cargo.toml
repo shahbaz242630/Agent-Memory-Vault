@@ -1,0 +1,91 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vault-core",
+    "crates/vault-storage",
+    "crates/vault-embedding",
+    "crates/vault-llm",
+    "crates/vault-retrieval",
+    "crates/vault-consolidator",
+    "crates/vault-mcp",
+    "crates/vault-sync",
+    "crates/vault-connectors",
+    "crates/vault-app",
+    "crates/vault-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+license = "Proprietary"
+authors = ["Shahbaz Malik"]
+repository = "https://github.com/shahbaz242630/Agent-Memory-Vault"
+
+# All dependencies pinned per BRD §2.9 / §4. Crates inherit via { workspace = true }.
+# Workspace.dependencies declarations are lazy — only fetched when a member crate
+# actually depends on them, so listing them all here is safe at the skeleton stage.
+[workspace.dependencies]
+# Async runtime (BRD §4.1)
+tokio = { version = "1.40", features = ["full"] }
+async-trait = "0.1"
+
+# Error handling (BRD §4.1)
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Serialization (BRD §4.1)
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Logging (BRD §4.1)
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Time (BRD §4.1)
+chrono = { version = "0.4", features = ["serde"] }
+
+# UUIDs (BRD §4.1)
+uuid = { version = "1.10", features = ["v4", "v7", "serde"] }
+
+# Storage (BRD §4.2)
+lancedb = "0.8"
+duckdb = { version = "1.0", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher", "chrono", "serde_json"] }
+
+# ML (BRD §4.3)
+ort = { version = "2.0", features = ["load-dynamic"] }
+tokenizers = "0.20"
+# llama-cpp-2: verify exact crate name and version at start of vault-llm task (BRD §4.3 note)
+
+# Sync (BRD §4.4)
+yrs = "0.21"
+dryoc = "0.7"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+
+# MCP (BRD §4.5)
+rmcp = "0.16"
+
+# Tauri (BRD §4.6)
+tauri = { version = "2.10", features = [] }
+tauri-build = "2.10"
+
+# Security primitives (BRD §11.5.3)
+zeroize = { version = "1.8", features = ["derive"] }
+
+# Test deps (BRD §4.7)
+proptest = "1.5"
+tokio-test = "0.4"
+mockall = "0.13"
+tempfile = "3.13"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.dev]
+opt-level = 0
+debug = true

@@ -1,0 +1,11 @@
+[package]
+name = "vault-retrieval"
+description = "Multi-strategy parallel retrieval (semantic, graph, temporal, keyword, frequency) with reranking. See BRD §5.5."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]

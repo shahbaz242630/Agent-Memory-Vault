@@ -1,0 +1,11 @@
+[package]
+name = "vault-mcp"
+description = "MCP adapter layer + server. Exposes the vault to AI agents via Model Context Protocol. See BRD §5.7."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]

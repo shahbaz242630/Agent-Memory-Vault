@@ -1,0 +1,182 @@
+# =====================================================================
+# Memory Vault — .gitignore
+# Goal: NEVER commit secrets, keys, encrypted vaults, ML model files,
+# or build artifacts. Cargo.lock IS committed (BRD §2.9 / §4).
+# =====================================================================
+
+# ---------- Rust / Cargo ----------
+target/
+**/target/
+**/*.rs.bk
+*.pdb
+
+# ---------- Tauri ----------
+src-tauri/target/
+src-tauri/gen/
+ui/node_modules/
+ui/dist/
+ui/build/
+ui/.next/
+ui/.svelte-kit/
+
+# ---------- Node / TS (cloud Workers, frontend) ----------
+node_modules/
+**/node_modules/
+.pnp.*
+yarn-debug.log*
+yarn-error.log*
+npm-debug.log*
+pnpm-debug.log*
+.npm/
+.yarn/
+.pnpm-store/
+
+# ---------- Secrets / credentials (NEVER commit) ----------
+.env
+.env.*
+!.env.example
+!.env.sample
+.envrc
+secrets/
+.secrets/
+*.secret
+*.secrets
+
+# Auth tokens, OAuth credentials, service accounts
+*credential*.json
+*credentials*.json
+client_secret*.json
+service-account*.json
+*-service-account.json
+gcloud-key*.json
+auth-config.json
+
+# Cloud provider credentials
+.aws/
+.gcloud/
+.azure/
+.cloudflare/
+wrangler.toml.local
+.dev.vars
+
+# Generic key/cert material
+*.pem
+*.key
+*.priv
+*.private
+*.crt
+*.cer
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.asc
+*.gpg
+private-key*
+*-private-key*
+
+# API tokens, session tokens
+*.token
+*.tokens
+api-key*
+*api_key*
+
+# ---------- Memory Vault — user data (NEVER commit) ----------
+# Local dev databases
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+
+# Encrypted vault files
+*.vault
+.vault/
+vault-data/
+user-data/
+
+# Audit logs (may contain sensitive metadata)
+audit.log
+audit-*.log
+*.audit
+
+# Sync state / local caches
+.sync/
+sync-state/
+.cache/
+
+# ---------- ML model files (large binaries; downloaded at first launch) ----------
+models/
+*.gguf
+*.onnx
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.ggml
+tokenizer.json
+!crates/vault-embedding/tests/fixtures/tokenizer.json
+
+# ---------- Logs / debug ----------
+*.log
+logs/
+debug/
+core
+core.*
+
+# ---------- IDE / editor ----------
+.vscode/
+!.vscode/settings.json.example
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-workspace
+*.sublime-project
+.zed/
+.cursor/
+.fleet/
+
+# ---------- OS ----------
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+ehthumbs.db
+*.lnk
+
+# ---------- Backup / temp files ----------
+*.bak
+*.backup
+*_backup
+*~backup
+*.tmp
+*.temp
+*.orig
+*.rej
+
+# ---------- Coverage / profiling ----------
+*.profraw
+*.profdata
+coverage/
+lcov.info
+tarpaulin-report.html
+
+# ---------- Local notes (exclude private scratch files) ----------
+NOTES.local.md
+SCRATCH.md
+TODO.local.md
+.private/
+
+# ---------- Claude Code per-machine state ----------
+# Project-shared settings (.claude/settings.json) MAY be committed if we want
+# to share permission baselines across machines. Per-machine local permissions
+# and session state must NOT be committed.
+.claude/settings.local.json
+.claude/.session/
+.claude/cache/

@@ -1,0 +1,11 @@
+[package]
+name = "vault-sync"
+description = "Encrypted CRDT-based sync between local device and Cloudflare R2 cloud backup. See BRD §5.8."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]

@@ -1,0 +1,11 @@
+[package]
+name = "vault-llm"
+description = "Local LLM inference using Phi-4-mini via llama.cpp bindings. See BRD §5.4."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]

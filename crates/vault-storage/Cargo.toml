@@ -1,0 +1,11 @@
+[package]
+name = "vault-storage"
+description = "Persistent storage across LanceDB (vectors), DuckDB (graph), and SQLite/SQLCipher (metadata). See BRD §5.2."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
