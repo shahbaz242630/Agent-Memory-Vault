@@ -3,35 +3,19 @@
 **Last updated:** 2026-04-29
 **Updated by:** Claude (Opus 4.7)
 **Current version:** V0.1 — Internal Alpha
-**Current phase:** V0.1 in progress — `vault-storage::MetadataStore` (T0.1.3) implementation complete locally, all four DoD gates green, awaiting commit/push approval
+**Current phase:** V0.1 in progress — T0.1.3 shipped (commit `f846df7`); pre-T0.1.4 follow-ups in flight (ADR-009 retry-queue policy, BRD §6 perf-budget addition, dryoc API spike scheduled)
 
 ---
 
 ## Current Status
 
-**Active task:** T0.1.3 — vault-storage: SQLite + SQLCipher — **implementation complete, all four DoD gates green locally; awaiting commit/push approval**
-**Started:** 2026-04-28
-**Last test run:** 2026-04-29 — `cargo test -p vault-storage` 39/39 passing; `cargo build --workspace` zero warnings; `cargo clippy --workspace --all-targets -- -D warnings` zero warnings; `cargo fmt --all --check` clean
+**Active item:** Pre-T0.1.4 follow-ups (per Shahbaz's review of T0.1.3) — three deliverables landing in one follow-up commit before T0.1.4 code starts:
+1. **ADR-009** in this file — retry queue policy (bounded vs unbounded, retry strategy, permanent-failure behaviour, user-visible surface, divergence verification). Gates T0.1.6 from improvising failure-recovery semantics.
+2. **BRD §6 V0.1.3 perf budget** — explicit acceptance criterion added to the BRD: `open + migrate + first audit insert ≤ 200ms`, of which ≤ 150ms may be SQLCipher first-open. Honest framing: this is **adding** explicit perf criteria (the previously-cited "BRD 50ms target" did not actually exist in the BRD — that reference in the prior session was a hallucinated constraint, no such line in §6 V0.1.3). Resolves the open blocker without weakening `kdf_iter`.
+3. **Dryoc API spike** — scheduled mini-task for this week (target: before T0.1.4 finishes). 2-hour scratch crate exercising dryoc 0.7's actual encrypt/decrypt API for a single-message envelope. Output updates ADR-008 with confirmed patterns. Goal: discover any vault-sync (T0.2.9) integration mismatch now, not in week 6.
 
-**Deliverables in this task:**
-- `MetadataStore` async API: `open`, `create_memory`, `get_memory`, `update_memory`, `delete_memory`, `list_memories` (with `MemoryFilter`), `append_audit_event`, `list_audit_events`, `verify_audit_chain`. Every CRUD path is transactional and atomic with the corresponding audit-log append.
-- Three tables created via the migration runner (`0001_initial.sql`):
-  - `memories` — flat metadata (id, content, memory_type, source_agent, boundary, created_at, valid_from, valid_until, confidence, access_count, last_accessed, superseded_by, metadata_json) with indexes on (boundary), (memory_type), (created_at desc), (superseded_by IS NULL).
-  - `audit_log` — tamper-evident BLAKE3 hash chain per BRD §11.9.2 (seq, event_id, timestamp, user_id, device_id, event_type, resource_type, resource_id, boundary, actor_kind, actor_name, result, details_json, prev_event_hash, event_hash).
-  - `schema_migrations` — one-row-per-applied-migration ledger (version, applied_at, description). Forward-migration test confirmed: pre-applied versions are skipped, only new versions run; version-gap detection refuses to run if migrations are non-contiguous.
-- SQLCipher key handling: `SqlCipherKey` newtype with `Zeroize`/`ZeroizeOnDrop`, no `Debug`/`Display`. Key set via `PRAGMA key` immediately after open; verified with a `SELECT count(*) FROM sqlite_master` round-trip; WAL + foreign_keys + synchronous=NORMAL pragmas applied. Wrong-key reopen test confirms decryption failure.
-- Boundary filtering enforced at the SQL level (`WHERE boundary = ?` bound param, never spliced) per BRD §11.7.1 — boundary leak via list query is mechanically impossible.
-- Audit chain integrity:
-  - Genesis hash documented as `0000…0000` (64 zero hex chars).
-  - `audit_chain_detects_tampering` direct test: tampering with `boundary` on seq=1 breaks `verify_audit_chain` with "tampering detected" error.
-  - `tampering_breaks_chain_at_every_seq` proptest (8 cases × chains of 2–5 events): for **every** seq position, a single-byte boundary mutation breaks the chain; restoring the original byte heals it. Adversarial coverage of "the audit chain catches every tamper, every time."
-  - `concurrent_writes_all_succeed_and_chain_stays_valid`: 20 concurrent `create_memory` tasks all succeed (Mutex<Connection> serialises chain-tip read + insert), all memories retrievable, chain validates after the fact, total event count matches expected.
-- Performance honestly measured (`perf_budget_open_migrate_first_audit`):
-  - `open + migrate` ≈ **120 ms** (BRD target was 50 ms — **missed by ~70 ms**)
-  - `+ first audit insert` ≈ 120 ms (steady-state, dominated by open cost above)
-  - steady-state audit insert ≈ **197 µs**
-  - The first-open cost is dominated by SQLCipher's default PBKDF2 (256k SHA-512 iterations) — the 50 ms target is not achievable with secure default KDF settings on this CPU class. **Decision needed (see Blockers below):** accept the cost and revise the target, or tune `kdf_iter` (security trade-off — would need ADR + threat-model review).
-- 39 tests across `audit`, `key`, `metadata_store`, `migrations` modules. Property tests use `tokio_test::block_on` (proptest is sync-only; we wrap each case in a block-on so async API can be exercised).
+**Started:** 2026-04-29 (post-T0.1.3 commit)
+**Last test run:** 2026-04-29 — `cargo test -p vault-storage` 39/39 passing; build/clippy/fmt clean (no code change since T0.1.3 commit; this turn is HANDOFF.md + BRD only)
 
 ---
 
@@ -42,21 +26,20 @@
 | Foundation | CLAUDE.md, HANDOFF.md, project memory files | 2026-04-28 | n/a | Pre-kickoff scaffolding (project rules + cross-session memory). Comprehensive `.gitignore` covers secrets, model files, encrypted vault data, ML binaries, Claude Code per-machine state. |
 | T0.1.1 | Workspace Setup | 2026-04-28 | ✅ build/test/clippy/fmt all green on Windows local; CI green on push (39s) | 11 crate skeletons under `crates/`. Workspace `Cargo.toml` pins all BRD §4 deps in `[workspace.dependencies]`. `rust-toolchain.toml` pins stable. CI: 3-job parallel matrix (fmt, clippy, build+test) on ubuntu-latest. `git init` + remote connected to `https://github.com/shahbaz242630/Agent-Memory-Vault.git`. |
 | T0.1.2 | vault-core | 2026-04-28 | ✅ 42 unit + 1 doc test passing; clippy clean; fmt clean | All BRD §5.1 types implemented across `error.rs` / `boundary.rs` / `memory.rs` / `entity.rs` with `lib.rs` re-exports. Validation enforced at construction (`try_new` constructors) AND at storage-write boundary (`validate()` method) per BRD §11.7.1. ID types use UUID v7 (time-ordered, good DB index locality). `Boundary` uses validated newtype with private field (deviation from BRD `pub String` — see ADR-005). |
-| CI hardening | `actions/checkout` v4 → v6 | 2026-04-28 | ✅ CI green | Resolves Node 20 deprecation flagged on f3923eb. GitHub Actions runners drop Node 20 on 2026-09-16; v6 runs on Node 24. `Swatinem/rust-cache@v2` and `dtolnay/rust-toolchain@stable` are unaffected (no Node 20 dependency). Followed GitHub's recommended floating-major tag convention (`@v6`) so security patches auto-apply. |
+| CI hardening | `actions/checkout` v4 → v6 | 2026-04-28 | ✅ CI green | Resolves Node 20 deprecation flagged on `f3923eb`. GitHub Actions runners drop Node 20 on 2026-09-16; v6 runs on Node 24. `Swatinem/rust-cache@v2` and `dtolnay/rust-toolchain@stable` are unaffected (no Node 20 dependency). Followed GitHub's recommended floating-major tag convention (`@v6`) so security patches auto-apply. |
+| T0.1.3 | vault-storage: SQLite + SQLCipher (`MetadataStore` + audit chain) | 2026-04-29 (commit `f846df7`) | ✅ 39/39 passing; build/clippy/fmt clean | `MetadataStore` async API (CRUD + audit append/list/verify, every CRUD txn-atomic with audit append). Three tables via migration runner: `memories` (boundary-indexed), `audit_log` (BLAKE3 hash chain per BRD §11.9.2, genesis = 0×64, canonical sorted-key JSON), `schema_migrations` (gap + out-of-order detection refuse to run, idempotent re-runs). SQLCipher key handling: `SqlCipherKey` newtype with `Zeroize`/`ZeroizeOnDrop`, no `Debug`/`Display` (ADR-007); WAL + foreign_keys + synchronous=NORMAL. Boundary filter parameterised at SQL level (BRD §11.7.1). Audit-tamper proptest hits every byte position in chains of 2–5 events; concurrent-writes proptest validates 20-task chain serialisation via `Mutex<Connection>`. Decisions logged: ADR-006 (rusqlite vendored OpenSSL + monthly CVE check), ADR-007 (no manual `Debug` on sensitive types), ADR-008 (dryoc 0.7 API drift formalised). Perf measured: `open+migrate` ≈ 120ms, steady-state audit insert ≈ 197µs. |
 
 ---
 
 ## In Progress
 
-**T0.1.3 — vault-storage: SQLite + SQLCipher** — code complete, all four DoD gates green locally, awaiting commit/push approval. Working-tree changes:
-- `Cargo.toml` (workspace) — `rusqlite` feature flipped to `bundled-sqlcipher-vendored-openssl`; `blake3 = "1.8"` added to `[workspace.dependencies]`
-- `crates/vault-storage/Cargo.toml` — deps wired (vault-core, rusqlite, tokio, async-trait, thiserror, tracing, serde, serde_json, chrono, uuid, blake3, zeroize) + dev-deps (proptest, tempfile, tokio-test)
-- `crates/vault-storage/src/lib.rs` — re-exports
-- `crates/vault-storage/src/key.rs` — `SqlCipherKey`
-- `crates/vault-storage/src/audit.rs` — audit types, BLAKE3 sealing, chain verification
-- `crates/vault-storage/src/metadata_store.rs` — `MetadataStore` async API + 39-test suite
-- `crates/vault-storage/src/migrations/{mod.rs, 0001_initial.sql}` — migration runner + initial schema
-- `crates/vault-storage/proptest-regressions/` — proptest seed files (recommended to commit per proptest docs)
+**Pre-T0.1.4 follow-ups** (single follow-up commit, no code change — HANDOFF.md + BRD §6 only):
+
+- [x] **ADR-009 — retry queue policy** (this file, ADR section)
+- [x] **BRD §6 V0.1.3 perf budget added** (`Agent Build Specification.txt` line ~1257)
+- [x] **Dryoc API spike scheduled** (this file, Tech Debt section, target: this week, before T0.1.4 finishes)
+
+Once these land in the follow-up commit, T0.1.4 (vault-storage: LanceDB) starts.
 
 ---
 
@@ -64,7 +47,7 @@
 
 - [ ] **T0.1.4** — vault-storage: LanceDB (vector store with boundary filtering)
 - [ ] **T0.1.5** — vault-storage: DuckDB (graph store with bi-temporal columns)
-- [ ] **T0.1.6** — vault-storage: Cascading Backend (StorageBackend orchestrator + retry queue)
+- [ ] **T0.1.6** — vault-storage: Cascading Backend (StorageBackend orchestrator + retry queue per ADR-009)
 - [ ] **T0.1.7** — vault-embedding (bge-small via ort)
 - [ ] **T0.1.8** — vault-retrieval: Semantic Strategy Only
 - [ ] **T0.1.9** — vault-mcp: Adapter + Stdio Server (memory.search, memory.write)
@@ -78,10 +61,10 @@ V0.2 and V1.0 task lists live in BRD §6 and will be promoted here when V0.1 com
 
 ## Blockers / Decisions Needed
 
-- **SQLCipher first-open cost vs. BRD 50 ms target.** Measured `open + migrate` ≈ 120 ms; the 50 ms target in BRD §6 V0.1.3 is not achievable with SQLCipher's default `kdf_iter = 256000` (PBKDF2-SHA512) on this CPU class. Two paths:
-  1. **Accept the cost, revise the target.** First-open is a once-per-session event (vault-tauri startup); 120 ms is imperceptible. Document in BRD addenda.
-  2. **Tune `kdf_iter` down.** Each halving of iterations roughly halves brute-force resistance. Would need an ADR + threat-model review, and would deviate from SQLCipher defaults that other security audits assume.
-  Recommendation: take path (1). Awaiting Shahbaz's call.
+_None outstanding._
+
+**Resolved:**
+- ~~SQLCipher first-open cost vs. "BRD 50ms target."~~ Resolved 2026-04-29 by adding explicit BRD §6 V0.1.3 perf-budget criterion (`open + migrate + first audit insert ≤ 200ms`, ≤ 150ms first-open allowance). **Honest correction:** the prior session's reference to "BRD 50ms target" was a hallucinated constraint — no such line existed in BRD §6 V0.1.3. The fix is therefore *adding* explicit perf criteria, not revising a real prior target. PBKDF2 256k iterations stays as the security property; `kdf_iter` is not tuned down.
 
 ---
 
@@ -132,6 +115,36 @@ V0.2 and V1.0 task lists live in BRD §6 and will be promoted here when V0.1 com
 - **Alternatives considered:** Stub `Debug` returning a fixed string like `"MetadataStore { .. }"` (rejected: sets the precedent above). Wrap the connection in a `Debug`-able newtype (rejected: same precedent, with extra ceremony).
 - **Test-side pattern:** Replace `assert!(matches!(x, Pattern(_)), "got {x:?}")` with an explicit `match x { Pattern(_) => {}, _ => panic!("static description here") }` when `x` doesn't impl `Debug`.
 
+### ADR-008 — 2026-04-29 — dryoc 0.7 API differs from BRD §11.6 sketch; verify with a spike before T0.2.9
+- **Context:** BRD §11.6 sync-envelope construction (T0.2.9) was sketched assuming dryoc exposes a libsodium-style single-shot AEAD (`crypto_aead_xchacha20poly1305_ietf_encrypt`). Inspecting dryoc 0.7's published API surface, the user-facing primitive is `dryocstream` — a streaming push/pull XChaCha20-Poly1305 construction, not single-shot. The BRD sketch will not compile against the actual crate as-is. Discovering this in week 6 of T0.2.9 would be expensive.
+- **Decision:** Run a 2-hour API-shape spike this week (before T0.1.4 finishes) in a scratch crate: minimal end-to-end encrypt → decrypt round-trip on a single-envelope payload using dryoc 0.7's actual API. Output: confirmed integration patterns annotated back into this ADR; a follow-up amendment fixes the BRD §11.6 sketch with the real call shape. Three plausible paths the spike will choose between:
+  1. **Wrap streaming in a single-message helper** (one `push` → `finalize` per envelope). Stays inside dryoc; minor wrapper cost.
+  2. **Use a single-shot AEAD from a sibling crate** (orion, sodiumoxide). Avoids streaming wrapper but adds a second crypto crate to vet.
+  3. **Switch to RustCrypto's `chacha20poly1305`** (XChaCha variant). Pure-Rust, no libsodium FFI; ergonomic, well-audited. Strong default if dryoc proves cumbersome.
+- **Reasoning:** Discovering API mismatch in week 1 is a 2-hour problem; in week 6 it's a 2-day problem mid-implementation. Cheap insurance, scoped explicitly so it cannot scope-creep into "build T0.2.9 early."
+- **Spike status:** Scheduled. Not yet run. This ADR will be amended with confirmed patterns + chosen path once the spike completes.
+
+### ADR-009 — 2026-04-29 — Retry queue policy for cascading-backend partial failures (gates T0.1.6)
+- **Context:** T0.1.3 schema reserves a `retry_queue` table for T0.1.6 (cascading writes across SQLite + LanceDB + DuckDB), but the *policy* for that queue was never specified. Without policy, T0.1.6 will improvise failure-recovery semantics — and improvisation in failure-recovery code is exactly where production data-loss bugs come from. Concrete failure mode this prevents: SQLite write succeeds, LanceDB write fails, retry never resolves; user adds a memory yesterday and searches for it today and it silently doesn't exist in the vector store. Per Shahbaz's T0.1.3 review.
+- **Decision:** The cascading retry queue (lands in T0.1.6) follows this policy:
+  1. **Bounded queue.** Hard cap of 10,000 pending entries. When the cap is hit, new cascading writes still succeed against SQLite (source of truth) but the system enters a *degraded mode*: vault-app raises a "vault repair required" warning to the UI, and consolidation is paused until the queue drains. Bounded prevents the queue from becoming an unbounded write-amplification disk hog.
+  2. **Retry strategy.** Exponential backoff with full jitter. Base delay 1s, multiplier 2, cap 5min. **Max 5 attempts** per entry; after the 5th failure the entry moves to a *dead-letter table* (separate from the live retry queue, in the same SQLite DB).
+  3. **Permanent-failure behaviour.** A dead-lettered entry triggers three things: (a) audit-log entry with `result=Error` and details of every attempt; (b) UI alert in the sync-health surface ("Memory `<id>` failed to propagate to vector/graph store after 5 attempts. Investigate before further consolidation."); (c) the affected memory is marked `divergence_pending` in SQLite — retrieval still serves the SQLite metadata, but search relevance is flagged as potentially incomplete.
+  4. **User-visible surface.** A "Sync Health" indicator in the Tauri UI (lands in T0.1.11 minimal form, polished in T0.2.15). Shows: pending retries (count + oldest age), dead-lettered entries (count, requires user action), last successful full-cascade-write timestamp. Click-through to the dead-letter list with per-entry "retry" / "force-mark-divergent" / "drop" actions.
+  5. **Periodic divergence verification.** A background task runs every 6 hours and on every app start: compares SQLite memory IDs against LanceDB and DuckDB tombstones. Any drift not already in the retry queue or dead-letter table is logged + alerts the user. Detects silent divergence from bugs that bypass the retry path entirely.
+- **Reasoning:** Each clause closes a specific data-loss failure mode raised in Shahbaz's T0.1.3 review. Bounded > unbounded because unbounded retry queues hide the underlying corruption while consuming disk indefinitely; degradation mode forces the failure to surface. 5 attempts (not infinite) because if LanceDB is rejecting a write 5 times, the failure is likely structural (corruption, schema drift) and silent retry won't fix it. The dead-letter table keeps the live queue fast and gives users explicit visibility into "what is broken right now." Periodic divergence verification is the belt-and-braces — even if the retry queue itself has a bug, the verification job catches drift.
+- **Alternatives considered:**
+  - *Unbounded queue with infinite retry* (rejected: hides corruption, fills disk, never surfaces failure).
+  - *Drop-on-failure* (rejected: silent data loss is the worst outcome).
+  - *Block writes on any retry-queue entry* (rejected: amplifies a single corrupt store into a full vault outage).
+  - *Sync directly to all three stores synchronously, no retry queue* (rejected: lockstep failure semantics are worse — any single store going down blocks the whole vault).
+- **Test requirements (T0.1.6):**
+  - Property test: arbitrary sequence of writes + injected partial failures → final state has every memory either active in all three stores, or dead-lettered with correct audit trail. No memory is ever silently dropped.
+  - Adversarial test: force LanceDB write to fail 6 times in a row → entry moves to dead-letter on attempt 5, UI alert fires, audit log has 5 retry events.
+  - Adversarial test: 10,001st cascading write while queue is at cap → SQLite write succeeds, system enters degraded mode, UI shows warning.
+  - Integration test: divergence verification job on a vault with 1 known-divergent memory → detects and alerts within one cycle.
+- **When to revisit:** After T0.1.6 lands and the policy meets real failure modes. After V0.2 sync introduces additional failure surface.
+
 ---
 
 ## Tech Debt Backlog
@@ -140,7 +153,7 @@ Items noticed but not addressed in their originating task — picked up explicit
 
 - [ ] **`llama-cpp-2 = "0.1"` not yet declared in `[workspace.dependencies]`** — BRD §4.3 flags it for verification at the start of vault-llm work (T0.2.1). Do crate-name-and-version verification on docs.rs at that point and add to workspace deps then. (Noted 2026-04-28, file: `Cargo.toml`)
 - [ ] **`.gitattributes` for line-ending normalisation** — currently relying on git's default `core.autocrlf=true` on Windows. Adding `* text=auto eol=lf` plus binary markers for known binary file types would silence the CRLF warnings on commit and make cross-platform behaviour deterministic. Quick win when convenient. (Noted 2026-04-28)
-- [ ] **dryoc 0.7 only exposes streaming XChaCha20-Poly1305, not single-shot AEAD** — BRD §11.6 sync envelope construction (T0.2.9) was sketched assuming `crypto_aead_xchacha20poly1305_ietf_encrypt` (single-shot). dryoc 0.7's surface is `dryocstream` (streaming push/pull). Two options when T0.2.9 lands: (a) wrap streaming in a single-message helper (one-`push`-then-`finalize` per envelope), (b) switch to a different crate that exposes the libsodium-style single-shot API (orion / sodiumoxide). Re-verify dryoc's API at T0.2.9 kickoff before deciding. (Noted 2026-04-28, file: `Agent Build Specification.txt` §11.6)
+- [ ] **dryoc 0.7 streaming-vs-single-shot — RUN THE SPIKE THIS WEEK** — per ADR-008. 2-hour scratch crate, single-envelope encrypt → decrypt round-trip using actual dryoc 0.7 API. Output: ADR-008 amended with confirmed call shape; BRD §11.6 sketch updated to compile against reality. **Target: complete before T0.1.4 finishes** so we know whether we're using dryoc, RustCrypto, or another crate before T0.2.9 design starts. (Noted 2026-04-28, scheduled 2026-04-29)
 - [ ] **(Recurring) Monthly OpenSSL CVE check** — per ADR-006. First Monday of each month, review https://www.openssl.org/news/vulnerabilities.html and the OpenSSL version vendored by `openssl-src` (`cargo tree -p openssl-src` from this workspace). Critical / High advisories affecting the vendored version → prioritise `cargo update -p openssl-src` ahead of other work. Next due: 2026-05-04. (Noted 2026-04-28)
 
 ---
@@ -153,26 +166,23 @@ _(populated once V0.1 ships)_
 
 ## Notes for Next Session
 
-**Immediate:** T0.1.3 working tree is staged-ready but **not committed** — every git history change requires per-action approval per CLAUDE.md. Once Shahbaz approves, commit + push, then move on.
+**Immediate state:** T0.1.3 committed and pushed (`f846df7`). Pre-T0.1.4 follow-ups (ADR-009 + BRD §6 perf criterion + dryoc spike scheduled) staged for the follow-up commit. After that commit lands, T0.1.4 (vault-storage: LanceDB) starts.
+
+**Pace caution:** Per Shahbaz's T0.1.3 review — "Watch for the temptation to move faster on T0.1.4 because momentum feels good. LanceDB integration has its own subtleties — vector dimension consistency, IVF index parameters, encryption-at-filesystem-level for the data dir. Don't let velocity override the same thoroughness." Keep T0.1.4 at the same test depth as T0.1.3 (Heavy: round-trip, boundary-leak proptest, concurrent-write test).
 
 **Two of the five tables in BRD §5.2 are intentionally deferred** to the tasks that actually need them:
-- `review_queue` — added at T0.1.X around connector ingestion (BRD §5.9)
-- `sync_state` and `retry_queue` — added at T0.1.6 (cascading backend) / T0.2.x (sync engine)
+- `review_queue` — added at the connector ingestion task (BRD §5.9)
+- `sync_state` and `retry_queue` — added at T0.1.6 (cascading backend per ADR-009) / T0.2.x (sync engine)
 
-This is per the "no scaffolding for unused features" rule (CLAUDE.md hard rule). Each table will land via a new numbered migration file (`0002_review_queue.sql`, etc.) — the migration runner already supports this and is regression-tested by `forward_migration_applies_next_version_only`.
+Per the "no scaffolding for unused features" rule (CLAUDE.md hard rule). Each table will land via a new numbered migration file (`0002_review_queue.sql`, etc.) — the migration runner already supports this and is regression-tested by `forward_migration_applies_next_version_only`.
 
 **Next task — T0.1.4 — vault-storage: LanceDB vector store (BRD §5.2.2):**
 
 - Add `lancedb` and `arrow` deps to `crates/vault-storage/Cargo.toml` (versions pinned per BRD §4)
 - Implement `VectorStore` trait + `LanceVectorStore` struct: `insert`, `update`, `delete`, `search(query_vec, boundary, k) -> Vec<(MemoryId, score)>`, `purge_boundary(b)` for boundary deletion
-- **Boundary filtering must happen at the LanceDB query layer**, not after-the-fact — same security principle as the SQL boundary filter we just shipped
+- **Boundary filtering must happen at the LanceDB query layer**, not after-the-fact — same security principle as the SQL boundary filter we just shipped. This is the place where it's easiest to slip; reread BRD §11.4.3 before writing the search method.
 - Encryption: LanceDB does not natively support encryption-at-rest. Decision needed at T0.1.4 kickoff: use a wrapper that encrypts the parquet files at OS-FS level (recommended), or store vectors inside SQLCipher (slower, scaling concerns). Document as an ADR.
-- Test level: **Heavy** — round-trip tests, boundary filter cannot leak, property tests for vector insert/search consistency
+- Test level: **Heavy** — round-trip tests, boundary filter cannot leak, property tests for vector insert/search consistency, concurrent-write test
 - Tie-in to T0.1.3: the next migration (`0002_…sql`) may add a `vector_id` column to `memories` if we choose a model where SQLite holds the cross-store reference
 
-**Working-tree state at end of session 2026-04-29:** T0.1.3 implementation complete, four DoD gates green, `HANDOFF.md` updated. Awaiting commit/push approval. Files in working tree:
-- `Cargo.toml`, `Cargo.lock` — workspace dep updates (rusqlite feature, blake3)
-- `crates/vault-storage/Cargo.toml` — full dep wiring
-- `crates/vault-storage/src/{lib.rs, key.rs, audit.rs, metadata_store.rs, migrations/}` — implementation + tests
-- `crates/vault-storage/proptest-regressions/` — proptest seed corpus (recommended-to-commit per proptest docs)
-- `HANDOFF.md` — this file
+**Working-tree state at the start of this turn:** clean (T0.1.3 committed at `f846df7`, pushed). Pending changes in this turn: `HANDOFF.md` (this file) + `Agent Build Specification.txt` (§6 V0.1.3 perf-budget criterion added). No code change.

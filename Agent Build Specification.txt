@@ -1255,6 +1255,7 @@ V0.1 → V0.2 → V1.0. Build in order. Do not skip ahead.
 - Schema migrations for memory metadata, audit log, review queue, sync state
 - Implement `MetadataStore` with CRUD
 - Acceptance: Encrypted SQLite database is created, all CRUD tests pass, can be opened only with correct passphrase
+- Performance budget: `open + migrate + first audit insert` ≤ 200ms total, of which ≤ 150ms may be SQLCipher first-open. Rationale: SQLCipher default `kdf_iter = 256000` (PBKDF2-SHA512) IS the security property — lowering it to hit a tighter latency target weakens password-derivation hardness. First-open is once-per-session (Tauri startup); 150ms is imperceptible. Steady-state audit inserts must be < 1ms.
 
 **T0.1.4 — vault-storage: LanceDB**
 - Set up LanceDB embedded
