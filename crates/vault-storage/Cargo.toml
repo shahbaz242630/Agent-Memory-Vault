@@ -11,6 +11,13 @@ repository.workspace = true
 [dependencies]
 vault-core = { path = "../vault-core" }
 rusqlite = { workspace = true }
+# LanceDB vector store (T0.1.4). lancedb re-exports arrow_schema; arrow-array
+# is needed directly for RecordBatch, RecordBatchIterator, Float32Array,
+# FixedSizeListArray. Versions pinned in workspace Cargo.toml.
+lancedb = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+futures = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }

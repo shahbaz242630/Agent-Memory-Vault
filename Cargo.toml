@@ -29,6 +29,9 @@ repository = "https://github.com/shahbaz242630/Agent-Memory-Vault"
 # Async runtime (BRD §4.1)
 tokio = { version = "1.40", features = ["full"] }
 async-trait = "0.1"
+# Futures combinators (TryStreamExt for draining lancedb's SendableRecordBatchStream
+# into Vec<RecordBatch>). Added in T0.1.4 Phase 3.
+futures = "0.3"
 
 # Error handling (BRD §4.1)
 thiserror = "2.0"
@@ -42,14 +45,25 @@ serde_json = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
-# Time (BRD §4.1)
-chrono = { version = "0.4", features = ["serde"] }
+# Time (BRD §4.1). Pinned to "=0.4.38" to dodge a transitive incompatibility:
+# chrono 0.4.44 added Datelike::quarter(), which conflicts with arrow-arith
+# 52.x's ChronoDateExt::quarter(), causing a "multiple `quarter` found"
+# compile error in arrow-arith via lancedb's transitive deps. 0.4.38 is the
+# last release pre-conflict that we know compiles cleanly with arrow 52.1.
+# Tracked in HANDOFF.md tech-debt; revisit when arrow updates past the conflict.
+chrono = { version = "=0.4.38", features = ["serde"] }
 
 # UUIDs (BRD §4.1)
 uuid = { version = "1.10", features = ["v4", "v7", "serde"] }
 
 # Storage (BRD §4.2)
 lancedb = "0.8"
+# arrow pinned to match lancedb 0.8's workspace ("52.1"). Required for direct
+# use of RecordBatch / RecordBatchIterator / Float32Array / FixedSizeListArray
+# in vault-storage; lancedb 0.8 only re-exports arrow_schema. Mismatch with
+# lancedb's transitive arrow would cause type-conversion errors. Added in T0.1.4.
+arrow-array = "52.1"
+arrow-schema = "52.1"
 duckdb = { version = "1.0", features = ["bundled"] }
 # rusqlite uses bundled-sqlcipher-vendored-openssl instead of bundled-sqlcipher
 # (deviation from BRD §4.2 — see HANDOFF.md ADR-006). Vendoring OpenSSL avoids

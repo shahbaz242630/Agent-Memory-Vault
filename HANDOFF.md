@@ -33,13 +33,40 @@
 
 ## In Progress
 
-**Pre-T0.1.4 follow-ups** (single follow-up commit, no code change — HANDOFF.md + BRD §6 only):
+**T0.1.4 — vault-storage: LanceDB vector store** — Phases 1 + 2 + 3 complete (working tree, uncommitted). **Awaiting Shahbaz review before Phase 4 commit.**
 
-- [x] **ADR-009 — retry queue policy** (this file, ADR section)
-- [x] **BRD §6 V0.1.3 perf budget added** (`Agent Build Specification.txt` line ~1257)
-- [x] **Dryoc API spike scheduled** (this file, Tech Debt section, target: this week, before T0.1.4 finishes)
+**Phase 3 done 2026-04-29 — DoD gates:**
+- `cargo build --workspace` — clean, zero warnings (3.9s)
+- `cargo test -p vault-storage --quiet` — **59 passed; 0 failed; 0 ignored** (up from 46 — 6 previously-ignored stubs now pass + 7 new Phase 3 tests including the boundary-leak proptest with 8 cases)
+- `cargo clippy -p vault-storage --all-targets -- -D warnings` — clean
+- `cargo fmt --all --check` — clean
 
-Once these land in the follow-up commit, T0.1.4 (vault-storage: LanceDB) starts.
+**Phase 3 implementation (all in `crates/vault-storage/src/vector_store.rs`):**
+- `upsert` — builds a single-row Arrow `RecordBatch` (helpers `make_schema`, `build_record_batch`), then `table.merge_insert(&["id"]).when_matched_update_all(None).when_not_matched_insert_all().execute(Box::new(reader))`. Match column is `"id"` ONLY per Shahbaz's review concern #1 — pinned by the new test `upsert_with_same_id_different_boundary_updates_existing_no_duplicate`. Builder ergonomics commented in code (mut binding required because `when_*` are `&mut self` but `execute` consumes by value).
+- `delete` — `table.delete(&format!("id = {}", quote_sql_string(uuid_str)))`. UUID can't contain a quote, but routed through `quote_sql_string` for defense-in-depth so a future MemoryId refactor can't introduce SQL injection here.
+- `search` — empty-`authorized_boundaries` → `Ok(vec![])` early-return (no LanceDB round-trip; runtime expression of the type-level invariant). Otherwise: dimension check, build filter via `build_boundary_filter`, `table.query().nearest_to(query)?.only_if(&filter).limit(limit).distance_type(DistanceType::Cosine).execute()`, drain `SendableRecordBatchStream` via `futures::TryStreamExt::try_collect`, decode `id` (Utf8) and `_distance` (Float32) columns into `Vec<(MemoryId, f32)>`.
+- `count` — `table.count_rows(boundary.map(|b| format!("boundary = {}", quote_sql_string(b.as_str()))))`.
+- `dimension` — accessor.
+
+**Three Phase 3 review concerns from Shahbaz — all addressed:**
+1. **`merge_insert` matches on id only.** Implementation uses `&["id"]` exactly. Test `upsert_with_same_id_different_boundary_updates_existing_no_duplicate` plants an id under "work", re-upserts under "personal", asserts (a) total count stays at 1 (no duplicate), (b) old boundary count = 0, (c) new boundary count = 1, (d) work-search no longer finds the id, (e) personal-search does.
+2. **`only_if` filter construction is security-critical.** Two-layer security argument documented in `build_boundary_filter`'s doc comment: type-level (Boundary's `[a-zA-Z0-9_-]{1,64}` charset) + construction-site (`quote_sql_string` doubles single quotes per SQL standard). Both layers must hold for the security property; either alone is insufficient. Unit tests `quote_sql_string_doubles_embedded_quotes` and `build_boundary_filter_uses_quoted_in_clause` lock in the SQL escape semantics. Defense-in-depth even though Boundary's charset already excludes quotes.
+3. **Distance metric is `DistanceType::Cosine`.** Documented at the struct level (`LanceVectorStore` doc comment) with the calibration note: bge-small-en-v1.5 outputs L2-normalised vectors so cosine and Euclidean rank identically; cosine is conventional for sentence embeddings; the T0.2.7 reranker will be calibrated to cosine-distance semantics; changing the metric here changes the score semantics for every consumer.
+
+**Other Phase 3 deliverables:**
+- Boundary-leak proptest `search_never_returns_unauthorized_boundary` — generates 2–5 random boundaries from `[a-z]{4,8}`, plants 1–6 memories per boundary, picks an authorised subset via random bitmask, runs the search, asserts every returned id's boundary is in the authorised set. 8 cases per run, all green.
+- `concurrent_upserts_all_succeed` — 20 concurrent `tokio::spawn` upserts via cloned `LanceVectorStore`, all complete, total count = 20, all 20 ids found via search.
+- `delete_absent_id_is_idempotent` — pins the trait's documented "deleting an absent id is not an error" semantics.
+- `search_rejects_dimension_mismatch` — symmetric guard to the upsert-side dimension check.
+- Removed scoped `#[allow(dead_code)]` on `LanceVectorStore` (was on `connection`/`table` fields). Dropped the `connection` field entirely — `Table` holds its own internal reference; we don't need a redundant handle.
+
+**Phase 4 (next, gated on this review):**
+1. Stage all working-tree files (Cargo.lock + Cargo.toml + HANDOFF.md + Agent Build Specification.txt + crates/vault-core/src/boundary.rs + crates/vault-storage/Cargo.toml + crates/vault-storage/src/lib.rs + crates/vault-storage/src/vector_store.rs)
+2. Show staged set + propose a single commit message covering: ADR-010/T0.2.0/ADR-011/ADR-012/ADR-013 + Boundary tightening + chrono pin + lancedb deps + `LanceVectorStore` Phases 2+3 + 7 new ADR-008/009/010/011/012/013 entries
+3. Ask for commit approval; on yes, ask separately for push approval
+4. After push: T0.1.4 → Recently Completed; T0.1.5 (DuckDB graph store) becomes the new In Progress
+
+Dryoc spike (ADR-008) — **still scheduled, not yet run.** Shahbaz acknowledged this is honest debt; deferred behind T0.1.4 Phase 4 commit per his "Approve Phase 3. Continue" direction. Will run after T0.1.4 commits, before T0.1.5 starts.
 
 ---
 
@@ -52,7 +79,7 @@ Once these land in the follow-up commit, T0.1.4 (vault-storage: LanceDB) starts.
 - [ ] **T0.1.8** — vault-retrieval: Semantic Strategy Only
 - [ ] **T0.1.9** — vault-mcp: Adapter + Stdio Server (memory.search, memory.write)
 - [ ] **T0.1.10** — vault-app: Wiring (Application, config, startup/shutdown)
-- [ ] **T0.1.11** — vault-tauri: Minimal UI (add memory, search, settings — also: convert vault-tauri from lib to bin crate)
+- [ ] **T0.1.11** — vault-tauri: Minimal UI (add memory, search, settings — also: convert vault-tauri from lib to bin crate). **MUST also implement two ADR-010 compensating controls:** (a) modal first-run banner — non-dismissible until acknowledged, click recorded in metadata_store; (b) persistent UI banner at the top of every launch ("ALPHA — vector store is unencrypted. V0.2 fixes this."). Both removed by T0.2.0. Easy to forget when UI work starts months from now — both items are pre-committed here.
 - [ ] **T0.1.12** — V0.1 End-to-End Test (founder uses for a full day, files ≥3 issues)
 
 V0.2 and V1.0 task lists live in BRD §6 and will be promoted here when V0.1 completes.
@@ -145,6 +172,111 @@ _None outstanding._
   - Integration test: divergence verification job on a vault with 1 known-divergent memory → detects and alerts within one cycle.
 - **When to revisit:** After T0.1.6 lands and the policy meets real failure modes. After V0.2 sync introduces additional failure surface.
 
+### ADR-010 — 2026-04-29 — LanceDB stores plaintext on disk for V0.1 only; T0.2.0 is a HARD GATE before any beta user
+- **Status:** APPROVED 2026-04-29 by Shahbaz. Per BRD §11.15 escalation discipline.
+
+- **Explicit deviation from BRD §11.5.1:** This ADR documents a *bounded, time-limited deviation* from BRD §11.5.1 ("All data on disk is encrypted. No exceptions"). The deviation applies **only to the V0.1 internal-alpha distribution on Shahbaz's own dev machine**. It does not apply to V0.2 or any external user. T0.2.0 (added to BRD §6 V0.2 by this commit) closes the deviation before any beta user installs the product.
+
+- **V0.1 alpha scope:** The deviation is in force from this commit through end of V0.1 only. V0.1 is founder-only, manual entry, no cloud sync, no external distribution. The plaintext exposure surface is one machine — Shahbaz's. The exception expires at the moment T0.2.0 lands; no further authorisation extends it.
+
+- **Context:** T0.1.4 introduces LanceDB as the vector store. LanceDB 0.8 has no native at-rest encryption — it writes plaintext Parquet files to a data directory. BRD §11.5.1 prescribes encrypted-data-dir-via-dryoc-into-tmpfs, but two obstacles block applying that prescription in T0.1.4: (1) the dryoc API is unresolved (ADR-008 spike has not run), so building on top of it now means rewriting after the spike; (2) the BRD's Windows half ("memory-only handle") is under-specified — Windows has no built-in tmpfs, and a proper sealed-`ObjectStore` adapter is its own architecture project. Three options were evaluated:
+  - **A. Plaintext on disk for V0.1, encryption gates V0.2 via T0.2.0.** Approved.
+  - B. Half-baked encryption now (sealed-tarball decrypted to a temp dir on open, re-encrypted on close). Process crash leaves plaintext temp dir; not actually "encrypted at rest" in any threat-model-meaningful sense.
+  - C. Skip LanceDB for V0.1 entirely — store 384-dim embeddings as BLOBs in SQLCipher's `memories` table, brute-force cosine in-memory. Honors §11.5.1 literally but defers the LanceDB integration risk to V0.2.
+
+- **Reasoning:**
+  - **V0.1 distribution is founder-only.** BRD §6 V0.1: "Founder can install the app on their Mac." No external user has disk access. The §11.1 threat "compromised endpoint" still applies but at a different risk magnitude than production.
+  - **Half-baked crypto is worse than no claim.** A sealed-tarball-on-close scheme that leaves plaintext temp dirs on crash violates CLAUDE.md ("no half-finished implementations") and would suggest a guarantee we don't deliver.
+  - **The dryoc question must be answered first.** Building cryptographic layers on an unverified API is exactly the rework the ADR-008 spike is meant to prevent.
+  - **Skipping LanceDB defers a different risk.** The BRD chose LanceDB after vector-DB evaluation; testing that integration in V0.1 surfaces real issues (vector dim consistency, IVF parameters, Arrow schema, query layer boundary filtering). Option C means V0.2 carries two large unknowns instead of one.
+  - **The deviation is bounded and reversible.** Plaintext window scoped to V0.1 founder-only. Adding the encryption layer in T0.2.0 is additive — no LanceDB code from T0.1.4 needs to change beyond the data-dir wrapper.
+
+- **HARD GATE — T0.2.0 before T0.2.16:** T0.2.0 (LanceDB Encryption at Rest) is added to BRD §6 V0.2 as a hard dependency for T0.2.16 (Beta Onboarding). **If T0.2.0 slips, V0.2 ship date slips.** No external user receives a build that contains the V0.1 plaintext-LanceDB code path. T0.2.0's Definition of Done includes a test that asserts the data dir contains no plaintext Parquet files after a write/close cycle, and that all four V0.1 compensating controls (below) are removed from the codebase.
+
+- **Compensating controls — loud, not buried:** Every one of these is mandatory for the V0.1 build that lands at T0.1.4. All four are removed automatically by T0.2.0:
+  1. **Modal first-run banner — not dismissible until acknowledged.** Tauri webview shows a modal on first launch: "ALPHA BUILD — your vector data is stored UNENCRYPTED on disk. Do NOT put real personal data, credentials, or sensitive information into this vault. Encryption ships in V0.2 before any beta user receives the product." User must click an "I understand" button to proceed; the click is recorded in `metadata_store` (so we can verify acknowledgement during alpha review). Lands at T0.1.11.
+  2. **Persistent banner at top of UI on every launch.** A small but always-visible warning strip at the top of the app window: "ALPHA — vector store is unencrypted. V0.2 fixes this." Persists across sessions until T0.2.0 ships. Lands at T0.1.11.
+  3. **WARN-level log on every startup** if the data dir is unencrypted. Emitted by `vault-storage` at LanceDB open: `tracing::warn!("LanceDB data dir is plaintext (V0.1 alpha — see ADR-010). Encryption layer ships in T0.2.0.")`. Lands at T0.1.4. Visible in any tracing subscriber, including the dev console and any future log forwarder.
+  4. **`ALPHA_DO_NOT_STORE_REAL_DATA.txt` file in the data dir.** Auto-written on first LanceDB open if absent. Content: explicit warning + ADR-010 reference + T0.2.0 issue tracker pointer + creation timestamp. Read-only on Mac/Linux (chmod 0444), not deletable from the UI. Lands at T0.1.4.
+  - **Removal trigger:** T0.2.0's DoD includes deleting all four. The modal/banner code paths are removed from the Tauri commands; the `warn!` log emits an `info!` "encryption active" message instead; the `ALPHA_DO_NOT_STORE_REAL_DATA.txt` file is deleted on T0.2.0 first-run with a one-time `info!` log noting the upgrade.
+
+- **Other (always-on, not gated to T0.2.0):**
+  - **Boundary filtering at the LanceDB query layer is non-negotiable** (BRD §11.4.3, BRD §11.7.1). Encryption deferred ≠ access control deferred. Filter implemented at `lance` query construction, not in application code post-fetch.
+  - **Memory inserts still go through boundary-validated `vault-core` types.** Plaintext-on-disk does not relax input validation.
+  - **The audit log (in SQLCipher) records every LanceDB write/search.** Cascading backend (T0.1.6) wires this through.
+
+- **Alternatives considered:**
+  - *Option B (half-baked encryption):* rejected per "Reasoning" above.
+  - *Option C (vectors-in-SQLCipher):* rejected — defers LanceDB integration risk to V0.2; nontrivial in-memory cosine code we'd throw away.
+  - *Whole-disk encryption (FileVault/BitLocker):* rejected — out of scope; doesn't satisfy §11.2 SP-1 zero-knowledge guarantee.
+
+- **Test requirements at T0.1.4:** round-trip integrity, boundary-leak proptest at the LanceDB query layer, concurrent-write test, vector dimension consistency. Plus: assert `ALPHA_DO_NOT_STORE_REAL_DATA.txt` is created on first open with the expected content + read-only perms; assert the WARN log fires on every open.
+
+- **Test requirements at T0.2.0 (must pass before T0.2.16 unblocks):** all four V0.1 compensating controls fully removed from the build; vector data dir contains no plaintext Parquet on disk after a write/close cycle (verified by reading raw bytes and checking entropy + magic-bytes absence); decryption with wrong key fails closed; round-trip identity (`encrypt → decrypt == original`) on the full vector store across all supported platforms (Mac, Windows, Linux).
+
+- **When to revisit:** Beginning of V0.2 — T0.2.0 is the first V0.2 task and gates all subsequent V0.2 work that touches user data.
+
+### ADR-011 — 2026-04-29 — `protoc` (Google Protobuf compiler) is a per-machine build-time dependency for lancedb
+- **Context:** During T0.1.4 kickoff, `cargo check -p vault-storage` failed because `lancedb` 0.8 transitively pulls `lance-encoding` and `lance-file`, both of which use `prost-build` to generate Rust from `.proto` schema files at build time. `prost-build` invokes the `protoc` binary; if it's not on PATH (or pointed at via `PROTOC` env var), the build fails immediately with `Could not find protoc`. Analogous to ADR-006's Strawberry Perl requirement for SQLCipher's OpenSSL build.
+- **Decision:** Each developer machine installs `protoc` system-wide. CI installs it per-job via `arduino/setup-protoc` (or platform equivalent). The `PROTOC` env var is preferred over PATH lookup for build determinism — set in `.cargo/config.toml` (tracked tech-debt) or per-shell.
+  - **Shahbaz's machine (done 2026-04-29):** `winget install Google.Protobuf` → installs to `C:\Users\<user>\AppData\Local\Microsoft\WinGet\Packages\Google.Protobuf_Microsoft.Winget.Source_8wekyb3d8bbwe\bin\protoc.exe`. winget adds the package's bin dir to PATH for new shells.
+  - **Mac/Linux (when added):** `brew install protobuf` / `apt install protobuf-compiler` / equivalent.
+  - **CI:** add `arduino/setup-protoc@v3` (or equivalent) before any storage-test job in `.github/workflows/ci.yml`. Pin major version per the same convention as ADR-001 / `actions/checkout@v6`.
+- **Reasoning:** lancedb is a BRD-pinned dep (§4.2). Replacing it to avoid protoc is a much bigger architecture decision; building with `protoc-bin-vendored` adds workspace-wide build-script weirdness for a problem the system install solves cleanly. Mirrors the established Strawberry Perl pattern.
+- **Alternatives considered:**
+  - *`protoc-bin-vendored` crate via cargo build-script PROTOC env-var indirection:* rejected — adds workspace-wide build-script complexity for a problem the system install solves.
+  - *Skip lancedb / use a different vector store:* rejected — out of scope; would require BRD §4.2 amendment.
+  - *Pin lancedb to a version that doesn't transitively need protoc:* rejected — lancedb has used prost since 0.x; no version dodges the requirement.
+- **Operational follow-up (required, recurring):** **Monthly protobuf CVE check.** First Monday of each month, review https://github.com/protocolbuffers/protobuf/security/advisories and the installed `protoc --version`. Critical / High advisories affecting the installed version → upgrade ahead of other work. Tracked in tech-debt below.
+- **Build environment that worked for T0.1.4 cargo check + tests on 2026-04-29 (git-bash on Windows):**
+  ```
+  PATH="/c/Strawberry/perl/bin:$PATH" \
+  PROTOC="/c/Users/shahb/AppData/Local/Microsoft/WinGet/Packages/Google.Protobuf_Microsoft.Winget.Source_8wekyb3d8bbwe/bin/protoc.exe" \
+  cargo check -p vault-storage   # 44.57s clean
+  cargo test  -p vault-storage   # 39/39 passing in 18.15s
+  cargo test  -p vault-core      # 44/44 passing in 0.03s
+  ```
+  - `PATH=/c/Strawberry/perl/bin:$PATH` is needed in git-bash because MSYS2's `/usr/bin/perl` lacks `Locale/Maketext/Simple.pm`, which openssl-src's build script requires (transitively pulled by lancedb's aws/azure object_store features). Strawberry Perl has the full standard library. PowerShell shells don't need this — they don't have `/usr/bin/perl` in PATH at all.
+  - `PROTOC=...` is preferred over PATH lookup so the build doesn't depend on shell PATH semantics.
+- **When to revisit:** When `.cargo/config.toml` lands with `[env]` block making the env vars persistent (tracked as tech debt). When CI adds vault-storage to its build matrix (need `setup-protoc` + Strawberry-equivalent there).
+
+### ADR-012 — 2026-04-29 — LanceDB feature minimization investigated; no flags available; AWS SDK + dual-arrow accepted as V0.1 cost
+- **Context:** Per Shahbaz's Phase-1 review, the lancedb 0.8 + lance 0.15 transitive tree pulled `aws-config`, `aws-sdk-*`, `datafusion 40`, plus arrow v51 AND arrow v52 simultaneously (Cargo.lock grew by ~5,900 lines). For an embedded vector store on user devices that never talks to LanceDB Cloud or S3, these are dead weight: bigger binary, larger supply-chain attack surface, more `cargo audit` noise, slower compiles. Investigated whether LanceDB exposes feature flags to disable these.
+- **Findings (verified 2026-04-29 via docs.rs + GitHub):**
+  - `lancedb` 0.8 features: `default = []` (empty), `remote = ["dep:reqwest"]`, `fp16kernels`, `s3-test`, `openai`, `polars`, `sentence-transformers`. **No feature gates the AWS / GCP / Azure cloud backends.** We never enabled `remote` — it's not the source of the AWS SDK pull.
+  - `lance` 0.15 features: `fp16kernels`, `cli`, `tensorflow`, `dynamodb` (gates aws-sdk-dynamodb), `dynamodb_tests`, `substrait`. **No feature gates the core S3/GCS/Azure backends in `object_store`** — those are non-optional in `lance-io` (`object_store = "0.10"` with default features in lance-io's Cargo.toml, which transitively includes AWS/GCP/Azure).
+  - `cargo tree -p vault-storage -i aws-config` confirms `aws-config` enters the tree exclusively through `lance-io`, not through any feature we toggled.
+  - `cargo tree -p vault-storage --duplicates` shows the unavoidable arrow 51/52 split: `fsst` (Lance's string compression) pins arrow 51 internally; the rest of the tree uses arrow 52. Plus typical churn on rand 0.8/0.9, hyper 0.14/1.x, rustls 0.21/0.23, http 0.2/1.x.
+- **Decision:** **No feature minimization available at the lance/lancedb 0.8/0.15 layer.** Accept the AWS SDK + dual-arrow + datafusion footprint for V0.1. Do NOT fork or `[patch]` lance / object_store for V0.1 — vendor maintenance is a much bigger cost than the binary footprint we save, and a fork delays T0.1.4 indefinitely. Document the constraint and revisit on a clear trigger.
+- **Reasoning:**
+  - **V0.1 internal alpha is not the time to fight the vendor's feature surface.** Forking lance to remove cloud backends would mean owning a parallel branch, tracking upstream security fixes, and re-applying patches at every lance release. The cost dwarfs V0.1's binary-size or CVE-noise benefit.
+  - **The supply-chain risk is bounded.** `cargo audit` runs in CI on every commit (BRD §11.7.5); CVEs in transitive AWS SDK or arrow crates surface immediately. We don't hide the risk by shipping it; we monitor.
+  - **`object_store`'s cloud backends are dormant code paths we never invoke.** The crates ship in the binary but no code path reaches them — we only call lance's local-filesystem read/write surface. Dormant code is still attack surface, but the surface is far smaller than active integration.
+- **Mandatory monitoring (ongoing):**
+  - `cargo audit` already runs in CI per BRD §11.7.5. Any High/Critical CVE in `aws-config`, `aws-sdk-*`, `arrow`, `arrow-*`, `object_store`, `datafusion*` triggers immediate triage.
+  - Monthly review of binary size at `cargo build --release -p vault-tauri` (when that crate becomes a binary at T0.1.11). Baseline measurement: capture at T0.1.11; investigate if it grows >10% month-over-month without an obvious feature reason.
+- **When to revisit (any of these triggers):**
+  - **lance gains feature flags for cloud backends** (track lance releases; check `[features]` at every minor bump).
+  - **A High/Critical CVE in the dormant cloud-backend tree** that we cannot patch without forking. At that point, fork pressure exceeds maintenance pressure.
+  - **V1.0 release prep.** Binary distribution to paying customers raises the bar — bloat we tolerate in alpha is harder to justify in production. Re-evaluate fork-vs-accept then.
+  - **lance/lancedb major-version bump** that restructures the dep graph. Re-audit at every major bump.
+- **Alternatives considered:**
+  - *Fork `lance` / `lance-io` to remove `object_store` cloud features* — rejected for V0.1; revisit at V1.0 prep if still relevant.
+  - *Use `[patch.crates-io]` in workspace `Cargo.toml`* — same problem as forking, plus brittle.
+  - *Pin to a different vector-store crate (e.g., `qdrant-client`, `instant-distance`)* — rejected; out of scope; would require BRD §4.2 amendment.
+
+### ADR-013 — 2026-04-29 — chrono `=0.4.38` pin: tactical, with explicit revisit triggers and monthly CVE monitoring
+- **Context:** chrono 0.4.44 added `Datelike::quarter()` which conflicts with arrow-arith 52.x's `ChronoDateExt::quarter()` (same method name on the same receiver via two traits — ambiguous at the call site in arrow-arith). T0.1.4 build broke until chrono was pinned to `=0.4.38`. The pin is a tactical fix, not a strategic one — pinning chrono to an old version forever is exactly the kind of tech debt that festers and slowly opens us to chrono CVEs we cannot patch.
+- **Decision:** chrono is pinned at `=0.4.38` until any one of these triggers fires; on trigger, evaluate the pin and update or remove. Monthly chrono security advisory check is added to the recurring task in tech debt.
+- **Revisit triggers (any):**
+  1. **arrow upgrade past the conflict.** When arrow-array / arrow-schema move past 52.x to a release that fixed `ChronoDateExt::quarter` (renamed it, removed the trait, or qualified the call site), bump chrono and remove the pin.
+  2. **High or Critical chrono CVE on a 0.4.39+ version that cannot be backported to 0.4.38.** At that point, the security exposure outweighs the build-break risk. Two paths in priority order: (a) check whether the CVE is patchable via a forward bump combined with arrow-arith fixes (PR upstream or local `[patch]`); (b) if neither path works, fork arrow-arith to qualify the `quarter()` call site; (c) absolute last resort, accept the CVE risk for the remaining V0.1 alpha window and document explicitly in HANDOFF.md as a security blocker.
+  3. **lancedb / arrow-arith publish a release where the conflict is resolved** — e.g., `arrow-arith` calls `ChronoDateExt::quarter(&d)` explicitly. Bump and unpin.
+  4. **chrono itself publishes a 0.4.4x release that removes the `Datelike::quarter` method**, or `chrono = "0.5"` ships and we evaluate the new major.
+- **Operational follow-up (recurring, monthly):** **chrono security-advisory check.** First Monday of each month — same recurring schedule as the OpenSSL CVE check (ADR-006) and the protobuf CVE check (ADR-011) — review https://rustsec.org/advisories/?keyword=chrono and the chrono crate's GitHub security advisories. High/Critical advisory affecting 0.4.38 → run the trigger 2 evaluation path above. Tracked in the Tech Debt Backlog below.
+- **Reasoning:** Without explicit triggers and a monitoring cadence, "tech debt logged" means "indefinite drift." Naming the triggers + putting it on the same monthly cadence as our other security pins (OpenSSL, protobuf) makes the pin a maintained artifact, not a forgotten one. The chrono pin becomes part of the same monthly security-hygiene rhythm rather than a separate concern.
+- **When to revisit:** Each monthly check, plus immediately on any of the explicit triggers above.
+
 ---
 
 ## Tech Debt Backlog
@@ -154,7 +286,12 @@ Items noticed but not addressed in their originating task — picked up explicit
 - [ ] **`llama-cpp-2 = "0.1"` not yet declared in `[workspace.dependencies]`** — BRD §4.3 flags it for verification at the start of vault-llm work (T0.2.1). Do crate-name-and-version verification on docs.rs at that point and add to workspace deps then. (Noted 2026-04-28, file: `Cargo.toml`)
 - [ ] **`.gitattributes` for line-ending normalisation** — currently relying on git's default `core.autocrlf=true` on Windows. Adding `* text=auto eol=lf` plus binary markers for known binary file types would silence the CRLF warnings on commit and make cross-platform behaviour deterministic. Quick win when convenient. (Noted 2026-04-28)
 - [ ] **dryoc 0.7 streaming-vs-single-shot — RUN THE SPIKE THIS WEEK** — per ADR-008. 2-hour scratch crate, single-envelope encrypt → decrypt round-trip using actual dryoc 0.7 API. Output: ADR-008 amended with confirmed call shape; BRD §11.6 sketch updated to compile against reality. **Target: complete before T0.1.4 finishes** so we know whether we're using dryoc, RustCrypto, or another crate before T0.2.9 design starts. (Noted 2026-04-28, scheduled 2026-04-29)
+- [ ] **chrono pinned to `=0.4.38` (POLICY: ADR-013, revisit triggers explicit)** — Tactical pin to dodge arrow-arith / chrono `quarter()` conflict; ADR-013 documents the four explicit revisit triggers (arrow upgrade past the conflict, High/Critical chrono CVE on 0.4.39+, lancedb/arrow-arith resolves the conflict, chrono major bump). Monthly chrono security-advisory check is on the recurring schedule below alongside OpenSSL and protobuf. (Noted 2026-04-29, file: `Cargo.toml`)
+- [ ] **Build env vars need a persistent home** — T0.1.4 build requires `PROTOC` set to the winget protoc path AND Strawberry Perl in front of `/usr/bin/perl` on PATH (so openssl-src's build script finds a Perl with the full standard library, not MSYS2's minimal one). Currently passed inline on every cargo invocation. Should land as either `.cargo/config.toml` `[env]` block (machine-portable via env-var lookup) or a `scripts/dev-build.sh` helper. CI needs equivalent: `arduino/setup-protoc` action + `shogo82148/actions-setup-perl` (or use Strawberry on Windows runners). (Noted 2026-04-29, ADR-011)
 - [ ] **(Recurring) Monthly OpenSSL CVE check** — per ADR-006. First Monday of each month, review https://www.openssl.org/news/vulnerabilities.html and the OpenSSL version vendored by `openssl-src` (`cargo tree -p openssl-src` from this workspace). Critical / High advisories affecting the vendored version → prioritise `cargo update -p openssl-src` ahead of other work. Next due: 2026-05-04. (Noted 2026-04-28)
+- [ ] **(Recurring) Monthly protobuf CVE check** — per ADR-011. First Monday of each month, review https://github.com/protocolbuffers/protobuf/security/advisories and the installed protoc version (`protoc --version`). Critical / High advisories affecting the installed version → bump via `winget upgrade Google.Protobuf` (Mac/Linux equivalent) ahead of other work. Next due: 2026-05-04. Noted 2026-04-29.
+- [ ] **(Recurring) Monthly chrono CVE check** — per ADR-013. First Monday of each month, review https://rustsec.org/advisories/?keyword=chrono and chrono's GitHub security advisories. High/Critical advisory affecting 0.4.38 → evaluate the ADR-013 trigger-2 paths in order (forward-bump + arrow-arith fix, fork arrow-arith, accept-and-document-as-blocker). Next due: 2026-05-04. Noted 2026-04-29.
+- [ ] **ADR-014 (TODO): ALPHA file write failure policy** — `LanceVectorStore::open` currently uses `fs::write(&path, body)?` for the `ALPHA_DO_NOT_STORE_REAL_DATA.txt` file; if the data dir is read-only / quota-exceeded / network-share-with-write-restrictions, `open()` fails entirely. That's denial-of-service against legitimate use. Per Shahbaz's Phase-3 review (2026-04-29): policy should be "log WARN with the underlying error + increment a metric + proceed with open()" — the startup WARN log is the primary safety control, the ALPHA file is secondary. Implementation: catch `Err` from `write_alpha_warning`, downgrade to a `tracing::warn!` with the io error, continue. Add a test that asserts `open()` succeeds when the data dir is made read-only after creation. Write as ADR-014 + amend ADR-010 to note the secondary-control downgrade. (Noted 2026-04-29, file: `crates/vault-storage/src/vector_store.rs`)
 
 ---
 
@@ -185,4 +322,4 @@ Per the "no scaffolding for unused features" rule (CLAUDE.md hard rule). Each ta
 - Test level: **Heavy** — round-trip tests, boundary filter cannot leak, property tests for vector insert/search consistency, concurrent-write test
 - Tie-in to T0.1.3: the next migration (`0002_…sql`) may add a `vector_id` column to `memories` if we choose a model where SQLite holds the cross-store reference
 
-**Working-tree state at the start of this turn:** clean (T0.1.3 committed at `f846df7`, pushed). Pending changes in this turn: `HANDOFF.md` (this file) + `Agent Build Specification.txt` (§6 V0.1.3 perf-budget criterion added). No code change.
+**Working-tree state at the start of T0.1.4 code work:** clean after the ADR-010 + T0.2.0 commit lands. The next code commit will introduce `crates/vault-storage/src/lance_vector_store.rs` (or similar — final naming follows the API verification step) plus deps in `crates/vault-storage/Cargo.toml`.

@@ -80,9 +80,21 @@ impl Boundary {
                 "boundary name exceeds {MAX_BOUNDARY_LEN} bytes",
             )));
         }
-        if name.chars().any(|c| c.is_control()) {
+        // Boundary names are identifier-like: ASCII letters, digits, dash, and
+        // underscore only. This is stricter than BRD §11.7.1's "no control
+        // characters" floor, and is required because boundary names are
+        // interpolated into the LanceDB `only_if` SQL filter at the query layer
+        // (T0.1.4) — LanceDB 0.8 has no parameter binding for `only_if`, so
+        // the type system is the only line of defence against quote breakout
+        // and SQL-metacharacter injection. Tightening here gives the same
+        // safety to every future store and filter context for free.
+        // ADR-005 amended 2026-04-29 to record this addition.
+        if !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
             return Err(VaultError::InvalidInput(
-                "boundary name contains control characters".into(),
+                "boundary name must contain only ASCII letters, digits, '-', or '_'".into(),
             ));
         }
         Ok(())
@@ -160,6 +172,52 @@ mod tests {
             Boundary::new("with\0null"),
             Err(VaultError::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    fn sql_metacharacters_rejected() {
+        // Boundary names flow into LanceDB's `only_if` SQL filter without
+        // parameter binding (T0.1.4 / ADR-010). These cases would otherwise
+        // be a quote-breakout into the filter string. NB: `--` and `-` alone
+        // are intentionally allowed as identifier characters; they are only
+        // dangerous in unquoted SQL, and our filter always single-quotes the
+        // boundary value.
+        for name in [
+            "work'stuff",
+            "work\"stuff",
+            "work; DROP",
+            "work OR 1=1",
+            "work/*",
+            "work\\stuff",
+            "work space",
+            "work.stuff",
+        ] {
+            match Boundary::new(name) {
+                Err(VaultError::InvalidInput(_)) => {}
+                other => panic!(
+                    "expected InvalidInput for boundary {name:?}, got {}",
+                    match other {
+                        Ok(_) => "Ok(...)",
+                        Err(_) => "different error variant",
+                    }
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn safe_charset_accepted() {
+        // Identifier-like names are explicitly permitted.
+        for name in [
+            "work",
+            "personal",
+            "health",
+            "work-stuff",
+            "work_2026",
+            "Work-2",
+        ] {
+            assert!(Boundary::new(name).is_ok(), "expected accept for {name}");
+        }
     }
 
     #[test]

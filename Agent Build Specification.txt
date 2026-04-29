@@ -1322,6 +1322,20 @@ V0.1 → V0.2 → V1.0. Build in order. Do not skip ahead.
 
 **Tasks:**
 
+**T0.2.0 — vault-storage: LanceDB Encryption at Rest** *(HARD GATE — see ADR-010)*
+- Resolve the ADR-008 dryoc/RustCrypto/sibling-crate spike before this task starts
+- Design the Windows path explicitly (the BRD §11.5.1 "memory-only handle on Windows" prescription is a TODO; this task is where it gets real). Likely path: per-file XChaCha20-Poly1305 sealing through a custom `lance::ObjectStore` adapter rather than tmpfs decryption — works uniformly across Mac, Linux, Windows.
+- Implement encrypted-at-rest storage for the LanceDB data directory using the chosen crypto crate
+- Migrate any existing V0.1 plaintext data on first launch (founder-only path; one-time conversion)
+- **Remove all four V0.1 compensating controls per ADR-010:** modal first-run banner, persistent UI banner, plaintext-data-dir WARN log, `ALPHA_DO_NOT_STORE_REAL_DATA.txt` file
+- Acceptance:
+  - Vector data dir contains no plaintext Parquet on disk after a write/close cycle (verified by reading raw bytes — entropy check + magic-bytes absence)
+  - Round-trip identity: `encrypt → decrypt == original` across Mac, Windows, Linux
+  - Decryption with wrong key fails closed (no partial reads, no information leakage in error)
+  - All four ADR-010 compensating controls removed from the codebase (test asserts they are absent)
+  - Tampered ciphertext is detected (AEAD authenticity check fires)
+- **Hard dependency for T0.2.16 (Beta Onboarding).** No external user receives a build that contains the V0.1 plaintext-LanceDB code path. **If T0.2.0 slips, V0.2 ship date slips.** This is non-negotiable per BRD §11.5.1 and ADR-010's HARD GATE clause.
+
 **T0.2.1 — vault-llm: Phi-4-mini Integration**
 - Bundle Phi-4-mini-instruct Q4_K_M GGUF (~2.49GB) with the installer
 - Integrate llama.cpp via Rust bindings
@@ -1406,10 +1420,11 @@ V0.1 → V0.2 → V1.0. Build in order. Do not skip ahead.
 - Sync status indicator
 - Acceptance: 30 beta users can use the app without explicit instructions for basic flows
 
-**T0.2.16 — Beta Onboarding**
+**T0.2.16 — Beta Onboarding** *(HARD-BLOCKED on T0.2.0)*
+- **Cannot start until T0.2.0 (LanceDB Encryption at Rest) is complete and merged.** No external user receives a build containing the V0.1 plaintext-LanceDB code path. Per ADR-010 HARD GATE.
 - Invite-only signup via Clerk (anticipating V1)
 - Welcome flow explaining the product
-- Acceptance: 30 invited users successfully install and use the app
+- Acceptance: 30 invited users successfully install and use the app, AND the build they install passes the T0.2.0 acceptance criteria (no plaintext on disk, no V0.1 compensating-control artefacts present).
 
 **T0.2.17 — V0.2 End-to-End Test**
 - Beta users use product for 2 weeks

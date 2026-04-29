@@ -16,6 +16,7 @@ pub mod audit;
 pub mod key;
 pub mod metadata_store;
 pub(crate) mod migrations;
+pub mod vector_store;
 
 pub use audit::{
     seal, verify_chain, ActorKind, AuditEvent, AuditEventType, AuditResult, PendingAuditEvent,
@@ -23,3 +24,4 @@ pub use audit::{
 };
 pub use key::SqlCipherKey;
 pub use metadata_store::{MemoryFilter, MetadataStore};
+pub use vector_store::{LanceVectorStore, VectorStore, ALPHA_WARNING_FILENAME};
