@@ -9,3 +9,20 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+vault-core = { path = "../vault-core" }
+rusqlite = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+blake3 = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = { workspace = true }
+tokio-test = { workspace = true }
