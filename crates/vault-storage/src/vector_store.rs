@@ -175,9 +175,24 @@ impl LanceVectorStore {
         fs::create_dir_all(data_dir)?;
 
         // ADR-010 compensating control #4: write the loud warning file.
-        write_alpha_warning(data_dir)?;
+        // Per ADR-014: the file is a SECONDARY safety control. If the data
+        // dir is read-only / quota-exceeded / otherwise un-writable, log a
+        // WARN with the underlying error and proceed — failing `open()`
+        // here would be a denial-of-service against legitimate use, and
+        // the primary safety control (the WARN log below) still fires.
+        if let Err(e) = write_alpha_warning(data_dir) {
+            warn!(
+                error = %e,
+                data_dir = %data_dir.display(),
+                "ALPHA warning file write failed (data dir may be read-only \
+                 or out of space). Continuing because the startup WARN log is \
+                 the primary safety control — see ADR-014."
+            );
+        }
 
-        // ADR-010 compensating control #3: WARN every open while plaintext.
+        // ADR-010 compensating control #3 (PRIMARY): WARN every open while
+        // plaintext. This fires regardless of whether the secondary ALPHA
+        // file write succeeded.
         warn!(
             data_dir = %data_dir.display(),
             "LanceDB data dir is plaintext (V0.1 alpha — see ADR-010). \
@@ -568,6 +583,36 @@ mod tests {
             "ALPHA warning file must be read-only \
              (Unix: write bits cleared; Windows: FILE_ATTRIBUTE_READONLY set)"
         );
+    }
+
+    /// ADR-014: if the ALPHA file write fails (read-only data dir, quota,
+    /// FS error), `open()` must STILL succeed. The startup WARN log is the
+    /// primary safety control; the file is secondary. We force the failure
+    /// by pre-creating the alpha *path* as a directory — `fs::write` then
+    /// fails because the path is a directory, but the rest of `open()`
+    /// proceeds.
+    #[tokio::test]
+    async fn open_succeeds_when_alpha_file_write_fails_per_adr_014() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path();
+
+        // Pre-create the alpha *path* as a directory. Subsequent fs::write
+        // calls to this path will fail on every platform we support.
+        let alpha_path = data_dir.join(ALPHA_WARNING_FILENAME);
+        fs::create_dir(&alpha_path).unwrap();
+        assert!(alpha_path.is_dir());
+
+        // open() must succeed despite the alpha-file write failure.
+        let store = LanceVectorStore::open(data_dir, 4).await.unwrap();
+
+        // The alpha path is still a directory (the failed fs::write didn't
+        // overwrite it) and the LanceDB store is otherwise functional.
+        assert!(
+            alpha_path.is_dir(),
+            "alpha path was clobbered by failed write"
+        );
+        assert_eq!(store.dimension(), 4);
+        assert_eq!(store.count(None).await.unwrap(), 0);
     }
 
     #[tokio::test]

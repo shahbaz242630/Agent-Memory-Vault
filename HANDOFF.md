@@ -1,9 +1,9 @@
 # Memory Vault — Build Handoff
 
-**Last updated:** 2026-04-29
+**Last updated:** 2026-04-29 (post-T0.1.4 commit `710576c`)
 **Updated by:** Claude (Opus 4.7)
 **Current version:** V0.1 — Internal Alpha
-**Current phase:** V0.1 in progress — T0.1.3 shipped (commit `f846df7`); pre-T0.1.4 follow-ups in flight (ADR-009 retry-queue policy, BRD §6 perf-budget addition, dryoc API spike scheduled)
+**Current phase:** V0.1 in progress — T0.1.4 (vault-storage LanceDB) shipped (`710576c`). Next: dryoc API spike (ADR-008, ~2h), then T0.1.5 (vault-storage DuckDB graph store).
 
 ---
 
@@ -28,51 +28,22 @@
 | T0.1.2 | vault-core | 2026-04-28 | ✅ 42 unit + 1 doc test passing; clippy clean; fmt clean | All BRD §5.1 types implemented across `error.rs` / `boundary.rs` / `memory.rs` / `entity.rs` with `lib.rs` re-exports. Validation enforced at construction (`try_new` constructors) AND at storage-write boundary (`validate()` method) per BRD §11.7.1. ID types use UUID v7 (time-ordered, good DB index locality). `Boundary` uses validated newtype with private field (deviation from BRD `pub String` — see ADR-005). |
 | CI hardening | `actions/checkout` v4 → v6 | 2026-04-28 | ✅ CI green | Resolves Node 20 deprecation flagged on `f3923eb`. GitHub Actions runners drop Node 20 on 2026-09-16; v6 runs on Node 24. `Swatinem/rust-cache@v2` and `dtolnay/rust-toolchain@stable` are unaffected (no Node 20 dependency). Followed GitHub's recommended floating-major tag convention (`@v6`) so security patches auto-apply. |
 | T0.1.3 | vault-storage: SQLite + SQLCipher (`MetadataStore` + audit chain) | 2026-04-29 (commit `f846df7`) | ✅ 39/39 passing; build/clippy/fmt clean | `MetadataStore` async API (CRUD + audit append/list/verify, every CRUD txn-atomic with audit append). Three tables via migration runner: `memories` (boundary-indexed), `audit_log` (BLAKE3 hash chain per BRD §11.9.2, genesis = 0×64, canonical sorted-key JSON), `schema_migrations` (gap + out-of-order detection refuse to run, idempotent re-runs). SQLCipher key handling: `SqlCipherKey` newtype with `Zeroize`/`ZeroizeOnDrop`, no `Debug`/`Display` (ADR-007); WAL + foreign_keys + synchronous=NORMAL. Boundary filter parameterised at SQL level (BRD §11.7.1). Audit-tamper proptest hits every byte position in chains of 2–5 events; concurrent-writes proptest validates 20-task chain serialisation via `Mutex<Connection>`. Decisions logged: ADR-006 (rusqlite vendored OpenSSL + monthly CVE check), ADR-007 (no manual `Debug` on sensitive types), ADR-008 (dryoc 0.7 API drift formalised). Perf measured: `open+migrate` ≈ 120ms, steady-state audit insert ≈ 197µs. |
+| T0.1.4 | vault-storage: LanceDB (`VectorStore` trait + `LanceVectorStore`) | 2026-04-29 (commit `710576c`) | ✅ vault-storage 59/59 + vault-core 44/44 + doc 1/1 = **104/104** passing; build/clippy/fmt clean | Domain-only `VectorStore` trait (BRD §2.2): `MemoryId` / `Boundary` / `&[f32]` only — Arrow types stay inside the impl. Mandatory access control on `search` via non-Optional `&[Boundary]` (BRD §11.4.3); empty slice returns empty result, not error — compile-time impossible to "forget to filter." `LanceVectorStore` on lancedb 0.8 + arrow 52.1: `merge_insert(&["id"])` with id-only match column (boundary-change updates in place, no duplicates), `DistanceType::Cosine` calibrated for L2-normalised bge-small embeddings, `only_if` filter via `build_boundary_filter` + `quote_sql_string` (defense-in-depth atop Boundary's tightened charset). 20 new tests including boundary-leak proptest and 20-task concurrent-upserts test. ADRs landed: 010 (V0.1 plaintext-on-disk HARD GATE before T0.2.16, four loud compensating controls), 011 (protoc + monthly CVE check), 012 (lance feature-minimisation investigated, no flags available, accept), 013 (chrono `=0.4.38` pin policy with revisit triggers + monthly CVE check). Boundary tightened to `[a-zA-Z0-9_-]{1,64}` in vault-core (ADR-005 amended). BRD §6 V0.1.3 perf budget added; BRD §6 V0.2 T0.2.0 (LanceDB encryption-at-rest) added as new first task with HARD GATE for T0.2.16. |
 
 ---
 
 ## In Progress
 
-**T0.1.4 — vault-storage: LanceDB vector store** — Phases 1 + 2 + 3 complete (working tree, uncommitted). **Awaiting Shahbaz review before Phase 4 commit.**
+**Pre-T0.1.5: dryoc API spike** (per ADR-008 + Shahbaz's direction "run after T0.1.4 commits, before T0.1.5 starts"). ~2-hour scratch crate exercising dryoc 0.7's actual encrypt/decrypt API on a single-message envelope. Output: ADR-008 amended with the confirmed call shape and chosen path (streaming wrapper / sibling crate / RustCrypto `chacha20poly1305`); BRD §11.6 sketch reconciled with reality. Then T0.1.5 (vault-storage DuckDB graph store) starts.
 
-**Phase 3 done 2026-04-29 — DoD gates:**
-- `cargo build --workspace` — clean, zero warnings (3.9s)
-- `cargo test -p vault-storage --quiet` — **59 passed; 0 failed; 0 ignored** (up from 46 — 6 previously-ignored stubs now pass + 7 new Phase 3 tests including the boundary-leak proptest with 8 cases)
-- `cargo clippy -p vault-storage --all-targets -- -D warnings` — clean
-- `cargo fmt --all --check` — clean
-
-**Phase 3 implementation (all in `crates/vault-storage/src/vector_store.rs`):**
-- `upsert` — builds a single-row Arrow `RecordBatch` (helpers `make_schema`, `build_record_batch`), then `table.merge_insert(&["id"]).when_matched_update_all(None).when_not_matched_insert_all().execute(Box::new(reader))`. Match column is `"id"` ONLY per Shahbaz's review concern #1 — pinned by the new test `upsert_with_same_id_different_boundary_updates_existing_no_duplicate`. Builder ergonomics commented in code (mut binding required because `when_*` are `&mut self` but `execute` consumes by value).
-- `delete` — `table.delete(&format!("id = {}", quote_sql_string(uuid_str)))`. UUID can't contain a quote, but routed through `quote_sql_string` for defense-in-depth so a future MemoryId refactor can't introduce SQL injection here.
-- `search` — empty-`authorized_boundaries` → `Ok(vec![])` early-return (no LanceDB round-trip; runtime expression of the type-level invariant). Otherwise: dimension check, build filter via `build_boundary_filter`, `table.query().nearest_to(query)?.only_if(&filter).limit(limit).distance_type(DistanceType::Cosine).execute()`, drain `SendableRecordBatchStream` via `futures::TryStreamExt::try_collect`, decode `id` (Utf8) and `_distance` (Float32) columns into `Vec<(MemoryId, f32)>`.
-- `count` — `table.count_rows(boundary.map(|b| format!("boundary = {}", quote_sql_string(b.as_str()))))`.
-- `dimension` — accessor.
-
-**Three Phase 3 review concerns from Shahbaz — all addressed:**
-1. **`merge_insert` matches on id only.** Implementation uses `&["id"]` exactly. Test `upsert_with_same_id_different_boundary_updates_existing_no_duplicate` plants an id under "work", re-upserts under "personal", asserts (a) total count stays at 1 (no duplicate), (b) old boundary count = 0, (c) new boundary count = 1, (d) work-search no longer finds the id, (e) personal-search does.
-2. **`only_if` filter construction is security-critical.** Two-layer security argument documented in `build_boundary_filter`'s doc comment: type-level (Boundary's `[a-zA-Z0-9_-]{1,64}` charset) + construction-site (`quote_sql_string` doubles single quotes per SQL standard). Both layers must hold for the security property; either alone is insufficient. Unit tests `quote_sql_string_doubles_embedded_quotes` and `build_boundary_filter_uses_quoted_in_clause` lock in the SQL escape semantics. Defense-in-depth even though Boundary's charset already excludes quotes.
-3. **Distance metric is `DistanceType::Cosine`.** Documented at the struct level (`LanceVectorStore` doc comment) with the calibration note: bge-small-en-v1.5 outputs L2-normalised vectors so cosine and Euclidean rank identically; cosine is conventional for sentence embeddings; the T0.2.7 reranker will be calibrated to cosine-distance semantics; changing the metric here changes the score semantics for every consumer.
-
-**Other Phase 3 deliverables:**
-- Boundary-leak proptest `search_never_returns_unauthorized_boundary` — generates 2–5 random boundaries from `[a-z]{4,8}`, plants 1–6 memories per boundary, picks an authorised subset via random bitmask, runs the search, asserts every returned id's boundary is in the authorised set. 8 cases per run, all green.
-- `concurrent_upserts_all_succeed` — 20 concurrent `tokio::spawn` upserts via cloned `LanceVectorStore`, all complete, total count = 20, all 20 ids found via search.
-- `delete_absent_id_is_idempotent` — pins the trait's documented "deleting an absent id is not an error" semantics.
-- `search_rejects_dimension_mismatch` — symmetric guard to the upsert-side dimension check.
-- Removed scoped `#[allow(dead_code)]` on `LanceVectorStore` (was on `connection`/`table` fields). Dropped the `connection` field entirely — `Table` holds its own internal reference; we don't need a redundant handle.
-
-**Phase 4 (next, gated on this review):**
-1. Stage all working-tree files (Cargo.lock + Cargo.toml + HANDOFF.md + Agent Build Specification.txt + crates/vault-core/src/boundary.rs + crates/vault-storage/Cargo.toml + crates/vault-storage/src/lib.rs + crates/vault-storage/src/vector_store.rs)
-2. Show staged set + propose a single commit message covering: ADR-010/T0.2.0/ADR-011/ADR-012/ADR-013 + Boundary tightening + chrono pin + lancedb deps + `LanceVectorStore` Phases 2+3 + 7 new ADR-008/009/010/011/012/013 entries
-3. Ask for commit approval; on yes, ask separately for push approval
-4. After push: T0.1.4 → Recently Completed; T0.1.5 (DuckDB graph store) becomes the new In Progress
-
-Dryoc spike (ADR-008) — **still scheduled, not yet run.** Shahbaz acknowledged this is honest debt; deferred behind T0.1.4 Phase 4 commit per his "Approve Phase 3. Continue" direction. Will run after T0.1.4 commits, before T0.1.5 starts.
+**Two T0.1.4 follow-ups noted by Shahbaz (next-session, low priority):**
+- **Search-side dimension check is already done** (post-Shahbaz-review verification: `search_rejects_dimension_mismatch` test passes; check at top of `search` after the empty-`authorized_boundaries` early-return). Flagged here so future-me doesn't accidentally re-add it.
+- **ADR-014 (TODO): ALPHA file write failure policy.** Currently `LanceVectorStore::open` returns `Err` if the data dir is read-only / quota-exceeded. Per Shahbaz: downgrade to "log WARN + proceed" — the startup WARN log is the primary safety control, the file is secondary. Implementation + ADR + test land in next session before T0.1.5 (or folded into the dryoc-spike turn).
 
 ---
 
 ## Pending — V0.1 (Internal Alpha)
 
-- [ ] **T0.1.4** — vault-storage: LanceDB (vector store with boundary filtering)
 - [ ] **T0.1.5** — vault-storage: DuckDB (graph store with bi-temporal columns)
 - [ ] **T0.1.6** — vault-storage: Cascading Backend (StorageBackend orchestrator + retry queue per ADR-009)
 - [ ] **T0.1.7** — vault-embedding (bge-small via ort)
@@ -142,14 +113,28 @@ _None outstanding._
 - **Alternatives considered:** Stub `Debug` returning a fixed string like `"MetadataStore { .. }"` (rejected: sets the precedent above). Wrap the connection in a `Debug`-able newtype (rejected: same precedent, with extra ceremony).
 - **Test-side pattern:** Replace `assert!(matches!(x, Pattern(_)), "got {x:?}")` with an explicit `match x { Pattern(_) => {}, _ => panic!("static description here") }` when `x` doesn't impl `Debug`.
 
-### ADR-008 — 2026-04-29 — dryoc 0.7 API differs from BRD §11.6 sketch; verify with a spike before T0.2.9
-- **Context:** BRD §11.6 sync-envelope construction (T0.2.9) was sketched assuming dryoc exposes a libsodium-style single-shot AEAD (`crypto_aead_xchacha20poly1305_ietf_encrypt`). Inspecting dryoc 0.7's published API surface, the user-facing primitive is `dryocstream` — a streaming push/pull XChaCha20-Poly1305 construction, not single-shot. The BRD sketch will not compile against the actual crate as-is. Discovering this in week 6 of T0.2.9 would be expensive.
-- **Decision:** Run a 2-hour API-shape spike this week (before T0.1.4 finishes) in a scratch crate: minimal end-to-end encrypt → decrypt round-trip on a single-envelope payload using dryoc 0.7's actual API. Output: confirmed integration patterns annotated back into this ADR; a follow-up amendment fixes the BRD §11.6 sketch with the real call shape. Three plausible paths the spike will choose between:
-  1. **Wrap streaming in a single-message helper** (one `push` → `finalize` per envelope). Stays inside dryoc; minor wrapper cost.
-  2. **Use a single-shot AEAD from a sibling crate** (orion, sodiumoxide). Avoids streaming wrapper but adds a second crypto crate to vet.
-  3. **Switch to RustCrypto's `chacha20poly1305`** (XChaCha variant). Pure-Rust, no libsodium FFI; ergonomic, well-audited. Strong default if dryoc proves cumbersome.
-- **Reasoning:** Discovering API mismatch in week 1 is a 2-hour problem; in week 6 it's a 2-day problem mid-implementation. Cheap insurance, scoped explicitly so it cannot scope-creep into "build T0.2.9 early."
-- **Spike status:** Scheduled. Not yet run. This ADR will be amended with confirmed patterns + chosen path once the spike completes.
+### ADR-008 — 2026-04-29 — dryoc 0.7 API differs from BRD §11.6 sketch; verified by spike, path #1 chosen
+- **Context:** BRD §11.6 sync-envelope construction (T0.2.9) was sketched assuming dryoc exposes a libsodium-style single-shot AEAD (`crypto_aead_xchacha20poly1305_ietf_encrypt`). Inspection of dryoc 0.7's API confirmed: the user-facing XChaCha20-Poly1305 primitive is `DryocStream` (the streaming construction `crypto_secretstream_xchacha20poly1305`); `dryoc::classic` lists `crypto_secretbox` (XSalsa20-Poly1305 — different cipher), `crypto_box`, `crypto_secretstream_xchacha20poly1305`, but no `crypto_aead_xchacha20poly1305_ietf` single-shot module. The BRD sketch as-written does not compile against dryoc 0.7. Three candidate paths from earlier draft:
+  1. **Wrap streaming as single-message** — one `init_push` → `push_to_vec(plaintext, AAD, Tag::FINAL)` → `init_pull` → `pull_to_vec` cycle per envelope. Stays inside dryoc.
+  2. **Sibling crate** (`orion`, `sodiumoxide`) — single-shot AEAD with XChaCha20. Adds a second crypto crate to vet.
+  3. **RustCrypto `chacha20poly1305`** — pure-Rust, single-shot XChaCha20-Poly1305 AEAD. Drop dryoc.
+- **Decision:** Take **path #1 — wrap streaming as single-message.** Verified by `crates/vault-sync/examples/dryoc_spike.rs` (run 2026-04-29, exit 0, all assertions held). Spike covered the full round-trip + adversarial tampering; the streaming construction with a single `Tag::FINAL` push is materially equivalent to a single-shot AEAD for our envelope use case.
+- **Spike findings (run 2026-04-29):**
+  - **API path:** `use dryoc::dryocstream::{DryocStream, Header, Key, Push, Pull, Tag}` + `use dryoc::types::{Bytes, NewByteArray}`. Both `Bytes` (for `header.as_slice()`) and `NewByteArray` (for `Key::gen()`) are trait imports the BRD sketch missed.
+  - **Sized-input quirk:** `push_to_vec` and `pull_to_vec` are generic over `Input: Bytes`, but `Bytes` requires `Sized`. Passing a `&[u8]` slice fails the bound (the slice ref is sized but Input is inferred as the unsized `[u8]`). Materialise plaintext / ciphertext as `Vec<u8>` and pass `&Vec<u8>` — Input is then inferred as `Vec<u8>`, sized. T0.2.9 envelope code must do the same; document at the call site.
+  - **Header is 24 bytes**, opaque, must travel alongside the ciphertext (the spike concatenates: `envelope = header || ciphertext`). On the receive side: `let header: Header = bytes.try_into()?;` recovers the typed header from the leading 24 bytes.
+  - **AEAD overhead is 17 bytes per envelope** (16 Poly1305 tag + 1 message tag byte). Plaintext 86 → ciphertext 103. Total wire size: 127 bytes for an 86-byte plaintext.
+  - **`Tag::FINAL` is `PUSH | REKEY`** in libsodium's bit layout (FINAL = 0x03 = 0x01 | 0x02). `matches!(tag, Tag::FINAL)` correctly identifies it; the `Debug` output renders the constituent bits (`Tag(PUSH | REKEY)`) which is initially confusing but harmless. Document at call sites that recover the tag.
+  - **AAD parameter:** `push_to_vec(&plaintext, aad: Option<&[u8]>, Tag::FINAL)`. The spike passes `None`; T0.2.9 binds `aad = Some(&memory_id_bytes_concat_boundary_bytes)` per BRD §11.3.2 ("AAD includes memory ID and boundary").
+  - **Adversarial assertions held:** wrong-key decryption returns `Err`; single-bit ciphertext flip returns `Err`. AEAD authenticity check works as expected.
+- **BRD §11.6 reconciliation:** The BRD sketch's call signature (`crypto_aead_xchacha20poly1305_ietf_encrypt(...)`) is not what we'll write. The actual T0.2.9 envelope code uses the streaming-as-single-message wrapper documented above. BRD §11.6 will be amended at T0.2.9 kickoff to match the real shape.
+- **Reasoning for path #1 over alternatives:**
+  - **Path #1 (chosen):** Already integrated; spike confirms the cipher and AEAD properties we want; only ergonomic cost is the per-envelope `Vec<u8>` materialisation and a thin wrapper that bundles `header || ciphertext`. Manageable.
+  - **Path #2 (sibling crate):** Would mean vetting a second cryptography crate (license, audit history, maintenance, dep tree) for marginal API ergonomics. Crypto crates are not a place to multiply-source.
+  - **Path #3 (RustCrypto):** Pure-Rust + single-shot is appealing, but means dropping dryoc entirely (we're already pinned via BRD §4.4) and re-evaluating the decision behind dryoc's selection. Defer until either dryoc proves problematic in production or a major version bump invalidates this spike.
+- **Spike artifact:** `crates/vault-sync/examples/dryoc_spike.rs` (~140 lines) — kept long-term as executable documentation of the working pattern. Re-runnable via `cargo run -p vault-sync --example dryoc_spike` to verify dryoc's behaviour after future bumps. dryoc declared as `[dev-dependencies]` in `vault-sync` so the spike compiles without making vault-sync formally depend on dryoc until T0.2.9.
+- **Spike status:** **Run 2026-04-29 — PASSED.** Path #1 viable. T0.2.9 will use the documented call shape.
+- **When to revisit:** T0.2.9 implementation kickoff (re-run spike to verify, then write the production envelope code). On any dryoc minor-version bump (re-run spike to confirm API still matches). On any path-decision concern (e.g., perf measurements showing the per-envelope wrapper is too costly — unlikely at our throughput).
 
 ### ADR-009 — 2026-04-29 — Retry queue policy for cascading-backend partial failures (gates T0.1.6)
 - **Context:** T0.1.3 schema reserves a `retry_queue` table for T0.1.6 (cascading writes across SQLite + LanceDB + DuckDB), but the *policy* for that queue was never specified. Without policy, T0.1.6 will improvise failure-recovery semantics — and improvisation in failure-recovery code is exactly where production data-loss bugs come from. Concrete failure mode this prevents: SQLite write succeeds, LanceDB write fails, retry never resolves; user adds a memory yesterday and searches for it today and it silently doesn't exist in the vector store. Per Shahbaz's T0.1.3 review.
@@ -216,6 +201,8 @@ _None outstanding._
 
 - **When to revisit:** Beginning of V0.2 — T0.2.0 is the first V0.2 task and gates all subsequent V0.2 work that touches user data.
 
+- **Amendment 2026-04-29 (ADR-014):** Compensating control #4 (the `ALPHA_DO_NOT_STORE_REAL_DATA.txt` file) is downgraded from "non-negotiable" to "secondary safety control." If the data directory is read-only / quota-exceeded / otherwise unwriteable, `LanceVectorStore::open` now logs a WARN with the underlying error and proceeds rather than failing. Compensating control #3 (the startup WARN log) remains the **primary** control and fires unconditionally on every open. Rationale + test details in ADR-014.
+
 ### ADR-011 — 2026-04-29 — `protoc` (Google Protobuf compiler) is a per-machine build-time dependency for lancedb
 - **Context:** During T0.1.4 kickoff, `cargo check -p vault-storage` failed because `lancedb` 0.8 transitively pulls `lance-encoding` and `lance-file`, both of which use `prost-build` to generate Rust from `.proto` schema files at build time. `prost-build` invokes the `protoc` binary; if it's not on PATH (or pointed at via `PROTOC` env var), the build fails immediately with `Could not find protoc`. Analogous to ADR-006's Strawberry Perl requirement for SQLCipher's OpenSSL build.
 - **Decision:** Each developer machine installs `protoc` system-wide. CI installs it per-job via `arduino/setup-protoc` (or platform equivalent). The `PROTOC` env var is preferred over PATH lookup for build determinism — set in `.cargo/config.toml` (tracked tech-debt) or per-shell.
@@ -277,6 +264,23 @@ _None outstanding._
 - **Reasoning:** Without explicit triggers and a monitoring cadence, "tech debt logged" means "indefinite drift." Naming the triggers + putting it on the same monthly cadence as our other security pins (OpenSSL, protobuf) makes the pin a maintained artifact, not a forgotten one. The chrono pin becomes part of the same monthly security-hygiene rhythm rather than a separate concern.
 - **When to revisit:** Each monthly check, plus immediately on any of the explicit triggers above.
 
+### ADR-014 — 2026-04-29 — ALPHA file write failure: WARN + proceed (file is secondary, log is primary)
+- **Context:** Phase 3 review (Shahbaz, 2026-04-29). The original ADR-010 implementation failed `LanceVectorStore::open` if `write_alpha_warning` returned an error — i.e., a read-only / quota-exceeded / network-share-restricted data directory would prevent the vault from opening at all. That's a denial-of-service against legitimate use: the user's vault simply doesn't load, and the diagnostic is buried in the inner io::Error rather than surfaced as a clean operational signal.
+- **Decision:** ALPHA file write is a **secondary** safety control. On failure: log a `tracing::warn!` event with the underlying io error + the data dir path, then proceed with `open()` — the LanceDB connection, table open, and PRIMARY startup WARN log (ADR-010 compensating control #3) all continue normally. The user's vault is operational; the alpha-warning signal is degraded but the primary safety mechanism (the WARN log on every open) still fires.
+- **Reasoning:**
+  - **Two-tier safety: primary vs secondary.** ADR-010's compensating controls fall into two tiers. The startup WARN log (#3) is **primary** — it fires every open via `tracing::warn!`, is captured by any tracing subscriber (dev console, log forwarder, future audit pipeline), and is impossible to silence without code changes. The ALPHA file (#4) is **secondary** — a passive on-disk artefact that's useful if a curious user browses the data directory but doesn't actively gate or signal during normal operation. Tying primary safety to a secondary control's success was the design error this ADR fixes.
+  - **The failure mode is realistic.** Read-only data dirs happen: network shares with restricted writes, full disks (the file is small but disk-full triggers `ENOSPC` regardless), Windows directories with inherited deny-write ACLs, sandboxed environments. Failing closed on any of these is a real UX defect.
+  - **The primary control still fires.** The WARN log is emitted unconditionally by `open()` regardless of whether the file write succeeded. The user's tracing subscriber (dev or production) sees the alpha warning every startup. We don't lose the safety signal; we just don't gate the entire vault on a secondary artefact.
+  - **The diagnostic is louder, not quieter.** Failing `open()` produces an opaque "io error: ..." that the user has to debug. Logging WARN + proceeding produces a *named* alarm: `"ALPHA warning file write failed (data dir may be read-only or out of space)"` with the underlying error attached. Operators can act on it without diving into source code.
+- **Implementation:** `LanceVectorStore::open` now wraps `write_alpha_warning(data_dir)` in `if let Err(e) = ... { warn!(error = %e, ..., "ALPHA warning file write failed ... see ADR-014"); }` instead of `?`. The startup WARN log (ADR-010 control #3) immediately follows and fires unconditionally.
+- **Test:** `open_succeeds_when_alpha_file_write_fails_per_adr_014` — pre-creates the alpha path as a *directory* (so `fs::write` fails on every platform we support), then asserts `open()` succeeds, the path is still a directory (not clobbered), and the store is otherwise functional (`dimension()`, `count()` work).
+- **Related amendments:** ADR-010 compensating-control #4 description amended (above) to mark the file as secondary and reference ADR-014.
+- **Alternatives considered:**
+  - *Fail closed (the original behaviour):* rejected — see "Reasoning" above.
+  - *Retry-with-backoff on the file write:* rejected — adds complexity for a secondary control. If the dir is read-only, retry won't help.
+  - *Move the alpha warning into a tracing-subscriber sink instead of a file:* rejected — that's just more elaborate primary control, not a replacement for the file's "passive on-disk hint when a user browses the data dir" purpose.
+- **When to revisit:** When T0.2.0 ships (encryption-at-rest), the ALPHA file is removed entirely along with the WARN log; ADR-014 becomes archival.
+
 ---
 
 ## Tech Debt Backlog
@@ -291,7 +295,7 @@ Items noticed but not addressed in their originating task — picked up explicit
 - [ ] **(Recurring) Monthly OpenSSL CVE check** — per ADR-006. First Monday of each month, review https://www.openssl.org/news/vulnerabilities.html and the OpenSSL version vendored by `openssl-src` (`cargo tree -p openssl-src` from this workspace). Critical / High advisories affecting the vendored version → prioritise `cargo update -p openssl-src` ahead of other work. Next due: 2026-05-04. (Noted 2026-04-28)
 - [ ] **(Recurring) Monthly protobuf CVE check** — per ADR-011. First Monday of each month, review https://github.com/protocolbuffers/protobuf/security/advisories and the installed protoc version (`protoc --version`). Critical / High advisories affecting the installed version → bump via `winget upgrade Google.Protobuf` (Mac/Linux equivalent) ahead of other work. Next due: 2026-05-04. Noted 2026-04-29.
 - [ ] **(Recurring) Monthly chrono CVE check** — per ADR-013. First Monday of each month, review https://rustsec.org/advisories/?keyword=chrono and chrono's GitHub security advisories. High/Critical advisory affecting 0.4.38 → evaluate the ADR-013 trigger-2 paths in order (forward-bump + arrow-arith fix, fork arrow-arith, accept-and-document-as-blocker). Next due: 2026-05-04. Noted 2026-04-29.
-- [ ] **ADR-014 (TODO): ALPHA file write failure policy** — `LanceVectorStore::open` currently uses `fs::write(&path, body)?` for the `ALPHA_DO_NOT_STORE_REAL_DATA.txt` file; if the data dir is read-only / quota-exceeded / network-share-with-write-restrictions, `open()` fails entirely. That's denial-of-service against legitimate use. Per Shahbaz's Phase-3 review (2026-04-29): policy should be "log WARN with the underlying error + increment a metric + proceed with open()" — the startup WARN log is the primary safety control, the ALPHA file is secondary. Implementation: catch `Err` from `write_alpha_warning`, downgrade to a `tracing::warn!` with the io error, continue. Add a test that asserts `open()` succeeds when the data dir is made read-only after creation. Write as ADR-014 + amend ADR-010 to note the secondary-control downgrade. (Noted 2026-04-29, file: `crates/vault-storage/src/vector_store.rs`)
+- [x] ~~**ADR-014: ALPHA file write failure policy**~~ — landed 2026-04-29 in this session. `LanceVectorStore::open` now logs WARN + proceeds on alpha-file write failure; ADR-014 written, ADR-010 compensating-control #4 amended, test `open_succeeds_when_alpha_file_write_fails_per_adr_014` pins the behaviour.
 
 ---
 

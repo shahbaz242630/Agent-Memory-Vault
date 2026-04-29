@@ -9,3 +9,9 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+
+# Spike-only deps. Promoted to real `[dependencies]` when T0.2.9 implements
+# the sync envelope. Keeping them as dev-dependencies for now means the spike
+# compiles but vault-sync's public surface stays empty until T0.2.9.
+[dev-dependencies]
+dryoc = { workspace = true }
