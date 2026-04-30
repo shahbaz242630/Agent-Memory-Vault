@@ -16,6 +16,7 @@
 pub mod audit;
 pub mod cascading;
 pub mod dead_letter;
+pub mod divergence;
 #[cfg(test)]
 pub(crate) mod fault_injection;
 pub mod graph_store;
@@ -36,6 +37,7 @@ pub use cascading::{Ack, DegradedMode, StorageBackend, MAX_RETRY_QUEUE_DEPTH};
 pub use dead_letter::{
     DeadLetter, DeadLetterEntry, NewDeadLetter, Resolution, FAILURE_REASON_MAX_BYTES,
 };
+pub use divergence::{DivergenceDetector, DivergenceReport, RECENT_WINDOW, SAMPLES_PER_STRATUM};
 pub use graph_store::{
     DuckDbGraphStore, GraphStore, TraversalOptions, CROSS_BOUNDARY_RELATION_TYPES,
 };

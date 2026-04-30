@@ -118,6 +118,20 @@ pub trait VectorStore: Send + Sync {
     /// because `count` does not return memory contents to the caller.
     async fn count(&self, boundary: Option<&Boundary>) -> VaultResult<usize>;
 
+    /// Returns `true` if the vector store has a row for `id`.
+    ///
+    /// Used by the divergence detector (T0.1.6 Phase C2) to verify that
+    /// every SQLite memory has a matching LanceDB row. Implementations
+    /// should make this O(1) — LanceDB's `count_rows` with an `id =
+    /// '<uuid>'` filter is the canonical shape (the UUID charset cannot
+    /// contain a quote, but [`crate::vector_store::quote_sql_string`]
+    /// is the defense-in-depth construction site).
+    ///
+    /// Existence check, not content hash — content lives in SQLite,
+    /// embeddings in LanceDB; cross-store content comparison would
+    /// require redundant storage. Existence is the right invariant.
+    async fn contains(&self, id: &MemoryId) -> VaultResult<bool>;
+
     /// Embedding dimension this store expects. Used by the cascading backend
     /// (T0.1.6) to validate compatibility before forwarding writes.
     fn dimension(&self) -> usize;
@@ -383,6 +397,22 @@ impl VectorStore for LanceVectorStore {
             .count_rows(filter)
             .await
             .map_err(|e| VaultError::Storage(format!("count_rows: {e}")))
+    }
+
+    #[instrument(skip(self), fields(id = %id.0))]
+    async fn contains(&self, id: &MemoryId) -> VaultResult<bool> {
+        // UUID hyphenated form is hex + dashes only — cannot contain a
+        // SQL quote — but quote_sql_string is the defense-in-depth
+        // construction site, used identically to upsert / search /
+        // count. A future refactor that changes MemoryId's inner type
+        // cannot accidentally introduce SQL injection here.
+        let filter = format!("id = {}", quote_sql_string(&id.0.to_string()));
+        let n = self
+            .table
+            .count_rows(Some(filter))
+            .await
+            .map_err(|e| VaultError::Storage(format!("count_rows for contains: {e}")))?;
+        Ok(n > 0)
     }
 
     fn dimension(&self) -> usize {

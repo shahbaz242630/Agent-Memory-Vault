@@ -1,9 +1,9 @@
 //! `vault-cli` — operator command-line interface for the Memory Vault
-//! (T0.1.6 Phase C1b).
+//! (T0.1.6 Phase C1b + C2).
 //!
 //! ## Scope (V0.1, founder-only alpha)
 //!
-//! Dead-letter triage. Four subcommands, nothing more:
+//! Dead-letter triage + on-demand divergence check:
 //!
 //! - `dead-letter list` — show unresolved dead-letter rows
 //! - `dead-letter inspect <id>` — show full detail for one row
@@ -11,10 +11,12 @@
 //!   resolved as `retried_succeeded` or `retried_failed`
 //! - `dead-letter acknowledge <id> --reason <text>` — operator accepts the
 //!   loss; row stays for audit but no further retries
+//! - `divergence-check` — two-tier consistency check (count + sampled
+//!   existence) between SQLite and the vector store; non-zero exit on
+//!   findings so scripts notice. See ADR-018.
 //!
-//! V0.2 lights up `divergence-check` (Phase C2) and any richer admin
-//! surface lives in its own task with its own scope review (per Phase C
-//! plan Q4 "tightness constraint").
+//! Any richer admin surface lives in its own task with its own scope
+//! review (per Phase C plan Q4 "tightness constraint").
 //!
 //! ## Authentication
 //!
@@ -35,7 +37,10 @@ use clap::{Parser, Subcommand};
 use uuid::Uuid;
 
 use vault_core::{Boundary, MemoryId};
-use vault_storage::{CascadeOperation, DeadLetterEntry, Resolution, SqlCipherKey, StorageBackend};
+use vault_storage::{
+    CascadeOperation, DeadLetterEntry, DivergenceDetector, DivergenceReport, Resolution,
+    SqlCipherKey, StorageBackend,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -73,6 +78,10 @@ enum Command {
         #[command(subcommand)]
         action: DeadLetterAction,
     },
+    /// On-demand consistency check between SQLite and the LanceDB
+    /// vector store. Reports tier-1 count comparison + tier-2 sampled
+    /// existence findings. Per Phase A Q3 / ADR-018.
+    DivergenceCheck,
 }
 
 #[derive(Subcommand, Debug)]
@@ -143,6 +152,52 @@ async fn real_main() -> Result<()> {
 
     match cli.command {
         Command::DeadLetter { action } => dispatch_dead_letter(&backend, action).await,
+        Command::DivergenceCheck => run_divergence_check(&backend).await,
+    }
+}
+
+async fn run_divergence_check(backend: &StorageBackend) -> Result<()> {
+    let detector = DivergenceDetector::new(backend.clone());
+    let report = detector.run().await?;
+    print_divergence_report(&report);
+    if report.has_findings() {
+        // Non-zero exit when there's anything to triage. Scripts can
+        // pipe to a notification channel or fail a CI job.
+        anyhow::bail!("divergence findings present — see report above");
+    }
+    Ok(())
+}
+
+fn print_divergence_report(r: &DivergenceReport) {
+    println!("divergence check at {}", r.run_at.to_rfc3339());
+    println!("  sqlite memories  : {}", r.sqlite_memory_count);
+    println!("  vector rows      : {}", r.vector_count);
+    if r.count_mismatch() {
+        let delta = r.sqlite_memory_count as i64 - r.vector_count as i64;
+        println!("  count mismatch   : sqlite - vector = {delta} (tier-1 finding)");
+    } else {
+        println!("  count match      : ok");
+    }
+    println!("  samples checked  : {}", r.samples_checked);
+    if r.missing_in_vector.is_empty() {
+        println!("  missing in vector: (none)");
+    } else {
+        println!(
+            "  missing in vector: {} id(s) — tier-2 sampled-existence finding",
+            r.missing_in_vector.len()
+        );
+        for id in &r.missing_in_vector {
+            println!("    - {id}");
+        }
+    }
+    println!(
+        "  pending_sync resync count: {} (V0.1 stub — see ADR-018 / HANDOFF tech debt)",
+        r.pending_sync_resync_count
+    );
+    if r.has_findings() {
+        println!("\nfindings present — investigate via vault-cli dead-letter list / inspect");
+    } else {
+        println!("\nno findings.");
     }
 }
 
@@ -508,6 +563,22 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_divergence_check() {
+        let cli = Cli::try_parse_from([
+            "vault-cli",
+            "--vault-db",
+            "/tmp/v.db",
+            "--vector-dir",
+            "/tmp/lance",
+            "--graph-db",
+            "/tmp/g.duckdb",
+            "divergence-check",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Command::DivergenceCheck));
+    }
+
+    #[test]
     fn cli_rejects_missing_required_flag() {
         let result = Cli::try_parse_from([
             "vault-cli",
@@ -696,5 +767,59 @@ mod tests {
     fn summarize_takes_first_line_only() {
         let multi = "first line\nsecond line";
         assert_eq!(summarize(multi, 60), "first line");
+    }
+
+    // --------------------------------------------------------------
+    // divergence-check end-to-end
+    // --------------------------------------------------------------
+
+    #[tokio::test]
+    async fn divergence_check_on_clean_vault_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        let backend = make_backend(tmp.path()).await;
+        // No memories → no findings → Ok return.
+        run_divergence_check(&backend).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn divergence_check_returns_err_when_findings_present() {
+        use vault_storage::StepResult;
+        use vault_storage::{FixedJitter, RetryWorker};
+
+        let tmp = TempDir::new().unwrap();
+        let backend = make_backend(tmp.path()).await;
+
+        // Plant a memory + drain the cascade so SQLite + LanceDB are in sync.
+        let m = vault_core::Memory::try_new(vault_core::NewMemory {
+            content: "doomed".into(),
+            memory_type: vault_core::MemoryType::Semantic,
+            boundary: Boundary::new("work").unwrap(),
+            source_agent: Some("test".into()),
+            confidence: 0.9,
+            valid_from: None,
+            valid_until: None,
+            metadata: serde_json::json!({}),
+        })
+        .unwrap();
+        backend.write_memory(&m, &embedding(0.1)).await.unwrap();
+
+        let mut w = RetryWorker::with_jitter(backend.clone(), Box::new(FixedJitter(0.0)));
+        let far_future = chrono::Utc::now() + chrono::Duration::seconds(60 * 60);
+        loop {
+            let r = w.step_at(far_future).await.unwrap();
+            if r == StepResult::Idle {
+                break;
+            }
+        }
+
+        // Silently drop the vector row → divergence finding.
+        backend.vector_store().delete(&m.id).await.unwrap();
+
+        // run_divergence_check should return Err so scripts notice.
+        let err = run_divergence_check(&backend).await.unwrap_err();
+        assert!(
+            err.to_string().contains("divergence findings present"),
+            "expected findings error, got: {err}"
+        );
     }
 }
