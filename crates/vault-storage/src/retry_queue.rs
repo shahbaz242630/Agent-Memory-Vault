@@ -53,27 +53,32 @@ pub const PAYLOAD_FORMAT_VERSION: i64 = 1;
 /// on `dead_letter.failure_reason` from migration 0002 (Phase A).
 pub const LAST_ERROR_MAX_BYTES: usize = 4096;
 
-/// Cascading-write operation kinds. Persisted as the canonical strings
-/// listed in migration 0002's column comment.
+/// Cascading-write operation kinds. **Per-cascade**, not per-store: a
+/// single retry-queue entry covers BOTH the LanceDB and DuckDB sub-ops
+/// for the corresponding write. The orchestrator's worker runs both sub-ops
+/// idempotently per attempt; either failure → whole entry reschedules.
+///
+/// Per ADR-016 / ADR-017 (T0.1.6 Phase C), reasoning in
+/// `T0.1.6_PLAN_PHASE_C.md` "One-row-per-write retry model": V0.1
+/// retrieval is LanceDB-only, so per-store dead-lettering granularity
+/// added complexity without a corresponding user benefit. Lockstep
+/// success/failure matches the user mental model of "memory write fully
+/// cascaded."
+///
+/// Persisted strings: `"write" / "update" / "delete"`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CascadeOperation {
-    LancedbWrite,
-    LancedbUpdate,
-    LancedbDelete,
-    DuckdbWrite,
-    DuckdbUpdate,
-    DuckdbDelete,
+    Write,
+    Update,
+    Delete,
 }
 
 impl CascadeOperation {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::LancedbWrite => "lancedb_write",
-            Self::LancedbUpdate => "lancedb_update",
-            Self::LancedbDelete => "lancedb_delete",
-            Self::DuckdbWrite => "duckdb_write",
-            Self::DuckdbUpdate => "duckdb_update",
-            Self::DuckdbDelete => "duckdb_delete",
+            Self::Write => "write",
+            Self::Update => "update",
+            Self::Delete => "delete",
         }
     }
 }
@@ -83,12 +88,9 @@ impl FromStr for CascadeOperation {
 
     fn from_str(s: &str) -> VaultResult<Self> {
         match s {
-            "lancedb_write" => Ok(Self::LancedbWrite),
-            "lancedb_update" => Ok(Self::LancedbUpdate),
-            "lancedb_delete" => Ok(Self::LancedbDelete),
-            "duckdb_write" => Ok(Self::DuckdbWrite),
-            "duckdb_update" => Ok(Self::DuckdbUpdate),
-            "duckdb_delete" => Ok(Self::DuckdbDelete),
+            "write" => Ok(Self::Write),
+            "update" => Ok(Self::Update),
+            "delete" => Ok(Self::Delete),
             other => Err(VaultError::Storage(format!(
                 "unknown cascade operation: {other}"
             ))),
@@ -684,7 +686,7 @@ mod tests {
     fn sample_new_retry(seq: i64) -> NewRetry {
         NewRetry {
             memory_id: MemoryId::new(),
-            operation: CascadeOperation::LancedbWrite,
+            operation: CascadeOperation::Write,
             sequence_id: seq,
             payload: serde_json::json!({"embedding": [0.1, 0.2, 0.3]}),
         }
@@ -695,12 +697,9 @@ mod tests {
     #[test]
     fn cascade_operation_string_round_trips() {
         for op in [
-            CascadeOperation::LancedbWrite,
-            CascadeOperation::LancedbUpdate,
-            CascadeOperation::LancedbDelete,
-            CascadeOperation::DuckdbWrite,
-            CascadeOperation::DuckdbUpdate,
-            CascadeOperation::DuckdbDelete,
+            CascadeOperation::Write,
+            CascadeOperation::Update,
+            CascadeOperation::Delete,
         ] {
             let s = op.as_str();
             let back = CascadeOperation::from_str(s).unwrap();
@@ -933,7 +932,7 @@ mod tests {
             q.enqueue(
                 NewRetry {
                     memory_id: mem,
-                    operation: CascadeOperation::LancedbWrite,
+                    operation: CascadeOperation::Write,
                     sequence_id: seq,
                     payload: serde_json::json!({"seq": seq}),
                 },
@@ -956,7 +955,7 @@ mod tests {
         q.enqueue(
             NewRetry {
                 memory_id: mem,
-                operation: CascadeOperation::LancedbWrite,
+                operation: CascadeOperation::Write,
                 sequence_id: 42,
                 payload: serde_json::json!({}),
             },
@@ -969,7 +968,7 @@ mod tests {
             .enqueue(
                 NewRetry {
                     memory_id: mem,
-                    operation: CascadeOperation::DuckdbWrite,
+                    operation: CascadeOperation::Update,
                     sequence_id: 42,
                     payload: serde_json::json!({}),
                 },
@@ -1032,7 +1031,7 @@ mod tests {
             q.enqueue(
                 NewRetry {
                     memory_id: mem,
-                    operation: CascadeOperation::LancedbWrite,
+                    operation: CascadeOperation::Write,
                     sequence_id: seq,
                     payload: serde_json::json!({"s": seq}),
                 },
@@ -1261,7 +1260,7 @@ mod tests {
                 q.enqueue(
                     NewRetry {
                         memory_id: m,
-                        operation: CascadeOperation::LancedbWrite,
+                        operation: CascadeOperation::Write,
                         sequence_id: seq,
                         payload: serde_json::json!({"s": seq}),
                     },

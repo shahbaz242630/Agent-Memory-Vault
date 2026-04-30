@@ -15,6 +15,8 @@
 
 pub mod audit;
 pub mod dead_letter;
+#[cfg(test)]
+pub(crate) mod fault_injection;
 pub mod graph_store;
 pub mod key;
 pub mod metadata_store;

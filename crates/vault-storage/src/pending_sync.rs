@@ -250,13 +250,11 @@ mod tests {
         let (_tmp, p) = make_pending().await;
         let mem = MemoryId::new();
         let now = Utc::now();
-        p.upsert(mem, CascadeOperation::LancedbWrite, now)
-            .await
-            .unwrap();
+        p.upsert(mem, CascadeOperation::Write, now).await.unwrap();
 
         let entry = p.get(mem).await.unwrap().unwrap();
         assert_eq!(entry.memory_id, mem);
-        assert_eq!(entry.operation, CascadeOperation::LancedbWrite);
+        assert_eq!(entry.operation, CascadeOperation::Write);
         // RFC3339 round-trip is microsecond-accurate; ensure the timestamp
         // matches at second granularity.
         assert_eq!(entry.queued_at.timestamp(), now.timestamp());
@@ -268,19 +266,19 @@ mod tests {
         let (_tmp, p) = make_pending().await;
         let mem = MemoryId::new();
         let earlier = Utc::now();
-        p.upsert(mem, CascadeOperation::LancedbWrite, earlier)
+        p.upsert(mem, CascadeOperation::Write, earlier)
             .await
             .unwrap();
 
         let later = earlier + Duration::seconds(10);
-        p.upsert(mem, CascadeOperation::DuckdbDelete, later)
+        p.upsert(mem, CascadeOperation::Delete, later)
             .await
             .unwrap();
 
         let entry = p.get(mem).await.unwrap().unwrap();
         assert_eq!(
             entry.operation,
-            CascadeOperation::DuckdbDelete,
+            CascadeOperation::Delete,
             "second UPSERT should replace operation"
         );
         assert_eq!(
@@ -310,9 +308,7 @@ mod tests {
         // column value, not insert order.
         for (i, m) in mems.iter().enumerate() {
             let qt = now + Duration::seconds(10 - i as i64);
-            p.upsert(*m, CascadeOperation::LancedbWrite, qt)
-                .await
-                .unwrap();
+            p.upsert(*m, CascadeOperation::Write, qt).await.unwrap();
         }
 
         let listed = p.oldest_first(100).await.unwrap();
@@ -334,9 +330,7 @@ mod tests {
         for i in 0..7 {
             let m = MemoryId::new();
             let qt = Utc::now() + Duration::seconds(i);
-            p.upsert(m, CascadeOperation::LancedbWrite, qt)
-                .await
-                .unwrap();
+            p.upsert(m, CascadeOperation::Write, qt).await.unwrap();
         }
         let limited = p.oldest_first(3).await.unwrap();
         assert_eq!(limited.len(), 3);
@@ -348,7 +342,7 @@ mod tests {
     async fn remove_returns_true_for_existing_row() {
         let (_tmp, p) = make_pending().await;
         let mem = MemoryId::new();
-        p.upsert(mem, CascadeOperation::LancedbWrite, Utc::now())
+        p.upsert(mem, CascadeOperation::Write, Utc::now())
             .await
             .unwrap();
 
@@ -373,9 +367,7 @@ mod tests {
         for i in 0..3 {
             let m = MemoryId::new();
             let qt = Utc::now() + Duration::seconds(i);
-            p.upsert(m, CascadeOperation::LancedbWrite, qt)
-                .await
-                .unwrap();
+            p.upsert(m, CascadeOperation::Write, qt).await.unwrap();
         }
         assert_eq!(p.len().await.unwrap(), 3);
     }
@@ -394,12 +386,9 @@ mod tests {
         let base = Utc::now();
 
         let ops = [
-            CascadeOperation::LancedbWrite,
-            CascadeOperation::LancedbUpdate,
-            CascadeOperation::LancedbDelete,
-            CascadeOperation::DuckdbWrite,
-            CascadeOperation::DuckdbUpdate,
-            CascadeOperation::DuckdbDelete,
+            CascadeOperation::Write,
+            CascadeOperation::Update,
+            CascadeOperation::Delete,
         ];
 
         let mut handles = Vec::new();
@@ -438,7 +427,7 @@ mod tests {
             let m = *m;
             let qt = Utc::now() + Duration::milliseconds(i as i64);
             handles.push(tokio::spawn(async move {
-                p.upsert(m, CascadeOperation::LancedbWrite, qt).await
+                p.upsert(m, CascadeOperation::Write, qt).await
             }));
         }
         for h in handles {
@@ -459,12 +448,9 @@ mod tests {
     async fn all_cascade_operations_round_trip() {
         let (_tmp, p) = make_pending().await;
         let kinds = [
-            CascadeOperation::LancedbWrite,
-            CascadeOperation::LancedbUpdate,
-            CascadeOperation::LancedbDelete,
-            CascadeOperation::DuckdbWrite,
-            CascadeOperation::DuckdbUpdate,
-            CascadeOperation::DuckdbDelete,
+            CascadeOperation::Write,
+            CascadeOperation::Update,
+            CascadeOperation::Delete,
         ];
         for op in kinds {
             let m = MemoryId::new();

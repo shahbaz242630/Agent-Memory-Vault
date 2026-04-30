@@ -141,6 +141,23 @@ pub trait GraphStore: Send + Sync {
         old_id: &RelationshipId,
         new_rel: &Relationship,
     ) -> VaultResult<()>;
+
+    /// Eager validation that the store is readable end-to-end (not merely
+    /// open-able). Used by `StorageBackend::open` (T0.1.6 Phase C, ADR-018)
+    /// to surface hard fragment corruption immediately.
+    ///
+    /// **Same load-bearing contract as
+    /// [`crate::VectorStore::validate_readable`]:** minimum-cost end-to-end
+    /// read that exercises data-decode. **Not** metadata-only. The
+    /// recommended shape is `SELECT id FROM entities ORDER BY id ASC LIMIT 1`
+    /// — deterministic, cheap, exercises the full row decode path. Empty
+    /// store validates vacuously (no rows, nothing to decode).
+    ///
+    /// Returns `Ok(())` on a clean / empty store; `Err` on corruption with
+    /// the underlying decode error. The orchestrator translates `Err` into
+    /// a CRITICAL audit event + degraded-mode flag, not a hard `open()`
+    /// failure (ADR-010 / Phase A Change 1).
+    async fn validate_readable(&self) -> VaultResult<()>;
 }
 
 /// DuckDB-backed [`GraphStore`] implementation.
@@ -589,6 +606,36 @@ impl GraphStore for DuckDbGraphStore {
 
             tx.commit()
                 .map_err(|e| VaultError::Storage(format!("commit: {e}")))
+        })
+        .await
+        .map_err(|e| VaultError::Storage(format!("spawn_blocking join: {e}")))?
+    }
+
+    /// Per the trait contract: minimum-cost end-to-end read that exercises
+    /// the data-decode path (NOT metadata-only). Reads the smallest-id
+    /// row's `id` column. Empty tables validate vacuously via
+    /// `query_row(...).optional()`.
+    ///
+    /// Same load-bearing rationale as
+    /// [`crate::VectorStore::validate_readable`]: corrupting `entities`
+    /// row data on disk must surface here, not silently pass on a
+    /// metadata-only check. The `ORDER BY id ASC LIMIT 1` shape forces
+    /// an actual row decode (the `id` BLOB column is read into
+    /// `Vec<u8>`).
+    #[instrument(skip(self))]
+    async fn validate_readable(&self) -> VaultResult<()> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || -> VaultResult<()> {
+            let conn = inner.lock()?;
+            let _row: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT id FROM entities ORDER BY id ASC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| VaultError::Storage(format!("validate_readable read: {e}")))?;
+            Ok(())
         })
         .await
         .map_err(|e| VaultError::Storage(format!("spawn_blocking join: {e}")))?
@@ -1552,5 +1599,22 @@ mod tests {
                 Ok(())
             })?;
         }
+    }
+
+    // ---------- validate_readable (ADR-018) ----------
+
+    #[tokio::test]
+    async fn validate_readable_passes_on_empty_graph() {
+        // Vacuous pass: empty entities → no rows → no decode → Ok.
+        let (_tmp, store) = open_tmp().await;
+        store.validate_readable().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn validate_readable_passes_on_clean_graph_with_entities() {
+        let (_tmp, store) = open_tmp().await;
+        let entity = ent("Alice", EntityType::Person, "work");
+        store.create_entity(&entity).await.unwrap();
+        store.validate_readable().await.unwrap();
     }
 }

@@ -43,6 +43,8 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
+use uuid::Uuid;
+
 use arrow_array::{
     Array, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray,
 };
@@ -119,6 +121,34 @@ pub trait VectorStore: Send + Sync {
     /// Embedding dimension this store expects. Used by the cascading backend
     /// (T0.1.6) to validate compatibility before forwarding writes.
     fn dimension(&self) -> usize;
+
+    /// Eager validation that the store is readable end-to-end (not merely
+    /// open-able). Used by `StorageBackend::open` (T0.1.6 Phase C, ADR-018)
+    /// to surface hard fragment corruption immediately, not the next time
+    /// the user searches.
+    ///
+    /// **Contract — load-bearing, do not relax in implementations:**
+    /// - The check MUST be a *minimum-cost end-to-end read that exercises
+    ///   data-decode*. **Not** metadata-only.
+    /// - Counts, manifests, version files, and other metadata-only paths
+    ///   are NOT sufficient — the LanceDB corruption spike (2026-04-30,
+    ///   `crates/vault-storage/examples/lance_corruption_spike.rs`) showed
+    ///   that LanceDB's row count and metadata both succeed on a store
+    ///   whose fragment data is corrupted to unreadability. A
+    ///   metadata-only impl recreates that blind spot.
+    /// - The recommended shape is "scan the row with smallest UUID, ORDER
+    ///   BY id ASC LIMIT 1" — deterministic, cheap, exercises the full
+    ///   decode path. Empty store validates vacuously (no decode happens
+    ///   because there are no rows; this is correct — there's nothing to
+    ///   corrupt).
+    ///
+    /// Returns `Ok(())` on a clean / empty store. Returns `Err` carrying
+    /// the underlying decode error on fragment corruption — the caller
+    /// (`StorageBackend::open`) translates this into a CRITICAL audit
+    /// event and degraded-mode flag rather than failing `open()`
+    /// outright (per ADR-010 / Phase A Change 1: founders must retain
+    /// vault-cli access for triage even when the vector store is unreadable).
+    async fn validate_readable(&self) -> VaultResult<()>;
 }
 
 /// LanceDB-backed implementation of [`VectorStore`].
@@ -357,6 +387,79 @@ impl VectorStore for LanceVectorStore {
 
     fn dimension(&self) -> usize {
         self.dimension
+    }
+
+    /// Per the trait contract: minimum-cost end-to-end read that exercises
+    /// the data-decode path (NOT metadata-only).
+    ///
+    /// **Implementation shape (load-bearing).** Scans the `id` column
+    /// across all rows AND parses each value as a UUID. The C1 spike
+    /// (and the corresponding test) revealed that `try_collect()` alone
+    /// returns RecordBatches with garbage bytes on a corrupted store
+    /// without erroring — Arrow IPC framing on a corrupted Lance fragment
+    /// often round-trips as "valid Arrow batch with nonsense data."
+    /// **Decode and parse, not just decode.**
+    ///
+    /// The full shape: `query().limit(count).execute().try_collect()`,
+    /// then walk every batch, downcast the `id` column to `StringArray`,
+    /// and `Uuid::parse_str` each value. The UUID parse is what the
+    /// spike's `search()` does internally — that's what surfaces "invalid
+    /// uuid in row N: ..." on corrupted bytes. Without the parse, the
+    /// validation passes vacuously even on a fully-corrupted store.
+    ///
+    /// Empty stores: `count_rows` returns 0; we short-circuit with
+    /// `Ok(())` — vacuous pass.
+    ///
+    /// Cost on a populated table: ~O(N) — read every id, parse each.
+    /// Fine for V0.1's expected store size (≤ tens of thousands of
+    /// memories per founder dogfood). If V0.2 grows the store
+    /// dramatically, revisit (sample-and-decode probe).
+    ///
+    /// Spike: `crates/vault-storage/examples/lance_corruption_spike.rs`.
+    /// The journey through five alternative shapes that DIDN'T surface
+    /// corruption is documented in the commit history for posterity.
+    #[instrument(skip(self))]
+    async fn validate_readable(&self) -> VaultResult<()> {
+        // count_rows is metadata-only (cheap) — verified by spike. Empty
+        // store → no rows to decode → vacuous pass.
+        let row_count = self
+            .table
+            .count_rows(None)
+            .await
+            .map_err(|e| VaultError::Storage(format!("validate_readable count: {e}")))?;
+        if row_count == 0 {
+            return Ok(());
+        }
+        let stream = self
+            .table
+            .query()
+            .limit(row_count)
+            .execute()
+            .await
+            .map_err(|e| VaultError::Storage(format!("validate_readable execute: {e}")))?;
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .map_err(|e| VaultError::Storage(format!("validate_readable collect: {e}")))?;
+        // Parse every id value — this is what surfaces UUID-decode errors
+        // on corrupted-but-Arrow-framing-valid fragments.
+        for batch in &batches {
+            let ids = batch
+                .column_by_name("id")
+                .ok_or_else(|| VaultError::Storage("validate_readable: missing id column".into()))?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    VaultError::Storage("validate_readable: id column not Utf8".into())
+                })?;
+            for i in 0..ids.len() {
+                let id_str = ids.value(i);
+                Uuid::parse_str(id_str).map_err(|e| {
+                    VaultError::Storage(format!("validate_readable: invalid uuid at row {i}: {e}"))
+                })?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1014,5 +1117,115 @@ mod tests {
                 Ok(())
             })?;
         }
+    }
+
+    // ---------- validate_readable (ADR-018) ----------
+
+    #[tokio::test]
+    async fn validate_readable_passes_on_empty_store() {
+        // Vacuous pass: empty table → no rows → no decode → Ok.
+        let tmp = TempDir::new().unwrap();
+        let store = LanceVectorStore::open(tmp.path(), 4).await.unwrap();
+        store.validate_readable().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn validate_readable_passes_on_clean_store_with_rows() {
+        let tmp = TempDir::new().unwrap();
+        let store = LanceVectorStore::open(tmp.path(), 4).await.unwrap();
+        let work = Boundary::new("work").unwrap();
+        store
+            .upsert(&new_id(), &embedding(4, 0.7), &work)
+            .await
+            .unwrap();
+        store
+            .upsert(&new_id(), &embedding(4, 0.3), &work)
+            .await
+            .unwrap();
+        store.validate_readable().await.unwrap();
+    }
+
+    /// The corruption-detection invariant the trait contract is about.
+    /// Mirrors `crates/vault-storage/examples/lance_corruption_spike.rs`'s
+    /// step 3 — the corrupted-fragment scenario must surface here, not via
+    /// metadata-only paths like `count`.
+    ///
+    /// LanceDB writes one fragment file per `upsert` call, so we corrupt
+    /// **every** `.lance` fragment file before re-opening. Corrupting just
+    /// the first one would let `validate_readable`'s `nearest_to` scan
+    /// satisfy itself from a clean fragment without hitting the corruption.
+    #[tokio::test]
+    async fn validate_readable_returns_err_on_corrupted_fragment() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+
+        // Set up: open, insert, drop the store so files flush to disk.
+        {
+            let store = LanceVectorStore::open(&data_dir, 4).await.unwrap();
+            let work = Boundary::new("work").unwrap();
+            for i in 0..3 {
+                store
+                    .upsert(&new_id(), &embedding(4, 0.1 * (i as f32 + 1.0)), &work)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        // Corrupt every fragment file's header — destroys the row-decode
+        // path while leaving the manifest intact (per spike findings).
+        let fragments = find_all_fragments(&data_dir);
+        assert!(
+            !fragments.is_empty(),
+            "expected at least one fragment file in {data_dir:?}"
+        );
+        for fragment in &fragments {
+            let mut bytes = std::fs::read(fragment).unwrap();
+            let n = 64.min(bytes.len());
+            for byte in bytes.iter_mut().take(n) {
+                *byte = 0xAB;
+            }
+            std::fs::write(fragment, &bytes).unwrap();
+        }
+
+        // Re-open + validate. validate_readable MUST return Err. The
+        // metadata-only `count` would still succeed — we don't test that
+        // here (the spike covered it); we test that our validation does
+        // what `count` cannot.
+        let store = LanceVectorStore::open(&data_dir, 4).await.unwrap();
+        let result = store.validate_readable().await;
+        assert!(
+            result.is_err(),
+            "corrupted fragment must surface as Err from validate_readable; got {result:?}"
+        );
+    }
+
+    /// Walk `data_dir/*.lance/data/` recursively and return every `.lance`
+    /// fragment file found. The corruption test corrupts all of them so
+    /// `nearest_to` can't dodge the corruption by satisfying from a clean
+    /// fragment.
+    fn find_all_fragments(data_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        fn walk(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+            let entries = match std::fs::read_dir(dir) {
+                Ok(e) => e,
+                Err(_) => return,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, found);
+                } else if path.extension().and_then(|s| s.to_str()) == Some("lance")
+                    && path
+                        .parent()
+                        .and_then(|p| p.file_name())
+                        .map(|n| n == "data")
+                        .unwrap_or(false)
+                {
+                    found.push(path);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        walk(data_dir, &mut found);
+        found
     }
 }

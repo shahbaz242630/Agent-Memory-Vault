@@ -431,7 +431,7 @@ mod tests {
         let now = Utc::now();
         NewDeadLetter {
             memory_id: MemoryId::new(),
-            failed_operation: CascadeOperation::LancedbWrite,
+            failed_operation: CascadeOperation::Write,
             failure_reason: reason.to_string(),
             attempts_made: 8,
             first_failed_at: now - Duration::seconds(241),

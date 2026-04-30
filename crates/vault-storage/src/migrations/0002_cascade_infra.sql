@@ -20,9 +20,9 @@ CREATE TABLE IF NOT EXISTS retry_queue (
                                                           -- best-effort retries even if memories row
                                                           -- was deleted; orphan retries are dropped
                                                           -- by the worker)
-    operation                TEXT    NOT NULL,           -- 'lancedb_write' | 'lancedb_update'
-                                                          -- | 'lancedb_delete' | 'duckdb_write'
-                                                          -- | 'duckdb_update' | 'duckdb_delete'
+    operation                TEXT    NOT NULL,           -- 'write' | 'update' | 'delete'
+                                                          -- per-cascade (covers BOTH LanceDB + DuckDB
+                                                          -- sub-ops); see ADR-016 / ADR-017 (T0.1.6 Phase C)
     payload_format_version   INTEGER NOT NULL,           -- so retry payloads can evolve
     payload                  BLOB    NOT NULL,           -- JSON-serialised retry context
     sequence_id              INTEGER NOT NULL,           -- audit-chain index for FIFO ordering

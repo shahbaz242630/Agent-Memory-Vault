@@ -342,10 +342,9 @@ impl MetadataStore {
     /// crate (`retry_queue`, `dead_letter`, `pending_sync`) so they can
     /// CRUD their own tables without each opening a separate connection.
     ///
-    /// Phase B-only contract: the caller is responsible for any transaction
-    /// scoping inside `f`. The Phase C orchestrator will likely add a
-    /// dedicated `with_transaction<F>` helper for cross-table writes — see
-    /// the open question flagged in `T0.1.6_PLAN.md` Phase C planning.
+    /// `f` receives `&mut Connection` and is responsible for any transaction
+    /// scoping itself. For atomic cross-table writes, prefer
+    /// [`Self::with_transaction`].
     pub(crate) async fn with_conn_blocking<F, R>(&self, f: F) -> VaultResult<R>
     where
         F: FnOnce(&mut Connection) -> VaultResult<R> + Send + 'static,
@@ -355,6 +354,45 @@ impl MetadataStore {
         tokio::task::spawn_blocking(move || {
             let mut conn = inner.lock()?;
             f(&mut conn)
+        })
+        .await
+        .map_err(|e| VaultError::Storage(format!("spawn_blocking join: {e}")))?
+    }
+
+    /// Run `f` inside a single SQLite transaction on the underlying
+    /// [`Connection`]. Per ADR-016 (T0.1.6 Phase C), this is the helper the
+    /// cascading orchestrator uses to span atomic writes across `memories`
+    /// + `audit_log` + `retry_queue` / `pending_sync`.
+    ///
+    /// **Closure contract:** receives `&Transaction<'_>`, **not**
+    /// `&mut Connection` and **not** `Transaction<'_>` by value. The
+    /// closure cannot call `commit()` or `rollback()` itself — the helper
+    /// owns commit on `Ok` and lets the transaction drop (i.e., rollback)
+    /// on `Err`. This means the closure can't accidentally half-commit a
+    /// cross-table write. The trade-off: closures that need to interleave
+    /// SQL with non-DB work (e.g., spawning subtasks) should not use this
+    /// helper — keep them in `with_conn_blocking` where they own scope.
+    ///
+    /// **`#[allow(dead_code)]` rationale:** the production consumer is the
+    /// cascading orchestrator that lands in C1b. C1a ships this helper +
+    /// its tests so the API surface is locked, but no production caller
+    /// exists yet. Consumed in the next commit; allow until then.
+    #[allow(dead_code)]
+    pub(crate) async fn with_transaction<F, T>(&self, f: F) -> VaultResult<T>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>) -> VaultResult<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = inner.lock()?;
+            let tx = conn
+                .transaction()
+                .map_err(|e| VaultError::Storage(format!("begin tx: {e}")))?;
+            let out = f(&tx)?;
+            tx.commit()
+                .map_err(|e| VaultError::Storage(format!("commit tx: {e}")))?;
+            Ok(out)
         })
         .await
         .map_err(|e| VaultError::Storage(format!("spawn_blocking join: {e}")))?
@@ -1197,5 +1235,66 @@ mod tests {
             "steady-state audit insert took {:?} — expected sub-100ms",
             steady_state_audit,
         );
+    }
+
+    // ---------- with_transaction (ADR-016 helper for the orchestrator) ----------
+
+    #[tokio::test]
+    async fn with_transaction_commits_on_ok() {
+        // Closure writes a row inside the transaction; helper commits
+        // automatically on Ok return. Row visible after the helper completes.
+        let (_tmp, store) = make_store().await;
+        let m = sample_memory("work", MemoryType::Semantic, "tx-commit-target");
+        let m_for_closure = m.clone();
+        store
+            .with_transaction(move |tx| {
+                tx_insert_memory(tx, &m_for_closure)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(store.get_memory(&m.id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn with_transaction_rolls_back_on_closure_error() {
+        // Closure writes a row, then returns Err — helper must NOT commit.
+        // The transaction is dropped without a commit() call, so rusqlite
+        // rolls it back. Verify nothing was persisted.
+        let (_tmp, store) = make_store().await;
+        let m = sample_memory("work", MemoryType::Semantic, "tx-rollback-target");
+        let m_for_closure = m.clone();
+
+        let err = store
+            .with_transaction(move |tx| {
+                tx_insert_memory(tx, &m_for_closure)?;
+                // Deliberately fail so the helper drops the tx without
+                // commit. The row's INSERT is rolled back.
+                Err::<(), _>(VaultError::Storage("simulated rollback".into()))
+            })
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, VaultError::Storage(s) if s.contains("simulated rollback")),
+            "expected the closure's error to propagate verbatim, got {err:?}",
+        );
+        // Row must not exist — tx was rolled back.
+        assert!(store.get_memory(&m.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn with_transaction_returns_closure_value_on_ok() {
+        // Closure may compute and return a value; helper passes it through.
+        // Verifies the generic T parameter.
+        let (_tmp, store) = make_store().await;
+        let row_count: i64 = store
+            .with_transaction(|tx| {
+                tx.query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
+                    .map_err(|e| VaultError::Storage(format!("query: {e}")))
+            })
+            .await
+            .unwrap();
+        assert_eq!(row_count, 0);
     }
 }

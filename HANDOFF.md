@@ -1,31 +1,116 @@
 # Memory Vault — Build Handoff
 
-**Last updated:** 2026-04-30 (T0.1.6 phase B locally complete + DoD-green, awaiting commit + push approval)
+**Last updated:** 2026-04-30 (T0.1.6 Phase C1a locally complete + DoD-green, awaiting commit + push approval)
 **Updated by:** Claude (Opus 4.7)
 **Current version:** V0.1 — Internal Alpha
-**Current phase:** V0.1 in progress — **T0.1.6 shipping in three phases per the agreed plan.** Phase A (commit `34b7715`) shipped: SQL migration 0002 + planning doc. **Phase B is locally complete** — three data-layer modules (`retry_queue.rs`, `dead_letter.rs`, `pending_sync.rs`) plus a `VaultError::DimensionMismatch` variant addition, all four DoD gates green, awaiting commit + push approval per CLAUDE.md. Phase C (cascading orchestrator + divergence + vault-cli + ADRs) closes the task next session.
+**Current phase:** V0.1 in progress — **T0.1.6 shipping in five steps now (A → B → C1a → C1b → C2).** Phase A (commit `34b7715`) and Phase B (commit `2c04fdb`) are on `origin/main`. **Phase C1a is locally complete** — foundation pieces (`CascadeOperation` enum collapse, `MetadataStore::with_transaction`, `validate_readable` trait methods + impls, `fault_injection` test infra) supporting the orchestrator that lands in C1b. All four DoD gates green, awaiting commit + push approval per CLAUDE.md. C1b (cascading orchestrator + retry worker + vault-cli + ADRs 016/017/018) is next session; C2 (divergence + its CLI subcommand) closes T0.1.6.
 
 ---
 
 ## Current Status
 
-**Active item:** **T0.1.6 phase B — locally complete, awaiting commit + push approval.** Three data-layer modules in vault-storage plus a small but load-bearing addition to `vault-core::VaultError` (Watchpoint #1 in Shahbaz's Phase B greenlight). All four DoD gates pass.
+**Active item:** **T0.1.6 Phase C1a — locally complete, awaiting commit + push approval.** Foundation pieces for the orchestrator (which lands in C1b). Phase B was committed and pushed at `2c04fdb`; this session's work builds directly on top.
 
-**Phase B deliverables (NOT yet committed):**
-1. **`crates/vault-core/src/error.rs`** — new `VaultError::DimensionMismatch { expected, actual }` structured variant. The `is_permanent` classifier in retry_queue.rs needs this as a real type — without it the classifier would never see a real `DimensionMismatch` (T0.1.4 returned `InvalidInput` for dimension errors). Watchpoint #1 explicitly directed this addition. Also a unit test pinning the variant's display + structure.
-2. **`crates/vault-storage/src/vector_store.rs`** — `LanceVectorStore::upsert` and `LanceVectorStore::search` now return `VaultError::DimensionMismatch { expected, actual }` instead of `VaultError::InvalidInput(format!(...))` for dim mismatches. Two test assertions updated to match the structured variant.
-3. **`crates/vault-storage/src/metadata_store.rs`** — added `pub(crate) async fn with_conn_blocking<F, R>(&self, f: F)` helper. Wraps the existing `Arc<Mutex<Connection>>` + `spawn_blocking` pattern so the three new sibling modules can CRUD their own tables without each opening a separate connection. **Phase C gate flagged**: the orchestrator may need cross-table transaction control (BEGIN/COMMIT spanning memories + retry_queue + audit_log) — Shahbaz instinct leans toward extending `MetadataStore` with a `with_transaction<F>` helper rather than giving the orchestrator its own `Connection`. That decision is the FIRST design item for Phase C planning.
-4. **`crates/vault-storage/src/retry_queue.rs`** — `RetryQueue` data layer + pure helpers (`base_backoff_secs`, `compute_next_attempt`, `is_permanent`) + `JitterSource` trait with `SeededJitter` (xorshift64, no `rand` dep added) + `FixedJitter` test fixture. Public types: `CascadeOperation`, `NewRetry`, `RetryEntry`, `FailureOutcome`, `DeadLetterReason`. Constants: `MAX_ATTEMPTS = 8`, `PAYLOAD_FORMAT_VERSION = 1`, `LAST_ERROR_MAX_BYTES = 4096`. **33 tests** including: schedule arithmetic for all 8 attempts, jitter band proptest (256 cases), classifier coverage, FIFO ordering by `sequence_id` ASC, full attempt-walk through 1→7 → dead-letter on 8th, permanent-failure path dead-letters at attempt 1, UTF-8-safe error truncation, concurrent-enqueue test (20 tasks).
-5. **`crates/vault-storage/src/dead_letter.rs`** — `DeadLetter` data layer with `Resolution` enum, `NewDeadLetter` / `DeadLetterEntry` types, partial-index-backed `list_unresolved`, idempotent `resolve` (same resolution → no-op success; different → `InvalidInput`), 4KB `failure_reason` truncation. **16 tests** including each Resolution variant round-trip, ordered-by-id-ASC list (UUID v7 = time-ordered), invalid-transition rejection.
-6. **`crates/vault-storage/src/pending_sync.rs`** — `PendingSync` data layer with UPSERT semantics on `memory_id` PK. **11 tests** including the explicit Watchpoint #3 property test "32 concurrent UPSERTs on same memory_id leave exactly one row" (passing). Dual case for distinct memory_ids → 20 distinct rows.
-7. **`crates/vault-storage/src/lib.rs`** — re-exports for the orchestrator (Phase C) to consume. New variant `VaultError::DimensionMismatch` available via `vault_core::VaultError::DimensionMismatch`.
+### Why C1 split into C1a + C1b (decided 2026-04-30 mid-session)
 
-**Watchpoints from Phase B greenlight — status:**
-- ✅ **#1 `VaultError::DimensionMismatch` exists as structured variant** — added to vault-core; LanceVectorStore migrated; tests assert structured fields `{ expected: 4, actual: 8 }`, not just variant kind. Future ADR (logged as tech debt) will split the remaining `Storage(String)` grab-bag into more structured variants so `is_permanent` becomes an exhaustive match.
-- ✅ **#2 Backoff jitter is injectable** — `JitterSource` trait with `Send` supertrait (so `&mut dyn JitterSource` can cross `tokio::spawn` boundaries in Phase C's worker loop). `SeededJitter` (deterministic per seed) + `FixedJitter` (constant) + `ScriptedJitter` test helper. Documented at the trait def: "Inject per BRD §2.3 — never module-private global state."
-- ✅ **#3 `pending_sync` UPSERT idempotent under concurrent calls** — schema is `INSERT … ON CONFLICT(memory_id) DO UPDATE SET operation = excluded.operation, queued_at = excluded.queued_at`. Property test `concurrent_upserts_on_same_memory_leave_exactly_one_row` runs 32 tasks against the same memory_id with mixed operations + timestamps; final state is `len() == 1` with internally-coherent `(operation, queued_at)` from one of the calls.
+After completing C1.1–C1.3 (enum collapse + `with_transaction` + `validate_readable`), Claude flagged that **`validate_readable` required six iterations** to land correctly. Five wrong query shapes passed silently on a corrupted store (`limit(1)`, `nearest_to(zeros).limit(1)`, `IS NOT NULL` predicate, sentinel-equality predicate, `LENGTH(id) > 0` predicate); the sixth (parse-the-id-column) finally surfaced corruption. The non-obvious finding: `try_collect()` on a corrupted Lance store returns RecordBatches with garbage bytes *without erroring* — Arrow IPC framing on corrupted Lance fragments often round-trips as "valid Arrow batch with nonsense data." Corruption only surfaces when you actually parse column values.
 
-**Last test run:** 2026-04-30 (Phase B) — `cargo test --workspace` **201 passing** (vault-core **46/46** [+1 dimension-mismatch test], vault-storage **154/154** [+60 from new modules], doc 1/1); `cargo build --workspace` zero warnings; `cargo clippy --workspace -- -D warnings` zero warnings; `cargo fmt --all --check` clean.
+That kind of non-obvious behaviour is exactly what the cascading orchestrator (~750 LoC + 5 adversarial tests + corruption-at-open test + DimensionMismatch rejection-path test) is going to expose more of. Pushing through to a single C1 commit while context was already heavy with the validate_readable iteration would risk rushing the highest-stakes module in V0.1.
+
+**Decision:** split C1 into C1a (foundations) + C1b (orchestrator + recovery tooling). Same pattern that worked for Phase A → B → C: clean checkpoint at the layer boundary, fresh session for the next layer's load-bearing logic.
+
+### Phase C1a deliverables (NOT yet committed)
+
+1. **`crates/vault-storage/src/retry_queue.rs`** — `CascadeOperation` enum collapsed from 6 per-store variants (`LancedbWrite, LancedbUpdate, LancedbDelete, DuckdbWrite, DuckdbUpdate, DuckdbDelete`) to 3 per-cascade variants (`Write, Update, Delete`). Persisted strings: `"write"` / `"update"` / `"delete"`. Per ADR-016 / ADR-017 (lands in C1b): one row per cascading write covers BOTH the LanceDB and DuckDB sub-ops; lockstep success/failure; reasoning in `T0.1.6_PLAN_PHASE_C.md` "One-row-per-write retry model."
+2. **`crates/vault-storage/src/dead_letter.rs`** — `failed_operation` references migrated to new enum.
+3. **`crates/vault-storage/src/pending_sync.rs`** — same migration; concurrent-upsert proptest now spans `[Write, Update, Delete]` instead of 6 ops.
+4. **`crates/vault-storage/src/migrations/0002_cascade_infra.sql`** — column comment updated (`'write' | 'update' | 'delete'`); raw-SQL test inserts in `migrations/mod.rs` updated to new strings.
+5. **`crates/vault-storage/src/metadata_store.rs`** — new `pub(crate) async fn with_transaction<F, T>(&self, f: F) -> VaultResult<T>` helper. Closure receives `&rusqlite::Transaction<'_>` (not `&mut Connection`) so callers cannot accidentally `COMMIT` / `ROLLBACK` — helper handles both. 3 unit tests (commit-success, rollback-on-closure-error, value-passthrough).
+6. **`crates/vault-storage/src/vector_store.rs`** — `VectorStore::validate_readable` trait method added with strict doc contract ("minimum-cost end-to-end read that exercises data-decode, NOT metadata-only"). `LanceVectorStore::validate_readable` impl reads every row's id column AND parses each as a UUID — the `try_collect()`-only shape we tried first wasn't enough (returned Ok on corrupted store). 3 tests (clean, empty, corrupted-fragment-fails).
+7. **`crates/vault-storage/src/graph_store.rs`** — `GraphStore::validate_readable` trait method + `DuckDbGraphStore::validate_readable` impl. Reads `SELECT id FROM entities ORDER BY id ASC LIMIT 1`. 2 tests (clean, empty).
+8. **`crates/vault-storage/src/fault_injection.rs`** — new `#![cfg(test)]`-gated module. `FaultInjector` trait + `NoFault` / `AlwaysFailVector` / `AlwaysFailGraph` stub impls + `into_result` helper. Test infra for C1b's adversarial tests (Q5 of Phase A plan). 5 self-validation tests. Production builds don't compile this file.
+9. **`crates/vault-storage/examples/lance_corruption_spike.rs`** — kept as executable documentation of LanceDB 0.8's lazy-corruption behaviour. Re-runnable via `cargo run -p vault-storage --example lance_corruption_spike`. Same long-term-doc pattern as `crates/vault-sync/examples/dryoc_spike.rs`.
+10. **`T0.1.6_PLAN_PHASE_C.md`** — Phase C plan v2 (approved 2026-04-30). Will land alongside this commit.
+
+### Contracts C1b consumes from C1a
+
+This is the API surface Phase C1b builds against. C1b's session opens with this list as the starting point — no need to re-discover.
+
+```rust
+// metadata_store.rs (pub(crate))
+impl MetadataStore {
+    async fn with_conn_blocking<F, R>(&self, f: F) -> VaultResult<R>
+    where F: FnOnce(&mut rusqlite::Connection) -> VaultResult<R> + Send + 'static,
+          R: Send + 'static;
+
+    /// Atomic cross-table writes (memories + audit_log + retry_queue / pending_sync).
+    /// Closure cannot commit / rollback — helper does both. Per ADR-016 (C1b).
+    async fn with_transaction<F, T>(&self, f: F) -> VaultResult<T>
+    where F: FnOnce(&rusqlite::Transaction<'_>) -> VaultResult<T> + Send + 'static,
+          T: Send + 'static;
+}
+
+// vector_store.rs (public trait method, default-impl-free)
+trait VectorStore {
+    async fn validate_readable(&self) -> VaultResult<()>;
+}
+
+// graph_store.rs (public trait method, default-impl-free)
+trait GraphStore {
+    async fn validate_readable(&self) -> VaultResult<()>;
+}
+
+// retry_queue.rs (public enum — collapsed from 6 to 3)
+pub enum CascadeOperation { Write, Update, Delete }
+
+// fault_injection.rs (#![cfg(test)] only)
+trait FaultInjector: Send + Sync {
+    fn vector_decision(&self) -> FaultDecision;
+    fn graph_decision(&self) -> FaultDecision;
+}
+enum FaultDecision { Allow, Fail(String) }
+struct NoFault;                 // production-shaped stub for tests
+struct AlwaysFailVector(String);
+struct AlwaysFailGraph(String);
+fn into_result(decision: FaultDecision) -> VaultResult<()>;
+```
+
+### What C1b will deliver (locked order)
+
+Per Phase C plan implementation rhythm + observation #2 from plan-v2 review (DimensionMismatch eager-validation rejection-path test).
+
+1. **`cascading.rs` test-first.** Tests cover:
+   - 5 adversarial tests per Phase A Q5 (mid-cascade abort, persistent LanceDB failure → dead-letter, soft corruption caught by divergence — wait, divergence is C2, soft corruption test stays here as a placeholder; **hard corruption-at-open test stays in C1b** per Issue 2 spike findings).
+   - Standard CRUD round-trips through the orchestrator.
+   - Hard-corruption-at-open: corrupt fragment, open `StorageBackend`, assert `degraded == DegradedMode::LanceUnreadable` + audit event tagged `lancedb_corruption_at_open`.
+   - **DimensionMismatch eager-validation rejection-path test (Shahbaz observation #2):** wrong-dim `write_memory` call asserts (a) no row in `memories`, (b) no `audit_log` entry, (c) no `retry_queue` entry, (d) returns `VaultError::DimensionMismatch`. Verifies the lockstep guarantee.
+
+   Then implement `StorageBackend::open` (with `validate_readable` calls) + `write_memory` / `update_memory` / `delete_memory` (with eager dim+boundary validation BEFORE the SQLite write) + audit-event emission + degraded-mode flag. ~750 LoC + tests.
+
+2. **`retry_worker.rs`.** `RetryWorker` with `step()` (sync test invocation) + `run(rx: tokio::sync::watch::Receiver<bool>)` (production loop). No `tokio-util` dep — use `tokio::sync::watch` per smaller-item-(c). Tests: deterministic `step()` outcomes (Idle / SucceededEntry / Rescheduled / DeadLettered) + `run()` smoke test that spawns + signals cancel via `watch::Sender::send(true)`. ~300 LoC + tests.
+
+3. **`crates/vault-cli/` new binary crate.** `clap` dispatch + **stdin-only no-echo passphrase auth** (no env var per smaller-item-(a)) + 4 subcommands: `dead-letter list / inspect <id> / retry <id> / acknowledge <id> --reason <text>`. Workspace deps `clap` + `rpassword` exact-pinned post-build per BRD §2.9. ~600 LoC.
+
+4. **HANDOFF.md ADRs (4 entries):**
+   - **ADR-009 amendment** (formalise 8-attempt schedule, `is_permanent` set, `pending_sync` overflow path).
+   - **ADR-016** Connection-ownership: orchestrator routes through `MetadataStore::with_transaction`, no second SQLite Connection.
+   - **ADR-017** Cascade-ordering invariant: strict FIFO per `memory_id` by audit `seq`.
+   - **ADR-018** FullySynced deferral to T0.2.x + eager corruption validation policy (with the 6-iteration journey documented as evidence for "metadata-only checks recreate the blind spot").
+   - Tech-debt entry: split `VaultError::Storage(String)` grab-bag into structured variants.
+
+5. **DoD gates** — all four must pass before commit-approval ask.
+
+### Watchpoints / observations that survived from Phase B + Phase C plan
+
+- ✅ **Phase B Watchpoint #1 (`VaultError::DimensionMismatch`)** — landed in Phase B (`2c04fdb`).
+- ✅ **Phase B Watchpoint #2 (injectable backoff jitter via `JitterSource: Send`)** — landed in Phase B.
+- ✅ **Phase B Watchpoint #3 (pending_sync UPSERT idempotency)** — landed in Phase B.
+- ✅ **Phase C plan-v2 Issue 1 (one-row-per-write)** — partly landed (enum collapsed in C1a); fully exercised by orchestrator code in C1b.
+- ✅ **Phase C plan-v2 Issue 2 (LanceDB lazy corruption)** — landed in C1a (`validate_readable` trait + LanceDB-correct impl via id-parse). Hard-corruption-at-open test belongs in C1b (`StorageBackend::open` is what calls validate_readable).
+- ⏳ **Phase C plan-v2 observation #1 (validate_readable contract is data-decode-not-metadata)** — landed verbatim in the trait doc-comment + in the impl's six-iterations history.
+- ⏳ **Phase C plan-v2 observation #2 (DimensionMismatch eager-validation rejection-path test)** — explicit task in C1b's locked test list above.
+
+**Last test run:** 2026-04-30 (Phase C1a) — `cargo test --workspace` **214 passing** (vault-core 46/46, vault-storage 167/167 [+13 from C1a: 3 with_transaction + 5 validate_readable + 5 fault_injection], doc 1/1); `cargo build --workspace` zero warnings; `cargo clippy --workspace -- -D warnings` zero warnings; `cargo fmt --all --check` clean.
 
 ---
 
@@ -44,13 +129,14 @@
 | T0.1.5 | vault-storage: DuckDB (`GraphStore` trait + `DuckDbGraphStore` + ADR-015 boundary scoping) | 2026-04-30 (commit `062e17f`) | ✅ vault-core **45/45** + vault-storage **92/92** + doc 1/1 = **138/138** passing; build/clippy/fmt clean | Domain-only `GraphStore` trait (BRD §2.2): `Entity` / `Relationship` / `EntityId` / `RelationshipId` / `Boundary` only — DuckDB types stay inside `DuckDbGraphStore`. Mandatory access control on `traverse` via non-Optional `&[Boundary]` (BRD §11.4.3); empty slice returns empty result, not error — same compile-time discipline as `LanceVectorStore::search`. **`TraversalOptions` struct** (Shahbaz refinement during T0.1.5 review) groups `max_hops` + `relation_filter` + `follow_aliases` so the trait signature stays stable as V0.2 adds knobs (`include_archived`, time-range filters) without breaking callers; mandatory params (`from`, `authorized_boundaries`) stay positional. **`DuckDbGraphStore`** on duckdb 1.2 (workspace pin "1.0" = ^1.0; T0.1.5b will exact-pin per BRD §2.9): `Connection: Send + !Sync` wrapped in `Mutex<Connection>` + `spawn_blocking` mirror of `MetadataStore`. Schema in `migrations_graph/0001_initial.sql`: `entities` with composite `UNIQUE (name, entity_type, boundary)` (ADR-015 watch #3), `relationships` with bi-temporal `valid_from` / `valid_until` / `confidence` from day one (watch #2) + denormalised `boundary` for fast traversal-time SQL filtering. **ADR-015 enforcement mechanism locked: app-layer in `create_relationship`** because DuckDB 1.x supports neither subquery-CHECK nor triggers; property test fuzzes the API as the SQL-layer backstop's substitute. **Recursive CTE traversal** with `list_append`-tracked relationship-id path (BLOB[]) for full-chain reconstruction, `list_position` cycle break, depth-bounded with strict respect for `max_hops` (Shahbaz-added test verifies a 5-hop graph queried with `max_hops=2` returns nothing past hop 2). Boundary filter applies at every recursion step + at the final entity join (defense in depth, watch #1). 28 graph_store tests + 4 migrations_graph tests including: cross-boundary rejection (`AccessDenied`), `same_as` / `alias_for` schema permissiveness (forward-compat), `follow_aliases=true` traverses alias edges but still respects `authorized_boundaries` (not a privilege escalation), bi-temporal supersede atomicity, 20-task concurrent-creates, and a property test fuzzing arbitrary small graphs to confirm zero boundary leaks. **vault-core amendment:** `Entity` gained `boundary: Boundary` field + `NewEntity` builder mirroring `NewMemory`. ADR-015 logged with three Shahbaz-supplied additions (schema-level enforcement specifics, `same_as` forward-compat pattern, consolidator policy contract for T0.2.2). T0.1.5b cleanup task logged in tech debt: workspace caret-pin → exact-pin sweep per BRD §2.9. **Tech-debt note:** discovered DuckDB 1.2.2 wedges on autocommit INSERT UNIQUE-violation; worked around with pre-flight `SELECT COUNT(*)` inside explicit tx in `create_entity` (logged for revisit on duckdb upgrade). |
 | T0.1.5b | Workspace caret pins → exact pins per BRD §2.9 | 2026-04-30 (commit `bc1ffca`) | ✅ Cargo.lock byte-identical post-edit (success criterion); 138/138 passing; build/clippy/fmt clean | Mechanical edit scoped to workspace `Cargo.toml` + HANDOFF.md only. Replaced caret syntax (`"X.Y"`) with exact pins (`"=X.Y.Z"`) for every dep that has a workspace-member consumer, using the version currently resolved in `Cargo.lock`: tokio `=1.52.1`, async-trait `=0.1.89`, futures `=0.3.32`, thiserror `=2.0.18`, anyhow `=1.0.102`, serde `=1.0.228`, serde_json `=1.0.149`, tracing `=0.1.44`, tracing-subscriber `=0.3.23`, uuid `=1.23.1`, lancedb `=0.8.0`, arrow-array `=52.2.0`, arrow-schema `=52.2.0`, duckdb `=1.2.2`, rusqlite `=0.32.1`, dryoc `=0.7.2`, reqwest `=0.12.28`, zeroize `=1.8.2`, blake3 `=1.8.5`, proptest `=1.11.0`, tokio-test `=0.4.5`, tempfile `=3.27.0`. `chrono =0.4.38` left as-is (already exact per ADR-013). **Deps NOT in `Cargo.lock` yet** (no workspace member consumes them): `ort`, `tokenizers`, `yrs`, `rmcp`, `tauri`, `tauri-build`, `mockall`. These stay caret-pinned with an inline comment explaining they get exact-pinned at the task that first wires them into a member crate (T0.1.7 / T0.1.9 / T0.1.11 / T0.2.1 / T0.2.9). The lazy `workspace.dependencies` semantics means caret-pinned-but-unused entries cannot drift in the lockfile until first use — safe by construction. **Verification:** `git diff Cargo.lock` returns zero lines after the edit + `cargo build --workspace` succeeds; all four DoD gates re-pass; tests unchanged at 138/138. No code changed. |
 | T0.1.6a | T0.1.6 phase A: SQL schema + planning doc | 2026-04-30 (commit `34b7715`) | ✅ vault-core 45/45 + vault-storage **94/94** (+2 new migration tests) + doc 1/1 = **140/140** passing; build/clippy/fmt clean | First of three commits shipping T0.1.6. Migration `0002_cascade_infra.sql` adds three tables to the SQLite metadata DB: `retry_queue` (UUID v7 PK + `(memory_id, sequence_id)` UNIQUE for FIFO-per-memory ordering anchored to audit chain + `(next_attempt_at)` index for worker polling), `dead_letter` (resolution enum: pending / retried_succeeded / retried_failed / acknowledged / auto_recovered, partial index on unresolved for CLI list query), `pending_sync` (UPSERT semantics on `memory_id` for cap-overflow catch-up). `T0.1.6_PLAN.md` lands at repo root as the historical reference for the design — Status: Approved with all seven Shahbaz refinements applied (corruption soft-fail test, FIFO ordering invariant, is_permanent classifier, pending_sync overflow path, deterministic stratified divergence sampling, vault-cli passphrase auth, background task lifecycle contract). `forward_migration_applies_next_version_only` test refactored to use synthetic migration lists so it stays robust against future migration count changes (T0.1.6b will add 0003 for sync_state in T0.2.x — this test won't break). Phase B (retry_queue.rs + dead_letter.rs + pending_sync.rs + module tests, ~1100 LoC) is next-session's work. |
-| T0.1.6b | T0.1.6 phase B: data-layer modules (retry_queue + dead_letter + pending_sync) | 2026-04-30 (locally complete, awaiting commit + push approval) | ✅ vault-core **46/46** + vault-storage **154/154** + doc 1/1 = **201/201** passing; build/clippy/fmt clean | Three new modules in vault-storage plus a small load-bearing addition to `vault-core::VaultError`. **`VaultError::DimensionMismatch { expected: usize, actual: usize }`** added (Watchpoint #1) — `is_permanent` classifier needs it as a real type; LanceVectorStore's two dim-check sites migrated from `InvalidInput(format!(...))` to the structured variant. **`MetadataStore::with_conn_blocking<F, R>`** added at `pub(crate)` visibility — wraps the spawn_blocking + `Arc<Mutex<Connection>>` lock pattern so the three new sibling modules don't each open a parallel connection. **`retry_queue.rs`** — `RetryQueue` + pure helpers (`base_backoff_secs` for the 1/2/4/8/16/30/60/120s schedule, `compute_next_attempt` with ±25% jitter band, `is_permanent` classifier per ADR-009 amendment) + `JitterSource: Send` trait with two impls: `SeededJitter` (xorshift64, no `rand` dep) and `FixedJitter`. 33 tests including a 256-case proptest on the jitter band and a full-walk test through attempts 1→7 that confirms dead-letter on the 8th. **`dead_letter.rs`** — `DeadLetter` + `Resolution` enum (4 terminal states), partial-index-backed `list_unresolved`, idempotent same-state `resolve` / `InvalidInput` on different-state, 4KB `failure_reason` truncation. 16 tests. **`pending_sync.rs`** — UPSERT semantics, `oldest_first` drain. 11 tests including Watchpoint #3's "32 concurrent UPSERTs on same memory_id leave exactly one row" (passes). All Phase B test files use `make_*()` helpers that build a real SQLCipher tempdir per test — same pattern as T0.1.3+. **Phase C gate flagged for next session:** "does the cascading orchestrator need its own `Connection` for cross-table transaction control, or extend `MetadataStore` with `with_transaction<F>(&self, f: F)`?" Shahbaz instinct (without seeing Phase C yet) leans toward the second option. Documented as the FIRST design item for Phase C planning. |
+| T0.1.6b | T0.1.6 phase B: data-layer modules (retry_queue + dead_letter + pending_sync) | 2026-04-30 (commit `2c04fdb`) | ✅ vault-core **46/46** + vault-storage **154/154** + doc 1/1 = **201/201** passing; build/clippy/fmt clean | Three new modules in vault-storage plus a small load-bearing addition to `vault-core::VaultError`. **`VaultError::DimensionMismatch { expected: usize, actual: usize }`** added (Watchpoint #1) — `is_permanent` classifier needs it as a real type; LanceVectorStore's two dim-check sites migrated from `InvalidInput(format!(...))` to the structured variant. **`MetadataStore::with_conn_blocking<F, R>`** added at `pub(crate)` visibility — wraps the spawn_blocking + `Arc<Mutex<Connection>>` lock pattern so the three new sibling modules don't each open a parallel connection. **`retry_queue.rs`** — `RetryQueue` + pure helpers (`base_backoff_secs` for the 1/2/4/8/16/30/60/120s schedule, `compute_next_attempt` with ±25% jitter band, `is_permanent` classifier per ADR-009 amendment) + `JitterSource: Send` trait with two impls: `SeededJitter` (xorshift64, no `rand` dep) and `FixedJitter`. 33 tests including a 256-case proptest on the jitter band and a full-walk test through attempts 1→7 that confirms dead-letter on the 8th. **`dead_letter.rs`** — `DeadLetter` + `Resolution` enum (4 terminal states), partial-index-backed `list_unresolved`, idempotent same-state `resolve` / `InvalidInput` on different-state, 4KB `failure_reason` truncation. 16 tests. **`pending_sync.rs`** — UPSERT semantics, `oldest_first` drain. 11 tests including Watchpoint #3's "32 concurrent UPSERTs on same memory_id leave exactly one row" (passes). All Phase B test files use `make_*()` helpers that build a real SQLCipher tempdir per test — same pattern as T0.1.3+. **Phase C gate flagged for next session:** "does the cascading orchestrator need its own `Connection` for cross-table transaction control, or extend `MetadataStore` with `with_transaction<F>(&self, f: F)`?" Shahbaz instinct (without seeing Phase C yet) leans toward the second option. Documented as the FIRST design item for Phase C planning. |
+| T0.1.6 C1a | T0.1.6 Phase C1a: orchestrator foundations (with_transaction + validate_readable + fault_injection + CascadeOperation collapse) | 2026-04-30 (locally complete, awaiting commit + push approval) | ✅ vault-core 46/46 + vault-storage **167/167** (+13: 3 with_transaction + 5 validate_readable + 5 fault_injection) + doc 1/1 = **214/214** passing; build/clippy/fmt clean | Foundation pieces for the cascading orchestrator that lands in C1b. **`MetadataStore::with_transaction<F, T>`** (per ADR-016): closure receives `&rusqlite::Transaction<'_>` (NOT `&mut Connection`) so callers can't accidentally `COMMIT`/`ROLLBACK` — helper handles both. 3 unit tests. **`VectorStore::validate_readable` + `GraphStore::validate_readable`** trait methods with strict doc contract per Shahbaz observation #1 ("minimum-cost end-to-end read that exercises data-decode, NOT metadata-only"). **LanceDB impl required 6 iterations** to land correctly: `try_collect()` alone returns RecordBatches with garbage on a corrupted store WITHOUT erroring — Arrow IPC framing on corrupted Lance fragments often round-trips as "valid Arrow batch with nonsense data." Corruption only surfaces when you actually parse column values. Final shape: read every row's `id` column AND `Uuid::parse_str` each value. The five wrong shapes (limit-1, nearest_to+limit-1, IS-NOT-NULL, sentinel-equality, function-predicate) are documented in the impl's doc-comment so future-Claude doesn't redo the journey. **`CascadeOperation` enum collapse** from 6 per-store variants to 3 per-cascade variants (`Write/Update/Delete`) per Phase C plan Issue 1 — Phase B's 154 tests stay green post-collapse (verified before any new C1a code landed). **`fault_injection.rs`** test infra: `#![cfg(test)]`-gated module with `FaultInjector` trait + `NoFault` / `AlwaysFailVector` / `AlwaysFailGraph` stub impls + `into_result` helper. 5 self-validation tests. Production builds don't compile this file. **`crates/vault-storage/examples/lance_corruption_spike.rs`** kept as executable docs (mirroring the dryoc spike pattern from ADR-008). **Phase C plan v2** (`T0.1.6_PLAN_PHASE_C.md`) lands alongside this commit. **C1 split decided mid-session** (see Current Status above) — orchestrator complexity warrants a fresh C1b session. |
 
 ---
 
 ## In Progress
 
-_None — Phase B is locally complete and awaiting commit + push approval per CLAUDE.md "confirm before every commit and every push." Phase C is queued; see "Notes for Next Session" below._
+_None — Phase C1a is locally complete and awaiting commit + push approval per CLAUDE.md "confirm before every commit and every push." Phase C1b (cascading.rs orchestrator + retry worker + vault-cli + ADRs) is queued for next session; see "Notes for Next Session" below._
 
 ---
 
@@ -410,43 +496,65 @@ _(populated once V0.1 ships)_
 
 ## Notes for Next Session
 
-**Immediate state:** Working tree has uncommitted Phase B changes (six files: vault-core/error.rs + vault-storage/{vector_store.rs, metadata_store.rs, lib.rs, retry_queue.rs *NEW*, dead_letter.rs *NEW*, pending_sync.rs *NEW*} + this HANDOFF.md). `origin/main` still at `34b7715` (T0.1.6a). Workspace **201/201** tests, build/clippy/fmt clean. **Phase B is awaiting commit + push approval per CLAUDE.md.**
+**Immediate state:** Working tree has uncommitted Phase C1a changes (8 files: vault-storage/{retry_queue.rs, dead_letter.rs, pending_sync.rs, metadata_store.rs, vector_store.rs, graph_store.rs, lib.rs, fault_injection.rs *NEW*, examples/lance_corruption_spike.rs *NEW*} + migration 0002.sql + migrations/mod.rs + this HANDOFF.md + `T0.1.6_PLAN_PHASE_C.md` *NEW*). `origin/main` at `2c04fdb` (T0.1.6b). Workspace **214/214** tests, build/clippy/fmt clean. **Phase C1a is awaiting commit + push approval per CLAUDE.md.**
 
-**T0.1.6 ship plan (three-phase, agreed 2026-04-30):**
+**T0.1.6 ship plan (now five steps, split decided 2026-04-30 mid-session):**
 - ✅ **Phase A — `34b7715`** — SQL migration 0002 + plan doc.
-- ✅ **Phase B — locally complete** — Data-layer modules done; awaiting commit + push approval. ~1.6k LoC across modules + tests (heavier than the ~1100 estimate due to richer test coverage and the `JitterSource` infrastructure).
-- 🔜 **Phase C — next session** — `cascading.rs` orchestrator + `divergence.rs` + `FaultInjector` + 5 adversarial tests + new `crates/vault-cli/` crate with passphrase auth + ADR-009 amendment + ADR-016 (FullySynced deferred + cascade-ordering invariant locked) + tech-debt note on `VaultError::Storage(String)` grab-bag refactor + final HANDOFF entry.
+- ✅ **Phase B — `2c04fdb`** — Data-layer modules.
+- ✅ **Phase C1a — locally complete** — Foundations: enum collapse, `with_transaction`, `validate_readable`, `fault_injection`. ~+200 LoC over Phase B. Awaiting commit + push approval.
+- 🔜 **Phase C1b — next session** — `cascading.rs` orchestrator + `retry_worker.rs` + `crates/vault-cli/` + ADR-009 amendment + ADR-016/017/018 + tech-debt entry. ~1.7k LoC.
+- ⏳ **Phase C2 — after C1b** — `divergence.rs` + `vault-cli divergence-check` subcommand. ~800 LoC.
 
-**How Phase C starts (concrete first steps):**
+### How Phase C1b starts (concrete first steps)
 
-1. **First design item — Connection ownership for the orchestrator (Shahbaz-flagged gate).** Decide:
-   - **Option A:** orchestrator opens its own SQLite `Connection` in addition to the one inside `MetadataStore`. Risk: SQLCipher in WAL mode is sensitive to multiple connections re-deriving the key; would need careful coordination.
-   - **Option B (Shahbaz instinct):** extend `MetadataStore` with `pub(crate) async fn with_transaction<F, R>(&self, f: F) -> VaultResult<R>` that wraps `conn.transaction()` + the existing `with_conn_blocking` machinery. Orchestrator routes all cross-table transactional writes through this. Keeps Connection ownership in `MetadataStore`.
-   - **Recommendation (Claude):** lean strongly toward Option B. The orchestrator's "atomic across memories + retry_queue + audit_log" requirement maps cleanly to `with_transaction(|tx| { … })`. Option A re-opens a multi-connection-SQLCipher risk we don't need.
-   - **Decision must be made before writing `cascading.rs`** — the orchestrator's CRUD calls into `RetryQueue` / `DeadLetter` / `PendingSync` will route through whichever helper Phase C standardises.
+1. **Re-read `T0.1.6_PLAN_PHASE_C.md` in full.** Plan v2 (approved 2026-04-30) has the locked design — Confirmation 1 (Connection pattern via `with_transaction`, **already implemented in C1a**), Confirmation 2 (`step()` + `run(rx)` worker shape), Confirmation 3 (C1/C2 split with vault-cli in C1), Issue 1 (one-row-per-write, **enum already collapsed in C1a**), Issue 2 (LanceDB lazy corruption, **`validate_readable` already implemented in C1a**), three smaller items (stdin-only CLI auth, ADR split 016/017/018, `tokio::sync::watch` instead of `tokio-util`).
 
-2. **Read `T0.1.6_PLAN.md` Q1 + Q5** before touching `cascading.rs`. Q1 has the cascade-ordering invariant (strict FIFO per `memory_id` by SQLite-commit order, anchored to audit `seq`); Q5 has the 5 adversarial tests (mid-cascade abort, persistent LanceDB failure, soft + hard corruption, concurrent-cascade-on-same-memory, retry queue overflow).
+2. **Re-read BRD §11 in full before any orchestrator code.** Orchestrator wires audit events into cascade outcomes (per CLAUDE.md "If the task touches anything in BRD §11.4–§11.7 (auth, crypto, access control, app security), re-read §11 in full first"). Phase C1a was data-layer foundations — didn't need §11. C1b absolutely does.
 
-3. **Re-read BRD §11 in full before any orchestrator code.** Orchestrator wires audit events into cascade outcomes (per CLAUDE.md "If the task touches anything in BRD §11.4–§11.7 (auth, crypto, access control, app security), re-read §11 in full first"). Phase B did NOT need this — pure data-layer plumbing — but Phase C does.
+3. **Build sequence (locked from Phase C plan-v2 + Shahbaz observation #2):**
+   1. **`cascading.rs` test-first** — write the 5 adversarial tests (Q5) + standard CRUD + the hard-corruption-at-open test + the **DimensionMismatch eager-validation rejection-path test** (Shahbaz observation #2: wrong-dim `write_memory` asserts no row in memories, no audit_log entry, no retry_queue entry, returns `VaultError::DimensionMismatch` — verifies lockstep guarantee). Then implement `StorageBackend::open` (with `validate_readable` calls) + `write_memory` / `update_memory` / `delete_memory` (with eager dim+boundary validation BEFORE the SQLite write) + audit-event emission + degraded-mode flag.
+   2. **`retry_worker.rs` test-first** — `step()` deterministic; `run(rx)` smoke test that spawns + signals cancel via `watch::Sender::send(true)`.
+   3. **`crates/vault-cli/` test-first** — clap dispatch + 4 dead-letter subcommand tests against a tempdir vault. Stdin-only auth path (no env var per smaller-item-(a)).
+   4. **HANDOFF.md** — ADR-009 amendment + ADR-016 (Connection-ownership) + ADR-017 (cascade-ordering invariant) + ADR-018 (FullySynced deferral + eager corruption validation) + tech-debt entry. Update Recently Completed with C1b row.
+   5. **DoD gates** — all four clean before commit-approval ask.
 
-4. **Build sequence (Phase C):**
-   - `cascading.rs` — `StorageBackend` orchestrator + `spawn_workers` contract per plan. Test-first.
-   - `divergence.rs` — two-tier check + deterministic stratified sampling + `pending_sync` sweep. Test-first.
-   - `fault_injection.rs` — `#[cfg(test)]`-gated trait + stub impls.
-   - 5 adversarial tests (Q5).
-   - `crates/vault-cli/` new binary crate — clap dispatch + passphrase auth (env var or no-echo stdin → `MetadataStore::open` to verify) + 4 dead-letter subcommands + `divergence-check`.
-   - HANDOFF entries: ADR-009 amendment, ADR-016 (FullySynced deferral + cascade-ordering invariant), tech-debt entry to split `VaultError::Storage(String)` into structured variants.
+### Contracts C1b consumes from C1a (the API surface to build against)
 
-**Phase B invariants now locked into code (Phase C must respect):**
-- `RetryQueue::poll_due` orders by `(sequence_id ASC, next_attempt_at ASC)` — that's the FIFO contract. Don't change in Phase C without amending the cascade-ordering invariant.
-- `is_permanent` covers `DimensionMismatch / AccessDenied / Storage(msg).contains("schema")`. Anything else returns `false` (retry). String-match on "schema" is documented tech debt.
-- `MAX_ATTEMPTS = 8`, schedule = `1, 2, 4, 8, 16, 30, 60, 120` seconds, ±25% jitter band. Total worst-case wait ≈ 4 min.
-- `dead_letter.resolution` strings exactly: `'retried_succeeded' | 'retried_failed' | 'acknowledged' | 'auto_recovered'`. Mapped in `Resolution::as_str` / `FromStr`.
-- `LAST_ERROR_MAX_BYTES = FAILURE_REASON_MAX_BYTES = 4096`. Both modules truncate UTF-8 at code-point boundaries.
-- `JitterSource: Send` so the orchestrator's spawned worker future stays `Send`.
-- `MetadataStore::with_conn_blocking` is `pub(crate)`. Phase C may add `with_transaction` next to it (see Connection-ownership gate above).
+Reproduced from "Current Status → Contracts C1b consumes from C1a" above for fast next-session lookup. Quick reference:
 
-**Pace caution carried forward:** T0.1.6 is the highest-stakes integration in V0.1. Phase B is independently green; Phase C integration-tests against Phase B's modules and against the LanceDB / DuckDB stores from T0.1.4 / T0.1.5. Don't merge Phase C until the 5 adversarial tests + the standard CRUD coverage all pass.
+```rust
+// Atomic cross-table writes — orchestrator's primary tool.
+MetadataStore::with_transaction<F, T>(f: F) -> VaultResult<T>
+  where F: FnOnce(&rusqlite::Transaction) -> VaultResult<T> + Send + 'static
+// Closure can't commit/rollback; helper does. Per ADR-016 (will land in C1b).
+
+// Eager corruption surface — orchestrator's StorageBackend::open calls these.
+VectorStore::validate_readable(&self) -> VaultResult<()>
+GraphStore::validate_readable(&self) -> VaultResult<()>
+// Empty store → Ok (vacuous). Corrupted fragment → Err.
+
+// Cascade operation enum (collapsed per Phase C plan Issue 1).
+enum CascadeOperation { Write, Update, Delete }
+// Persisted strings: "write" / "update" / "delete".
+
+// Test-only fault infra (#![cfg(test)] gated, production-cost zero).
+trait FaultInjector { fn vector_decision() -> FaultDecision; fn graph_decision() -> ...; }
+struct NoFault;                 // production-shaped default for tests
+struct AlwaysFailVector(String);
+struct AlwaysFailGraph(String);
+fn into_result(decision) -> VaultResult<()>;
+```
+
+### Locked-into-code invariants C1b must respect
+
+- `RetryQueue::poll_due` orders by `(sequence_id ASC, next_attempt_at ASC)` — FIFO per memory_id. Don't change without amending ADR-017.
+- `is_permanent` covers `DimensionMismatch / AccessDenied / Storage(msg).contains("schema")`. Orchestrator validates dim+boundary at `write_memory` entry so these classes shouldn't reach the queue (Issue 1's load-bearing precondition); if they do, dead-letter loud.
+- `MAX_ATTEMPTS = 8`, schedule `1/2/4/8/16/30/60/120` seconds, ±25% jitter band.
+- `dead_letter.resolution` strings exactly: `'retried_succeeded' | 'retried_failed' | 'acknowledged' | 'auto_recovered'`.
+- `LAST_ERROR_MAX_BYTES = FAILURE_REASON_MAX_BYTES = 4096`.
+- `JitterSource: Send` (so the worker future stays Send across `tokio::spawn`).
+
+**Pace caution carried forward:** T0.1.6 is the highest-stakes integration in V0.1. C1a foundations are independently green; C1b integration-tests against the foundations + LanceDB / DuckDB stores from T0.1.4 / T0.1.5. Don't merge C1b until the 5 adversarial tests + standard CRUD + the rejection-path test all pass. The C1 split exists specifically because rushing the orchestrator is the wrong move.
 
 **Tables still deferred to later tasks** (no scaffolding rule):
 - `review_queue` — added at connector ingestion task (BRD §5.9)

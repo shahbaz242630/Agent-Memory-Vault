@@ -214,7 +214,7 @@ mod tests {
         conn.execute(
             "INSERT INTO retry_queue (id, memory_id, operation, payload_format_version, \
              payload, sequence_id, next_attempt_at, created_at) \
-             VALUES (?1, ?2, 'lancedb_write', 1, ?3, 5, ?4, ?4)",
+             VALUES (?1, ?2, 'write', 1, ?3, 5, ?4, ?4)",
             rusqlite::params![entry_a, memory_id, payload, now],
         )
         .unwrap();
@@ -223,7 +223,7 @@ mod tests {
         let err = conn.execute(
             "INSERT INTO retry_queue (id, memory_id, operation, payload_format_version, \
              payload, sequence_id, next_attempt_at, created_at) \
-             VALUES (?1, ?2, 'duckdb_write', 1, ?3, 5, ?4, ?4)",
+             VALUES (?1, ?2, 'update', 1, ?3, 5, ?4, ?4)",
             rusqlite::params![entry_b, memory_id, payload, now],
         );
         assert!(err.is_err(), "expected UNIQUE constraint violation");
@@ -232,7 +232,7 @@ mod tests {
         conn.execute(
             "INSERT INTO retry_queue (id, memory_id, operation, payload_format_version, \
              payload, sequence_id, next_attempt_at, created_at) \
-             VALUES (?1, ?2, 'duckdb_write', 1, ?3, 6, ?4, ?4)",
+             VALUES (?1, ?2, 'update', 1, ?3, 6, ?4, ?4)",
             rusqlite::params![entry_b, memory_id, payload, now],
         )
         .unwrap();
