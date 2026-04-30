@@ -111,10 +111,17 @@ impl FromStr for CascadeOperation {
 /// deterministic schedule arithmetic, or a `SeededJitter::from_seed(N)`
 /// for reproducible randomised behaviour.
 ///
-/// `Send` is required so callers can hold an `&mut dyn JitterSource`
-/// across `tokio::spawn` boundaries (the orchestrator's worker loop in
-/// Phase C does this).
-pub trait JitterSource: Send {
+/// `Send + Sync` is required so the cascading orchestrator's
+/// [`crate::RetryWorker`] (Phase C1b) can hold a `Box<dyn JitterSource>`
+/// across `tokio::spawn` boundaries. `&mut dyn JitterSource` lives across
+/// awaits inside `record_failure`, which means the worker future is held
+/// across that await with `&Self` carrying the trait object — `Sync` is
+/// what makes `&Box<dyn JitterSource>: Send`.
+///
+/// In practice `Sync` is a free constraint: jitter sources are pure-state
+/// PRNGs without interior mutability ([`SeededJitter`] holds a `u64`,
+/// [`FixedJitter`] holds an `f64`).
+pub trait JitterSource: Send + Sync {
     /// Return the next factor. Out-of-range values are tolerated and
     /// clamped at use-site, but well-behaved sources should respect the
     /// `[-1.0, 1.0]` contract.

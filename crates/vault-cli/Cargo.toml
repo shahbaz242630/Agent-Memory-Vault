@@ -1,0 +1,29 @@
+[package]
+name = "vault-cli"
+description = "Operator CLI for the Memory Vault. Dead-letter recovery + divergence triage. See BRD §5.2 / ADR-009 / T0.1.6."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "vault-cli"
+path = "src/main.rs"
+
+[dependencies]
+vault-core = { path = "../vault-core" }
+vault-storage = { path = "../vault-storage" }
+clap = { workspace = true }
+rpassword = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/vault-core",
     "crates/vault-storage",
+    "crates/vault-cli",
     "crates/vault-embedding",
     "crates/vault-llm",
     "crates/vault-retrieval",
@@ -94,6 +95,14 @@ reqwest = { version = "=0.12.28", features = ["json", "rustls-tls"] }
 
 # MCP (BRD §4.5) — caret pin; exact-pin at T0.1.9 (vault-mcp first use).
 rmcp = "0.16"
+
+# CLI (T0.1.6 Phase C1b — vault-cli operator binary). Exact-pinned per
+# BRD §2.9 from Cargo.lock at first build. The two deps are tightly
+# scoped: `clap` parses subcommands, `rpassword` reads the SQLCipher
+# passphrase without echo. No env-var auth path (per Phase C plan
+# smaller-item-(a)).
+clap = { version = "=4.6.1", features = ["derive"] }
+rpassword = "=7.5.1"
 
 # Tauri (BRD §4.6) — caret pins; exact-pin at T0.1.11 (vault-tauri lib→bin conversion).
 tauri = { version = "2.10", features = [] }

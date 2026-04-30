@@ -23,8 +23,10 @@
 //! gives each test the freedom to construct an `Arc<dyn FaultInjector>`
 //! with whatever state shape it needs without bloating an enum that has
 //! to serve every scenario.
-
-#![cfg(test)]
+//!
+//! The whole module is `#[cfg(test)]`-gated at the `lib.rs` declaration
+//! site (`#[cfg(test)] pub(crate) mod fault_injection`), so production
+//! builds don't compile this file.
 
 use vault_core::{VaultError, VaultResult};
 

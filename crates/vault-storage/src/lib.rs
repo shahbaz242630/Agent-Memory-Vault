@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 pub mod audit;
+pub mod cascading;
 pub mod dead_letter;
 #[cfg(test)]
 pub(crate) mod fault_injection;
@@ -24,12 +25,14 @@ pub(crate) mod migrations;
 pub(crate) mod migrations_graph;
 pub mod pending_sync;
 pub mod retry_queue;
+pub mod retry_worker;
 pub mod vector_store;
 
 pub use audit::{
     seal, verify_chain, ActorKind, AuditEvent, AuditEventType, AuditResult, PendingAuditEvent,
     AUDIT_GENESIS_HASH,
 };
+pub use cascading::{Ack, DegradedMode, StorageBackend, MAX_RETRY_QUEUE_DEPTH};
 pub use dead_letter::{
     DeadLetter, DeadLetterEntry, NewDeadLetter, Resolution, FAILURE_REASON_MAX_BYTES,
 };
@@ -44,4 +47,5 @@ pub use retry_queue::{
     FailureOutcome, FixedJitter, JitterSource, NewRetry, RetryEntry, RetryQueue, SeededJitter,
     LAST_ERROR_MAX_BYTES, MAX_ATTEMPTS, PAYLOAD_FORMAT_VERSION,
 };
+pub use retry_worker::{RetryWorker, StepResult, DEFAULT_POLL_INTERVAL};
 pub use vector_store::{LanceVectorStore, VectorStore, ALPHA_WARNING_FILENAME};

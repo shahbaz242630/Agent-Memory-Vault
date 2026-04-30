@@ -402,9 +402,14 @@ impl MetadataStore {
 // ---------------------------------------------------------------------------
 // Transaction-bound helpers (sync). Centralised so the test harness can
 // exercise them too if needed and so all SQL lives in one place.
+//
+// `pub(crate)` so the cascading orchestrator (`cascading.rs`) can invoke
+// them inside [`MetadataStore::with_transaction`] — the cascading-write
+// atomicity contract spans `memories` + `audit_log` + `retry_queue` /
+// `pending_sync` and must run inside one SQLite transaction.
 // ---------------------------------------------------------------------------
 
-fn tx_insert_memory(tx: &Transaction<'_>, m: &Memory) -> VaultResult<()> {
+pub(crate) fn tx_insert_memory(tx: &Transaction<'_>, m: &Memory) -> VaultResult<()> {
     tx.execute(
         "INSERT INTO memories (
             id, content, memory_type, source_agent, boundary,
@@ -432,13 +437,13 @@ fn tx_insert_memory(tx: &Transaction<'_>, m: &Memory) -> VaultResult<()> {
     .map_err(|e| VaultError::Storage(format!("insert memory {}: {e}", m.id)))
 }
 
-fn tx_get_memory(tx: &Transaction<'_>, id: &MemoryId) -> VaultResult<Option<Memory>> {
+pub(crate) fn tx_get_memory(tx: &Transaction<'_>, id: &MemoryId) -> VaultResult<Option<Memory>> {
     tx.query_row(MEMORY_SELECT_SQL, params![id.to_string()], row_to_memory)
         .optional()
         .map_err(|e| VaultError::Storage(format!("get memory {id}: {e}")))
 }
 
-fn tx_update_memory(tx: &Transaction<'_>, m: &Memory) -> VaultResult<usize> {
+pub(crate) fn tx_update_memory(tx: &Transaction<'_>, m: &Memory) -> VaultResult<usize> {
     tx.execute(
         "UPDATE memories SET
             content = ?2, memory_type = ?3, source_agent = ?4, boundary = ?5,
@@ -513,7 +518,22 @@ fn tx_list_memories(
     Ok(out)
 }
 
-fn tx_append_audit(tx: &Transaction<'_>, pending: PendingAuditEvent) -> VaultResult<AuditEvent> {
+/// Append a [`PendingAuditEvent`] to the chain inside an existing
+/// [`Transaction`] and return the persisted [`AuditEvent`] (with its
+/// assigned `seq` and `event_hash`).
+///
+/// `pub(crate)` so the cascading orchestrator (`cascading.rs`) can append
+/// audit events inside [`MetadataStore::with_transaction`] alongside its
+/// `memories` / `retry_queue` / `pending_sync` writes — atomicity of the
+/// cascade-write requires the audit append to happen in the same SQLite
+/// transaction.
+///
+/// External callers go through [`MetadataStore::append_audit_event`] which
+/// owns its own transaction.
+pub(crate) fn tx_append_audit(
+    tx: &Transaction<'_>,
+    pending: PendingAuditEvent,
+) -> VaultResult<AuditEvent> {
     let prev_hash: String = tx
         .query_row(
             "SELECT event_hash FROM audit_log ORDER BY seq DESC LIMIT 1",

@@ -37,6 +37,20 @@ pub enum AuditEventType {
     MemoryDelete,
     MemoryList,
     SchemaMigration,
+    /// A cascading write exhausted retries or hit a permanent failure and
+    /// landed in the dead-letter table. CRITICAL — the founder must know.
+    /// Per ADR-009 amendment + ADR-018 (T0.1.6 Phase C).
+    CascadeDeadLetter,
+    /// `StorageBackend::open` ran `validate_readable` on a downstream store
+    /// (LanceDB or DuckDB) and the read failed. The vault is opened in
+    /// degraded mode so vault-cli triage still works, but search will not.
+    /// Per ADR-018 + Phase A Change 1 (T0.1.6 Phase C).
+    StoreCorruption,
+    /// The cascading retry queue is at the 10,000-entry cap and the user
+    /// write fell back to `pending_sync`. Fired on the *transition* into
+    /// overflow (one event per wave), not per overflowing write —
+    /// debouncing keeps the audit log readable. Per Phase C plan Q2.
+    CascadeQueueOverflow,
 }
 
 impl AuditEventType {
@@ -50,6 +64,9 @@ impl AuditEventType {
             Self::MemoryDelete => "memory.delete",
             Self::MemoryList => "memory.list",
             Self::SchemaMigration => "schema.migration",
+            Self::CascadeDeadLetter => "cascade.dead_letter",
+            Self::StoreCorruption => "store.corruption",
+            Self::CascadeQueueOverflow => "cascade.queue_overflow",
         }
     }
 
@@ -63,6 +80,9 @@ impl AuditEventType {
             "memory.delete" => Some(Self::MemoryDelete),
             "memory.list" => Some(Self::MemoryList),
             "schema.migration" => Some(Self::SchemaMigration),
+            "cascade.dead_letter" => Some(Self::CascadeDeadLetter),
+            "store.corruption" => Some(Self::StoreCorruption),
+            "cascade.queue_overflow" => Some(Self::CascadeQueueOverflow),
             _ => None,
         }
     }
@@ -416,6 +436,9 @@ mod tests {
             AuditEventType::MemoryDelete,
             AuditEventType::MemoryList,
             AuditEventType::SchemaMigration,
+            AuditEventType::CascadeDeadLetter,
+            AuditEventType::StoreCorruption,
+            AuditEventType::CascadeQueueOverflow,
         ] {
             assert_eq!(AuditEventType::parse(et.as_str()), Some(et));
         }
