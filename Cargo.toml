@@ -24,26 +24,35 @@ repository = "https://github.com/shahbaz242630/Agent-Memory-Vault"
 
 # All dependencies pinned per BRD §2.9 / §4. Crates inherit via { workspace = true }.
 # Workspace.dependencies declarations are lazy — only fetched when a member crate
-# actually depends on them, so listing them all here is safe at the skeleton stage.
+# actually depends on them.
+#
+# T0.1.5b — every dep that has a workspace member consuming it is pinned to
+# its exact resolved version from Cargo.lock (`"=X.Y.Z"`). Deps below that
+# show as `"X.Y"` (caret) are NOT yet consumed by any workspace member, so
+# Cargo.lock has no resolved entry for them — they'll be exact-pinned at
+# the task that first wires them into a member crate (per the docs.rs +
+# version-verification step established by ADR-006 / ADR-011). The lazy
+# workspace.dependencies semantics means caret-pinned-but-unused entries
+# cannot drift in the lockfile until first use, so this is safe.
 [workspace.dependencies]
 # Async runtime (BRD §4.1)
-tokio = { version = "1.40", features = ["full"] }
-async-trait = "0.1"
+tokio = { version = "=1.52.1", features = ["full"] }
+async-trait = "=0.1.89"
 # Futures combinators (TryStreamExt for draining lancedb's SendableRecordBatchStream
 # into Vec<RecordBatch>). Added in T0.1.4 Phase 3.
-futures = "0.3"
+futures = "=0.3.32"
 
 # Error handling (BRD §4.1)
-thiserror = "2.0"
-anyhow = "1.0"
+thiserror = "=2.0.18"
+anyhow = "=1.0.102"
 
 # Serialization (BRD §4.1)
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.149"
 
 # Logging (BRD §4.1)
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "json"] }
 
 # Time (BRD §4.1). Pinned to "=0.4.38" to dodge a transitive incompatibility:
 # chrono 0.4.44 added Datelike::quarter(), which conflicts with arrow-arith
@@ -54,50 +63,54 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 chrono = { version = "=0.4.38", features = ["serde"] }
 
 # UUIDs (BRD §4.1)
-uuid = { version = "1.10", features = ["v4", "v7", "serde"] }
+uuid = { version = "=1.23.1", features = ["v4", "v7", "serde"] }
 
 # Storage (BRD §4.2)
-lancedb = "0.8"
-# arrow pinned to match lancedb 0.8's workspace ("52.1"). Required for direct
-# use of RecordBatch / RecordBatchIterator / Float32Array / FixedSizeListArray
-# in vault-storage; lancedb 0.8 only re-exports arrow_schema. Mismatch with
-# lancedb's transitive arrow would cause type-conversion errors. Added in T0.1.4.
-arrow-array = "52.1"
-arrow-schema = "52.1"
-duckdb = { version = "1.0", features = ["bundled"] }
+lancedb = "=0.8.0"
+# arrow pinned to lancedb 0.8's resolved transitive 52.2 (workspace declared
+# "52.1", caret resolved to 52.2.0). Required for direct use of RecordBatch /
+# RecordBatchIterator / Float32Array / FixedSizeListArray in vault-storage;
+# lancedb 0.8 only re-exports arrow_schema. Added in T0.1.4.
+arrow-array = "=52.2.0"
+arrow-schema = "=52.2.0"
+duckdb = { version = "=1.2.2", features = ["bundled"] }
 # rusqlite uses bundled-sqlcipher-vendored-openssl instead of bundled-sqlcipher
 # (deviation from BRD §4.2 — see HANDOFF.md ADR-006). Vendoring OpenSSL avoids
 # requiring a system OpenSSL install on Windows/Mac/Linux dev machines.
-rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl", "chrono", "serde_json"] }
+rusqlite = { version = "=0.32.1", features = ["bundled-sqlcipher-vendored-openssl", "chrono", "serde_json"] }
 
-# ML (BRD §4.3)
+# ML (BRD §4.3) — caret pins; not yet consumed. Exact-pin at T0.1.7 (vault-embedding)
+# and T0.2.1 (vault-llm) when first wired into a member crate's [dependencies].
 ort = { version = "2.0", features = ["load-dynamic"] }
 tokenizers = "0.20"
 # llama-cpp-2: verify exact crate name and version at start of vault-llm task (BRD §4.3 note)
 
-# Sync (BRD §4.4)
+# Sync (BRD §4.4) — yrs caret-pinned; exact-pin at T0.2.x (sync-engine first use).
+# dryoc consumed today as dev-dependency in vault-sync (dryoc spike); reqwest will
+# be exact-pinned-on-first-use too — declared but not yet consumed.
 yrs = "0.21"
-dryoc = "0.7"
-reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+dryoc = "=0.7.2"
+reqwest = { version = "=0.12.28", features = ["json", "rustls-tls"] }
 
-# MCP (BRD §4.5)
+# MCP (BRD §4.5) — caret pin; exact-pin at T0.1.9 (vault-mcp first use).
 rmcp = "0.16"
 
-# Tauri (BRD §4.6)
+# Tauri (BRD §4.6) — caret pins; exact-pin at T0.1.11 (vault-tauri lib→bin conversion).
 tauri = { version = "2.10", features = [] }
 tauri-build = "2.10"
 
 # Security primitives (BRD §11.5.3)
-zeroize = { version = "1.8", features = ["derive"] }
+zeroize = { version = "=1.8.2", features = ["derive"] }
 
 # Hashing (BRD §11.9.2 audit log tamper-evident chain — added in T0.1.3, ADR-006)
-blake3 = "1.8"
+blake3 = "=1.8.5"
 
 # Test deps (BRD §4.7)
-proptest = "1.5"
-tokio-test = "0.4"
+proptest = "=1.11.0"
+tokio-test = "=0.4.5"
+# mockall — caret pin; exact-pin when first wired into a crate's [dev-dependencies].
 mockall = "0.13"
-tempfile = "3.13"
+tempfile = "=3.27.0"
 
 [profile.release]
 opt-level = 3
