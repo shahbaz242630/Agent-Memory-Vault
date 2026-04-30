@@ -25,11 +25,18 @@ struct Migration {
 }
 
 /// All migrations, in order. Append new ones — never edit existing ones.
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    description: "Initial schema: memories, audit_log",
-    up: include_str!("0001_initial.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        description: "Initial schema: memories, audit_log",
+        up: include_str!("0001_initial.sql"),
+    },
+    Migration {
+        version: 2,
+        description: "T0.1.6 cascade infra: retry_queue, dead_letter, pending_sync",
+        up: include_str!("0002_cascade_infra.sql"),
+    },
+];
 
 /// Apply any pending migrations to the open connection. Uses the
 /// hard-coded production [`MIGRATIONS`] slice.
@@ -148,7 +155,14 @@ mod tests {
         let mut conn = open_memory();
         run(&mut conn).unwrap();
 
-        for table in ["memories", "audit_log", "schema_migrations"] {
+        for table in [
+            "memories",
+            "audit_log",
+            "schema_migrations",
+            "retry_queue",
+            "dead_letter",
+            "pending_sync",
+        ] {
             let exists: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -158,6 +172,70 @@ mod tests {
                 .unwrap();
             assert_eq!(exists, 1, "expected table {table} to exist");
         }
+    }
+
+    #[test]
+    fn migration_0002_creates_indexes_for_retry_queue_and_dead_letter() {
+        // Performance-critical indexes for the cascade orchestrator's
+        // hot paths (worker polling, dead-letter list query).
+        let mut conn = open_memory();
+        run(&mut conn).unwrap();
+
+        for index in [
+            "idx_retry_queue_mem_seq",
+            "idx_retry_queue_next_attempt",
+            "idx_dead_letter_unresolved",
+        ] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                    [index],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "expected index {index} to exist");
+        }
+    }
+
+    #[test]
+    fn migration_0002_retry_queue_unique_per_memory_sequence() {
+        // The (memory_id, sequence_id) UNIQUE constraint is the FIFO-per-memory
+        // anchor (cascade-ordering invariant). Verify the constraint is enforced
+        // at the SQL layer.
+        let mut conn = open_memory();
+        run(&mut conn).unwrap();
+
+        let memory_id = vec![1u8; 16];
+        let entry_a = vec![10u8; 16];
+        let entry_b = vec![11u8; 16];
+        let now = chrono::Utc::now().to_rfc3339();
+        let payload = vec![0u8];
+
+        conn.execute(
+            "INSERT INTO retry_queue (id, memory_id, operation, payload_format_version, \
+             payload, sequence_id, next_attempt_at, created_at) \
+             VALUES (?1, ?2, 'lancedb_write', 1, ?3, 5, ?4, ?4)",
+            rusqlite::params![entry_a, memory_id, payload, now],
+        )
+        .unwrap();
+
+        // Same (memory_id, sequence_id) = collision — must fail.
+        let err = conn.execute(
+            "INSERT INTO retry_queue (id, memory_id, operation, payload_format_version, \
+             payload, sequence_id, next_attempt_at, created_at) \
+             VALUES (?1, ?2, 'duckdb_write', 1, ?3, 5, ?4, ?4)",
+            rusqlite::params![entry_b, memory_id, payload, now],
+        );
+        assert!(err.is_err(), "expected UNIQUE constraint violation");
+
+        // Different sequence_id for the same memory_id — must succeed.
+        conn.execute(
+            "INSERT INTO retry_queue (id, memory_id, operation, payload_format_version, \
+             payload, sequence_id, next_attempt_at, created_at) \
+             VALUES (?1, ?2, 'duckdb_write', 1, ?3, 6, ?4, ?4)",
+            rusqlite::params![entry_b, memory_id, payload, now],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -182,21 +260,29 @@ mod tests {
 
     #[test]
     fn forward_migration_applies_next_version_only() {
-        // Simulate the world where v1 is already applied but a future
-        // v2 is now defined. The runner should skip v1 and only apply v2.
+        // Test the principle: an already-applied migration is never replayed,
+        // and a new migration appended after it gets applied exactly once.
+        // Uses a synthetic migration list throughout (not the production
+        // MIGRATIONS slice) so the test is robust against future additions.
         let mut conn = open_memory();
-        run(&mut conn).unwrap(); // applies v1
 
-        let v1_count: i64 = conn
+        let initial: &[Migration] = &[Migration {
+            version: 1,
+            description: "test v1",
+            up: "CREATE TABLE m1 (id INTEGER PRIMARY KEY);",
+        }];
+        run_with_migrations(&mut conn, initial).unwrap();
+
+        let after_v1: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v1_count, 1);
+        assert_eq!(after_v1, 1);
 
         let extended: &[Migration] = &[
             // v1 already applied — runner should NOT replay this
             Migration {
                 version: 1,
-                description: "Initial schema: memories, audit_log",
+                description: "test v1",
                 up: "/* no-op — already applied */",
             },
             Migration {
