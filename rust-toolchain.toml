@@ -1,4 +1,13 @@
 [toolchain]
-channel = "stable"
+# Pinned to a specific version (consistent with BRD §2.9's "no surprise
+# version drift" rationale, extended to the compiler).
+# Reason: rustc 1.95.0 tightened the trait-solver depth limit; lance 0.15.0
+# exceeds it ("error: queries overflow the depth limit!" while compiling
+# lance::dataset). 1.92.0 is the version that currently builds the workspace
+# cleanly on local Windows; CI must match. Revisit when (a) lance bumps to a
+# version that compiles on newer rustc, (b) a critical Rust security advisory
+# affects 1.92.0, or (c) we drop lance for a different vector store. See
+# HANDOFF tech debt for the monthly revisit cadence.
+channel = "1.92.0"
 components = ["rustfmt", "clippy"]
 profile = "minimal"
