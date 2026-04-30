@@ -227,11 +227,10 @@ impl VectorStore for LanceVectorStore {
         boundary: &Boundary,
     ) -> VaultResult<()> {
         if embedding.len() != self.dimension {
-            return Err(VaultError::InvalidInput(format!(
-                "embedding has {} dimensions, store expects {}",
-                embedding.len(),
-                self.dimension
-            )));
+            return Err(VaultError::DimensionMismatch {
+                expected: self.dimension,
+                actual: embedding.len(),
+            });
         }
 
         let schema = Arc::new(make_schema(self.dimension));
@@ -296,11 +295,10 @@ impl VectorStore for LanceVectorStore {
         }
 
         if query.len() != self.dimension {
-            return Err(VaultError::InvalidInput(format!(
-                "query embedding has {} dimensions, store expects {}",
-                query.len(),
-                self.dimension
-            )));
+            return Err(VaultError::DimensionMismatch {
+                expected: self.dimension,
+                actual: query.len(),
+            });
         }
 
         let filter = build_boundary_filter(authorized_boundaries);
@@ -778,8 +776,11 @@ mod tests {
         let work = Boundary::new("work").unwrap();
         let result = store.upsert(&new_id(), &embedding(8, 1.0), &work).await;
         match result {
-            Err(VaultError::InvalidInput(_)) => {}
-            _ => panic!("expected InvalidInput for dimension mismatch"),
+            Err(VaultError::DimensionMismatch {
+                expected: 4,
+                actual: 8,
+            }) => {}
+            _ => panic!("expected DimensionMismatch{{expected:4, actual:8}} for upsert"),
         }
     }
 
@@ -792,8 +793,11 @@ mod tests {
             .search(&embedding(8, 1.0), 5, std::slice::from_ref(&work))
             .await;
         match result {
-            Err(VaultError::InvalidInput(_)) => {}
-            _ => panic!("expected InvalidInput for query dimension mismatch"),
+            Err(VaultError::DimensionMismatch {
+                expected: 4,
+                actual: 8,
+            }) => {}
+            _ => panic!("expected DimensionMismatch{{expected:4, actual:8}} for search"),
         }
     }
 

@@ -66,6 +66,21 @@ pub enum VaultError {
     #[error("invalid input: {0}")]
     InvalidInput(String),
 
+    /// Embedding vector dimensionality did not match the configured store
+    /// dimension. Carried as a structured variant (rather than as a string
+    /// inside [`Self::Storage`]) because the cascading retry queue's
+    /// `is_permanent` classifier in `vault-storage` matches on it
+    /// exhaustively to dead-letter on attempt 1 — a dimension mismatch is
+    /// always a contract / config error, never transient. See T0.1.6_PLAN
+    /// Q2 and ADR-009 amendment.
+    #[error("dimension mismatch: expected {expected}, got {actual}")]
+    DimensionMismatch {
+        /// Dimension the store was configured for.
+        expected: usize,
+        /// Dimension actually presented by the caller.
+        actual: usize,
+    },
+
     /// The requested resource (memory, entity, boundary) does not exist.
     #[error("not found: {0}")]
     NotFound(String),
@@ -126,5 +141,23 @@ mod tests {
         let serde_err = serde_json::from_str::<serde_json::Value>("{invalid").unwrap_err();
         let vault_err: VaultError = serde_err.into();
         assert!(matches!(vault_err, VaultError::Serde(_)));
+    }
+
+    #[test]
+    fn dimension_mismatch_is_structured_and_displays_both_dims() {
+        let err = VaultError::DimensionMismatch {
+            expected: 384,
+            actual: 256,
+        };
+        let s = err.to_string();
+        assert!(s.contains("384"), "display should mention expected: {s}");
+        assert!(s.contains("256"), "display should mention actual: {s}");
+        assert!(matches!(
+            err,
+            VaultError::DimensionMismatch {
+                expected: 384,
+                actual: 256
+            }
+        ));
     }
 }

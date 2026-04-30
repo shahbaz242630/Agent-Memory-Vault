@@ -14,20 +14,32 @@
 #![forbid(unsafe_code)]
 
 pub mod audit;
+pub mod dead_letter;
 pub mod graph_store;
 pub mod key;
 pub mod metadata_store;
 pub(crate) mod migrations;
 pub(crate) mod migrations_graph;
+pub mod pending_sync;
+pub mod retry_queue;
 pub mod vector_store;
 
 pub use audit::{
     seal, verify_chain, ActorKind, AuditEvent, AuditEventType, AuditResult, PendingAuditEvent,
     AUDIT_GENESIS_HASH,
 };
+pub use dead_letter::{
+    DeadLetter, DeadLetterEntry, NewDeadLetter, Resolution, FAILURE_REASON_MAX_BYTES,
+};
 pub use graph_store::{
     DuckDbGraphStore, GraphStore, TraversalOptions, CROSS_BOUNDARY_RELATION_TYPES,
 };
 pub use key::SqlCipherKey;
 pub use metadata_store::{MemoryFilter, MetadataStore};
+pub use pending_sync::{PendingSync, PendingSyncEntry};
+pub use retry_queue::{
+    base_backoff_secs, compute_next_attempt, is_permanent, CascadeOperation, DeadLetterReason,
+    FailureOutcome, FixedJitter, JitterSource, NewRetry, RetryEntry, RetryQueue, SeededJitter,
+    LAST_ERROR_MAX_BYTES, MAX_ATTEMPTS, PAYLOAD_FORMAT_VERSION,
+};
 pub use vector_store::{LanceVectorStore, VectorStore, ALPHA_WARNING_FILENAME};

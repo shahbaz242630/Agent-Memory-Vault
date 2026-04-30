@@ -336,6 +336,29 @@ impl MetadataStore {
         let events = self.list_audit_events(usize::MAX).await?;
         crate::audit::verify_chain(&events)
     }
+
+    /// Run `f` against the underlying SQLite [`Connection`] inside
+    /// [`tokio::task::spawn_blocking`]. Used by sibling modules in the same
+    /// crate (`retry_queue`, `dead_letter`, `pending_sync`) so they can
+    /// CRUD their own tables without each opening a separate connection.
+    ///
+    /// Phase B-only contract: the caller is responsible for any transaction
+    /// scoping inside `f`. The Phase C orchestrator will likely add a
+    /// dedicated `with_transaction<F>` helper for cross-table writes — see
+    /// the open question flagged in `T0.1.6_PLAN.md` Phase C planning.
+    pub(crate) async fn with_conn_blocking<F, R>(&self, f: F) -> VaultResult<R>
+    where
+        F: FnOnce(&mut Connection) -> VaultResult<R> + Send + 'static,
+        R: Send + 'static,
+    {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = inner.lock()?;
+            f(&mut conn)
+        })
+        .await
+        .map_err(|e| VaultError::Storage(format!("spawn_blocking join: {e}")))?
+    }
 }
 
 // ---------------------------------------------------------------------------
