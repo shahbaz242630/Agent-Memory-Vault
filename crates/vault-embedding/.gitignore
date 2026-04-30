@@ -1,0 +1,4 @@
+# bge-small fixture files (model.onnx ~133 MB, tokenizer.json, ORT dylib).
+# Downloaded by scripts/setup-dev-env.{sh,ps1} once per checkout.
+# Never committed: too large, distribution belongs to BAAI / Microsoft.
+test-fixtures/

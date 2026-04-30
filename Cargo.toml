@@ -80,10 +80,15 @@ duckdb = { version = "=1.2.2", features = ["bundled"] }
 # requiring a system OpenSSL install on Windows/Mac/Linux dev machines.
 rusqlite = { version = "=0.32.1", features = ["bundled-sqlcipher-vendored-openssl", "chrono", "serde_json"] }
 
-# ML (BRD §4.3) — caret pins; not yet consumed. Exact-pin at T0.1.7 (vault-embedding)
-# and T0.2.1 (vault-llm) when first wired into a member crate's [dependencies].
-ort = { version = "2.0", features = ["load-dynamic"] }
-tokenizers = "0.20"
+# ML (BRD §4.3) — exact-pinned at T0.1.7 (vault-embedding) per BRD §2.9 / T0.1.5b
+# discipline. ort 2.0 is still in release candidate (rc.12 is the latest as of
+# 2026-04-30) — RC versions don't match caret pins, so we MUST be explicit.
+# load-dynamic feature: dylib loaded at runtime via ort::init_from(path), not
+# at link time (Spike 1 finding — see T0.1.7_PLAN.md amendment block).
+# llama-cpp-2: still caret-pinned; verify exact crate name + version at start
+# of vault-llm task (T0.2.1) per BRD §4.3 note.
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["load-dynamic"] }
+tokenizers = "=0.20.4"
 # llama-cpp-2: verify exact crate name and version at start of vault-llm task (BRD §4.3 note)
 
 # Sync (BRD §4.4) — yrs caret-pinned; exact-pin at T0.2.x (sync-engine first use).
@@ -113,6 +118,12 @@ zeroize = { version = "=1.8.2", features = ["derive"] }
 
 # Hashing (BRD §11.9.2 audit log tamper-evident chain — added in T0.1.3, ADR-006)
 blake3 = "=1.8.5"
+# sha2 (T0.1.7 vault-embedding model + tokenizer integrity per ADR-020).
+# Exact-pinned per BRD §2.9 / T0.1.5b discipline. Note: there is also a
+# sha2 0.11.0 transitive (via tokenizers) — duplication accepted; tokenizers
+# pulls 0.11 internally, we pin 0.10.x for our own use to match the rest of
+# the workspace's Digest-trait expectations.
+sha2 = "=0.10.9"
 
 # Test deps (BRD §4.7)
 proptest = "=1.11.0"

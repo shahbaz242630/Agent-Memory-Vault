@@ -81,6 +81,24 @@ pub enum VaultError {
         actual: usize,
     },
 
+    /// Model or tokenizer file integrity check failed at provider construction.
+    /// Carried as a structured variant so vault-app / vault-tauri can pattern-
+    /// match exhaustively to surface a fatal-error dialog (per T0.1.7 plan
+    /// Q5: integrity failure is fatal at startup, no degraded mode). The
+    /// `file` field names which artefact failed (so the dialog can be specific:
+    /// "model" vs "tokenizer"); `expected` and `actual` are hex-encoded
+    /// SHA-256 strings so operators can verify against the canonical hash
+    /// in MODEL_PROVENANCE.md. See ADR-020 (lands in T0.1.7 Phase 2).
+    #[error("model integrity check failed for {file}: expected {expected}, got {actual}")]
+    ModelIntegrityFailed {
+        /// Logical name of the artefact that failed (e.g. "model", "tokenizer").
+        file: String,
+        /// Expected SHA-256 hex string (compiled into the binary).
+        expected: String,
+        /// Actual SHA-256 hex string of the file on disk.
+        actual: String,
+    },
+
     /// The requested resource (memory, entity, boundary) does not exist.
     #[error("not found: {0}")]
     NotFound(String),
@@ -159,5 +177,20 @@ mod tests {
                 actual: 256
             }
         ));
+    }
+
+    #[test]
+    fn model_integrity_failed_is_structured_and_displays_all_fields() {
+        let err = VaultError::ModelIntegrityFailed {
+            file: "model".into(),
+            expected: "abc123".into(),
+            actual: "def456".into(),
+        };
+        let s = err.to_string();
+        assert!(s.contains("model"), "display should name the file: {s}");
+        assert!(s.contains("abc123"), "display should mention expected: {s}");
+        assert!(s.contains("def456"), "display should mention actual: {s}");
+        let matched = matches!(err, VaultError::ModelIntegrityFailed { .. });
+        assert!(matched);
     }
 }
