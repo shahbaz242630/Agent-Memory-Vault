@@ -1,0 +1,177 @@
+name: Monthly Tech-Debt Check
+
+# Auto-fires first Monday of each month at 09:00 UTC.
+# Tracks the recurring pin / CVE checks documented in HANDOFF.md tech-debt section:
+#   - ADR-006: OpenSSL CVE check (vendored via openssl-src)
+#   - ADR-011: protobuf CVE check (protoc binary)
+#   - ADR-013: chrono pin (=0.4.38)
+#   - rust-toolchain.toml: rustc pin (=1.92.0) — gated by lance trait-solver depth limit
+#   - ADR-019: ort RC-policy + ORT_VERSION coupling (ort=2.0.0-rc.10 ↔ ORT 1.22.0)
+#
+# Outputs a GitHub issue every run (even all-clean) so there's a visible
+# "did the monthly check fire?" trail in the issue tracker. Close manually
+# when the month's checks are complete.
+
+on:
+  schedule:
+    # Cron: 0 9 1-7 * 1 = 09:00 UTC on day-of-month 1-7 IF day-of-week is Monday.
+    # The intersection (1-7 AND Monday) = first Monday of every month.
+    # GitHub Actions cron runs in UTC; 09:00 UTC = 09:00 GMT / 10:00 BST.
+    - cron: '0 9 1-7 * 1'
+  # Manual trigger via Actions UI — useful for testing the workflow on
+  # demand without waiting for the next scheduled run. Removable if pure
+  # auto-only is preferred; doesn't affect the cron schedule.
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write  # required to auto-open the report issue
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  monthly-check:
+    name: Monthly tech-debt sweep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # Match existing CI's setup so cargo tree resolves the full lancedb +
+      # ort transitive trees. protoc is required by lancedb's transitive
+      # deps (lance-encoding, lance-file via prost-build) per ADR-011.
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # cargo audit — RustSec advisory database covers known CVEs across
+      # ALL transitive deps. The foundation check: catches most things we'd
+      # manually look up for OpenSSL (via openssl-src), chrono, ort-sys, etc.
+      # `continue-on-error: true` so findings land in the issue instead of
+      # failing the workflow.
+      - name: cargo audit
+        id: audit
+        continue-on-error: true
+        run: |
+          cargo install cargo-audit --locked --quiet
+          set +e
+          cargo audit > audit-output.txt 2>&1
+          AUDIT_EXIT=$?
+          set -e
+          cat audit-output.txt
+          echo "audit_exit=$AUDIT_EXIT" >> "$GITHUB_OUTPUT"
+
+      # Version-pin verification — concrete commands from HANDOFF.md tech-
+      # debt section. Reads ort / ort-sys versions from Cargo.lock,
+      # ORT_VERSION from setup-dev-env.sh, chrono pin from Cargo.toml,
+      # rustc pin from rust-toolchain.toml, protoc version from the CI-
+      # installed binary. Surfaces them with the source-of-truth URLs the
+      # user checks against.
+      - name: Version-pin verification
+        run: |
+          set -euo pipefail
+          REPORT="version-pin-report.md"
+          {
+            echo "## Version-pin verification"
+            echo
+            echo "### ort ↔ ONNX Runtime native lib coupling (ADR-019)"
+            ORT_CRATE_VER=$(grep -A1 '^name = "ort"' Cargo.lock | head -2 | grep '^version' | awk -F'"' '{print $2}')
+            ORT_SYS_VER=$(grep -A1 '^name = "ort-sys"' Cargo.lock | head -2 | grep '^version' | awk -F'"' '{print $2}')
+            ORT_NATIVE_VER=$(grep -E '^ORT_VERSION=' scripts/setup-dev-env.sh | head -1 | awk -F'"' '{print $2}')
+            echo "- \`ort\` crate version: \`$ORT_CRATE_VER\`"
+            echo "- \`ort-sys\` version: \`$ORT_SYS_VER\`"
+            echo "- \`scripts/setup-dev-env.sh\` ORT_VERSION: \`$ORT_NATIVE_VER\`"
+            echo "- **Verify:** ORT_VERSION's major-minor matches ort's expected ORT version per release notes:"
+            echo "  https://github.com/pykeio/ort/releases/tag/v$ORT_CRATE_VER"
+            echo
+            echo "### chrono pin (ADR-013)"
+            CHRONO_VER=$(grep -E '^chrono\s*=' Cargo.toml | head -1 | awk -F'"' '{print $2}')
+            echo "- Pinned: \`chrono = \"$CHRONO_VER\"\`"
+            echo "- **Verify:** advisories at https://rustsec.org/advisories/?keyword=chrono"
+            echo
+            echo "### rustc pin (rust-toolchain.toml tech-debt entry)"
+            RUSTC_VER=$(grep -E '^channel\s*=' rust-toolchain.toml | head -1 | awk -F'"' '{print $2}')
+            echo "- Pinned: \`channel = \"$RUSTC_VER\"\`"
+            echo "- **Verify:** advisories at https://blog.rust-lang.org"
+            echo
+            echo "### OpenSSL via openssl-src (ADR-006)"
+            OPENSSL_SRC_VER=$(grep -A1 '^name = "openssl-src"' Cargo.lock | head -2 | grep '^version' | awk -F'"' '{print $2}' || echo 'not in Cargo.lock')
+            echo "- \`openssl-src\` resolved: \`$OPENSSL_SRC_VER\`"
+            echo "- **Verify:** advisories at https://www.openssl.org/news/vulnerabilities.html"
+            echo
+            echo "### protoc (ADR-011)"
+            PROTOC_VER=$(protoc --version || echo 'protoc not on PATH')
+            echo "- CI-installed: \`$PROTOC_VER\`"
+            echo "- **Verify:** advisories at https://github.com/protocolbuffers/protobuf/security/advisories"
+          } > "$REPORT"
+          cat "$REPORT"
+
+      # Open a GitHub issue with the combined report. Creates the labels
+      # if they don't exist yet (idempotent — no error if already present).
+      # Always creates an issue (even all-clean) so there's a visible trail
+      # of "this month's check fired."
+      - name: Open monthly tech-debt report issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const audit = fs.readFileSync('audit-output.txt', 'utf8');
+            const pins = fs.readFileSync('version-pin-report.md', 'utf8');
+            const date = new Date().toISOString().slice(0, 10);
+
+            const auditExit = '${{ steps.audit.outputs.audit_exit }}';
+            const auditStatus = auditExit === '0'
+              ? ':white_check_mark: no advisories found'
+              : `:warning: findings (cargo audit exit ${auditExit})`;
+
+            // Ensure labels exist; ignore "already exists" errors so the
+            // workflow is idempotent across runs.
+            const labels = [
+              { name: 'tech-debt', color: 'ededed' },
+              { name: 'recurring-check', color: 'fbca04' },
+            ];
+            for (const label of labels) {
+              try {
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: label.name,
+                  color: label.color,
+                });
+              } catch (e) {
+                if (e.status !== 422) throw e;  // 422 = already exists
+              }
+            }
+
+            const body = [
+              'Auto-generated by `.github/workflows/monthly-tech-debt.yml`.',
+              'Tracks the recurring pin / CVE checks documented in HANDOFF.md',
+              'tech-debt section (ADR-006 / 011 / 013 / rust-toolchain.toml / ADR-019).',
+              '',
+              '## cargo audit',
+              '',
+              `Status: ${auditStatus}`,
+              '',
+              '```',
+              audit.trim() || '(no output)',
+              '```',
+              '',
+              pins,
+              '',
+              '---',
+              '',
+              '**Next steps:** if cargo audit reports advisories OR any version pin is',
+              'now outdated against its source-of-truth URL, take action per the linked',
+              'HANDOFF.md tech-debt entries. Close this issue when this month\'s checks',
+              'are complete.',
+            ].join('\n');
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Monthly tech-debt sweep — ${date}`,
+              body: body,
+              labels: ['tech-debt', 'recurring-check'],
+            });
