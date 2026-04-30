@@ -48,8 +48,12 @@ static ORT_INIT: OnceLock<Result<(), String>> = OnceLock::new();
 /// and avoids the per-thread Session pool a higher-throughput design
 /// would need.
 pub struct BgeSmallProvider {
-    session: Arc<Mutex<Session>>,
-    tokenizer: Arc<Tokenizer>,
+    // `pub(crate)` so the `testing` module (gated `testing` feature) can
+    // access these fields directly to implement `mean_pooled_for` — the
+    // CLS-vs-mean comparison needed by test 9. External callers still see
+    // the struct as opaque.
+    pub(crate) session: Arc<Mutex<Session>>,
+    pub(crate) tokenizer: Arc<Tokenizer>,
 }
 
 impl BgeSmallProvider {

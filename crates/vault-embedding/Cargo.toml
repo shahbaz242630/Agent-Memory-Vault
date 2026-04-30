@@ -8,6 +8,13 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[features]
+# Test-verification helpers (e.g., mean-pool variant of `embed` for test 9's
+# CLS-vs-mean comparison). Self-enabled for integration tests via the
+# `[dev-dependencies]` circular self-reference below; production builds do
+# NOT include the testing module.
+testing = []
+
 [dependencies]
 vault-core = { path = "../vault-core" }
 ort = { workspace = true }
@@ -21,3 +28,8 @@ tracing = { workspace = true }
 [dev-dependencies]
 tokio-test = { workspace = true }
 tempfile = { workspace = true }
+# Self-referential dev-dep enables the `testing` feature for integration
+# tests in `tests/`. Without this, integration tests would have to be invoked
+# with `cargo test --features testing`; with this, plain `cargo test` works
+# and the `testing` feature is auto-enabled when building the test profile.
+vault-embedding = { path = ".", features = ["testing"] }

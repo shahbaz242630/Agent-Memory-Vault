@@ -24,6 +24,13 @@ pub mod bge_small;
 pub mod integrity;
 pub mod provider;
 
+/// Test-verification helpers — gated `testing` cargo feature.
+/// Self-enabled for integration tests via the `[dev-dependencies]`
+/// circular self-reference in `Cargo.toml`. Production builds without
+/// `--features testing` do not include this module.
+#[cfg(feature = "testing")]
+pub mod testing;
+
 pub use bge_small::BgeSmallProvider;
 pub use integrity::{
     verify_file_sha256, BGE_SMALL_EN_V1_5_MODEL_SHA256, BGE_SMALL_EN_V1_5_TOKENIZER_SHA256,

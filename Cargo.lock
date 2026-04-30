@@ -6739,6 +6739,7 @@ dependencies = [
  "tokio-test",
  "tracing",
  "vault-core",
+ "vault-embedding",
 ]
 
 [[package]]

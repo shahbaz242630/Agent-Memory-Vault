@@ -111,7 +111,6 @@ async fn test_2_embed_output_is_l2_normalized_single_input() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "Phase 3 — needs BgeSmallProvider::embed impl + downloaded fixtures"]
 async fn test_3_embed_is_deterministic() {
     let provider = open_provider();
     let a = provider
@@ -134,7 +133,6 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 }
 
 #[tokio::test]
-#[ignore = "Phase 3 — needs BgeSmallProvider::embed impl + downloaded fixtures"]
 async fn test_4_cosine_sanity_similar_vs_dissimilar() {
     let provider = open_provider();
     let a = provider.embed("the cat sat on the mat").await.expect("a");
@@ -203,23 +201,46 @@ async fn test_6_embed_within_100ms_budget() {
 // Test 7 — spawn_blocking correctness (no reactor starvation)
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-#[ignore = "Phase 3 — needs BgeSmallProvider::embed impl + downloaded fixtures"]
+/// Verifies `embed()`'s `spawn_blocking` wrapping doesn't starve the tokio
+/// reactor — i.e. another task awaiting a 50ms sleep completes near 50ms
+/// even while inference (~150-250ms on dev hardware) is in flight.
+///
+/// **Test design note** (added v1.3 follow-up after the initial v1.2 design
+/// caught a real reactor-starve scenario but also tripped on its own
+/// measurement methodology):
+/// - Uses `#[tokio::test(flavor = "multi_thread")]` so the production runtime
+///   shape matches what `vault-app` uses (`tokio::main` is multi-thread by
+///   default). Single-thread `#[tokio::test]` would interleave but not
+///   parallelise; this test wants real parallelism.
+/// - Spawns the sleep as its OWN task and records elapsed-at-sleep-completion
+///   independently of when `embed()` finishes. A naive `tokio::join!` would
+///   measure `max(inference, sleep)` and report inference time, which is
+///   not what "reactor not starved" means.
+/// - 200ms ceiling on the SLEEP's elapsed (not the join!) is generous for
+///   scheduler jitter; actual reactor starvation would manifest as multiple
+///   seconds (the sleep wouldn't tick until inference released the worker).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_7_spawn_blocking_does_not_starve_reactor() {
     let provider = open_provider();
-    let sleep_start = std::time::Instant::now();
-    let (embed_result, _) = tokio::join!(
-        provider.embed("a moderately long sentence to exercise inference time"),
-        tokio::time::sleep(std::time::Duration::from_millis(50)),
-    );
-    let elapsed = sleep_start.elapsed();
-    let _ = embed_result.expect("embed");
-    // Sleep should complete in roughly 50ms, not blocked by inference time.
-    // 200ms ceiling is generous (covers slow machines + scheduler jitter)
-    // while still catching the failure mode (inference blocking the reactor).
+    let start = std::time::Instant::now();
+
+    let sleep_task = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        start.elapsed()
+    });
+
+    let _ = provider
+        .embed("a moderately long sentence to exercise inference time")
+        .await
+        .expect("embed");
+
+    let sleep_elapsed = sleep_task.await.expect("sleep task join");
+
     assert!(
-        elapsed.as_millis() < 200,
-        "tokio sleep must complete near 50ms (reactor not starved); got {elapsed:?}"
+        sleep_elapsed.as_millis() < 200,
+        "tokio sleep should complete near 50ms even with inference in flight \
+         (got {sleep_elapsed:?}); a multi-second elapsed would indicate the \
+         spawn_blocking wrapping in BgeSmallProvider::embed is starving the reactor"
     );
 }
 
@@ -228,7 +249,6 @@ async fn test_7_spawn_blocking_does_not_starve_reactor() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "Phase 3 — needs BgeSmallProvider::embed impl + downloaded fixtures"]
 async fn test_8_embed_output_is_l2_normalized_across_diverse_inputs() {
     let provider = open_provider();
     // Owned long-lived strings for entries that would otherwise be temporaries.
@@ -282,38 +302,66 @@ async fn test_8_embed_output_is_l2_normalized_across_diverse_inputs() {
 // Test 9 — pooling-mode contract (CLS, not mean) — load-bearing per Spike 3
 // ---------------------------------------------------------------------------
 
-/// Independently compute a mean-pooled L2-normalised embedding for the same
-/// input, then assert the production output (CLS-pooled) is NOT element-wise
-/// equal. This is the test that catches a future "let's switch pooling for
-/// performance" regression that would silently break `LanceVectorStore` cosine
-/// scoring. Test 8 (L2-norm) and test 4 (cosine sanity) would NOT catch it.
+/// Compares the production CLS-pooled embedding against an independently-
+/// computed mean-pooled embedding (via the `testing` feature's
+/// `BgeSmallProvider::mean_pooled_for`) for the SAME input. Both go through
+/// the same tokenizer + ort session + L2-normalize step, so the only
+/// difference is pooling mode. Asserts the two outputs are NOT
+/// element-wise equal — confirms CLS extraction is in use, not mean-pool.
 ///
-/// **Phase 1**: this test calls `provider.embed()` (stub → panics). Phase 3
-/// implements `embed`; Phase 4 also adds a stronger sentence-transformers
-/// reference cross-check for the same input.
+/// **Catches the silent-failure-class bug Spike 3 warned about.** Mean-
+/// pooled bge-small produces vectors of correct shape (384) and L2 norm
+/// (1.0) but with shifted semantics. Tests 1 (shape), 2/8 (L2 norm), 4
+/// (cosine sanity) would all PASS against a mean-pooled implementation
+/// because their assertions don't distinguish the two pooling modes. Only
+/// this test pins the contract.
 ///
-/// The mean-pool comparison vector is constructed via a private test-only
-/// path that mirrors the production tokenize → run-session pipeline but
-/// substitutes mean-pool for CLS-pool before normalisation. This path lands
-/// alongside the production code at Phase 3.
+/// **The mean-pool helper is in production-crate code, gated `testing`
+/// feature** (`crates/vault-embedding/src/testing.rs`). Production builds
+/// without `--features testing` do not include the helper. The integration
+/// test build auto-enables it via the `[dev-dependencies]` self-reference
+/// in `Cargo.toml` so plain `cargo test` works without manual flags.
 #[tokio::test]
-#[ignore = "stronger version + mean-pool comparison path lands at Phase 3 — Phase 1 panics on stubbed embed"]
 async fn test_9_embed_uses_cls_pooling_not_mean_pooling() {
     let provider = open_provider();
-    let cls_output = provider.embed("hello world").await.expect("embed (CLS)");
+    let input = "hello world";
 
-    // Phase 3 will provide `vault_embedding::testing::mean_pooled_for("hello world")`
-    // that runs the same tokenizer + session but mean-pools instead of CLS-pools.
-    // Until then this test is `#[ignore]`-d. Phase 3 commit removes the ignore
-    // attribute and lands the comparison.
-    let mean_output = vec![0.0_f32; EMBEDDING_DIM]; // placeholder
-    let differ = cls_output
+    let cls_output = provider.embed(input).await.expect("embed (CLS)");
+    let mean_output = provider
+        .mean_pooled_for(input)
+        .await
+        .expect("mean_pooled_for");
+
+    assert_eq!(cls_output.len(), EMBEDDING_DIM);
+    assert_eq!(mean_output.len(), EMBEDDING_DIM);
+
+    // Both must be unit-norm (the comparison isolates pooling mode, not norm).
+    let cls_norm: f32 = cls_output.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let mean_norm: f32 = mean_output.iter().map(|x| x * x).sum::<f32>().sqrt();
+    assert!(
+        (cls_norm - 1.0).abs() < 1e-5,
+        "CLS output must be unit-norm: got {cls_norm}"
+    );
+    assert!(
+        (mean_norm - 1.0).abs() < 1e-5,
+        "mean-pool output must be unit-norm: got {mean_norm}"
+    );
+
+    // The actual contract: CLS-pool and mean-pool must produce element-wise
+    // different vectors for a non-trivial input. If equal, production is
+    // mean-pooling, not CLS-pooling — silent semantic break.
+    let max_diff = cls_output
         .iter()
         .zip(mean_output.iter())
-        .any(|(a, b)| (a - b).abs() > 1e-5);
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f32, f32::max);
+
     assert!(
-        differ,
-        "CLS-pooled and mean-pooled outputs must differ — confirms CLS extraction is in use"
+        max_diff > 1e-3,
+        "CLS-pool and mean-pool outputs must differ measurably; \
+         max element-wise difference was {max_diff} — production may be \
+         mean-pooling instead of CLS-pooling. Spike 3 finding: bge-small \
+         requires CLS-token extraction per BAAI's 1_Pooling/config.json."
     );
 }
 
