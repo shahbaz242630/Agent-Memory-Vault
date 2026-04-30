@@ -17,6 +17,10 @@ rusqlite = { workspace = true }
 lancedb = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
+# DuckDB graph store (T0.1.5). Pinned in workspace Cargo.toml. `bundled`
+# avoids requiring a system DuckDB install. Connection: Send + !Sync — same
+# shape as rusqlite, wrapped in Mutex<Connection> + spawn_blocking.
+duckdb = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }

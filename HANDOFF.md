@@ -1,21 +1,22 @@
 # Memory Vault — Build Handoff
 
-**Last updated:** 2026-04-29 (post-T0.1.4 commit `710576c`)
+**Last updated:** 2026-04-30 (T0.1.5 done, awaiting commit approval)
 **Updated by:** Claude (Opus 4.7)
 **Current version:** V0.1 — Internal Alpha
-**Current phase:** V0.1 in progress — T0.1.4 (vault-storage LanceDB) shipped (`710576c`). Next: dryoc API spike (ADR-008, ~2h), then T0.1.5 (vault-storage DuckDB graph store).
+**Current phase:** V0.1 in progress — **T0.1.5 (vault-storage DuckDB `GraphStore` + ADR-015) implementation complete**, all DoD gates green, awaiting commit approval per CLAUDE.md confirm-before-commit-push rule. Next: T0.1.5b workspace caret-pin cleanup, then T0.1.6.
 
 ---
 
 ## Current Status
 
-**Active item:** Pre-T0.1.4 follow-ups (per Shahbaz's review of T0.1.3) — three deliverables landing in one follow-up commit before T0.1.4 code starts:
-1. **ADR-009** in this file — retry queue policy (bounded vs unbounded, retry strategy, permanent-failure behaviour, user-visible surface, divergence verification). Gates T0.1.6 from improvising failure-recovery semantics.
-2. **BRD §6 V0.1.3 perf budget** — explicit acceptance criterion added to the BRD: `open + migrate + first audit insert ≤ 200ms`, of which ≤ 150ms may be SQLCipher first-open. Honest framing: this is **adding** explicit perf criteria (the previously-cited "BRD 50ms target" did not actually exist in the BRD — that reference in the prior session was a hallucinated constraint, no such line in §6 V0.1.3). Resolves the open blocker without weakening `kdf_iter`.
-3. **Dryoc API spike** — scheduled mini-task for this week (target: before T0.1.4 finishes). 2-hour scratch crate exercising dryoc 0.7's actual encrypt/decrypt API for a single-message envelope. Output updates ADR-008 with confirmed patterns. Goal: discover any vault-sync (T0.2.9) integration mismatch now, not in week 6.
+**Active item:** **T0.1.5 implementation complete — pending commit approval.** All five DoD gates green:
+1. `cargo build --workspace` — zero warnings
+2. `cargo test --workspace` — **138/138** passing (vault-core 45, vault-storage 92, doc 1)
+3. `cargo clippy --workspace --all-targets -- -D warnings` — clean
+4. `cargo fmt --all --check` — clean
+5. HANDOFF.md updated (this commit)
 
-**Started:** 2026-04-29 (post-T0.1.3 commit)
-**Last test run:** 2026-04-29 — `cargo test -p vault-storage` 39/39 passing; build/clippy/fmt clean (no code change since T0.1.3 commit; this turn is HANDOFF.md + BRD only)
+**Last test run:** 2026-04-30 — `cargo test --workspace` 138 passing (vault-core 45, vault-storage 92, doc 1); build/clippy/fmt clean.
 
 ---
 
@@ -29,22 +30,22 @@
 | CI hardening | `actions/checkout` v4 → v6 | 2026-04-28 | ✅ CI green | Resolves Node 20 deprecation flagged on `f3923eb`. GitHub Actions runners drop Node 20 on 2026-09-16; v6 runs on Node 24. `Swatinem/rust-cache@v2` and `dtolnay/rust-toolchain@stable` are unaffected (no Node 20 dependency). Followed GitHub's recommended floating-major tag convention (`@v6`) so security patches auto-apply. |
 | T0.1.3 | vault-storage: SQLite + SQLCipher (`MetadataStore` + audit chain) | 2026-04-29 (commit `f846df7`) | ✅ 39/39 passing; build/clippy/fmt clean | `MetadataStore` async API (CRUD + audit append/list/verify, every CRUD txn-atomic with audit append). Three tables via migration runner: `memories` (boundary-indexed), `audit_log` (BLAKE3 hash chain per BRD §11.9.2, genesis = 0×64, canonical sorted-key JSON), `schema_migrations` (gap + out-of-order detection refuse to run, idempotent re-runs). SQLCipher key handling: `SqlCipherKey` newtype with `Zeroize`/`ZeroizeOnDrop`, no `Debug`/`Display` (ADR-007); WAL + foreign_keys + synchronous=NORMAL. Boundary filter parameterised at SQL level (BRD §11.7.1). Audit-tamper proptest hits every byte position in chains of 2–5 events; concurrent-writes proptest validates 20-task chain serialisation via `Mutex<Connection>`. Decisions logged: ADR-006 (rusqlite vendored OpenSSL + monthly CVE check), ADR-007 (no manual `Debug` on sensitive types), ADR-008 (dryoc 0.7 API drift formalised). Perf measured: `open+migrate` ≈ 120ms, steady-state audit insert ≈ 197µs. |
 | T0.1.4 | vault-storage: LanceDB (`VectorStore` trait + `LanceVectorStore`) | 2026-04-29 (commit `710576c`) | ✅ vault-storage 59/59 + vault-core 44/44 + doc 1/1 = **104/104** passing; build/clippy/fmt clean | Domain-only `VectorStore` trait (BRD §2.2): `MemoryId` / `Boundary` / `&[f32]` only — Arrow types stay inside the impl. Mandatory access control on `search` via non-Optional `&[Boundary]` (BRD §11.4.3); empty slice returns empty result, not error — compile-time impossible to "forget to filter." `LanceVectorStore` on lancedb 0.8 + arrow 52.1: `merge_insert(&["id"])` with id-only match column (boundary-change updates in place, no duplicates), `DistanceType::Cosine` calibrated for L2-normalised bge-small embeddings, `only_if` filter via `build_boundary_filter` + `quote_sql_string` (defense-in-depth atop Boundary's tightened charset). 20 new tests including boundary-leak proptest and 20-task concurrent-upserts test. ADRs landed: 010 (V0.1 plaintext-on-disk HARD GATE before T0.2.16, four loud compensating controls), 011 (protoc + monthly CVE check), 012 (lance feature-minimisation investigated, no flags available, accept), 013 (chrono `=0.4.38` pin policy with revisit triggers + monthly CVE check). Boundary tightened to `[a-zA-Z0-9_-]{1,64}` in vault-core (ADR-005 amended). BRD §6 V0.1.3 perf budget added; BRD §6 V0.2 T0.2.0 (LanceDB encryption-at-rest) added as new first task with HARD GATE for T0.2.16. |
+| T0.1.4 follow-ups | ADR-014 (ALPHA-file fail-soft) + ADR-008 dryoc spike PASSED | 2026-04-29 (commit `9effa1a`) | ✅ vault-storage **60/60** + vault-core 44/44 + doc 1/1 = **105/105** passing; build/clippy/fmt clean; `cargo run -p vault-sync --example dryoc_spike` exit 0 | **ADR-014:** `LanceVectorStore::open` no longer fails on alpha-warning-file write errors (read-only data dir, quota, FS error). Startup WARN log (ADR-010 control #3) is the **primary** safety control; the file (#4) is **secondary**. Test `open_succeeds_when_alpha_file_write_fails_per_adr_014` pre-creates the alpha path as a directory so `fs::write` fails on every platform; asserts `open()` succeeds and the store remains functional. ADR-010 compensating-control #4 amended to mark the file as secondary + reference ADR-014. **ADR-008 dryoc spike:** `crates/vault-sync/examples/dryoc_spike.rs` (~180 lines) — round-trip + adversarial (wrong-key, single-bit ciphertext flip) all pass. Findings annotated into ADR-008: required imports (`Bytes` + `NewByteArray` from `dryoc::types` — BRD §11.6 sketch missed these), `Sized` quirk (pass `&Vec<u8>` not `&[u8]`), 24-byte opaque header, 17-byte AEAD overhead per envelope, `Tag::FINAL = PUSH \| REKEY` libsodium bit layout. Path #1 (streaming-as-single-message) chosen over path #2 (sibling crate) and path #3 (RustCrypto). dryoc declared as `[dev-dependencies]` in vault-sync (not promoted to `[dependencies]` until T0.2.9). |
+| ADR-008 lock-down | AAD scheme + chunk-size policy | 2026-04-29 (commit `5fdf0d8`) | ✅ no code change; ADR-only commit | **AAD scheme** locked: `AAD = BLAKE3("vault-aad-v1" \|\| memory_id_bytes \|\| boundary_bytes)`. Domain-separator prefix prevents collision with the audit-log BLAKE3 chain in vault-storage; `v1` suffix lets us rotate later without ambiguity; fixed 32-byte AAD regardless of boundary length. T0.2.9 passes this as `aad` to `push_to_vec` / `pull_to_vec`; wrong metadata in transit → AEAD auth fails → decryption fails closed. **Chunk-size policy:** ≤ 1MB plaintext = single-shot (one `push_to_vec(..., FINAL)`); > 1MB = chunked streaming. V0.1/V0.2 single-shot only — BRD §11.7.1 caps memories at 100KB, far below the threshold. Triggers to re-evaluate listed in ADR-008. ADR-008 is now fully retired; T0.2.9 can proceed without re-investigation. |
+| T0.1.5 | vault-storage: DuckDB (`GraphStore` trait + `DuckDbGraphStore` + ADR-015 boundary scoping) | 2026-04-30 (commit pending approval) | ✅ vault-core **45/45** + vault-storage **92/92** + doc 1/1 = **138/138** passing; build/clippy/fmt clean | Domain-only `GraphStore` trait (BRD §2.2): `Entity` / `Relationship` / `EntityId` / `RelationshipId` / `Boundary` only — DuckDB types stay inside `DuckDbGraphStore`. Mandatory access control on `traverse` via non-Optional `&[Boundary]` (BRD §11.4.3); empty slice returns empty result, not error — same compile-time discipline as `LanceVectorStore::search`. **`TraversalOptions` struct** (Shahbaz refinement during T0.1.5 review) groups `max_hops` + `relation_filter` + `follow_aliases` so the trait signature stays stable as V0.2 adds knobs (`include_archived`, time-range filters) without breaking callers; mandatory params (`from`, `authorized_boundaries`) stay positional. **`DuckDbGraphStore`** on duckdb 1.2 (workspace pin "1.0" = ^1.0; T0.1.5b will exact-pin per BRD §2.9): `Connection: Send + !Sync` wrapped in `Mutex<Connection>` + `spawn_blocking` mirror of `MetadataStore`. Schema in `migrations_graph/0001_initial.sql`: `entities` with composite `UNIQUE (name, entity_type, boundary)` (ADR-015 watch #3), `relationships` with bi-temporal `valid_from` / `valid_until` / `confidence` from day one (watch #2) + denormalised `boundary` for fast traversal-time SQL filtering. **ADR-015 enforcement mechanism locked: app-layer in `create_relationship`** because DuckDB 1.x supports neither subquery-CHECK nor triggers; property test fuzzes the API as the SQL-layer backstop's substitute. **Recursive CTE traversal** with `list_append`-tracked relationship-id path (BLOB[]) for full-chain reconstruction, `list_position` cycle break, depth-bounded with strict respect for `max_hops` (Shahbaz-added test verifies a 5-hop graph queried with `max_hops=2` returns nothing past hop 2). Boundary filter applies at every recursion step + at the final entity join (defense in depth, watch #1). 28 graph_store tests + 4 migrations_graph tests including: cross-boundary rejection (`AccessDenied`), `same_as` / `alias_for` schema permissiveness (forward-compat), `follow_aliases=true` traverses alias edges but still respects `authorized_boundaries` (not a privilege escalation), bi-temporal supersede atomicity, 20-task concurrent-creates, and a property test fuzzing arbitrary small graphs to confirm zero boundary leaks. **vault-core amendment:** `Entity` gained `boundary: Boundary` field + `NewEntity` builder mirroring `NewMemory`. ADR-015 logged with three Shahbaz-supplied additions (schema-level enforcement specifics, `same_as` forward-compat pattern, consolidator policy contract for T0.2.2). T0.1.5b cleanup task logged in tech debt: workspace caret-pin → exact-pin sweep per BRD §2.9. **Tech-debt note:** discovered DuckDB 1.2.2 wedges on autocommit INSERT UNIQUE-violation; worked around with pre-flight `SELECT COUNT(*)` inside explicit tx in `create_entity` (logged for revisit on duckdb upgrade). |
 
 ---
 
 ## In Progress
 
-**Pre-T0.1.5: dryoc API spike** (per ADR-008 + Shahbaz's direction "run after T0.1.4 commits, before T0.1.5 starts"). ~2-hour scratch crate exercising dryoc 0.7's actual encrypt/decrypt API on a single-message envelope. Output: ADR-008 amended with the confirmed call shape and chosen path (streaming wrapper / sibling crate / RustCrypto `chacha20poly1305`); BRD §11.6 sketch reconciled with reality. Then T0.1.5 (vault-storage DuckDB graph store) starts.
-
-**Two T0.1.4 follow-ups noted by Shahbaz (next-session, low priority):**
-- **Search-side dimension check is already done** (post-Shahbaz-review verification: `search_rejects_dimension_mismatch` test passes; check at top of `search` after the empty-`authorized_boundaries` early-return). Flagged here so future-me doesn't accidentally re-add it.
-- **ADR-014 (TODO): ALPHA file write failure policy.** Currently `LanceVectorStore::open` returns `Err` if the data dir is read-only / quota-exceeded. Per Shahbaz: downgrade to "log WARN + proceed" — the startup WARN log is the primary safety control, the file is secondary. Implementation + ADR + test land in next session before T0.1.5 (or folded into the dryoc-spike turn).
+_Awaiting commit approval for T0.1.5._ After commit + push:
+1. **T0.1.5b** — workspace caret-pin → exact-pin sweep per BRD §2.9 (~30min mechanical, isolated commit, see tech debt).
+2. **T0.1.6** — `StorageBackend` orchestrator with cascading writes + retry queue per ADR-009.
 
 ---
 
 ## Pending — V0.1 (Internal Alpha)
 
-- [ ] **T0.1.5** — vault-storage: DuckDB (graph store with bi-temporal columns)
 - [ ] **T0.1.6** — vault-storage: Cascading Backend (StorageBackend orchestrator + retry queue per ADR-009)
 - [ ] **T0.1.7** — vault-embedding (bge-small via ort)
 - [ ] **T0.1.8** — vault-retrieval: Semantic Strategy Only
@@ -298,6 +299,78 @@ _None outstanding._
   - *Move the alpha warning into a tracing-subscriber sink instead of a file:* rejected — that's just more elaborate primary control, not a replacement for the file's "passive on-disk hint when a user browses the data dir" purpose.
 - **When to revisit:** When T0.2.0 ships (encryption-at-rest), the ALPHA file is removed entirely along with the WARN log; ADR-014 becomes archival.
 
+### ADR-015 — 2026-04-30 — `Entity` and `Relationship` are boundary-scoped at the schema layer (deviation from BRD §5.1)
+- **Status:** APPROVED 2026-04-30 by Shahbaz. Per BRD §11.15 escalation discipline.
+
+- **Context:** BRD §5.1 sketches `Entity` and `Relationship` without a `boundary` field. BRD §11.4.3 mandates boundaries as access control on every retrieval surface. T0.1.5 must reconcile the two before schema lands. Two paths considered:
+  - **(a) Boundary on `Entity`** — every entity tagged at creation; relationships restricted to within-boundary endpoints (one explicit exception, see *same_as* below); traversal queries take `authorized_boundaries: &[Boundary]` and filter at the SQL `WHERE` clause. Strongest enforcement, biggest deviation from §5.1.
+  - **(b) Unbounded entities, derive boundary at retrieval** — entities/relationships are global; access control happens later when retrieval joins entities back to memories that carry boundary. Matches §5.1 literally.
+
+- **Decision: take path (a).** `Entity` carries a `boundary: Boundary` field (validated newtype per ADR-005). Relationships are within-boundary by default. The DuckDB schema enforces this, the `GraphStore` API surfaces require the caller to declare authorized boundaries, and SQL filters apply at every traversal hop.
+
+- **Reasoning (continuity with prior decisions):**
+  - **Same pattern as ADR-005, ADR-010, and ADR-007.** Each of those chose "enforce at the schema/storage/type layer" over "enforce at the caller" for the same reason: caller discipline fails silently, schema enforcement fails loudly. ADR-005 made `Boundary` a validated newtype. ADR-010 made boundary filtering at the LanceDB query layer non-negotiable. ADR-015 extends the same posture to the graph store.
+  - **Path (b)'s specific failure mode is invisible by construction.** Any direct graph-traversal call that bypasses the memory join becomes a boundary leak. We don't have such a call today, but the consolidator (T0.2.2–T0.2.4) and retrieval entity-expansion (V1.0+) will both need direct entity traversal. If a future caller forgets the join, no test catches it — the traversal returns syntactically correct entities, just from the wrong boundary. Path (a) makes that failure mode unrepresentable: the SQL `WHERE` clause is the gate.
+  - **Cross-boundary entity duplication is a feature, not a bug.** Auto-fusing "Sarah at work" with "Sarah my friend" means an agent in the work boundary could pull personal context (birthday, family) it should never see. The user explicitly opting in via *same_as* (below) is the right interaction. The duplication matches how humans actually compartmentalise — recall context for "Sarah at work" differs from "Sarah my friend" even in human cognition. Bounded duplication, not broken model.
+
+- **Three additions Shahbaz called out for the ADR (locked here so T0.1.5 implementation and T0.2.2–T0.2.4 consolidator have a clear contract):**
+
+  1. **Schema-level enforcement specifics (DuckDB).**
+     - `entities` table: `boundary TEXT NOT NULL` column. Validated as `Boundary` (newtype, charset `[a-zA-Z0-9_-]{1,64}` per amended ADR-005) at the `create_entity` API boundary before insert.
+     - `relationships` table: `from_entity_id` and `to_entity_id` both reference `entities` via `FOREIGN KEY` (DuckDB enforces FK on insert). Plus a denormalised `boundary TEXT NOT NULL` column on the relationship row itself for fast traversal-time filtering (avoids a JOIN back to `entities` on every hop of every traversal — meaningful at 1–3 hop depths over a multi-thousand-entity graph).
+     - **Enforcement mechanism (LOCKED 2026-04-30 after duckdb 1.0 API + DuckDB engine 1.x SQL feature verification):** the within-boundary invariant is **app-layer-enforced inside `create_relationship`**, transactionally:
+       1. `BEGIN`.
+       2. `SELECT boundary FROM entities WHERE id IN (?, ?)` — both endpoints.
+       3. If both endpoints share the same boundary → set `relationships.boundary` to that value, proceed to insert.
+       4. If endpoints differ AND `relation_type IN ('same_as', 'alias_for')` → permitted; set `relationships.boundary` to the from-endpoint's boundary (asymmetric, but consistent — traversal-time filtering can still use this column as a hint, and `follow_aliases = true` widens the filter to the caller's full `authorized_boundaries` slice).
+       5. If endpoints differ AND `relation_type` is anything else → return a named `VaultError::CrossBoundaryRelationshipForbidden` (or equivalent variant). `ROLLBACK`.
+       6. `COMMIT`.
+       **Why app-layer not SQL-layer:** DuckDB 1.x does not support triggers, and CHECK constraints in DuckDB 1.x cannot reference other rows / other tables via subquery (column-level CHECK only takes per-row boolean expressions). Both SQL-layer mechanisms that *would* have enforced this invariant declaratively are unavailable. The next-best alternative — declarative SQL-layer enforcement — would require materialising endpoint boundaries onto the relationship row and a per-row CHECK that the inserted row's `boundary` matches the materialised endpoint boundaries, which is exactly what the app-layer transactional path already does. App-layer + property test is the same enforcement strength with simpler schema.
+       **Property test (mandatory, locked):** fuzz `create_relationship` with arbitrary endpoint pairs (same boundary, different boundary, mix of `same_as` / `alias_for` / other relation types) and assert the API returns `Ok` exactly when the invariant holds and `Err(CrossBoundaryRelationshipForbidden)` otherwise. The property test IS the SQL-layer backstop's substitute — without it the invariant becomes "trust the impl," which fails the schema-vs-caller-discipline test in ADR-015's reasoning.
+     - Every traversal query takes `authorized_boundaries: &[Boundary]` (non-`Optional`, mirroring `LanceVectorStore::search`'s mandatory access-control parameter from T0.1.4). Empty slice returns empty result, not an error — compile-time impossible to "forget to filter."
+     - Defense in depth atop `Boundary`'s tightened charset: SQL parameter binding (parameterised query, never interpolation) + `quote_sql_string` helper (carry-over from `LanceVectorStore`) for any unavoidable literal embedding in CTE construction.
+
+  2. **`same_as` / `alias_for` relationship — documented escape valve for cross-boundary linking (forward-compat note, NOT implemented in T0.1.5).**
+     - `relation_type = "same_as"` (and reserved sibling `"alias_for"`) are the **only** relation types allowed to span boundaries. Schema enforcement: the within-boundary CHECK on relationships exempts rows where `relation_type IN ('same_as', 'alias_for')`.
+     - `same_as` creation is **never auto-generated by the consolidator, extractors, or any ingestion path**. Always requires explicit user action via the UI / a deliberate API call, never implicit.
+     - Traversal queries that follow `same_as` edges must be opt-in: `traverse(..., follow_aliases: bool)`, default `false`. With `follow_aliases = true`, the recursive CTE may cross to entities in any of the `authorized_boundaries` (still bounded by the caller's authorization set — `same_as` is not a privilege escalation).
+     - Every `same_as` / `alias_for` create / supersede / delete is a **privacy-significant audit event**: `audit_log.action = 'same_as_link'` or `'same_as_unlink'`, full from/to entity IDs, both boundaries, user-confirmation token. Audit chain (BLAKE3 from T0.1.3) covers it like any other event.
+     - **T0.1.5 scope:** the schema MUST permit `same_as` rows (the within-boundary CHECK exempts them), the trait API SHOULD reserve a `follow_aliases` parameter on `traverse` (default false, no-op for V0.1 because no `same_as` rows exist yet), no UI / consolidator / audit-event work in V0.1. Forward-compatibility groundwork only.
+
+  3. **Consolidator policy (specs the contract for T0.2.2–T0.2.4 now, before they're implemented).**
+     - When the consolidator processes memories from multiple boundaries and finds entities with the same `(name, entity_type)` across boundaries, it **never auto-merges them**.
+     - It **may** flag `(boundary_a:entity_x, boundary_b:entity_y)` as a candidate for user review in a `cross_boundary_link_candidates` queue (separate table, lands at T0.2.2 alongside the consolidator). The user reviews and either creates a `same_as` link explicitly or dismisses the candidate.
+     - The consolidator **never** writes to the `same_as` / `alias_for` graph itself; only the user-driven UI path does.
+     - This is a contract spec, not V0.1 implementation. T0.1.5 doesn't build the candidates queue; T0.2.2 does. Documenting now means T0.2.2 starts from "implement this contract" instead of "improvise this contract."
+
+- **Three implementation watch-items for T0.1.5** (called out by Shahbaz; tests must cover):
+
+  1. **Recursive CTE traversal must apply boundary filter at every hop, not just the start.** A 2-hop traversal from entity A in boundary `work` could otherwise traverse a relationship into boundary `personal` and return personal entities (in path (a) this should already be impossible because cross-boundary edges don't exist outside `same_as`, but the CTE must still filter defensively). **Property test (Heavy): for any 1–3 hop traversal with `authorized_boundaries = [b]`, no returned entity has `boundary != b`.** Run the proptest with arbitrary graphs including injected `same_as` edges with `follow_aliases = false` to verify the alias bypass guard.
+  2. **Bi-temporal columns on `relationships` from day one.** Per BRD §5.1, `Relationship` has `valid_from`, `valid_until`, `confidence`. Schema includes all three from the first migration. Adding bi-temporal columns to a graph table after rows exist is migration-painful. **Test: queries-as-of-past-time return historical state.** When the consolidator (T0.2.2–T0.2.4) supersedes a relationship by setting `valid_until = now` and creating a successor, a traversal at time `t < now` returns the old relationship; at time `t >= now` returns the new one.
+  3. **Entity name uniqueness scoped to `(name, entity_type, boundary)`, not `(name, entity_type)`.** Two entities both named "Sarah" can coexist if they're in different boundaries — that's the cross-boundary feature, not a bug. UNIQUE constraint on the composite key. **Test: insert "Sarah" / Person / work succeeds; insert "Sarah" / Person / personal succeeds; insert "Sarah" / Person / work again fails with a duplicate-key error mapped to a clean `VaultError` variant.**
+
+- **Alternatives considered:**
+  - *Path (b) with retrieval-layer enforcement:* rejected — see "Reasoning" above. Invisible failure mode in any future direct-traversal caller.
+  - *Boundary on `Relationship` only, not `Entity`:* rejected — leaves entity-only traversals (graph operations that walk entities without going through edges) unguarded.
+  - *Tag-based boundary (multi-boundary entities by default, intersect with authorized at query):* rejected — collapses the privacy-decision boundary back into the data model, undermining the user-opt-in property of `same_as`.
+  - *Defer the decision to T0.2.x:* rejected — schema decisions are expensive to retrofit (Shahbaz's framing, applied here: five minutes of policy now saves a week of migration later, especially once millions of rows exist).
+
+- **Test requirements at T0.1.5 (Heavy):**
+  - Round-trip identity for `Entity` / `Relationship` (write → read returns identical struct).
+  - Boundary-leak property test (item 1 above) — every 1–3 hop traversal respects `authorized_boundaries`.
+  - Bi-temporal correctness (item 2 above) — historical-time queries return the correct historical state.
+  - Composite-uniqueness test (item 3 above) — `(name, entity_type, boundary)` is unique, not `(name, entity_type)`.
+  - Concurrent-write safety: 20 tasks creating / superseding entities and relationships in parallel, final state coherent.
+  - Cross-boundary edge rejection: `create_relationship` with endpoints in different boundaries and `relation_type != 'same_as'` returns `VaultError::BoundaryViolation` (or equivalent named variant).
+  - `same_as` schema permissiveness (forward-compat): the schema *accepts* a `same_as` row spanning two boundaries (test inserts one directly via SQL and asserts the row persists). The trait API does not yet expose the creation path — that's T0.2.2+.
+
+- **Test requirements at T0.2.2 (consolidator, when it lands):** consolidator never produces `same_as` rows; the cross-boundary candidate queue receives flagged pairs; an integration test confirms the user-review path is the only way `same_as` rows can be created.
+
+- **When to revisit:**
+  - When T0.2.2 implements the consolidator, verify the policy contract above is what the consolidator code actually does. Update ADR-015 if any clause needs sharpening.
+  - If user research surfaces a workflow where auto-fusion is the preferred default for some entity classes, re-evaluate — but the bar is high (the privacy default is the right default).
+  - If DuckDB's constraint mechanics force an awkward encoding (e.g., the within-boundary CHECK has to live entirely in app-layer code with no SQL backstop), revisit and decide whether to harden via a different mechanism (trigger with PL/SQL emulation, or a tighter app-layer assertion + property-test discipline).
+
 ---
 
 ## Tech Debt Backlog
@@ -305,8 +378,10 @@ _None outstanding._
 Items noticed but not addressed in their originating task — picked up explicitly when scheduled, never as drive-by work.
 
 - [ ] **`llama-cpp-2 = "0.1"` not yet declared in `[workspace.dependencies]`** — BRD §4.3 flags it for verification at the start of vault-llm work (T0.2.1). Do crate-name-and-version verification on docs.rs at that point and add to workspace deps then. (Noted 2026-04-28, file: `Cargo.toml`)
+- [ ] **T0.1.5b — `[workspace.dependencies]` caret pins → exact pins per BRD §2.9** — Pre-existing across the workspace and surfaced during T0.1.5 (the `duckdb = "1.0"` pin resolved to 1.2.2 because cargo treats `"1.0"` as `^1.0`). BRD §2.9 mandates exact versions (no `^`, `~`, `*`); only `chrono = "=0.4.38"` complies today. **Scope:** bulk edit of `[workspace.dependencies]` in the workspace `Cargo.toml` only — replace every `"X.Y"` / `"X.Y.Z"` non-exact pin with `"=X.Y.Z"` using the exact version currently locked in `Cargo.lock`. **No other changes** in the same commit — no version bumps, no feature changes, no Cargo.lock regeneration. **Verification:** `cargo build --workspace` and `cargo test --workspace` must produce identical Cargo.lock contents before and after the edit (i.e., `git diff Cargo.lock` is empty post-edit). **Schedule:** dedicated micro-task between T0.1.5 ship and T0.1.6 start. Estimated ~30 min mechanical. **Why not in T0.1.5:** drive-by-refactor rule (CLAUDE.md hard rule) + keeps the T0.1.5 diff focused + safer as an isolated "pin-syntax-only" commit that's easy to verify. (Noted 2026-04-30)
+- [ ] **DuckDB 1.2.2 autocommit-INSERT wedge on UNIQUE constraint violation** — Discovered during T0.1.5: `Connection::execute("INSERT INTO entities ...", ...)` against a row that violates the composite UNIQUE `(name, entity_type, boundary)` does NOT return an error promptly — it wedges the connection indefinitely (test hung >5min, killed). Worked around in `DuckDbGraphStore::create_entity` by pre-checking with `SELECT COUNT(*)` inside an explicit transaction before the INSERT (the explicit-tx + pre-flight pattern avoids the wedge). The pre-check + insert is atomic because we hold the connection mutex for the whole tx. **Operational follow-up:** revisit on every duckdb-rs minor bump — if a fix lands upstream, drop the pre-flight check and rely on a single INSERT with native UNIQUE-violation error mapping (cleaner code + one less round-trip). Tracked here so future-us doesn't quietly inherit the workaround as canon. (Noted 2026-04-30, file: `crates/vault-storage/src/graph_store.rs` `create_entity`)
 - [ ] **`.gitattributes` for line-ending normalisation** — currently relying on git's default `core.autocrlf=true` on Windows. Adding `* text=auto eol=lf` plus binary markers for known binary file types would silence the CRLF warnings on commit and make cross-platform behaviour deterministic. Quick win when convenient. (Noted 2026-04-28)
-- [ ] **dryoc 0.7 streaming-vs-single-shot — RUN THE SPIKE THIS WEEK** — per ADR-008. 2-hour scratch crate, single-envelope encrypt → decrypt round-trip using actual dryoc 0.7 API. Output: ADR-008 amended with confirmed call shape; BRD §11.6 sketch updated to compile against reality. **Target: complete before T0.1.4 finishes** so we know whether we're using dryoc, RustCrypto, or another crate before T0.2.9 design starts. (Noted 2026-04-28, scheduled 2026-04-29)
+- [x] ~~**dryoc 0.7 streaming-vs-single-shot — RUN THE SPIKE THIS WEEK**~~ — DONE 2026-04-29 (commit `9effa1a`). Path #1 (DryocStream-as-single-message) confirmed; spike artifact `crates/vault-sync/examples/dryoc_spike.rs` kept long-term. ADR-008 fully retired in commit `5fdf0d8` with AAD scheme + chunk-size policy locked.
 - [ ] **chrono pinned to `=0.4.38` (POLICY: ADR-013, revisit triggers explicit)** — Tactical pin to dodge arrow-arith / chrono `quarter()` conflict; ADR-013 documents the four explicit revisit triggers (arrow upgrade past the conflict, High/Critical chrono CVE on 0.4.39+, lancedb/arrow-arith resolves the conflict, chrono major bump). Monthly chrono security-advisory check is on the recurring schedule below alongside OpenSSL and protobuf. (Noted 2026-04-29, file: `Cargo.toml`)
 - [ ] **Build env vars need a persistent home** — T0.1.4 build requires `PROTOC` set to the winget protoc path AND Strawberry Perl in front of `/usr/bin/perl` on PATH (so openssl-src's build script finds a Perl with the full standard library, not MSYS2's minimal one). Currently passed inline on every cargo invocation. Should land as either `.cargo/config.toml` `[env]` block (machine-portable via env-var lookup) or a `scripts/dev-build.sh` helper. CI needs equivalent: `arduino/setup-protoc` action + `shogo82148/actions-setup-perl` (or use Strawberry on Windows runners). (Noted 2026-04-29, ADR-011)
 - [ ] **(Recurring) Monthly OpenSSL CVE check** — per ADR-006. First Monday of each month, review https://www.openssl.org/news/vulnerabilities.html and the OpenSSL version vendored by `openssl-src` (`cargo tree -p openssl-src` from this workspace). Critical / High advisories affecting the vendored version → prioritise `cargo update -p openssl-src` ahead of other work. Next due: 2026-05-04. (Noted 2026-04-28)
@@ -324,23 +399,26 @@ _(populated once V0.1 ships)_
 
 ## Notes for Next Session
 
-**Immediate state:** T0.1.3 committed and pushed (`f846df7`). Pre-T0.1.4 follow-ups (ADR-009 + BRD §6 perf criterion + dryoc spike scheduled) staged for the follow-up commit. After that commit lands, T0.1.4 (vault-storage: LanceDB) starts.
+**Immediate state:** T0.1.5 implementation complete (working tree dirty with the T0.1.5 diff staged for review). 138/138 tests passing across the workspace. All five DoD gates green. Awaiting Shahbaz's commit + push approval per CLAUDE.md confirm-before-commit-push rule.
 
-**Pace caution:** Per Shahbaz's T0.1.3 review — "Watch for the temptation to move faster on T0.1.4 because momentum feels good. LanceDB integration has its own subtleties — vector dimension consistency, IVF index parameters, encryption-at-filesystem-level for the data dir. Don't let velocity override the same thoroughness." Keep T0.1.4 at the same test depth as T0.1.3 (Heavy: round-trip, boundary-leak proptest, concurrent-write test).
+**Files changed in this T0.1.5 commit (uncommitted):**
+- `HANDOFF.md` — T0.1.5 entry in Recently Completed, ADR-015 logged with three Shahbaz-required additions, T0.1.5b cleanup task + DuckDB-wedge entries in Tech Debt, In Progress / Current Status / header refreshed.
+- `crates/vault-core/src/entity.rs` — `Entity` gains `boundary: Boundary` field; `NewEntity` builder mirrors `NewMemory`. New test `entity_in_two_boundaries_with_same_name_are_distinct`.
+- `crates/vault-core/src/lib.rs` — re-export `NewEntity`.
+- `crates/vault-storage/Cargo.toml` — `duckdb = { workspace = true }`.
+- `crates/vault-storage/src/lib.rs` — declare + re-export `graph_store` module + `migrations_graph` (crate-private).
+- `crates/vault-storage/src/graph_store.rs` — new (~1100 lines including tests): `GraphStore` trait, `TraversalOptions` struct, `DuckDbGraphStore` impl, 28 tests.
+- `crates/vault-storage/src/migrations_graph/mod.rs` — new: DuckDB migration runner (mirror of `migrations/mod.rs`).
+- `crates/vault-storage/src/migrations_graph/0001_initial.sql` — new: entities + relationships schema with ADR-015 invariant + JSON-EntityType comments.
+- `crates/vault-storage/src/vector_store.rs` — `build_boundary_filter` and `quote_sql_string` promoted to `pub(crate)` for graph_store reuse.
 
-**Two of the five tables in BRD §5.2 are intentionally deferred** to the tasks that actually need them:
-- `review_queue` — added at the connector ingestion task (BRD §5.9)
+**Pace caution carried forward:** the DuckDB autocommit wedge cost ~20 minutes of debugging time. T0.1.6 will introduce the cascading backend with retry queue (ADR-009 policy) — that's the highest-stakes test surface so far (data-loss bugs there are the worst kind). Re-read ADR-009 before starting.
+
+**Right after T0.1.5 ships:**
+1. **T0.1.5b (caret-pin sweep)** — isolated, ~30min, easy to review.
+2. **T0.1.6 — Cascading Backend** — heavy crate, big test surface. Property-test the retry queue per ADR-009 §"Test requirements (T0.1.6)". The dead-letter table lands here.
+
+**Tables still deferred to later tasks** (no scaffolding rule):
+- `review_queue` — added at connector ingestion task (BRD §5.9)
 - `sync_state` and `retry_queue` — added at T0.1.6 (cascading backend per ADR-009) / T0.2.x (sync engine)
-
-Per the "no scaffolding for unused features" rule (CLAUDE.md hard rule). Each table will land via a new numbered migration file (`0002_review_queue.sql`, etc.) — the migration runner already supports this and is regression-tested by `forward_migration_applies_next_version_only`.
-
-**Next task — T0.1.4 — vault-storage: LanceDB vector store (BRD §5.2.2):**
-
-- Add `lancedb` and `arrow` deps to `crates/vault-storage/Cargo.toml` (versions pinned per BRD §4)
-- Implement `VectorStore` trait + `LanceVectorStore` struct: `insert`, `update`, `delete`, `search(query_vec, boundary, k) -> Vec<(MemoryId, score)>`, `purge_boundary(b)` for boundary deletion
-- **Boundary filtering must happen at the LanceDB query layer**, not after-the-fact — same security principle as the SQL boundary filter we just shipped. This is the place where it's easiest to slip; reread BRD §11.4.3 before writing the search method.
-- Encryption: LanceDB does not natively support encryption-at-rest. Decision needed at T0.1.4 kickoff: use a wrapper that encrypts the parquet files at OS-FS level (recommended), or store vectors inside SQLCipher (slower, scaling concerns). Document as an ADR.
-- Test level: **Heavy** — round-trip tests, boundary filter cannot leak, property tests for vector insert/search consistency, concurrent-write test
-- Tie-in to T0.1.3: the next migration (`0002_…sql`) may add a `vector_id` column to `memories` if we choose a model where SQLite holds the cross-store reference
-
-**Working-tree state at the start of T0.1.4 code work:** clean after the ADR-010 + T0.2.0 commit lands. The next code commit will introduce `crates/vault-storage/src/lance_vector_store.rs` (or similar — final naming follows the API verification step) plus deps in `crates/vault-storage/Cargo.toml`.
+Each lands via a new numbered SQLite migration file (`0002_…sql`, etc.). The migration runner already supports this and is regression-tested by `forward_migration_applies_next_version_only`.

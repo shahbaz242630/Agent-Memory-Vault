@@ -15,6 +15,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::boundary::Boundary;
 use crate::error::{VaultError, VaultResult};
 
 /// Maximum length of an entity name in bytes (BRD §11.7.1).
@@ -107,15 +108,30 @@ pub enum EntityType {
 /// memories about "Sara" share one [`EntityId`] so graph traversal can find
 /// related context.
 ///
+/// Each entity is **boundary-scoped** at the schema layer (HANDOFF.md
+/// ADR-015). The same name in two different boundaries is two distinct
+/// entities — cross-boundary fusion is a privacy decision the user opts into
+/// via an explicit `same_as` / `alias_for` relationship, never a default.
+///
 /// **Invariants** (enforced by [`Entity::try_new`] / [`Entity::validate`]):
 /// - `name` is non-empty and ≤ [`MAX_ENTITY_NAME_BYTES`] bytes
 /// - `name` contains no control characters
+/// - `boundary` is a validated [`Boundary`] (charset enforced by the newtype)
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entity {
     pub id: EntityId,
     pub name: String,
     pub entity_type: EntityType,
+    pub boundary: Boundary,
     pub created_at: DateTime<Utc>,
+}
+
+/// Builder-style arguments for [`Entity::try_new`].
+#[derive(Clone, Debug)]
+pub struct NewEntity {
+    pub name: String,
+    pub entity_type: EntityType,
+    pub boundary: Boundary,
 }
 
 impl Entity {
@@ -123,20 +139,22 @@ impl Entity {
     ///
     /// # Errors
     ///
-    /// Returns [`VaultError::InvalidInput`] if `name` violates the
-    /// invariants listed on [`Entity`].
-    pub fn try_new(name: impl Into<String>, entity_type: EntityType) -> VaultResult<Self> {
+    /// Returns [`VaultError::InvalidInput`] if any of the invariants
+    /// listed on [`Entity`] are violated by the provided arguments.
+    pub fn try_new(args: NewEntity) -> VaultResult<Self> {
         let entity = Self {
             id: EntityId::new(),
-            name: name.into(),
-            entity_type,
+            name: args.name,
+            entity_type: args.entity_type,
+            boundary: args.boundary,
             created_at: Utc::now(),
         };
         entity.validate()?;
         Ok(entity)
     }
 
-    /// Re-check all invariants. Storage layers must call this before write.
+    /// Re-check all invariants. Storage layers must call this before write
+    /// (BRD §11.7.1: validate at every public API boundary).
     pub fn validate(&self) -> VaultResult<()> {
         if self.name.is_empty() {
             return Err(VaultError::InvalidInput(
@@ -254,18 +272,27 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    fn ne(name: &str, entity_type: EntityType) -> NewEntity {
+        NewEntity {
+            name: name.to_string(),
+            entity_type,
+            boundary: Boundary::new("work").unwrap(),
+        }
+    }
+
     #[test]
     fn entity_try_new_produces_valid_entity() {
-        let e = Entity::try_new("Sara", EntityType::Person).unwrap();
+        let e = Entity::try_new(ne("Sara", EntityType::Person)).unwrap();
         e.validate().unwrap();
         assert_eq!(e.entity_type, EntityType::Person);
         assert_eq!(e.name, "Sara");
+        assert_eq!(e.boundary.as_str(), "work");
     }
 
     #[test]
     fn empty_entity_name_rejected() {
         assert!(matches!(
-            Entity::try_new("", EntityType::Person),
+            Entity::try_new(ne("", EntityType::Person)),
             Err(VaultError::InvalidInput(_))
         ));
     }
@@ -274,7 +301,7 @@ mod tests {
     fn overlong_entity_name_rejected() {
         let too_long = "x".repeat(MAX_ENTITY_NAME_BYTES + 1);
         assert!(matches!(
-            Entity::try_new(too_long, EntityType::Concept),
+            Entity::try_new(ne(&too_long, EntityType::Concept)),
             Err(VaultError::InvalidInput(_))
         ));
     }
@@ -282,9 +309,30 @@ mod tests {
     #[test]
     fn empty_custom_entity_label_rejected() {
         assert!(matches!(
-            Entity::try_new("X", EntityType::Custom(String::new())),
+            Entity::try_new(ne("X", EntityType::Custom(String::new()))),
             Err(VaultError::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    fn entity_in_two_boundaries_with_same_name_are_distinct() {
+        // ADR-015: same (name, entity_type) in different boundaries → two
+        // distinct entities. Cross-boundary fusion is opt-in via same_as.
+        let work = NewEntity {
+            name: "Sarah".into(),
+            entity_type: EntityType::Person,
+            boundary: Boundary::new("work").unwrap(),
+        };
+        let personal = NewEntity {
+            name: "Sarah".into(),
+            entity_type: EntityType::Person,
+            boundary: Boundary::new("personal").unwrap(),
+        };
+        let a = Entity::try_new(work).unwrap();
+        let b = Entity::try_new(personal).unwrap();
+        assert_ne!(a.id, b.id);
+        assert_eq!(a.name, b.name);
+        assert_ne!(a.boundary, b.boundary);
     }
 
     #[test]
@@ -374,7 +422,7 @@ mod tests {
 
     #[test]
     fn entity_serde_roundtrip() {
-        let e = Entity::try_new("Acme Corp", EntityType::Organization).unwrap();
+        let e = Entity::try_new(ne("Acme Corp", EntityType::Organization)).unwrap();
         let json = serde_json::to_string(&e).unwrap();
         let back: Entity = serde_json::from_str(&json).unwrap();
         assert_eq!(e, back);

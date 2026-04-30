@@ -497,7 +497,7 @@ fn build_record_batch(
 ///
 /// Caller guarantees `boundaries` is non-empty (the trait method
 /// returns early on an empty slice).
-fn build_boundary_filter(boundaries: &[Boundary]) -> String {
+pub(crate) fn build_boundary_filter(boundaries: &[Boundary]) -> String {
     let quoted: Vec<String> = boundaries
         .iter()
         .map(|b| quote_sql_string(b.as_str()))
@@ -512,7 +512,7 @@ fn build_boundary_filter(boundaries: &[Boundary]) -> String {
 /// security argument. `Boundary` already restricts inputs to a charset
 /// that cannot contain `'`; this function makes the SQL construction site
 /// safe even if that invariant were ever weakened.
-fn quote_sql_string(s: &str) -> String {
+pub(crate) fn quote_sql_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
     for c in s.chars() {

@@ -19,7 +19,7 @@ pub mod memory;
 // `use vault_core::Memory;` rather than `use vault_core::memory::Memory;`.
 pub use boundary::{Boundary, MAX_BOUNDARY_LEN};
 pub use entity::{
-    Entity, EntityId, EntityType, Relationship, RelationshipId, MAX_ENTITY_NAME_BYTES,
+    Entity, EntityId, EntityType, NewEntity, Relationship, RelationshipId, MAX_ENTITY_NAME_BYTES,
     MAX_RELATION_TYPE_BYTES,
 };
 pub use error::{VaultError, VaultResult};
