@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row, Transaction};
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 use uuid::Uuid;
 
 use vault_core::{Boundary, Memory, MemoryId, MemoryType, VaultError, VaultResult};
@@ -281,6 +281,94 @@ impl MetadataStore {
             tx.commit()
                 .map_err(|e| VaultError::Storage(format!("commit: {e}")))?;
             Ok(memories)
+        })
+        .await
+        .map_err(|e| VaultError::Storage(format!("spawn_blocking join: {e}")))?
+    }
+
+    /// Hydrate a batch of memories by ID, preserving input order. IDs not
+    /// present in the store are silently omitted from the returned `Vec`
+    /// — a `warn!` is logged for each so an operator reviewing logs sees
+    /// the orphan IDs. Used by `vault_retrieval::SemanticRetriever::retrieve`
+    /// to hydrate the top-k vector hits in a single round-trip
+    /// (Q10 in `T0.1.8_PLAN.md`); also intended for T0.2.7 reranking which
+    /// fetches top-50 candidates.
+    ///
+    /// **Order preservation contract.** SQLite returns `IN (...)` rows in
+    /// unspecified order; this method re-sorts in-process so the caller can
+    /// zip the returned `Memory` rows against parallel score / distance
+    /// vectors. With N ≤ 100 (V0.1's `max_results` cap), the in-process
+    /// `O(N^2)` reconstruction is trivially fast — no `HashMap` needed.
+    ///
+    /// **Audit policy: this method does NOT append a per-ID `memory.read`
+    /// audit event.** Doing so would inflate the audit log linearly with
+    /// every retrieval. The caller (`SemanticRetriever`) appends a single
+    /// `retrieval.query` event at pipeline level, capturing the batch
+    /// shape rather than per-row reads (T0.1.8_PLAN.md §3 Q-3.5 v1.2).
+    ///
+    /// **SQLite parameter limit.** SQLite's default `SQLITE_LIMIT_VARIABLE_NUMBER`
+    /// is 32,766 in modern builds. We reject `ids.len() > 32_000` as
+    /// `InvalidInput` rather than silently splitting into multiple
+    /// queries — V0.1's caller is bounded by `max_results = 100`, and
+    /// any caller approaching the limit deserves to see the error.
+    ///
+    /// # Errors
+    ///
+    /// - [`VaultError::InvalidInput`] if `ids.len() > 32_000`.
+    /// - [`VaultError::Storage`] on SQL prepare / execute / row-decode failure.
+    #[instrument(skip(self, ids), fields(id_count = ids.len()))]
+    pub async fn get_memories_batch(&self, ids: &[MemoryId]) -> VaultResult<Vec<Memory>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if ids.len() > 32_000 {
+            return Err(VaultError::InvalidInput(format!(
+                "get_memories_batch: {} ids exceeds SQLite parameter cap (32,000)",
+                ids.len()
+            )));
+        }
+        let ids = ids.to_vec();
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = inner.lock()?;
+            // Build "?1, ?2, ?3, ..." placeholders. We never splice ID
+            // strings into the query — UUIDs are bound as parameters.
+            let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("?{i}")).collect();
+            let sql = format!(
+                "SELECT id, content, memory_type, source_agent, boundary,
+                        created_at, valid_from, valid_until,
+                        confidence, access_count, last_accessed,
+                        superseded_by, metadata_json
+                 FROM memories WHERE id IN ({})",
+                placeholders.join(", ")
+            );
+            let bindings: Vec<rusqlite::types::Value> =
+                ids.iter().map(|id| id.to_string().into()).collect();
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| VaultError::Storage(format!("prepare get_memories_batch: {e}")))?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(bindings.iter()), row_to_memory)
+                .map_err(|e| VaultError::Storage(format!("query get_memories_batch: {e}")))?;
+            let mut found: Vec<Memory> = Vec::with_capacity(ids.len());
+            for r in rows {
+                found.push(r.map_err(|e| VaultError::Storage(format!("decode memory row: {e}")))?);
+            }
+            // Reconstruct in input order. `swap_remove` is O(1); the
+            // outer loop is O(N) over input ids, inner `position` is
+            // O(remaining) — overall O(N^2). Fine for N ≤ 100.
+            let mut out = Vec::with_capacity(ids.len());
+            for id in &ids {
+                if let Some(pos) = found.iter().position(|m| m.id == *id) {
+                    out.push(found.swap_remove(pos));
+                } else {
+                    warn!(
+                        memory_id = %id,
+                        "get_memories_batch: id not found in metadata store; omitting"
+                    );
+                }
+            }
+            Ok(out)
         })
         .await
         .map_err(|e| VaultError::Storage(format!("spawn_blocking join: {e}")))?
@@ -973,6 +1061,90 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(limited.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn get_memories_batch_empty_input_returns_empty_vec() {
+        let (_tmp, store) = make_store().await;
+        let out = store.get_memories_batch(&[]).await.unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_memories_batch_preserves_input_order() {
+        let (_tmp, store) = make_store().await;
+        // Insert in one order; query in a different order; assert the
+        // returned Vec follows the *query* order, not insertion order.
+        let mems: Vec<Memory> = (0..5)
+            .map(|i| sample_memory("work", MemoryType::Semantic, &format!("mem-{i}")))
+            .collect();
+        for m in &mems {
+            store.create_memory(m).await.unwrap();
+        }
+        // Reverse-order query.
+        let ids: Vec<MemoryId> = mems.iter().map(|m| m.id).rev().collect();
+        let out = store.get_memories_batch(&ids).await.unwrap();
+        assert_eq!(out.len(), 5);
+        for (out_mem, expected_id) in out.iter().zip(ids.iter()) {
+            assert_eq!(
+                out_mem.id, *expected_id,
+                "order mismatch: get_memories_batch must preserve input order"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_memories_batch_partial_hit_warns_and_omits() {
+        let (_tmp, store) = make_store().await;
+        let a = sample_memory("work", MemoryType::Semantic, "a");
+        let c = sample_memory("work", MemoryType::Semantic, "c");
+        store.create_memory(&a).await.unwrap();
+        store.create_memory(&c).await.unwrap();
+        let b_missing = MemoryId::new(); // never inserted
+                                         // Query [a, b_missing, c] — middle ID has no row.
+        let out = store
+            .get_memories_batch(&[a.id, b_missing, c.id])
+            .await
+            .unwrap();
+        // b_missing is omitted; a and c are returned in input order.
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].id, a.id);
+        assert_eq!(out[1].id, c.id);
+        // The `warn!` log is emitted but not asserted here — capturing
+        // tracing in tests requires a `tracing-subscriber` test fixture
+        // not currently wired in vault-storage. The OMIT semantic is the
+        // load-bearing contract for retrieval correctness; the WARN is
+        // operational signal.
+    }
+
+    #[tokio::test]
+    async fn get_memories_batch_does_not_append_audit_event() {
+        // Per the doc-comment promise: get_memories_batch deliberately
+        // does NOT append per-ID memory.read audit events. The caller
+        // (vault-retrieval::SemanticRetriever) appends a single
+        // retrieval.query event at pipeline level.
+        let (_tmp, store) = make_store().await;
+        let m = sample_memory("work", MemoryType::Semantic, "no-audit");
+        store.create_memory(&m).await.unwrap();
+        // Snapshot audit count after the create (which DOES audit).
+        let before = store.list_audit_events(100).await.unwrap().len();
+        let out = store.get_memories_batch(&[m.id]).await.unwrap();
+        assert_eq!(out.len(), 1);
+        // After the batch fetch + an extra list_audit_events, the chain
+        // has not grown from the batch fetch itself.
+        let after = store.list_audit_events(100).await.unwrap().len();
+        assert_eq!(
+            after, before,
+            "get_memories_batch must not append audit events"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_memories_batch_rejects_oversized_input() {
+        let (_tmp, store) = make_store().await;
+        let too_many: Vec<MemoryId> = (0..32_001).map(|_| MemoryId::new()).collect();
+        let err = store.get_memories_batch(&too_many).await.unwrap_err();
+        assert!(matches!(err, VaultError::InvalidInput(_)));
     }
 
     #[tokio::test]

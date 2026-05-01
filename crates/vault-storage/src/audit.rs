@@ -51,6 +51,16 @@ pub enum AuditEventType {
     /// overflow (one event per wave), not per overflowing write —
     /// debouncing keeps the audit log readable. Per Phase C plan Q2.
     CascadeQueueOverflow,
+    /// A retrieval pipeline call (`vault_retrieval::Retriever::retrieve`)
+    /// completed (success or error). Records the query shape — query
+    /// length, boundary count, result count, latency — but **never** the
+    /// query plaintext or any salted hash of it. Per `T0.1.8_PLAN.md`
+    /// §3 Q-3.5 v1.2: the ADR-021 cross-vault audit-leak defense was
+    /// reversed because audit logs are local-only in V0.1 / V0.2; the
+    /// shape-only record is enough for the user's own forensic needs
+    /// without standing up the salt + hashing machinery. Re-evaluate if
+    /// audit-log distribution ever lands.
+    RetrievalQuery,
 }
 
 impl AuditEventType {
@@ -67,6 +77,7 @@ impl AuditEventType {
             Self::CascadeDeadLetter => "cascade.dead_letter",
             Self::StoreCorruption => "store.corruption",
             Self::CascadeQueueOverflow => "cascade.queue_overflow",
+            Self::RetrievalQuery => "retrieval.query",
         }
     }
 
@@ -83,6 +94,7 @@ impl AuditEventType {
             "cascade.dead_letter" => Some(Self::CascadeDeadLetter),
             "store.corruption" => Some(Self::StoreCorruption),
             "cascade.queue_overflow" => Some(Self::CascadeQueueOverflow),
+            "retrieval.query" => Some(Self::RetrievalQuery),
             _ => None,
         }
     }
@@ -439,10 +451,15 @@ mod tests {
             AuditEventType::CascadeDeadLetter,
             AuditEventType::StoreCorruption,
             AuditEventType::CascadeQueueOverflow,
+            AuditEventType::RetrievalQuery,
         ] {
             assert_eq!(AuditEventType::parse(et.as_str()), Some(et));
         }
         assert_eq!(AuditEventType::parse("unknown.kind"), None);
+        // Pin the v1.2 wire format string explicitly — the constant is
+        // load-bearing for the retrieval-audit contract per
+        // T0.1.8_PLAN.md §3 Q-3.5.
+        assert_eq!(AuditEventType::RetrievalQuery.as_str(), "retrieval.query");
     }
 
     #[test]

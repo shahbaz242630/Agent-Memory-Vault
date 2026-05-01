@@ -2,39 +2,33 @@
 //! BRD §7.1). Coverage maps directly to T0.1.8_PLAN.md §5 v1.2 — 16
 //! integration tests + 1 ignored perf gate.
 //!
-//! ## Phase 1 / Phase 2 / Phase 3 split
+//! ## Phase 2 state
 //!
-//! Phase 1 (this commit) scaffolds every test. Tests whose body only
-//! exercises the public `Retriever::retrieve` surface use
-//! `#[should_panic(expected = "T0.1.8 Phase 2")]` so the unimplemented
-//! body's panic is the failure signal — Phase 2 implements
-//! `retrieve()` and removes the `should_panic` attributes one by one.
+//! Phase 2 (this commit) implemented `SemanticRetriever::retrieve()` so
+//! every `should_panic` from Phase 1 became a real assertion, and the
+//! 4 previously-`#[ignore]`-d Phase-2-dependent tests un-ignore (they
+//! exercise `MetadataStore::get_memories_batch` and the
+//! `AuditEventType::RetrievalQuery` audit-event variant). The 1
+//! `#[ignore]`-d perf gate stays ignored — runs via
+//! `cargo test -p vault-retrieval -- --ignored`.
 //!
-//! Tests with a Phase 2 dependency that goes beyond `retrieve()` body
-//! (e.g., `MetadataStore::get_memories_batch` for tests 13/14, the
-//! `AuditEventType::RetrievalQuery` variant for tests 15/16) are
-//! `#[ignore]`-d with a clear reason; Phase 2 lands the dependency
-//! and removes the ignore.
-//!
-//! Phase 3 lands tests 2 (boundary-leak proptest), 3 (empty vault),
-//! 10 / 11 (adversarial inputs), 12 (orphan-row warn), and unignores
-//! 16 (chain integrity).
+//! Phase 3 lands the heavy proptest wrapper around test 2 (boundary
+//! leak), tightens test 12 (orphan-row warn-log assertion), and any
+//! remaining hardening.
 
 mod common;
 
 use common::{boundary, insert_memory_with_drift, make_memory, make_test_retriever, query};
-use vault_retrieval::{RetrievalOptions, Retriever, MAX_QUERY_BYTES, MAX_RESULTS_CAP};
+use vault_core::MemoryId;
+use vault_embedding::EMBEDDING_DIM;
+use vault_retrieval::{Retriever, MAX_QUERY_BYTES};
+use vault_storage::{AuditEventType, AuditResult};
 
 // =============================================================================
 // 1. Happy path
 // =============================================================================
 
-/// 5-memory fixture, all in `work`. Retrieve "tell me about cats" with
-/// `max_results = 2`. The two highest-similarity hits are returned;
-/// `RetrievedMemory.score` is in `[-1, 1]` and `explanation` follows
-/// the Q6 format. Phase 2 turns this green.
 #[tokio::test]
-#[should_panic(expected = "T0.1.8 Phase 2")]
 async fn happy_path_returns_top_two_results() {
     let t = make_test_retriever().await;
     let b = boundary("work");
@@ -71,14 +65,14 @@ async fn happy_path_returns_top_two_results() {
 // `tests/trait_invariants.rs`. Keeping the entry-point in that file
 // (not duplicating it here) is the discipline that lets T0.2.7's
 // `MultiStrategyRetriever` re-use the same harness without rewriting
-// the leak proof.
+// the leak proof. Phase 3 wraps the harness in a `proptest!` block to
+// fuzz arbitrary boundary configurations.
 
 // =============================================================================
 // 3. Empty vault returns empty result, audit records result_count = 0
 // =============================================================================
 
 #[tokio::test]
-#[should_panic(expected = "T0.1.8 Phase 2")]
 async fn empty_vault_returns_empty_result_not_error() {
     let t = make_test_retriever().await;
     let res = t
@@ -87,6 +81,10 @@ async fn empty_vault_returns_empty_result_not_error() {
         .await
         .expect("retrieve");
     assert!(res.is_empty(), "empty vault should yield no results");
+    let events = t.metadata.list_audit_events(100).await.expect("audit");
+    let last = events.last().expect("at least one event");
+    assert_eq!(last.event_type, AuditEventType::RetrievalQuery);
+    assert!(last.details_json.contains(r#""result_count":0"#));
 }
 
 // =============================================================================
@@ -94,7 +92,6 @@ async fn empty_vault_returns_empty_result_not_error() {
 // =============================================================================
 
 #[tokio::test]
-#[should_panic(expected = "T0.1.8 Phase 2")]
 async fn empty_authorized_boundaries_short_circuits() {
     let t = make_test_retriever().await;
     let pre_calls = t.embedder.call_count();
@@ -107,8 +104,13 @@ async fn empty_authorized_boundaries_short_circuits() {
     assert_eq!(
         t.embedder.call_count(),
         pre_calls,
-        "empty boundaries must not invoke the embedder"
+        "watch-point #1: empty boundaries must not invoke the embedder"
     );
+    let events = t.metadata.list_audit_events(100).await.expect("audit");
+    let last = events.last().expect("audit event");
+    assert_eq!(last.event_type, AuditEventType::RetrievalQuery);
+    assert!(last.details_json.contains(r#""boundary_count":0"#));
+    assert!(last.details_json.contains(r#""result_count":0"#));
 }
 
 // =============================================================================
@@ -116,7 +118,6 @@ async fn empty_authorized_boundaries_short_circuits() {
 // =============================================================================
 
 #[tokio::test]
-#[should_panic(expected = "T0.1.8 Phase 2")]
 async fn determinism_five_runs_byte_identical() {
     let t = make_test_retriever().await;
     let b = boundary("work");
@@ -151,7 +152,6 @@ async fn determinism_five_runs_byte_identical() {
 // =============================================================================
 
 #[tokio::test]
-#[should_panic(expected = "T0.1.8 Phase 2")]
 async fn max_results_honoured() {
     let t = make_test_retriever().await;
     let b = boundary("work");
@@ -172,13 +172,9 @@ async fn max_results_honoured() {
 // =============================================================================
 
 #[tokio::test]
-#[should_panic(expected = "T0.1.8 Phase 2")]
 async fn result_ordering_score_then_created_at_desc() {
     let t = make_test_retriever().await;
     let b = boundary("work");
-    // Insert 5 memories with monotonically increasing drift → distinct
-    // scores. The retrieval order should be drift-DESC equivalent
-    // (closer-to-query first).
     for i in 0..5 {
         let m = make_memory(&format!("memory {i}"), &b);
         insert_memory_with_drift(&t, &m, i).await;
@@ -209,7 +205,6 @@ async fn result_ordering_score_then_created_at_desc() {
 // =============================================================================
 
 #[tokio::test]
-#[should_panic(expected = "T0.1.8 Phase 2")]
 async fn score_range_all_in_negative_one_to_one() {
     let t = make_test_retriever().await;
     let b = boundary("work");
@@ -236,7 +231,6 @@ async fn score_range_all_in_negative_one_to_one() {
 // =============================================================================
 
 #[tokio::test]
-#[should_panic(expected = "T0.1.8 Phase 2")]
 async fn memory_hydration_correctness() {
     let t = make_test_retriever().await;
     let work = boundary("work");
@@ -264,7 +258,6 @@ async fn memory_hydration_correctness() {
 // =============================================================================
 
 #[tokio::test]
-#[should_panic(expected = "T0.1.8 Phase 2")]
 async fn adversarial_query_with_control_chars_rejected() {
     let t = make_test_retriever().await;
     let res = t
@@ -279,12 +272,11 @@ async fn adversarial_query_with_control_chars_rejected() {
 // =============================================================================
 
 #[tokio::test]
-#[should_panic(expected = "T0.1.8 Phase 2")]
 async fn adversarial_query_length_exact_cap_and_one_over() {
     let t = make_test_retriever().await;
     let just_at_cap = "x".repeat(MAX_QUERY_BYTES);
     let one_over = "x".repeat(MAX_QUERY_BYTES + 1);
-    // At-cap should succeed (or at least not be rejected for length).
+    // At-cap should succeed (no length-rejection).
     let _ = t
         .retriever
         .retrieve(query(&just_at_cap, vec![boundary("work")], 10))
@@ -302,29 +294,21 @@ async fn adversarial_query_length_exact_cap_and_one_over() {
 // 12. Adversarial: deleted-but-not-purged memory (LanceDB has it, MetadataStore doesn't)
 // =============================================================================
 
-/// Phase 2/3 behaviour: orphan vector rows (present in LanceDB,
-/// absent from MetadataStore) should produce a `warn!` log and be
-/// silently omitted from the result. The retriever does NOT crash and
-/// returns whatever real memories *did* hydrate.
 #[tokio::test]
-#[should_panic(expected = "T0.1.8 Phase 2")]
 async fn adversarial_deleted_but_not_purged_memory() {
     let t = make_test_retriever().await;
     let b = boundary("work");
-    // Insert a real memory, then upsert a fake vector row whose ID has
-    // no corresponding metadata row — simulates the "delete from
-    // metadata succeeded, vector cascade failed" partial-state.
     let real = make_memory("real memory", &b);
     insert_memory_with_drift(&t, &real, 1).await;
-    let fake_id = vault_core::MemoryId::new();
-    let mut emb = vec![0.0_f32; vault_embedding::EMBEDDING_DIM];
+    // Orphan vector row: present in LanceDB, absent from MetadataStore.
+    let fake_id = MemoryId::new();
+    let mut emb = vec![0.0_f32; EMBEDDING_DIM];
     emb[0] = 1.0;
     t.vectors
         .upsert(&fake_id, &emb, &b)
         .await
         .expect("orphan vector upsert");
-    // Retrieval must not crash; it should return the one real memory
-    // (and warn about the orphan).
+    // retrieve() must not crash; orphan must be filtered out.
     let res = t
         .retriever
         .retrieve(query("anything", vec![b], 10))
@@ -338,68 +322,128 @@ async fn adversarial_deleted_but_not_purged_memory() {
         res.iter().any(|r| r.memory.id == real.id),
         "real memory must still be returned"
     );
+    // The `warn!` is emitted by `get_memories_batch` but log capture
+    // requires a `tracing-subscriber` test fixture not currently wired.
+    // Phase 3 hardening could add log-line assertion.
 }
 
 // =============================================================================
-// 13. get_memories_batch order preservation (Phase 2 dep)
+// 13. get_memories_batch order preservation
 // =============================================================================
 
-/// `MetadataStore::get_memories_batch(&[a, b, c])` returns memories in
-/// that exact input order. Phase 2 ships `get_memories_batch`; until
-/// then this test compiles cleanly because the body doesn't reference
-/// the not-yet-existing method.
 #[tokio::test]
-#[ignore = "T0.1.8 Phase 2: depends on MetadataStore::get_memories_batch"]
 async fn get_memories_batch_preserves_input_order() {
-    unimplemented!("T0.1.8 Phase 2");
+    let t = make_test_retriever().await;
+    let b = boundary("work");
+    let mems: Vec<_> = (0..5)
+        .map(|i| make_memory(&format!("mem-{i}"), &b))
+        .collect();
+    for m in &mems {
+        t.metadata.create_memory(m).await.expect("create");
+    }
+    // Query in reverse order — assert returned Vec preserves input order.
+    let ids: Vec<MemoryId> = mems.iter().map(|m| m.id).rev().collect();
+    let out = t
+        .metadata
+        .get_memories_batch(&ids)
+        .await
+        .expect("batch fetch");
+    assert_eq!(out.len(), 5);
+    for (got, expected_id) in out.iter().zip(ids.iter()) {
+        assert_eq!(got.id, *expected_id, "input-order preservation broken");
+    }
 }
 
 // =============================================================================
-// 14. get_memories_batch partial-hit (Phase 2 dep)
+// 14. get_memories_batch partial-hit (warns + omits)
 // =============================================================================
 
-/// `MetadataStore::get_memories_batch(&[a, b_missing, c])` returns
-/// `[a, c]` and emits a `warn!` for `b_missing`. Phase 2 implementation.
 #[tokio::test]
-#[ignore = "T0.1.8 Phase 2: depends on MetadataStore::get_memories_batch"]
 async fn get_memories_batch_partial_hit_warns_and_omits() {
-    unimplemented!("T0.1.8 Phase 2");
+    let t = make_test_retriever().await;
+    let b = boundary("work");
+    let a = make_memory("a", &b);
+    let c = make_memory("c", &b);
+    t.metadata.create_memory(&a).await.expect("create a");
+    t.metadata.create_memory(&c).await.expect("create c");
+    let b_missing = MemoryId::new();
+    let out = t
+        .metadata
+        .get_memories_batch(&[a.id, b_missing, c.id])
+        .await
+        .expect("batch fetch");
+    // b_missing omitted; a and c returned in input order.
+    assert_eq!(out.len(), 2);
+    assert_eq!(out[0].id, a.id);
+    assert_eq!(out[1].id, c.id);
 }
 
 // =============================================================================
-// 15. Audit-event round-trip on success (Phase 2 dep)
+// 15. Audit-event round-trip on success (v1.2 shape — no query_hash)
 // =============================================================================
 
-/// One retrieve() → one new audit_log row with `action =
-/// "retrieval.query"` and details_json containing the v1.2 fields:
-/// query_length, boundary_count, result_count, max_results,
-/// score_threshold, include_archived, latency_ms. Critically: NO
-/// `query_hash` (v1.2 dropped that under ADR-021 reversal).
 #[tokio::test]
-#[ignore = "T0.1.8 Phase 2: depends on AuditEventType::RetrievalQuery variant"]
 async fn audit_event_round_trip_v1_2_shape() {
-    unimplemented!("T0.1.8 Phase 2");
+    let t = make_test_retriever().await;
+    let b = boundary("work");
+    let m = make_memory("seed", &b);
+    insert_memory_with_drift(&t, &m, 1).await;
+    let _ = t
+        .retriever
+        .retrieve(query("anything", vec![b], 5))
+        .await
+        .expect("retrieve");
+    let events = t.metadata.list_audit_events(100).await.expect("audit");
+    let last = events.last().expect("event");
+    assert_eq!(last.event_type, AuditEventType::RetrievalQuery);
+    assert_eq!(last.result, AuditResult::Success);
+    let d = &last.details_json;
+    // Watch-point #3: every v1.2 field present.
+    for key in [
+        "boundary_count",
+        "include_archived",
+        "latency_ms",
+        "max_results",
+        "query_length",
+        "result_count",
+        "score_threshold",
+    ] {
+        assert!(d.contains(&format!("\"{key}\"")), "missing {key} in {d}");
+    }
+    // Watch-point #3: query_hash MUST NOT appear (v1.2 dropped salt scheme).
+    assert!(
+        !d.contains("query_hash"),
+        "v1.2 must NOT include query_hash; got {d}"
+    );
 }
 
 // =============================================================================
 // 16. Audit-event chain integrity after retrieve()
 // =============================================================================
 
-/// After a retrieve(), `MetadataStore::verify_audit_chain()` must
-/// return `Ok(())`. The new audit event participates in the chain
-/// (BRD §11.9.2 / T0.1.3) without breaking it.
 #[tokio::test]
-#[ignore = "T0.1.8 Phase 2: depends on AuditEventType::RetrievalQuery variant"]
 async fn audit_event_chain_integrity_after_retrieve() {
-    unimplemented!("T0.1.8 Phase 2");
+    let t = make_test_retriever().await;
+    let b = boundary("work");
+    let m = make_memory("chain-test", &b);
+    insert_memory_with_drift(&t, &m, 1).await;
+    let _ = t
+        .retriever
+        .retrieve(query("chain-test", vec![b], 5))
+        .await
+        .expect("retrieve");
+    // The full audit chain (memory.create from create_memory + retrieval.query
+    // from retrieve) must verify cleanly.
+    t.metadata
+        .verify_audit_chain()
+        .await
+        .expect("audit chain must remain valid after retrieve()");
 }
 
 // =============================================================================
 // 17. Perf gate (BRD §5.5: end-to-end retrieval < 200ms over 1k memories)
 // =============================================================================
 
-/// `#[ignore]`-d so it runs only via `cargo test -- --ignored`. Mirrors
-/// the T0.1.7 perf-gate pattern (test 6 in vault-embedding).
 #[tokio::test]
 #[ignore = "perf gate: run via `cargo test -p vault-retrieval -- --ignored`"]
 async fn end_to_end_retrieval_latency_under_200ms_with_1k_memories() {
@@ -421,13 +465,4 @@ async fn end_to_end_retrieval_latency_under_200ms_with_1k_memories() {
         elapsed.as_millis() < 200,
         "perf gate violated: {elapsed:?} > 200ms"
     );
-}
-
-// Suppress the "unused" warning on RetrievalOptions / MAX_RESULTS_CAP
-// imports in Phase 1. Phase 2/3 lights them up via the threshold +
-// over-cap tests.
-#[allow(dead_code)]
-fn _phase_1_keepalive() {
-    let _ = RetrievalOptions::default();
-    let _ = MAX_RESULTS_CAP;
 }
