@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 5da14a5defdef51f29b781ea121414e9a80e1a15bf45acd632e7706c6b9c2487 # shrinks to boundary_names = ["A", "a", "0"], memory_counts = [0, 0], auth_bitmask = 3125759752

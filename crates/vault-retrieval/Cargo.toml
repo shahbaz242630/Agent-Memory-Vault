@@ -44,3 +44,6 @@ tokio = { workspace = true }
 tokio-test.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
+# tracing-test — used in tests/retrieval_tests.rs to verify the cross-crate
+# `warn!` from get_memories_batch's orphan-id branch fires (Phase 3 item 2).
+tracing-test.workspace = true

@@ -294,7 +294,15 @@ async fn adversarial_query_length_exact_cap_and_one_over() {
 // 12. Adversarial: deleted-but-not-purged memory (LanceDB has it, MetadataStore doesn't)
 // =============================================================================
 
+/// `#[traced_test]` (Phase 3) installs a thread-local subscriber that
+/// captures `tracing` events emitted during the test. Cross-crate
+/// emission works: the `warn!` fires in vault-storage's
+/// `MetadataStore::get_memories_batch::missing-id` branch, and
+/// `logs_contain` finds it from the vault-retrieval test thread. Per
+/// the tracing-test docs, this captures only the calling thread's
+/// events — concurrent cargo test parallelism is safe.
 #[tokio::test]
+#[tracing_test::traced_test]
 async fn adversarial_deleted_but_not_purged_memory() {
     let t = make_test_retriever().await;
     let b = boundary("work");
@@ -322,9 +330,30 @@ async fn adversarial_deleted_but_not_purged_memory() {
         res.iter().any(|r| r.memory.id == real.id),
         "real memory must still be returned"
     );
-    // The `warn!` is emitted by `get_memories_batch` but log capture
-    // requires a `tracing-subscriber` test fixture not currently wired.
-    // Phase 3 hardening could add log-line assertion.
+    // Phase 3: assert the cross-crate `warn!` from
+    // `MetadataStore::get_memories_batch` (missing-id branch) actually
+    // fires. The exact log message lives in vault-storage's
+    // metadata_store.rs and pins this contract — if the message
+    // changes there, this assertion fails loudly and the operator log
+    // semantics are re-reviewed at the same time.
+    //
+    // We bypass the macro-injected `logs_contain` (which scopes by the
+    // test function name) and call the internal API with scope
+    // `"vault_storage"` instead — the warn fires from a `spawn_blocking`
+    // worker thread that doesn't carry the test's `info_span` context,
+    // so the formatted line contains ` vault_storage:` (the event's
+    // target prefix) but not the test's span name. The
+    // `no-env-filter` feature on `tracing-test` (workspace dep) ensures
+    // vault_storage events reach the capture buffer in the first place
+    // — without it, the default `vault_retrieval=trace` filter drops
+    // them silently.
+    assert!(
+        tracing_test::internal::logs_with_scope_contain(
+            "vault_storage",
+            "get_memories_batch: id not found in metadata store",
+        ),
+        "expected warn! from get_memories_batch's missing-id branch"
+    );
 }
 
 // =============================================================================
@@ -444,8 +473,36 @@ async fn audit_event_chain_integrity_after_retrieve() {
 // 17. Perf gate (BRD §5.5: end-to-end retrieval < 200ms over 1k memories)
 // =============================================================================
 
+/// **Status: investigation deferred to post-T0.1.10** — see HANDOFF.md
+/// tech-debt entry "vault-retrieval perf gate — investigation deferred."
+///
+/// First end-to-end run of this gate (T0.1.8 Phase 3, 2026-05-01, idle
+/// machine + fresh build cache) measured **412ms** (run 1) and
+/// **1,852ms** (run 2) — both well over the 200ms BRD §5.5 ceiling.
+/// Phase 1 had `retrieve()` as `unimplemented!()` so this gate had
+/// never actually executed before; Phase 2 left it `#[ignore]`-d.
+///
+/// **Suspected cause:** LanceDB fragmentation. The setup loop does
+/// 1000 individual `vectors.upsert` calls, creating 1000 fragments;
+/// without an explicit vector index, search falls back to per-fragment
+/// full-scan cosine k-NN, so latency grows roughly
+/// `O(fragments × rows_per_fragment)`. Production V0.1 writes
+/// memories one-at-a-time, so fragmentation accumulates similarly —
+/// this isn't a synthetic-fixture artefact, it's a real V0.1 perf
+/// concern surfaced by the gate.
+///
+/// **Why not fix in Phase 3:** lowering the fixture count, adding
+/// compaction in setup, or implementing indexing each papers over or
+/// pre-empts the real concern. Right time to investigate is
+/// post-T0.1.10 when integration smoke surfaces realistic workload
+/// patterns. Phase 3 ships proptest + warn-log assertion as the
+/// substantive deliverables; this gate stays honestly deferred.
+///
+/// The `assert!(elapsed.as_millis() < 200, ...)` line below stays
+/// load-bearing for whenever the investigation lands — the gate is
+/// preserved as the contract pin even though it's currently `#[ignore]`-d.
 #[tokio::test]
-#[ignore = "perf gate: run via `cargo test -p vault-retrieval -- --ignored`"]
+#[ignore = "T0.1.8 Phase 3 finding: gate exceeds 200ms ceiling on real measurement (412ms / 1852ms). Investigation deferred to post-T0.1.10. See HANDOFF.md tech-debt 'vault-retrieval perf gate — investigation deferred'."]
 async fn end_to_end_retrieval_latency_under_200ms_with_1k_memories() {
     let t = make_test_retriever().await;
     let b = boundary("work");

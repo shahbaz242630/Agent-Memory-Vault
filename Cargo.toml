@@ -143,6 +143,19 @@ tokio-test = "=0.4.5"
 # mockall — caret pin; exact-pin when first wired into a crate's [dev-dependencies].
 mockall = "0.13"
 tempfile = "=3.27.0"
+# tracing-test (T0.1.8 Phase 3) — captures `tracing` events emitted during a
+# `#[traced_test]`-annotated test so we can assert specific log lines fire.
+# Used in vault-retrieval to verify the cross-crate `warn!` from
+# vault-storage's `MetadataStore::get_memories_batch` orphan-id branch
+# actually emits when the orphan-row test path runs. Exact-pinned per
+# BRD §2.9 / T0.1.5b at first use.
+#
+# `no-env-filter` feature: the default macro-installed env filter is
+# `{calling_crate}=trace`, which drops events from any other crate
+# before they reach the capture buffer. Phase 3 needs to capture
+# vault_storage events from a vault_retrieval test, so we widen the
+# filter to `trace` (capture everything) via this feature flag.
+tracing-test = { version = "=0.2.6", features = ["no-env-filter"] }
 
 [profile.release]
 opt-level = 3
