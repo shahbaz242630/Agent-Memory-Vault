@@ -191,6 +191,11 @@ async fn test_6_embed_within_100ms_budget() {
         .await
         .expect("embed");
     let elapsed = start.elapsed();
+    // Visible-on-pass diagnostic so the margin against the BRD §5.3 100ms
+    // ceiling is captured in the test output (not just "PASS"). Useful on
+    // any future hardware where someone runs `cargo test -- --ignored` and
+    // wants to know how much headroom we have.
+    eprintln!("test_6_embed_within_100ms_budget: elapsed = {elapsed:?}");
     assert!(
         elapsed.as_millis() <= 100,
         "single embed must be ≤100ms per BRD §5.3; got {elapsed:?}"
