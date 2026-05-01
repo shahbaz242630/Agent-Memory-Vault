@@ -302,9 +302,12 @@ impl MetadataStore {
     ///
     /// **Audit policy: this method does NOT append a per-ID `memory.read`
     /// audit event.** Doing so would inflate the audit log linearly with
-    /// every retrieval. The caller (`SemanticRetriever`) appends a single
-    /// `retrieval.query` event at pipeline level, capturing the batch
-    /// shape rather than per-row reads (T0.1.8_PLAN.md §3 Q-3.5 v1.2).
+    /// every retrieval. Per T0.1.9 §6 audit-removal sub-phase, the
+    /// retrieval pipeline (`SemanticRetriever::retrieve`) does NOT
+    /// audit either — it emits operational `tracing::info!` only.
+    /// Audit accounting moved up to vault-mcp, which appends a single
+    /// `AuditEventType::McpToolInvoke` event per tool dispatch (see
+    /// ADR-024 for the locked details_json schema).
     ///
     /// **SQLite parameter limit.** SQLite's default `SQLITE_LIMIT_VARIABLE_NUMBER`
     /// is 32,766 in modern builds. We reject `ids.len() > 32_000` as
@@ -1120,9 +1123,9 @@ mod tests {
     #[tokio::test]
     async fn get_memories_batch_does_not_append_audit_event() {
         // Per the doc-comment promise: get_memories_batch deliberately
-        // does NOT append per-ID memory.read audit events. The caller
-        // (vault-retrieval::SemanticRetriever) appends a single
-        // retrieval.query event at pipeline level.
+        // does NOT append per-ID memory.read audit events. T0.1.9 §6
+        // moved audit accounting up to vault-mcp's `mcp.tool_invoke`
+        // event; vault-retrieval emits operational `tracing::info!` only.
         let (_tmp, store) = make_store().await;
         let m = sample_memory("work", MemoryType::Semantic, "no-audit");
         store.create_memory(&m).await.unwrap();

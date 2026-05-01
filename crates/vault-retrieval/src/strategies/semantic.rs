@@ -24,38 +24,44 @@
 //!         result = scored.enumerate().map(|(rank, (m, score))| RetrievedMemory)
 //!         Ok(result)
 //!     latency_ms = start.elapsed()
-//!     append_audit(query, result, latency_ms)              # Q-3.5 v1.2 — every call
-//!     result                                               # propagate inner Ok or Err
+//!     tracing::info!(target: "vault_retrieval::query", ...)  # operational only
+//!     result                                                 # propagate inner Ok or Err
 //! ```
 //!
-//! Three load-bearing watch-points (per Shahbaz, lock at implementation):
+//! ## T0.1.9 audit-removal sub-phase (v1.3 plan §6)
+//!
+//! T0.1.8 v1.2 emitted an `AuditEventType::RetrievalQuery` audit event from
+//! this pipeline. T0.1.9 §6 moves audit-event accounting up to the MCP
+//! layer — `vault_mcp` is the single audit boundary; this pipeline emits
+//! operational `tracing::info!` only. The contract:
+//!
+//! - **No audit append.** `append_retrieval_audit` was removed; the chain
+//!   gets its `mcp.tool_invoke` entry from the caller instead.
+//! - **Operational `tracing::info!` retained.** Same diagnostic fields as
+//!   the old audit shape (query_length, boundary_count, result_count,
+//!   max_results, score_threshold, include_archived, latency_ms, error?)
+//!   emitted as structured `tracing` fields at `target: "vault_retrieval::query"`.
+//!
+//! Two load-bearing watch-points (Phase 2 watch-point #3 — audit shape —
+//! moved to vault-mcp; the two below stay local to this pipeline):
 //!
 //! 1. **Empty boundaries (Q1)** — short-circuit returns `Ok(vec![])` BEFORE any
-//!    `embedder` or `vector_store` round-trip; the audit append still runs
-//!    with `boundary_count = 0` and `result_count = 0`. Empty-auth must not
-//!    accidentally bypass the audit chain.
+//!    `embedder` or `vector_store` round-trip; the operational `tracing::info!`
+//!    still emits with `boundary_count = 0` and `result_count = 0`.
 //! 2. **Score-transform site (Q7)** — `score = 1.0 - distance` happens
 //!    *exactly once*, at the boundary right after `vector_store.search`,
 //!    before any sort / threshold / take. Tests 5 (cosine sanity) and
 //!    8 (score range) catch transform-direction errors loudly.
-//! 3. **Audit shape v1.2 (Q-3.5)** — `details_json` keys are
-//!    `boundary_count, error?, include_archived, latency_ms, max_results,
-//!    query_length, result_count, score_threshold` (alphabetic = canonical
-//!    sorted order via `BTreeMap`). **No `query_hash`** — the salt scheme
-//!    was reversed in v1.2 because audit logs are local-only.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
 use tracing::instrument;
 use vault_core::{Memory, MemoryId, VaultError, VaultResult};
 use vault_embedding::EmbeddingProvider;
-use vault_storage::{
-    ActorKind, AuditEventType, AuditResult, MetadataStore, PendingAuditEvent, VectorStore,
-};
+use vault_storage::{MetadataStore, VectorStore};
 
 use crate::retriever::{
     RetrievalQuery, RetrievedMemory, Retriever, MAX_QUERY_BYTES, MAX_RESULTS_CAP,
@@ -66,7 +72,8 @@ use crate::retriever::{
 /// Holds three reference-counted handles:
 ///
 /// - `metadata_store` — batched memory hydration via `get_memories_batch`
-///   (Q10) AND audit-event append at retrieval-pipeline level (Q-3.5).
+///   (Q10). T0.1.9 §6 moved audit-event accounting up to vault-mcp;
+///   `MetadataStore` is no longer used for audit append from this layer.
 /// - `embedding_provider` — embeds the user's query text to a 384-dim
 ///   L2-normalised vector.
 /// - `vector_store` — runs cosine k-NN with the boundary filter applied
@@ -216,74 +223,6 @@ impl SemanticRetriever {
             .collect();
         Ok(result)
     }
-
-    /// Build the v1.2-shape audit event for a completed retrieval and
-    /// append it to the local audit chain.
-    ///
-    /// Watch-point #3: `details_json` keys are exactly
-    /// `boundary_count, error?, include_archived, latency_ms, max_results,
-    /// query_length, result_count, score_threshold` — alphabetical order
-    /// via `BTreeMap` gives the canonical sorted-key form per BRD §11.9.2.
-    /// **No `query_hash`** (the salt scheme was reversed in v1.2 because
-    /// audit logs are local-only in V0.1 / V0.2).
-    async fn append_retrieval_audit(
-        &self,
-        query: &RetrievalQuery,
-        result: &VaultResult<Vec<RetrievedMemory>>,
-        latency_ms: u64,
-    ) -> VaultResult<()> {
-        let trimmed_len = query.query_text.trim().len() as u32;
-        let boundary_count = query.authorized_boundaries.len() as u32;
-        let max_results = query.max_results as u32;
-        let include_archived = query.options.include_archived;
-        let score_threshold_value = match query.options.score_threshold {
-            Some(t) => json!(t),
-            None => Value::Null,
-        };
-
-        let (audit_result, result_count, error_field) = match result {
-            Ok(v) => (AuditResult::Success, v.len() as u32, None),
-            Err(e) => (AuditResult::Error, 0_u32, Some(e.to_string())),
-        };
-
-        // BTreeMap iterates by sorted key — that's the canonical form
-        // serde_json serialises (we don't enable serde_json's
-        // `preserve_order` feature, so the canonical-sorted invariant
-        // holds without extra ceremony).
-        let mut details: BTreeMap<&'static str, Value> = BTreeMap::new();
-        details.insert("boundary_count", json!(boundary_count));
-        if let Some(err) = error_field {
-            details.insert("error", json!(err));
-        }
-        details.insert("include_archived", json!(include_archived));
-        details.insert("latency_ms", json!(latency_ms));
-        details.insert("max_results", json!(max_results));
-        details.insert("query_length", json!(trimmed_len));
-        details.insert("result_count", json!(result_count));
-        details.insert("score_threshold", score_threshold_value);
-
-        let details_json = serde_json::to_string(&details).map_err(|e| {
-            VaultError::Serde(format!("retrieval audit details_json serialise: {e}"))
-        })?;
-
-        let pending = PendingAuditEvent {
-            event_type: AuditEventType::RetrievalQuery,
-            resource_type: None,
-            resource_id: None,
-            // No single boundary — retrieval spans `boundary_count`
-            // boundaries, recorded inside `details_json`. The audit
-            // table's nullable `boundary` column matches this.
-            boundary: None,
-            actor_kind: ActorKind::System,
-            actor_name: None,
-            user_id: None,
-            device_id: None,
-            result: audit_result,
-            details_json,
-        };
-        self.metadata_store.append_audit_event(pending).await?;
-        Ok(())
-    }
 }
 
 #[async_trait]
@@ -301,20 +240,53 @@ impl Retriever for SemanticRetriever {
         let start = Instant::now();
         let result = self.retrieve_inner(&query).await;
         let latency_ms = start.elapsed().as_millis() as u64;
-        self.append_retrieval_audit(&query, &result, latency_ms)
-            .await?;
+
+        // T0.1.9 §6: operational logging only — audit accounting moved
+        // to the MCP layer (`mcp.tool_invoke` event). Same diagnostic
+        // shape as the old v1.2 audit `details_json` so the operator
+        // log retains its forensic value, just at info-log level not
+        // audit chain level.
+        let trimmed_len = query.query_text.trim().len();
+        let (result_count, error_str) = match &result {
+            Ok(v) => (v.len(), None::<String>),
+            Err(e) => (0_usize, Some(e.to_string())),
+        };
+        tracing::info!(
+            target: "vault_retrieval::query",
+            query_length = trimmed_len,
+            boundary_count = query.authorized_boundaries.len(),
+            result_count = result_count,
+            max_results = query.max_results,
+            include_archived = query.options.include_archived,
+            score_threshold = ?query.options.score_threshold,
+            latency_ms = latency_ms,
+            error = ?error_str,
+            "retrieval pipeline completed"
+        );
+
         result
     }
 }
 
 // =============================================================================
-// Unit tests — Phase 2 (real bodies; should_panic markers removed)
+// Unit tests — T0.1.9 v1.3 (audit-removal sub-phase: 3 audit-shape tests
+// rewritten to assert `tracing::info!` emission via `tracing-test`)
 // =============================================================================
 //
-// Coverage matches T0.1.8_PLAN.md §5 v1.2 (13 unit tests). The 10
-// formerly-`should_panic` tests now run real assertions; the 3
-// audit-event tests un-ignore now that `AuditEventType::RetrievalQuery`
-// exists.
+// Coverage matches T0.1.8_PLAN.md §5 v1.2 (13 unit tests), with
+// T0.1.9 §6 removing the audit-append from `Retriever::retrieve`. The
+// 3 audit-event tests (formerly `audit_event_appended_*` /
+// `audit_event_latency_ms_is_recorded`) become tracing-event tests:
+// `tracing_event_emitted_*` / `tracing_event_latency_ms_is_recorded`.
+// Tests #1 and #2 (which previously asserted audit fallout) now assert
+// the equivalent `tracing::info!` emission.
+//
+// `#[tracing_test::traced_test]` installs a thread-local subscriber
+// that captures `tracing` events emitted during the test. The
+// `no-env-filter` feature on the workspace `tracing-test` dep ensures
+// `vault_retrieval` events reach the capture buffer (the default
+// macro-installed env filter is `{calling_crate}=trace`, which is fine
+// here since the events fire from this crate).
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,9 +296,7 @@ mod tests {
     use tempfile::tempdir;
     use vault_core::{Boundary, Memory, MemoryType, NewMemory, VaultError};
     use vault_embedding::{EmbeddingProvider, EMBEDDING_DIM};
-    use vault_storage::{
-        AuditEventType, AuditResult, LanceVectorStore, MetadataStore, SqlCipherKey, VectorStore,
-    };
+    use vault_storage::{LanceVectorStore, MetadataStore, SqlCipherKey, VectorStore};
 
     // --- test infrastructure --------------------------------------------
 
@@ -450,6 +420,7 @@ mod tests {
     // --- 1. embedder error propagation ----------------------------------
 
     #[tokio::test]
+    #[tracing_test::traced_test]
     async fn embed_query_path_propagates_embedder_error() {
         let b = make_bundle().await;
         let res = b
@@ -457,16 +428,26 @@ mod tests {
             .retrieve(query("FAIL me please", vec![boundary("work")], 10))
             .await;
         assert!(matches!(res, Err(VaultError::Embedding(_))));
-        // The audit event still appended (error path).
-        let events = b.metadata.list_audit_events(100).await.expect("audit list");
-        let last = events.last().expect("at least one event");
-        assert_eq!(last.event_type, AuditEventType::RetrievalQuery);
-        assert_eq!(last.result, AuditResult::Error);
+        // T0.1.9 §6: operational tracing::info! emission carries the
+        // diagnostic shape the audit chain used to. Error path
+        // populates the `error` field with the propagated VaultError.
+        assert!(
+            tracing_test::internal::logs_with_scope_contain(
+                "vault_retrieval",
+                "retrieval pipeline completed",
+            ),
+            "expected info-log emission from retrieve() error path"
+        );
+        assert!(
+            tracing_test::internal::logs_with_scope_contain("vault_retrieval", "stub: induced"),
+            "error field must contain the underlying embedder error message"
+        );
     }
 
     // --- 2. empty-boundaries short circuit ------------------------------
 
     #[tokio::test]
+    #[tracing_test::traced_test]
     async fn empty_authorized_boundaries_returns_empty_result_no_round_trip() {
         let b = make_bundle().await;
         let pre_calls = b.embedder.call_count();
@@ -481,12 +462,18 @@ mod tests {
             pre_calls,
             "watch-point #1: embedder must not be called"
         );
-        // Audit event still appended with boundary_count = 0, result_count = 0.
-        let events = b.metadata.list_audit_events(100).await.expect("audit");
-        let last = events.last().expect("audit event");
-        assert_eq!(last.event_type, AuditEventType::RetrievalQuery);
-        assert!(last.details_json.contains(r#""boundary_count":0"#));
-        assert!(last.details_json.contains(r#""result_count":0"#));
+        // T0.1.9 §6: tracing::info! still emits with boundary_count=0
+        // and result_count=0. Empty-auth is a legitimate observability
+        // data point, not a bypass — same posture as the old audit
+        // contract, just at info-log level.
+        assert!(
+            tracing_test::internal::logs_with_scope_contain("vault_retrieval", "boundary_count=0",),
+            "watch-point #1: tracing emission must record boundary_count=0"
+        );
+        assert!(
+            tracing_test::internal::logs_with_scope_contain("vault_retrieval", "result_count=0",),
+            "watch-point #1: tracing emission must record result_count=0"
+        );
     }
 
     // --- 3. query text validation ---------------------------------------
@@ -700,99 +687,85 @@ mod tests {
         );
     }
 
-    // --- 11. audit event on success path --------------------------------
+    // --- 11. tracing event on success path ------------------------------
 
     #[tokio::test]
-    async fn audit_event_appended_on_success() {
+    #[tracing_test::traced_test]
+    async fn tracing_event_emitted_on_success() {
         let bundle = make_bundle().await;
         let work = boundary("work");
         let m = make_memory("hello", &work);
         insert(&bundle, &m, 1).await;
-        let pre = bundle
-            .metadata
-            .list_audit_events(1000)
-            .await
-            .expect("audit pre")
-            .len();
         let _ = bundle
             .retriever
             .retrieve(query("hello", vec![work], 5))
             .await
             .expect("retrieve");
-        let events = bundle
-            .metadata
-            .list_audit_events(1000)
-            .await
-            .expect("audit post");
-        assert_eq!(events.len(), pre + 1, "exactly one new audit event");
-        let last = events.last().unwrap();
-        assert_eq!(last.event_type, AuditEventType::RetrievalQuery);
-        assert_eq!(last.result, AuditResult::Success);
-        // Watch-point #3: v1.2 shape — fields present, no query_hash.
-        let d = &last.details_json;
-        for key in [
-            "boundary_count",
-            "include_archived",
-            "latency_ms",
-            "max_results",
-            "query_length",
-            "result_count",
-            "score_threshold",
+        // T0.1.9 §6: every diagnostic field from the old audit
+        // `details_json` shape carries forward as a structured tracing
+        // field. The default formatter renders `field=value`, so we
+        // assert each expected field name appears in the captured log.
+        for field_eq in [
+            "query_length=",
+            "boundary_count=",
+            "result_count=",
+            "max_results=",
+            "include_archived=",
+            "score_threshold=",
+            "latency_ms=",
         ] {
-            assert!(d.contains(&format!("\"{key}\"")), "missing {key} in {d}");
+            assert!(
+                tracing_test::internal::logs_with_scope_contain("vault_retrieval", field_eq),
+                "expected tracing field '{field_eq}' in retrieval pipeline log"
+            );
         }
+        // The "no query_hash" invariant from T0.1.8 v1.2 watch-point #3
+        // carries forward — the v1.2 ADR-021 salt scheme reversal stays
+        // applied (audit logs are local-only; no need for query hashing).
         assert!(
-            !d.contains("query_hash"),
-            "watch-point #3: v1.2 must NOT include query_hash; got {d}"
+            !tracing_test::internal::logs_with_scope_contain("vault_retrieval", "query_hash"),
+            "T0.1.9 §6 must NOT introduce query_hash in tracing emission"
         );
     }
 
-    // --- 12. audit event on failure path --------------------------------
+    // --- 12. tracing event on failure path ------------------------------
 
     #[tokio::test]
-    async fn audit_event_appended_on_failure_with_error_field() {
+    #[tracing_test::traced_test]
+    async fn tracing_event_emitted_on_failure_with_error_field() {
         let bundle = make_bundle().await;
         let res = bundle
             .retriever
             .retrieve(query("FAIL stub", vec![boundary("work")], 5))
             .await;
         assert!(matches!(res, Err(VaultError::Embedding(_))));
-        let events = bundle
-            .metadata
-            .list_audit_events(1000)
-            .await
-            .expect("audit");
-        let last = events.last().unwrap();
-        assert_eq!(last.event_type, AuditEventType::RetrievalQuery);
-        assert_eq!(last.result, AuditResult::Error);
+        // The `error = ?error_str` field renders as `error=Some("...")`
+        // in the formatted log line (Debug format for the Option).
         assert!(
-            last.details_json.contains(r#""error":"#),
-            "error field must be populated on failure path: {}",
-            last.details_json
+            tracing_test::internal::logs_with_scope_contain("vault_retrieval", "error=Some("),
+            "error field must be Some(...) on failure path"
+        );
+        assert!(
+            tracing_test::internal::logs_with_scope_contain("vault_retrieval", "stub: induced"),
+            "error field must carry the underlying VaultError message"
         );
     }
 
-    // --- 13. audit event records latency_ms -----------------------------
+    // --- 13. tracing event records latency_ms ---------------------------
 
     #[tokio::test]
-    async fn audit_event_latency_ms_is_recorded() {
+    #[tracing_test::traced_test]
+    async fn tracing_event_latency_ms_is_recorded() {
         let bundle = make_bundle().await;
         let _ = bundle
             .retriever
             .retrieve(query("anything", vec![boundary("work")], 5))
             .await
             .expect("retrieve");
-        let events = bundle
-            .metadata
-            .list_audit_events(1000)
-            .await
-            .expect("audit");
-        let last = events.last().unwrap();
         // Field-existence check — we don't bound the value (CI flakiness).
         assert!(
-            last.details_json.contains(r#""latency_ms":"#),
-            "latency_ms field must be present in details_json: {}",
-            last.details_json
+            tracing_test::internal::logs_with_scope_contain("vault_retrieval", "latency_ms="),
+            "latency_ms field must appear in retrieval pipeline log"
         );
     }
 }

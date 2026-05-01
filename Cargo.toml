@@ -55,13 +55,16 @@ serde_json = "=1.0.149"
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "json"] }
 
-# Time (BRD §4.1). Pinned to "=0.4.38" to dodge a transitive incompatibility:
-# chrono 0.4.44 added Datelike::quarter(), which conflicts with arrow-arith
-# 52.x's ChronoDateExt::quarter(), causing a "multiple `quarter` found"
-# compile error in arrow-arith via lancedb's transitive deps. 0.4.38 is the
-# last release pre-conflict that we know compiles cleanly with arrow 52.1.
-# Tracked in HANDOFF.md tech-debt; revisit when arrow updates past the conflict.
-chrono = { version = "=0.4.38", features = ["serde"] }
+# Time (BRD §4.1). Pinned to "=0.4.39" to keep below chrono 0.4.44 which
+# added Datelike::quarter() (conflicts with arrow-arith 52.x's
+# ChronoDateExt::quarter() — "multiple `quarter` found" in arrow-arith
+# via lancedb's transitive deps). Bumped from 0.4.38 → 0.4.39 at T0.1.9
+# Phase 1 because rmcp 1.5.0 → schemars 1.0 → requires chrono ^0.4.39
+# (a hard dep, not gated by the schemars cargo feature). 0.4.39 satisfies
+# schemars's lower bound while staying safely below 0.4.44's conflict.
+# Tracked in HANDOFF.md tech-debt; revisit when arrow updates past 0.4.44
+# (or when we drop chrono entirely in favour of std::time).
+chrono = { version = "=0.4.39", features = ["serde"] }
 
 # UUIDs (BRD §4.1)
 uuid = { version = "=1.23.1", features = ["v4", "v7", "serde"] }
@@ -110,8 +113,17 @@ yrs = "0.21"
 dryoc = "=0.7.2"
 reqwest = { version = "=0.12.28", features = ["json", "rustls-tls"] }
 
-# MCP (BRD §4.5) — caret pin; exact-pin at T0.1.9 (vault-mcp first use).
-rmcp = "0.16"
+# MCP (BRD §4.5) — exact-pinned at T0.1.9 (vault-mcp first use) per BRD §2.9 /
+# T0.1.5b discipline. rmcp 1.5.0 was released 2026-04-16, one day after the
+# OX Security April 15 stdio RCE class disclosure. ADR-026 documents the
+# host-vs-server scope analysis: vault-mcp is a stdio SERVER (spawned, not
+# spawner) — structurally not in the threat surface — so this pin is for
+# server-side surface only. When future tasks introduce MCP-host
+# functionality (T0.1.11 vault-tauri or successor), the threat surface
+# revisits per ADR-026 forward pointer. Features (server / transport-io /
+# macros / etc.) declared per-crate in `vault-mcp/Cargo.toml` so the set
+# stays scoped to actual usage.
+rmcp = "=1.5.0"
 
 # CLI (T0.1.6 Phase C1b — vault-cli operator binary). Exact-pinned per
 # BRD §2.9 from Cargo.lock at first build. The two deps are tightly

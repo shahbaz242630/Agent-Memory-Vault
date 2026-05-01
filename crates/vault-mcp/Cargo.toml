@@ -1,6 +1,6 @@
 [package]
 name = "vault-mcp"
-description = "MCP adapter layer + server. Exposes the vault to AI agents via Model Context Protocol. See BRD §5.7."
+description = "MCP adapter layer + stdio server. Exposes the vault to AI agents via Model Context Protocol. See BRD §5.7 / T0.1.9_PLAN.md."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,3 +9,62 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Async traits for the Adapter abstraction (memory.search / write / update / delete).
+async-trait.workspace = true
+
+# Tokio — rmcp's stdio transport runs on tokio I/O. Server lifecycle uses
+# spawn + select for graceful shutdown.
+tokio = { workspace = true }
+
+# tracing — every tool call emits a structured `tracing::info!` event
+# with `{tool, duration_ms, result, boundary_count}` per ADR-024 + plan §3.5.
+tracing.workspace = true
+
+# Domain types: Boundary (mandatory auth-gate input per ADR-025),
+# MemoryId, VaultError, VaultResult.
+vault-core = { path = "../vault-core" }
+
+# StorageBackend (Phase 2 wires write/update/delete handlers) +
+# AuditEventType::McpToolInvoke (Phase 2 audit append per ADR-024).
+vault-storage = { path = "../vault-storage" }
+
+# Retriever trait (Phase 2 wires the search handler).
+vault-retrieval = { path = "../vault-retrieval" }
+
+# rmcp 1.5.0 — exact-pinned in workspace deps per ADR-026 (pinned 2026-04-16,
+# one day after the OX Security April 15 RCE class disclosure). vault-mcp is
+# a stdio SERVER — structurally not in the host-side threat surface per
+# ADR-026 host-vs-server scope analysis.
+#
+# Features:
+# - server (default): ServerHandler trait + tool dispatch.
+# - macros (default): #[tool] / #[tool_router] / #[prompt] attribute macros.
+# - transport-io: server-side stdio transport (rmcp::transport::stdio()).
+# - transport-async-rw: generic async-read/write transport (used by the
+#   `initialize` round-trip runtime-confirmation smoke test in Phase 1
+#   to drive the server over a `tokio::io::duplex()` pair instead of
+#   real stdin/stdout).
+#
+# **schemars feature DELIBERATELY excluded** at T0.1.9 Phase 1: rmcp 1.5.0's
+# schemars feature pulls schemars 1.0, which in turn requires chrono ^0.4.39.
+# Our workspace pins `chrono = "=0.4.38"` per ADR-013 to avoid a transitive
+# `Datelike::quarter()` collision in arrow-arith 52.x via lancedb's tree.
+# Path forward: revisit when chrono pin can advance OR when rmcp ships a
+# version that uses schemars 0.8 / makes schemars optional. Tracked in
+# tech-debt; T0.1.9 Phase 1 uses untyped `serde_json::Value` parameters
+# instead of `#[derive(schemars::JsonSchema)]`-typed structs.
+rmcp = { workspace = true, features = ["server", "macros", "transport-io", "transport-async-rw"] }
+
+# serde + serde_json — tool param/result types serialise via serde; rmcp's
+# protocol layer handles the JSON-RPC envelope. Phase 1 uses untyped
+# `serde_json::Value` for tool parameters (see schemars note above).
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+tokio-test.workspace = true
+tempfile.workspace = true
+# tracing-test — used by tool-call observability tests + the audit-append
+# tests in Phase 2.
+tracing-test.workspace = true

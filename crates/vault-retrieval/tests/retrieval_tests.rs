@@ -2,19 +2,18 @@
 //! BRD §7.1). Coverage maps directly to T0.1.8_PLAN.md §5 v1.2 — 16
 //! integration tests + 1 ignored perf gate.
 //!
-//! ## Phase 2 state
+//! ## T0.1.9 §6 audit-removal sub-phase state
 //!
-//! Phase 2 (this commit) implemented `SemanticRetriever::retrieve()` so
-//! every `should_panic` from Phase 1 became a real assertion, and the
-//! 4 previously-`#[ignore]`-d Phase-2-dependent tests un-ignore (they
-//! exercise `MetadataStore::get_memories_batch` and the
-//! `AuditEventType::RetrievalQuery` audit-event variant). The 1
-//! `#[ignore]`-d perf gate stays ignored — runs via
-//! `cargo test -p vault-retrieval -- --ignored`.
+//! T0.1.8 emitted an `AuditEventType::RetrievalQuery` audit event from
+//! every `retrieve()` call. T0.1.9 §6 moves audit-event accounting up
+//! to vault-mcp (`mcp.tool_invoke`) — this layer emits operational
+//! `tracing::info!` only. The 4 audit-shape tests (#3, #4, #15, #16)
+//! are rewritten to assert the equivalent `tracing::info!` emission via
+//! `tracing-test` instead of asserting audit-event side effects.
 //!
-//! Phase 3 lands the heavy proptest wrapper around test 2 (boundary
-//! leak), tightens test 12 (orphan-row warn-log assertion), and any
-//! remaining hardening.
+//! Phase 3 (T0.1.8 prior) added proptest boundary-leak harness +
+//! cross-crate `warn!` log assertion in test #12. Those stay
+//! load-bearing here.
 
 mod common;
 
@@ -22,7 +21,6 @@ use common::{boundary, insert_memory_with_drift, make_memory, make_test_retrieve
 use vault_core::MemoryId;
 use vault_embedding::EMBEDDING_DIM;
 use vault_retrieval::{Retriever, MAX_QUERY_BYTES};
-use vault_storage::{AuditEventType, AuditResult};
 
 // =============================================================================
 // 1. Happy path
@@ -69,10 +67,11 @@ async fn happy_path_returns_top_two_results() {
 // fuzz arbitrary boundary configurations.
 
 // =============================================================================
-// 3. Empty vault returns empty result, audit records result_count = 0
+// 3. Empty vault returns empty result, tracing emits result_count=0
 // =============================================================================
 
 #[tokio::test]
+#[tracing_test::traced_test]
 async fn empty_vault_returns_empty_result_not_error() {
     let t = make_test_retriever().await;
     let res = t
@@ -81,10 +80,12 @@ async fn empty_vault_returns_empty_result_not_error() {
         .await
         .expect("retrieve");
     assert!(res.is_empty(), "empty vault should yield no results");
-    let events = t.metadata.list_audit_events(100).await.expect("audit");
-    let last = events.last().expect("at least one event");
-    assert_eq!(last.event_type, AuditEventType::RetrievalQuery);
-    assert!(last.details_json.contains(r#""result_count":0"#));
+    // T0.1.9 §6: audit accounting moved to MCP layer; this layer emits
+    // structured `tracing::info!` carrying the diagnostic shape.
+    assert!(
+        tracing_test::internal::logs_with_scope_contain("vault_retrieval", "result_count=0"),
+        "empty vault must emit result_count=0 in operational log"
+    );
 }
 
 // =============================================================================
@@ -92,6 +93,7 @@ async fn empty_vault_returns_empty_result_not_error() {
 // =============================================================================
 
 #[tokio::test]
+#[tracing_test::traced_test]
 async fn empty_authorized_boundaries_short_circuits() {
     let t = make_test_retriever().await;
     let pre_calls = t.embedder.call_count();
@@ -106,11 +108,17 @@ async fn empty_authorized_boundaries_short_circuits() {
         pre_calls,
         "watch-point #1: empty boundaries must not invoke the embedder"
     );
-    let events = t.metadata.list_audit_events(100).await.expect("audit");
-    let last = events.last().expect("audit event");
-    assert_eq!(last.event_type, AuditEventType::RetrievalQuery);
-    assert!(last.details_json.contains(r#""boundary_count":0"#));
-    assert!(last.details_json.contains(r#""result_count":0"#));
+    // T0.1.9 §6: empty-auth still emits a tracing event with
+    // boundary_count=0, result_count=0 — same legitimate observability
+    // data point as the old audit posture, just at info-log level.
+    assert!(
+        tracing_test::internal::logs_with_scope_contain("vault_retrieval", "boundary_count=0"),
+        "watch-point #1: tracing emission must record boundary_count=0"
+    );
+    assert!(
+        tracing_test::internal::logs_with_scope_contain("vault_retrieval", "result_count=0"),
+        "watch-point #1: tracing emission must record result_count=0"
+    );
 }
 
 // =============================================================================
@@ -408,11 +416,12 @@ async fn get_memories_batch_partial_hit_warns_and_omits() {
 }
 
 // =============================================================================
-// 15. Audit-event round-trip on success (v1.2 shape — no query_hash)
+// 15. Tracing-event round-trip on success (v1.3 shape — no query_hash)
 // =============================================================================
 
 #[tokio::test]
-async fn audit_event_round_trip_v1_2_shape() {
+#[tracing_test::traced_test]
+async fn tracing_event_round_trip_v1_3_shape() {
     let t = make_test_retriever().await;
     let b = boundary("work");
     let m = make_memory("seed", &b);
@@ -422,47 +431,68 @@ async fn audit_event_round_trip_v1_2_shape() {
         .retrieve(query("anything", vec![b], 5))
         .await
         .expect("retrieve");
-    let events = t.metadata.list_audit_events(100).await.expect("audit");
-    let last = events.last().expect("event");
-    assert_eq!(last.event_type, AuditEventType::RetrievalQuery);
-    assert_eq!(last.result, AuditResult::Success);
-    let d = &last.details_json;
-    // Watch-point #3: every v1.2 field present.
-    for key in [
-        "boundary_count",
-        "include_archived",
-        "latency_ms",
-        "max_results",
-        "query_length",
-        "result_count",
-        "score_threshold",
+    // T0.1.9 §6: every diagnostic field from the old v1.2 audit
+    // `details_json` shape carries forward as a structured tracing
+    // field. The default formatter renders `field=value`.
+    for field_eq in [
+        "query_length=",
+        "boundary_count=",
+        "result_count=",
+        "max_results=",
+        "include_archived=",
+        "score_threshold=",
+        "latency_ms=",
     ] {
-        assert!(d.contains(&format!("\"{key}\"")), "missing {key} in {d}");
+        assert!(
+            tracing_test::internal::logs_with_scope_contain("vault_retrieval", field_eq),
+            "missing tracing field '{field_eq}' in retrieval pipeline log"
+        );
     }
-    // Watch-point #3: query_hash MUST NOT appear (v1.2 dropped salt scheme).
+    // The "no query_hash" invariant from T0.1.8 v1.2 watch-point #3
+    // carries forward — operational logging must not introduce hashing.
     assert!(
-        !d.contains("query_hash"),
-        "v1.2 must NOT include query_hash; got {d}"
+        !tracing_test::internal::logs_with_scope_contain("vault_retrieval", "query_hash"),
+        "v1.3 must NOT introduce query_hash in tracing emission"
     );
 }
 
 // =============================================================================
-// 16. Audit-event chain integrity after retrieve()
+// 16. Audit-chain integrity unaffected by retrieve()
 // =============================================================================
 
+/// T0.1.9 §6 audit-removal: `retrieve()` no longer appends to the audit
+/// chain (the equivalent `mcp.tool_invoke` event lands at the MCP layer
+/// instead). The audit chain still contains `memory.create` entries from
+/// setup; `retrieve()` MUST NOT touch the chain. This test pins that
+/// contract — the chain verifies cleanly after `retrieve()` precisely
+/// because `retrieve()` was a no-op against it.
 #[tokio::test]
-async fn audit_event_chain_integrity_after_retrieve() {
+async fn audit_chain_integrity_unaffected_by_retrieve() {
     let t = make_test_retriever().await;
     let b = boundary("work");
     let m = make_memory("chain-test", &b);
     insert_memory_with_drift(&t, &m, 1).await;
+    let pre_chain_len = t
+        .metadata
+        .list_audit_events(1000)
+        .await
+        .expect("audit pre")
+        .len();
     let _ = t
         .retriever
         .retrieve(query("chain-test", vec![b], 5))
         .await
         .expect("retrieve");
-    // The full audit chain (memory.create from create_memory + retrieval.query
-    // from retrieve) must verify cleanly.
+    let post_chain_len = t
+        .metadata
+        .list_audit_events(1000)
+        .await
+        .expect("audit post")
+        .len();
+    assert_eq!(
+        pre_chain_len, post_chain_len,
+        "T0.1.9 §6: retrieve() must not append audit events (audit moved to MCP layer)"
+    );
     t.metadata
         .verify_audit_chain()
         .await

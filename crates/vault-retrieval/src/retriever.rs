@@ -142,11 +142,14 @@ pub struct RetrievedMemory {
 /// 3. **Sort order:** results are sorted `score DESC`, then
 ///    `memory.created_at DESC` for equal scores.
 /// 4. **Score domain:** every `score` is finite and in `[-1, 1]`.
-/// 5. **Audit trail:** every call appends exactly one
-///    `AuditEventType::RetrievalQuery` event to the local audit chain
-///    (Phase 2 wires this; the trait promise stands now). Failure
-///    paths still append, with `result = error` and a populated
-///    `error` field in `details_json`.
+/// 5. **Operational logging:** every call emits exactly one
+///    structured `tracing::info!(target: "vault_retrieval::query", ...)`
+///    event with the diagnostic shape (query_length, boundary_count,
+///    result_count, max_results, score_threshold, include_archived,
+///    latency_ms, optional error). Failure paths still emit, with
+///    `error = Some("...")`. T0.1.9 §6 moved audit-event accounting up
+///    to the MCP layer (`mcp.tool_invoke`); `Retriever` itself is
+///    audit-neutral, so the chain is unaffected by `retrieve()`.
 #[async_trait]
 pub trait Retriever: Send + Sync {
     /// Run the retrieval pipeline. See trait-level invariants above.

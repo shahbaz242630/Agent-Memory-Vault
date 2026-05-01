@@ -1,13 +1,63 @@
-//! `vault-mcp` — MCP adapter layer + server. Wraps the official `rmcp` SDK behind
-//! a vault-specific abstraction so we can swap MCP implementations or absorb
-//! protocol changes without touching business logic.
+//! `vault-mcp` — MCP adapter layer + stdio server for Memory Vault.
 //!
-//! See `Agent Build Specification.txt` §5.7 for the public API specification.
-//! V0.1 (T0.1.9) ships stdio transport with `memory.search` and `memory.write`.
-//! HTTP/SSE transport is deferred to V1.1+.
+//! See `Agent Build Specification.txt` §5.7 for the public API specification
+//! and `T0.1.9_PLAN.md` for the V0.1 design (5 surfaces, 3-phase split,
+//! ADRs 023 / 024 / 025 / 026).
 //!
-//! Security boundary: this crate enforces mandatory access control. Per BRD §11.4.3,
-//! the boundary filter must be applied at the storage level (not application code)
-//! so buggy retrieval logic cannot return cross-boundary results.
+//! V0.1 (T0.1.9) ships **stdio-only**, **single-user**, **strictly serial**
+//! request handling, with four tools: `memory.search` / `memory.write` /
+//! `memory.update` / `memory.delete`.
+//!
+//! ## Trust boundary (ADR-025 — load-bearing)
+//!
+//! - **UNTRUSTED:** every field of the JSON-RPC request body. Tool args
+//!   from the MCP client (an AI agent) are NEVER read for authorization
+//!   decisions.
+//! - **TRUSTED:** the `authorized_boundaries: Vec<Boundary>` slice handed
+//!   to [`StdioServer::new`] at startup by `Application` after passphrase
+//!   unlock. This is the SOLE auth-gate input.
+//! - **Handlers MUST NOT** parse boundary names from request bodies,
+//!   interpolate request data into auth-gate inputs, or accept boundary
+//!   overrides via headers / metadata. The handler always uses
+//!   `self.authorized_boundaries.clone()`.
+//!
+//! ## Audit (ADR-024 — locked schema)
+//!
+//! Every tool call appends one [`vault_storage::AuditEventType::McpToolInvoke`]
+//! event to the local audit chain (Phase 2). `details_json` shape:
+//!
+//! ```json
+//! {
+//!   "tool": "memory.search" | "memory.write" | "memory.update" | "memory.delete",
+//!   "duration_ms": <u64>,
+//!   "result_count": <u32>,
+//!   "boundary_count": <u32>,
+//!   "max_results": <u32>,         // search only
+//!   "score_threshold": <f32>,     // search only
+//!   "include_archived": <bool>,   // search only
+//!   "query_length": <u32>,        // search only
+//!   "error": { "type": "<VaultError variant>", "detail": <Value> }   // optional
+//! }
+//! ```
+//!
+//! Plus a per-call `tracing::info!(target: "vault_mcp::tool_invoke", ...)`
+//! for operational observability (rate-limit hooks deferred to V0.2 per
+//! plan §3.5).
+//!
+//! ## rmcp threat-surface scope (ADR-026)
+//!
+//! vault-mcp is a stdio **server** — spawned by a host (Claude Desktop,
+//! Cursor, future vault-tauri host functionality), reads stdin, writes
+//! stdout, does NOT spawn child processes. The April 15 RCE class
+//! (OX Security 2026-04-15, 13 CVEs) affects MCP **hosts/clients**, not
+//! servers. vault-mcp at T0.1.9 is structurally not in that threat
+//! surface; the forward pointer for whichever future task introduces
+//! MCP-host functionality lives in ADR-026 + the §10 tech-debt entry.
 
 #![forbid(unsafe_code)]
+
+mod adapter;
+mod server;
+
+pub use adapter::Adapter;
+pub use server::{SearchToolParams, StdioServer, WriteToolParams};

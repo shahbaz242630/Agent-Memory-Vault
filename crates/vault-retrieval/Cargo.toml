@@ -12,38 +12,44 @@ repository.workspace = true
 # Trait shape for async Retriever + EmbeddingProvider consumption.
 async-trait.workspace = true
 
-# tracing — every retrieve() is #[instrument]-ed so the audit-event
-# Phase 2 hook has a span to attach to.
+# tracing — every retrieve() is #[instrument]-ed AND emits a structured
+# `tracing::info!(target: "vault_retrieval::query", ...)` event at the
+# end of the pipeline. T0.1.9 §6 moved audit accounting up to vault-mcp;
+# this crate emits operational logging only.
 tracing.workspace = true
-
-# serde_json — Phase 2 builds the canonical sorted-key details_json
-# (BRD §11.9.2) for the retrieval-audit event. Wired in Phase 1 so the
-# Cargo.toml stays stable across phases.
-serde_json.workspace = true
-
-# chrono — Phase 2 measures latency_ms inside retrieve(). Wired in Phase 1
-# to keep the dep set stable; not yet referenced from code in Phase 1.
-chrono.workspace = true
 
 # Domain types: Memory, Boundary, MemoryId, VaultError, VaultResult.
 vault-core = { path = "../vault-core" }
 
-# MetadataStore (memory hydration + audit append at Phase 2),
-# VectorStore (k-NN search), audit primitives.
+# MetadataStore (memory hydration via get_memories_batch),
+# VectorStore (k-NN search). T0.1.9 §6 dropped audit-primitive imports
+# from this crate — vault-storage is consumed only for hydration + the
+# vector-search trait now, not for `PendingAuditEvent` / `AuditEventType`.
 vault-storage = { path = "../vault-storage" }
 
 # EmbeddingProvider trait + EMBEDDING_DIM constant.
 vault-embedding = { path = "../vault-embedding" }
 
-# v1.2 explicitly DROPS blake3 from this crate's deps (was in v1.1 for
-# query-hashing under ADR-021; ADR-021 reversed in v1.2 — see
-# T0.1.8_PLAN.md §0 history index).
+# T0.1.9 §6 audit-removal sub-phase: chrono dropped (was wired in T0.1.8
+# Phase 1 for measuring latency_ms inside the audit-append builder; we
+# now measure with `std::time::Instant` only inside `retrieve()`, no
+# chrono needed). serde_json moved to dev-deps (only used by
+# `serde_json::json!` in test-only `make_memory()` helpers — production
+# pipeline no longer builds JSON at this layer).
 
 [dev-dependencies]
 tokio = { workspace = true }
 tokio-test.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
-# tracing-test — used in tests/retrieval_tests.rs to verify the cross-crate
-# `warn!` from get_memories_batch's orphan-id branch fires (Phase 3 item 2).
+# serde_json — used only by test helpers (`make_memory` builds an empty
+# metadata JSON object). T0.1.9 §6 moved this from production deps to
+# dev-deps when audit append moved to vault-mcp.
+serde_json.workspace = true
+# tracing-test — used by:
+# - tests/retrieval_tests.rs::adversarial_deleted_but_not_purged_memory
+#   (T0.1.8 Phase 3) to verify the cross-crate `warn!` from
+#   get_memories_batch's orphan-id branch fires.
+# - T0.1.9 §6 audit-removal tests (semantic.rs::tests + retrieval_tests.rs)
+#   to verify `tracing::info!` emission carries the diagnostic shape.
 tracing-test.workspace = true

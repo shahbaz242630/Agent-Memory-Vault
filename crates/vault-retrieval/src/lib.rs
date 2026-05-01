@@ -13,12 +13,14 @@
 //!   query and result types.
 //! - [`SemanticRetriever`] — V0.1 implementer. Embeds the query, runs k-NN
 //!   over the LanceDB vector store filtered by `authorized_boundaries`,
-//!   hydrates memories from the SQLite metadata store, and appends a
-//!   `RetrievalQuery` audit event (Phase 2).
+//!   hydrates memories from the SQLite metadata store, and emits a
+//!   structured `tracing::info!` event at `target: "vault_retrieval::query"`.
+//!   Per T0.1.9 §6, audit-event accounting lives at the MCP layer
+//!   (`AuditEventType::McpToolInvoke`); this layer is audit-neutral.
 //!
-//! See `T0.1.8_PLAN.md` for the full design rationale, the v1.0 → v1.2
-//! plan history, and the Q1–Q10 + Q-3.5 design-question resolutions
-//! that lock the contracts surfaced here.
+//! See `T0.1.8_PLAN.md` for the original design rationale (Q1–Q10 +
+//! Q-3.5) and `T0.1.9_PLAN.md` §6 for the audit-removal sub-phase that
+//! moved retrieval audit accounting up to vault-mcp.
 
 #![forbid(unsafe_code)]
 
