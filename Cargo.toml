@@ -88,7 +88,19 @@ rusqlite = { version = "=0.32.1", features = ["bundled-sqlcipher-vendored-openss
 # llama-cpp-2: still caret-pinned; verify exact crate name + version at start
 # of vault-llm task (T0.2.1) per BRD §4.3 note.
 ort = { version = "=2.0.0-rc.10", default-features = false, features = ["load-dynamic"] }
-tokenizers = "=0.20.4"
+# tokenizers — default features (`progressbar`, `onig`, `esaxx_fast`) trimmed
+# at SPIKE-22 / ADR-022 (T0.1.8 Phase 1). `esaxx_fast` was the load-bearing
+# blocker: it pulls `esaxx-rs`, a C++ crate compiled with /MT (static CRT),
+# which conflicts with `duckdb-sys`'s /MD (dynamic CRT) at MSVC link time.
+# Our usage in BgeSmallProvider is pure inference — `Tokenizer::from_file`
+# + `.encode()` + `Encoding::{truncate,get_*}` — and only `onig` is
+# load-bearing for compile (tokenizers 0.20 has a non-gated
+# `use onig::Regex` in `utils/onig.rs`; the feature CANNOT be dropped
+# without forking the crate). `esaxx_fast` (Unigram training) and
+# `progressbar` (training UI) are not needed for inference — both dropped.
+# Tech-debt: re-verify the feature-trim survives any tokenizers upgrade
+# (HANDOFF.md monthly check, alongside OpenSSL / protobuf / chrono / ort).
+tokenizers = { version = "=0.20.4", default-features = false, features = ["onig"] }
 # llama-cpp-2: verify exact crate name and version at start of vault-llm task (BRD §4.3 note)
 
 # Sync (BRD §4.4) — yrs caret-pinned; exact-pin at T0.2.x (sync-engine first use).

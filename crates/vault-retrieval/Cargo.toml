@@ -9,3 +9,38 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Trait shape for async Retriever + EmbeddingProvider consumption.
+async-trait.workspace = true
+
+# tracing — every retrieve() is #[instrument]-ed so the audit-event
+# Phase 2 hook has a span to attach to.
+tracing.workspace = true
+
+# serde_json — Phase 2 builds the canonical sorted-key details_json
+# (BRD §11.9.2) for the retrieval-audit event. Wired in Phase 1 so the
+# Cargo.toml stays stable across phases.
+serde_json.workspace = true
+
+# chrono — Phase 2 measures latency_ms inside retrieve(). Wired in Phase 1
+# to keep the dep set stable; not yet referenced from code in Phase 1.
+chrono.workspace = true
+
+# Domain types: Memory, Boundary, MemoryId, VaultError, VaultResult.
+vault-core = { path = "../vault-core" }
+
+# MetadataStore (memory hydration + audit append at Phase 2),
+# VectorStore (k-NN search), audit primitives.
+vault-storage = { path = "../vault-storage" }
+
+# EmbeddingProvider trait + EMBEDDING_DIM constant.
+vault-embedding = { path = "../vault-embedding" }
+
+# v1.2 explicitly DROPS blake3 from this crate's deps (was in v1.1 for
+# query-hashing under ADR-021; ADR-021 reversed in v1.2 — see
+# T0.1.8_PLAN.md §0 history index).
+
+[dev-dependencies]
+tokio = { workspace = true }
+tokio-test.workspace = true
+proptest.workspace = true
+tempfile.workspace = true

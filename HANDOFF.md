@@ -1,15 +1,15 @@
 # Memory Vault — Build Handoff
 
-**Last updated:** 2026-05-01 (T0.1.7 fully shipped — Phase 1 expanded `cf153f1` + follow-up `a8c5e8e`; monthly tech-debt CI workflow shipped at `66f3097`; both pushed, origin/main clean. Active task next: **T0.1.8 — vault-retrieval (semantic-only)**, plan-first per the T0.1.6 / T0.1.7 rhythm.)
+**Last updated:** 2026-05-01 (T0.1.8 plan v1.2 approved; **Phase 1 implementation complete on disk + SPIKE-22 resolved + ADR-022 written + tech-debt entry added**; holding for Shahbaz review per the spec-driven phase rhythm before Phase 2.)
 **Updated by:** Claude (Opus 4.7)
 **Current version:** V0.1 — Internal Alpha
-**Current phase:** V0.1 in progress — **T0.1.6 fully shipped (`f2d7cae`); T0.1.7 fully shipped (plan `82a715b` → Phase 1 expanded `cf153f1` → follow-up `a8c5e8e`); monthly tech-debt CI workflow shipped (`66f3097`).** Phase 4 integration smoke (`BgeSmallProvider × StorageBackend::write_memory` end-to-end) deferred to T0.1.10 per BRD §2.4 architecture (vault-embedding ⊥ vault-storage; integration belongs in vault-app where both are wired). **Next:** T0.1.8 vault-retrieval semantic strategy (BRD §5.5) — plan-first.
+**Current phase:** V0.1 in progress — **T0.1.6 fully shipped (`f2d7cae`); T0.1.7 fully shipped (`a8c5e8e`); monthly tech-debt CI workflow shipped (`66f3097`).** **T0.1.8 plan v1.2 approved; Phase 1 implementation complete on disk; SPIKE-22 resolved (tokenizers feature-trim, ADR-022); awaiting Shahbaz Phase 1 review before Phase 2.**
 
 ---
 
 ## Current Status
 
-**Active item:** **T0.1.8 — vault-retrieval (semantic strategy only) — plan-first.** Per the T0.1.6 / T0.1.7 rhythm: draft `T0.1.8_PLAN.md` covering pre-design questions (boundary contract reconciliation between BRD §5.5 sketch's `Option<Boundary>` and the ADR-005 / ADR-010 / ADR-015 mandatory-`&[Boundary]` pattern; query-text validation; result-limit defaults & caps; relevance-threshold policy; `time_range` + `strategies` field handling for V0.1; explanation string format; score semantics; empty-query handling; retrieval determinism), module breakdown, test strategy (Heavy per BRD §7.1), spike check, phased implementation rhythm, acceptance criteria. Hold for Shahbaz review before any code. **Last shipped state: T0.1.7 fully closed at `a8c5e8e`; tech-debt CI workflow shipped at `66f3097`; workspace 285 passing + 1 ignored** (test 6 perf gate); build/clippy/fmt clean; origin/main clean.
+**Active item:** **T0.1.8 — vault-retrieval (semantic-only) — Phase 1 implementation complete on disk, holding for Shahbaz review before Phase 2.** Plan v1.2 approved 2026-05-01; Phase 1 scaffolded the trait + types + `SemanticRetriever` skeleton (with `unimplemented!()` body) + 13 unit tests + 16 integration tests + 1 ignored perf gate + the trait-level boundary-leak invariant harness. **SPIKE-22 fired** mid-Phase-1 when the test binary failed to link with MSVC `LNK2038` (esaxx-rs /MT vs duckdb-sys /MD CRT mismatch); resolved by trimming `tokenizers` workspace dep to `default-features = false, features = ["onig"]` (drops `esaxx_fast` + `progressbar`; `onig` retained as load-bearing for compile). ADR-022 documents the decision; monthly tokenizers-trim verification added to tech-debt. **Workspace state:** 309 passing + 9 ignored, 0 failed; build/clippy/fmt all clean; T0.1.7 perf gate 84.17ms (under 100ms BRD §5.3 ceiling); origin/main clean (Phase 1 commit pending Shahbaz approval).
 
 **Spike 4 (ort default-features audit) folded into Phase 1 — no ADR-021 needed.** Pre-emptively trimmed to `default-features = false, features = ["load-dynamic"]`; `cargo tree -p vault-embedding -e features` confirms zero CUDA / TensorRT / DirectML / CoreML / ROCm / OneDNN execution-provider deps in the tree. Clean minimal feature set. Tech-debt entry added for the ort RC-pin policy.
 
@@ -104,7 +104,32 @@ Built on C1b's orchestrator + retry worker + vault-cli (`e26e66d`). All four DoD
 
 ## In Progress
 
-**T0.1.8 — vault-retrieval (Semantic Strategy Only) — plan-first phase.** BRD §5.5 spec, V0.1 scope = Semantic strategy only (no graph / temporal / keyword / frequency yet — those land at T0.2.7). Following the T0.1.6 / T0.1.7 rhythm: drafting `T0.1.8_PLAN.md` covering pre-design questions (boundary contract reconciliation between BRD §5.5 sketch's `Option<Boundary>` and the ADR-005 / ADR-010 / ADR-015 mandatory-`&[Boundary]` pattern, query-text validation, result-limit defaults & caps, relevance-threshold policy, `time_range` + `strategies` field handling for V0.1, explanation-string format, score semantics, empty-query handling, retrieval determinism), module breakdown, test strategy (Heavy per BRD §7.1: unit per strategy + integration boundary-leak proptest + adversarial), spike check (low — both integration partners — `EmbeddingProvider::embed` and `LanceVectorStore::search` — are already exercised by their own crates' tests; the cosine-distance-vs-similarity ordering is the one item worth a 5-minute confirm), phased implementation rhythm, acceptance criteria mapped to BRD T0.1.8 + DoD §0.1. Plan held for Shahbaz review before any implementation code.
+**T0.1.8 — vault-retrieval (Semantic Strategy Only) — Phase 1 implementation complete on disk, holding for Shahbaz review before Phase 2.**
+
+**Phase 1 deliverables on disk (uncommitted):**
+- `crates/vault-retrieval/Cargo.toml` — workspace deps wired (async-trait, tracing, serde_json, chrono, vault-core, vault-storage, vault-embedding); dev-deps for tokio + tokio-test + proptest + tempfile.
+- `src/lib.rs` — public API re-exports.
+- `src/retriever.rs` — `Retriever` trait + `RetrievalQuery` + `RetrievalOptions { score_threshold, include_archived }` + `RetrievedMemory`. All Q-resolved contracts (Q1 boundary, Q2 query validation, Q3 max_results cap, Q4 score threshold, Q5b include_archived, Q6 explanation, Q7 score = 1 − distance, Q9 sort order) documented in module + type doc-comments. `MAX_RESULTS_CAP = 100`, `MAX_QUERY_BYTES = 2048`.
+- `src/strategies/{mod.rs, semantic.rs}` — `SemanticRetriever` skeleton with three `Arc` fields (`MetadataStore`, `EmbeddingProvider`, `VectorStore`) + `new()` + `Retriever` impl with `unimplemented!("T0.1.8 Phase 2: SemanticRetriever::retrieve pipeline")` body. Phase 2 fills the body following the pseudocode in the module docs.
+- `src/strategies/semantic.rs::tests` — 13 unit tests scaffolded; 10 panic via `should_panic` at `unimplemented!()`, 3 ignored with reason "Phase 2: depends on AuditEventType::RetrievalQuery variant".
+- `tests/common/mod.rs` — `StubEmbedder` (with FAIL marker + DRIFT_n marker for ordering tests; tracks call count to prove empty-boundaries short-circuit) + `make_test_retriever()` fixture + `boundary` / `query` / `make_memory` / `insert_memory_with_drift` helpers.
+- `tests/trait_invariants.rs` — generic `assert_boundary_leakage_invariant<R: Retriever>` harness + `SemanticRetriever`-driven entry point. T0.2.7's `MultiStrategyRetriever` re-uses without modification.
+- `tests/retrieval_tests.rs` — 16 integration tests + 1 ignored perf gate; 11 panic via `should_panic`, 5 ignored (Phase 2 deps on `MetadataStore::get_memories_batch` + `AuditEventType::RetrievalQuery` + perf gate).
+
+**SPIKE-22 — `tokenizers` feature-trim (mid-Phase-1, methodology = compile-and-run):**
+- **Problem:** vault-retrieval is the first crate in the workspace to depend on both vault-storage (→ duckdb-sys, /MD CRT) and vault-embedding (→ tokenizers → esaxx-rs, /MT CRT). MSVC `link.exe` rejected the mixed CRT with `LNK2038 / LNK1319`.
+- **Resolution:** trimmed workspace `tokenizers` to `default-features = false, features = ["onig"]`. `esaxx_fast` (Unigram-training helper) + `progressbar` (training UI) dropped; `onig` retained because tokenizers 0.20.4's `utils/onig.rs` has a non-feature-gated `use onig::Regex` that fails compile without it.
+- **Verified:** all 9 active T0.1.7 tests + 4 unit tests + `test_concurrent_init_succeeds` pass with the trim; perf gate **84.17ms** (16% headroom under 100ms BRD §5.3 ceiling); `test_9_embed_uses_cls_pooling_not_mean_pooling` (the load-bearing tokenization-drift detector) passes; `cargo build -p vault-retrieval --tests` finishes cleanly. Workspace **309 passing + 9 ignored, 0 failed.**
+- **Perf-gate measurement methodology delta (worth surfacing, not silently absorbing):** T0.1.7 follow-up close measured a median of **12.3ms** (5 consecutive runs, range 6.4–15.8ms, post-fresh-build, no concurrent build activity). T0.1.8 SPIKE-22 measured **84.17ms** as a **single run during heavy concurrent build activity** (parallel `cargo build --workspace` + `cargo clippy --workspace --all-targets` were running in adjacent shells while the perf gate was invoked, contending for CPU + filesystem cache). The ~7× delta is **not investigated cleanly**; methodologically the two numbers aren't comparable (single cold run with concurrent build vs. 5-run warm median, idle machine). Both stay safely under the 100ms BRD §5.3 ceiling, so neither is a regression flag — but the delta should not sit silently in the record. **Worth re-measuring under T0.1.7's clean methodology** (5 consecutive runs, no concurrent cargo activity, post-fresh-build) at T0.1.10 integration time, where the integration smoke test will surface any additional latency on top. If the re-measurement still shows the trim cost ~70ms vs the baseline median, then it's a tokenizers-trim consequence to diagnose; if it returns to the 12.3ms median, the spike-time number was just measurement noise.
+- **Documented:** ADR-022 (full decision + alternatives + revisit triggers); tech-debt entry "Monthly tokenizers upgrade-compatibility check" with concrete commands and 2026-06-01 next-due date (alongside OpenSSL / protobuf / chrono / rustc / ort RC-policy).
+
+**DoD gates (all four green, Phase 1 ready for review):**
+1. `cargo build --workspace` — zero warnings.
+2. `cargo test --workspace` — 309 passing, 0 failed, 9 ignored (5 of 9 are new vault-retrieval Phase-2-dep stubs; 1 is the new vault-retrieval perf gate; the rest are T0.1.7's perf gate + 3 vault-retrieval unit-test Phase-2-dep stubs).
+3. `cargo clippy --workspace --all-targets -- -D warnings` — zero warnings.
+4. `cargo fmt --all --check` — clean.
+
+**Holding for Shahbaz Phase 1 review before Phase 2.** Phase 2 fills `retrieve()` body + lands `MetadataStore::get_memories_batch` + adds `AuditEventType::RetrievalQuery` variant + writes the audit append. Phase 3 lands the heavy adversarial / property tests. Per CLAUDE.md commit + push policy, the Phase 1 commit waits for explicit approval.
 
 ---
 
@@ -605,6 +630,38 @@ Two related items locked together (both about V0.1 cascade failure surfaces) for
   - When BRD §11.6 evolves to require signed-binary verification (Ed25519 / cosign) instead of just SHA-256 — extend the integrity module rather than replacing it.
   - When the bundled model changes (model swap, version bump) — update the canonical hashes in `integrity.rs` AND `MODEL_PROVENANCE.md` AND `scripts/setup-dev-env.{sh,ps1}` `EXPECTED_MODEL_SHA256` together.
 
+### ADR-022 — 2026-05-01 — `tokenizers` feature-trim: drop `esaxx_fast` + `progressbar` to resolve MSVC C runtime mismatch (T0.1.8 Phase 1 / SPIKE-22)
+
+- **Context:** T0.1.8 Phase 1 introduced `vault-retrieval`, the first crate in the workspace to depend on **both** `vault-storage` (transitively → `duckdb-sys`, /MD dynamic CRT) and `vault-embedding` (transitively → `tokenizers` → `esaxx-rs`, /MT static CRT). MSVC `link.exe` rejects mixed CRT libraries in a single binary:
+  ```
+  libesaxx_rs-...rlib(esaxx.o) : error LNK2038: mismatch detected for 'RuntimeLibrary':
+    value 'MT_StaticRelease' doesn't match value 'MD_DynamicRelease'
+    in liblibduckdb_sys-...rlib(...ub_src_main_capi.o)
+  LINK : fatal error LNK1319: 1 mismatches detected
+  ```
+  vault-retrieval's lib (rlib) compiled fine, but its **test binary** failed to link, blocking Phase 1 DoD condition 1 ("cargo build --workspace" zero warnings). vault-app (T0.1.10) and vault-tauri (T0.1.11) would hit the identical wall — fixing once unblocks all three downstream tasks.
+- **Decision:** trim `tokenizers` workspace dep to `default-features = false, features = ["onig"]`. Drops `esaxx_fast` (Unigram-model training helper, pulls `esaxx-rs`) and `progressbar` (training-time `indicatif` UI). Keeps `onig` (load-bearing for compile in tokenizers 0.20.4 — `utils/onig.rs` has a non-feature-gated `use onig::Regex` line; dropping `onig` fails compile with `error[E0432]: unresolved import 'onig'`).
+- **Reasoning:** BgeSmallProvider's tokenizer surface is **inference-only** — `Tokenizer::from_file` + `tokenizer.encode(text, true)` + `Encoding::{truncate, get_ids, get_attention_mask, get_type_ids}`. None of these need `esaxx_fast` (which only accelerates Unigram training, a workflow we never run) or `progressbar` (a TTY UI for training loops). bge-small-en-v1.5 uses BertPreTokenizer (WordPiece-based) which doesn't exercise Onigmo regex paths, but tokenizers 0.20's compile gate forces us to keep `onig` until we either upgrade to a tokenizers version that gates the import correctly, or fork the crate. Keeping `onig` is the smaller-blast-radius move and is what the spike verified end-to-end.
+- **Spike verification (compile-and-run, methodology declared up-front per the spike playbook):**
+  - **Acceptance:** all 9 currently-active T0.1.7 tests pass with the trimmed feature set; perf gate (test 6) stays under the 100ms BRD §5.3 ceiling; vault-retrieval test binary links.
+  - **Result:** all 9 active tests + 4 vault-embedding unit tests + `test_concurrent_init_succeeds` pass. **`test_9_embed_uses_cls_pooling_not_mean_pooling` passes** — the load-bearing test for catching any tokenization drift (if `esaxx_fast` had been silently used in any encoding path, the CLS-vs-mean-pool comparison would have surfaced it as a different vector). Perf gate **84.17ms** (16% headroom). `cargo build -p vault-retrieval --tests` finishes cleanly. Workspace **309 passing + 9 ignored, 0 failed.**
+  - **Failure path (not taken):** had any T0.1.7 test failed, the planned fallback was Option B — workspace-level `target-feature=+crt-static` rustflags forcing all native deps to /MT. Larger blast radius (every native dep in the workspace recompiles). Not needed.
+- **`cargo tree -p vault-embedding` still shows `esaxx-rs v0.1.10` as a transitive entry — this is harmless.** `cargo tree` lists every crate that *could* be linked under any feature combination, not what's *actually* compiled. With `default-features = false` (and no other consumer in the workspace turning on a feature that would activate it), `tokenizers`'s `esaxx_fast` Cargo feature gate is off, so `esaxx-rs`'s `build.rs` skips its C++ compilation (zero `.o` artefacts contribute to the final test binary). The proof is the link succeeding — if any /MT-compiled `esaxx_rs` object had landed in the deps directory, MSVC's `LNK2038` would re-fire. **Future-self running `cargo tree` six months from now: the `esaxx-rs` line is a dependency-graph residue, not a link participant.** To re-prove this empirically: `cargo build -p vault-retrieval --tests` succeeds; if the proof regresses, the LINK will fail loudly with the same `LNK2038` signature.
+- **Alternatives considered (and rejected):**
+  - *Option B — `crt-static` rustflags:* would force lance, sqlcipher, openssl-src, duckdb-sys et al to recompile against /MT. Risk of breaking native deps that aren't currently /MT-clean. Asymmetric cost vs Option A (one-line revert) — only worth it if A failed.
+  - *Option C — fork `esaxx-rs` to drop `-static`:* introduces a maintained fork. Last resort.
+  - *Drop `onig` too:* would require forking tokenizers 0.20.4 to gate the `use onig::Regex` correctly. Unnecessary blast radius given onig isn't the CRT-conflict source.
+- **Operational follow-up:** monthly tokenizers-upgrade compatibility check (next due 2026-06-01, alongside ort / OpenSSL / protobuf / chrono / rustc per `.github/workflows/monthly-tech-debt.yml`). When upgrading `tokenizers`, re-verify the trim survives:
+  1. `cargo build -p vault-embedding` — must compile with the trimmed feature set.
+  2. `cargo test -p vault-embedding` — all 9 active integration tests + 4 unit tests pass.
+  3. `cargo test -p vault-retrieval` — test binary links.
+  4. If any fail, revisit the trim — possibly a feature got renamed or a previously-gated import lost its gate. Document in this ADR.
+- **When to revisit:**
+  - When `tokenizers` releases a version that fixes the non-gated `use onig::Regex` (we may then drop `onig` too — but only if BertPreTokenizer paths still work without it).
+  - When the workspace adds a new native C/C++ dep — verify it's /MD-compatible before merging.
+  - When we move to a tokenizer crate that doesn't pull `esaxx-rs` at all (unlikely given tokenizers is the canonical HuggingFace-aligned crate).
+- **Files touched:** `Cargo.toml` (workspace `tokenizers` declaration). No code changes in `vault-embedding` — the API surface used by `BgeSmallProvider` is unaffected.
+
 ---
 
 ## Tech Debt Backlog
@@ -644,6 +701,26 @@ Items noticed but not addressed in their originating task — picked up explicit
     5. **If they agree** (expected, no-op month): record "ort RC-policy check OK 202X-MM-DD" and move on.
   - **Next due:** 2026-06-01 (first Monday of June). Tracked here in HANDOFF.md tech-debt — the same place the OpenSSL / protobuf / chrono / rustc checks live. (Noted 2026-04-30 + concrete commands added 2026-04-30; files: `Cargo.toml` `ort` workspace dep + `scripts/setup-dev-env.{sh,ps1}` `ORT_VERSION`/`$OrtVersion`)
 - [ ] **`BGE_SMALL_EN_V1_5_TOKENIZER_SHA256` placeholder — fill after first fixture download (Phase 2 prerequisite)** — Phase 1 ships the const as all-zeroes (deliberately invalid so any verification before Phase 2 fails loud). Phase 2's first action: run `scripts/setup-dev-env.{sh,ps1}` which downloads the tokenizer.json + computes + reports the SHA-256; operator pastes into `crates/vault-embedding/src/integrity.rs`. Then Phase 2's BgeSmallProvider::open wires the verification. Until done, `verify_file_sha256(tokenizer_path, BGE_SMALL_EN_V1_5_TOKENIZER_SHA256, "tokenizer")` always errors — that's the fail-loud-by-construction property. (Noted 2026-04-30, file: `crates/vault-embedding/src/integrity.rs`)
+- [ ] **(Recurring) Monthly `tokenizers` upgrade-compatibility check (per ADR-022)** — `tokenizers = "=0.20.4"` is exact-pinned with `default-features = false, features = ["onig"]`. The trim drops `esaxx_fast` (pulls `esaxx-rs` /MT, conflicts with duckdb-sys /MD at MSVC link) and `progressbar` (training-time UI). When upgrading tokenizers (any version bump), the trim's compatibility must be re-verified — a feature rename or a previously-gated import losing its gate could silently break compile or runtime behaviour. **Operational procedure (cadence: first Monday of each month, alongside OpenSSL / protobuf / chrono / rustc / ort per `.github/workflows/monthly-tech-debt.yml`):**
+  1. **Inspect resolved `tokenizers` version + `esaxx-rs` presence:**
+     ```bash
+     cargo tree -p vault-embedding -e normal | grep -E "tokenizers|esaxx|onig|indicatif"
+     ```
+     `esaxx-rs` may still appear in the tree as a transitive entry but should NOT be compiled (no `.rlib` artefact in `target/debug/deps/` that contributes objects to the test binary). The proof is the link succeeding, not the absence of the line.
+  2. **Run vault-embedding's full test suite + perf gate:**
+     ```bash
+     cargo test -p vault-embedding
+     cargo test -p vault-embedding -- --ignored  # perf gate (test 6)
+     ```
+     All 9 active tests + 4 unit tests + `test_concurrent_init_succeeds` must pass; perf gate stays under the 100ms BRD §5.3 ceiling. `test_9_embed_uses_cls_pooling_not_mean_pooling` is the load-bearing tokenization-drift detector.
+  3. **Run vault-retrieval test build (the original blocker):**
+     ```bash
+     cargo build -p vault-retrieval --tests
+     ```
+     Must finish without LNK2038 / LNK1319.
+  4. **If any fail:** revisit ADR-022's "When to revisit" triggers. Likely fixes: re-add a feature that was renamed; pin tokenizers back; or fall back to ADR-022's Option B (`crt-static` rustflags). Document in ADR-022.
+  5. **If all pass** (expected, no-op month): record "tokenizers feature-trim check OK 202X-MM-DD" and move on.
+  - **Next due:** 2026-06-01 (first Monday of June). Tracked here in HANDOFF.md tech-debt — the same place the OpenSSL / protobuf / chrono / rustc / ort RC-policy checks live. (Noted 2026-05-01, ADR-022, files: `Cargo.toml` `tokenizers` workspace dep)
 
 ---
 

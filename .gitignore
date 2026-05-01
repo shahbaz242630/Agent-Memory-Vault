@@ -176,7 +176,11 @@ TODO.local.md
 # ---------- Claude Code per-machine state ----------
 # Project-shared settings (.claude/settings.json) MAY be committed if we want
 # to share permission baselines across machines. Per-machine local permissions
-# and session state must NOT be committed.
+# and session state must NOT be committed. The directory-wide ignore catches
+# session locks (e.g. `scheduled_tasks.lock`) so they stop surfacing as
+# untracked; un-ignore specific files (e.g. `!.claude/settings.json`) when
+# we want to share them.
+.claude/
 .claude/settings.local.json
 .claude/.session/
 .claude/cache/
