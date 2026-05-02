@@ -3,35 +3,40 @@
 //! ## Phase 1 — `StubAdapter`
 //!
 //! Panics on every CRUD adapter call with `unimplemented!()`. Trust-boundary
-//! tests are `#[should_panic]`-marked at the panic site. Step 5 / Step 7
-//! replace this with a `RecordingAdapter` (mock variant) that captures
+//! tests are `#[should_panic]`-marked at the panic site. Step 7
+//! replaces this with a `RecordingAdapter` (mock variant) that captures
 //! call arguments so the trust-boundary invariant can be asserted
 //! positively (the trusted slice was used, NOT the malicious body field).
 //!
 //! ## Phase 2 Step 3 — `DimMismatchAdapter`
 //!
 //! Returns `Err(VaultError::DimensionMismatch { expected: 384, actual: 256 })`
-//! from `search()`. Used by `tests/error_mapping.rs` to pin the
-//! `VaultError::DimensionMismatch → JSON-RPC InvalidParams` contract
-//! (ADR-024 + plan v1.1 Step 3). Single-purpose; not the recording
-//! mock that Step 5 / Step 7 need.
+//! from `search()`. Step 5 extends `delete()` to return `NotFound` so
+//! `tool_delete`'s adapter-error path has a fixture (the boundary check
+//! for write/update happens at the handler layer, but delete has no
+//! handler-level check — adapter-level error is the only path). Used by
+//! `tests/error_mapping.rs` (Step 3 + Step 4 + Step 5).
 //!
 //! ## Phase 2 Step 4 — `append_tool_invoke_audit` recording
 //!
-//! Both adapters now implement `append_tool_invoke_audit` by pushing
-//! the typed [`ToolInvokeDetails`] onto an internal `Mutex<Vec<_>>`.
-//! `recorded_audits()` returns a snapshot for assertion. The audit
-//! method does NOT panic on either adapter — Step 4's
-//! `dimension_mismatch_audit_row_pins_full_detail` test (DimMismatch
-//! adapter) and any future trust-boundary audit-shape tests (Stub
-//! adapter, Step 7+) need it to actually record.
+//! Every adapter implements `append_tool_invoke_audit` by pushing the
+//! typed [`ToolInvokeDetails`] onto an internal `Mutex<Vec<_>>`.
+//! `recorded_audits()` returns a snapshot for assertion.
+//!
+//! ## Phase 2 Step 5 — `SuccessAdapter`
+//!
+//! Returns `Ok(...)` from every CRUD method. Used by Step 5's success
+//! integration tests (search + write + update + delete) and by the
+//! tool_write/update error tests (where `AccessDenied` fires at the
+//! handler before the adapter is reached, so a non-erroring adapter
+//! is fine).
 
 #![allow(dead_code)]
 
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use vault_core::{Boundary, MemoryId, NewMemory, VaultError, VaultResult};
+use vault_core::{Boundary, Memory, MemoryId, MemoryType, NewMemory, VaultError, VaultResult};
 use vault_mcp::{Adapter, StdioServer, ToolInvokeDetails};
 use vault_retrieval::{RetrievalQuery, RetrievedMemory};
 
@@ -141,15 +146,21 @@ impl Adapter for DimMismatchAdapter {
     }
 
     async fn write(&self, _new_memory: NewMemory) -> VaultResult<MemoryId> {
-        unimplemented!("DimMismatchAdapter: only search() is exercised by Step 3/4 tests")
+        unimplemented!("DimMismatchAdapter: write() is not exercised by any current test")
     }
 
     async fn update(&self, _id: MemoryId, _new_memory: NewMemory) -> VaultResult<()> {
-        unimplemented!("DimMismatchAdapter: only search() is exercised by Step 3/4 tests")
+        unimplemented!("DimMismatchAdapter: update() is not exercised by any current test")
     }
 
-    async fn delete(&self, _id: MemoryId) -> VaultResult<()> {
-        unimplemented!("DimMismatchAdapter: only search() is exercised by Step 3/4 tests")
+    /// Step 5 extension: returns `NotFound` so `tool_delete`'s error
+    /// path has an adapter-level error fixture. NotFound is the
+    /// natural delete-by-id error and exercises the ADR-024-silent
+    /// Internal-collapse default in `ToolInvokeError::from_vault_error`
+    /// (audit row records `error.type = "Internal"`,
+    /// `error.detail.category = "NotFound"`).
+    async fn delete(&self, id: MemoryId) -> VaultResult<()> {
+        Err(VaultError::NotFound(format!("memory {id} not found")))
     }
 
     async fn append_tool_invoke_audit(&self, details: ToolInvokeDetails) -> VaultResult<()> {
@@ -159,6 +170,106 @@ impl Adapter for DimMismatchAdapter {
             .push(details);
         Ok(())
     }
+}
+
+// =============================================================================
+// Phase 2 Step 5 — SuccessAdapter
+// =============================================================================
+
+/// Test fixture: returns `Ok(...)` from every CRUD method. Used by:
+///
+/// - Step 5 success integration tests (search + write + update + delete)
+///   — exercise the full success-path response shape + audit-row
+///   contract end-to-end.
+/// - Step 5 error integration tests for `tool_write` / `tool_update`
+///   where `AccessDenied` fires at the handler BEFORE the adapter is
+///   reached (boundary check in `handle_write` / `handle_update`).
+///   Pairing an unauthorized boundary with `SuccessAdapter` exercises
+///   the handler-layer error path while keeping the fixture simple.
+///
+/// Search returns a single deterministic [`RetrievedMemory`] so the
+/// integration test can assert on the wire shape. Write / update /
+/// delete return their natural success types.
+#[derive(Default)]
+pub struct SuccessAdapter {
+    audits: Mutex<Vec<ToolInvokeDetails>>,
+}
+
+impl SuccessAdapter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn recorded_audits(&self) -> Vec<ToolInvokeDetails> {
+        self.audits
+            .lock()
+            .expect("SuccessAdapter audit mutex poisoned")
+            .clone()
+    }
+}
+
+#[async_trait]
+impl Adapter for SuccessAdapter {
+    async fn search(&self, query: RetrievalQuery) -> VaultResult<Vec<RetrievedMemory>> {
+        // One deterministic hit pinned to the first authorized
+        // boundary so the boundary-leak invariant is preserved
+        // trivially. Score is a conventional 0.95 — irrelevant to
+        // the response-shape tests but plausible.
+        let boundary = query
+            .authorized_boundaries
+            .first()
+            .cloned()
+            .unwrap_or_else(|| Boundary::new("test").expect("valid test boundary"));
+        let memory = Memory::try_new(NewMemory {
+            content: "deterministic test memory content".to_string(),
+            memory_type: MemoryType::Semantic,
+            boundary,
+            source_agent: Some("success-adapter".to_string()),
+            confidence: 0.9,
+            valid_from: None,
+            valid_until: None,
+            metadata: serde_json::json!({}),
+        })?;
+        Ok(vec![RetrievedMemory {
+            memory,
+            score: 0.95,
+            explanation: "semantic: cosine=0.9500 (rank 1/1)".to_string(),
+        }])
+    }
+
+    async fn write(&self, _new_memory: NewMemory) -> VaultResult<MemoryId> {
+        Ok(MemoryId::new())
+    }
+
+    async fn update(&self, _id: MemoryId, _new_memory: NewMemory) -> VaultResult<()> {
+        Ok(())
+    }
+
+    async fn delete(&self, _id: MemoryId) -> VaultResult<()> {
+        Ok(())
+    }
+
+    async fn append_tool_invoke_audit(&self, details: ToolInvokeDetails) -> VaultResult<()> {
+        self.audits
+            .lock()
+            .expect("SuccessAdapter audit mutex poisoned")
+            .push(details);
+        Ok(())
+    }
+}
+
+/// Build a `StdioServer` paired with a shared `Arc<SuccessAdapter>`,
+/// returning both so tests can call `recorded_audits()` after invoking
+/// the server. Used by Step 5 success integration tests + tool_write /
+/// tool_update handler-layer-error tests.
+pub fn make_success_server_with_adapter(trusted: Vec<&str>) -> (StdioServer, Arc<SuccessAdapter>) {
+    let trusted_boundaries: Vec<Boundary> = trusted
+        .into_iter()
+        .map(|s| Boundary::new(s).expect("valid trusted boundary"))
+        .collect();
+    let adapter = Arc::new(SuccessAdapter::new());
+    let server = StdioServer::new(adapter.clone(), trusted_boundaries);
+    (server, adapter)
 }
 
 /// Build a `StdioServer` paired with a shared `Arc<DimMismatchAdapter>`,

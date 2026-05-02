@@ -392,6 +392,16 @@ impl StdioServer {
 
     /// `memory.write` MCP tool — create a new memory in a boundary the
     /// host application has authorized.
+    ///
+    /// **Step 5 (Phase 2): audit + tracing wired** per Q7(a)
+    /// handler-mediated audit. Same shape as Step 4's `tool_search`:
+    /// timer brackets the handler dispatch, ToolInvokeDetails records
+    /// `boundary_count` from the trusted slice + `result_count = 1`
+    /// on success / `0` on error. Search-only fields (`max_results`,
+    /// `score_threshold`, `include_archived`, `query_length`) stay
+    /// `None` so the canonical-JSON serialisation OMITS them per Q1
+    /// (ABSENT, not `null`). Tracing emits before audit-append so the
+    /// operational log fires regardless of audit-store health.
     #[tool(
         name = "memory.write",
         description = "Create a new memory in the user's vault. \
@@ -403,11 +413,71 @@ impl StdioServer {
         params: Parameters<WriteToolParams>,
     ) -> Result<CallToolResult, McpError> {
         let Parameters(p) = params;
-        let id = self.handle_write(p).await.map_err(vault_error_to_mcp)?;
+        let boundary_count_recorded: u32 = self.authorized_boundaries.len() as u32;
+
+        let start = Instant::now();
+        let dispatch_result = self.handle_write(p).await;
+        let duration_ms: u64 = start.elapsed().as_millis() as u64;
+
+        let (result_count, error_for_audit) = match &dispatch_result {
+            Ok(_) => (1_u32, None),
+            Err(e) => (0_u32, Some(ToolInvokeError::from_vault_error(e))),
+        };
+
+        let details = ToolInvokeDetails {
+            tool: "memory.write",
+            duration_ms,
+            result_count,
+            boundary_count: boundary_count_recorded,
+            // Q1: search-only fields ABSENT (not null) on write.
+            max_results: None,
+            score_threshold: None,
+            include_archived: None,
+            query_length: None,
+            error: error_for_audit,
+        };
+
+        // Tracing first, audit second — same ordering as tool_search
+        // (operational log independent of audit-store health). Q6:
+        // tracing fields = audit fields minus content; for write that
+        // means tool / duration_ms / result_count / boundary_count /
+        // error?. Search-only fields are absent here too.
+        tracing::info!(
+            target: "vault_mcp::tool_invoke",
+            tool = details.tool,
+            duration_ms = details.duration_ms,
+            result_count = details.result_count,
+            boundary_count = details.boundary_count,
+            error = ?details.error,
+            "memory.write tool invocation completed"
+        );
+
+        self.adapter
+            .append_tool_invoke_audit(details)
+            .await
+            .map_err(vault_error_to_mcp)?;
+
+        let id = dispatch_result.map_err(vault_error_to_mcp)?;
         success_json_result(&serde_json::json!({ "id": id.to_string() }))
     }
 
     /// `memory.update` MCP tool — replace an existing memory's content.
+    ///
+    /// **Step 5 (Phase 2): audit + tracing wired** with the same
+    /// handler-mediated pattern as `tool_write` / `tool_search`.
+    ///
+    /// **`parse_memory_id_traced` early-return contract:** if the agent
+    /// supplies a malformed UUID, this returns `McpError` BEFORE the
+    /// audit/tracing timer starts. Rationale: the audit chain records
+    /// vault dispatches (Q7 a), and a malformed-id request never
+    /// reaches the vault. Pre-dispatch validation is analogous to
+    /// JSON deserialisation, which is not audited either. Operational
+    /// visibility for malformed requests lives at the
+    /// `tracing::warn!(target: "vault_mcp::request_validation", ...)`
+    /// emission inside `parse_memory_id_traced` — different tracing
+    /// target (`vault_mcp::request_validation` vs
+    /// `vault_mcp::tool_invoke`) so operators can filter parse-level
+    /// errors from tool-dispatch events cleanly.
     #[tool(
         name = "memory.update",
         description = "Replace an existing memory's content. \
@@ -420,7 +490,10 @@ impl StdioServer {
         params: Parameters<UpdateToolParams>,
     ) -> Result<CallToolResult, McpError> {
         let Parameters(p) = params;
-        let id = parse_memory_id(&p.id)?;
+        // Pre-dispatch parse: not audited (handler-mediated audit
+        // contract per Q7 a). Tracing-level visibility only.
+        let id = parse_memory_id_traced(&p.id, "memory.update")?;
+
         let write_params = WriteToolParams {
             content: p.content,
             boundary: p.boundary,
@@ -428,13 +501,54 @@ impl StdioServer {
             source_agent: p.source_agent,
             confidence: p.confidence,
         };
-        self.handle_update(id, write_params)
+
+        let boundary_count_recorded: u32 = self.authorized_boundaries.len() as u32;
+        let start = Instant::now();
+        let dispatch_result = self.handle_update(id, write_params).await;
+        let duration_ms: u64 = start.elapsed().as_millis() as u64;
+
+        let (result_count, error_for_audit) = match &dispatch_result {
+            Ok(()) => (1_u32, None),
+            Err(e) => (0_u32, Some(ToolInvokeError::from_vault_error(e))),
+        };
+
+        let details = ToolInvokeDetails {
+            tool: "memory.update",
+            duration_ms,
+            result_count,
+            boundary_count: boundary_count_recorded,
+            // Q1: search-only fields ABSENT on update.
+            max_results: None,
+            score_threshold: None,
+            include_archived: None,
+            query_length: None,
+            error: error_for_audit,
+        };
+
+        tracing::info!(
+            target: "vault_mcp::tool_invoke",
+            tool = details.tool,
+            duration_ms = details.duration_ms,
+            result_count = details.result_count,
+            boundary_count = details.boundary_count,
+            error = ?details.error,
+            "memory.update tool invocation completed"
+        );
+
+        self.adapter
+            .append_tool_invoke_audit(details)
             .await
             .map_err(vault_error_to_mcp)?;
+
+        dispatch_result.map_err(vault_error_to_mcp)?;
         success_json_result(&serde_json::json!({ "updated": p.id }))
     }
 
     /// `memory.delete` MCP tool — remove a memory by id.
+    ///
+    /// **Step 5 (Phase 2): audit + tracing wired** with the same
+    /// handler-mediated pattern. `parse_memory_id` early-return
+    /// contract is identical to `tool_update` (see that doc comment).
     #[tool(
         name = "memory.delete",
         description = "Delete a memory by id. The vault verifies the \
@@ -446,8 +560,47 @@ impl StdioServer {
         params: Parameters<DeleteToolParams>,
     ) -> Result<CallToolResult, McpError> {
         let Parameters(p) = params;
-        let id = parse_memory_id(&p.id)?;
-        self.handle_delete(id).await.map_err(vault_error_to_mcp)?;
+        let id = parse_memory_id_traced(&p.id, "memory.delete")?;
+
+        let boundary_count_recorded: u32 = self.authorized_boundaries.len() as u32;
+        let start = Instant::now();
+        let dispatch_result = self.handle_delete(id).await;
+        let duration_ms: u64 = start.elapsed().as_millis() as u64;
+
+        let (result_count, error_for_audit) = match &dispatch_result {
+            Ok(()) => (1_u32, None),
+            Err(e) => (0_u32, Some(ToolInvokeError::from_vault_error(e))),
+        };
+
+        let details = ToolInvokeDetails {
+            tool: "memory.delete",
+            duration_ms,
+            result_count,
+            boundary_count: boundary_count_recorded,
+            // Q1: search-only fields ABSENT on delete.
+            max_results: None,
+            score_threshold: None,
+            include_archived: None,
+            query_length: None,
+            error: error_for_audit,
+        };
+
+        tracing::info!(
+            target: "vault_mcp::tool_invoke",
+            tool = details.tool,
+            duration_ms = details.duration_ms,
+            result_count = details.result_count,
+            boundary_count = details.boundary_count,
+            error = ?details.error,
+            "memory.delete tool invocation completed"
+        );
+
+        self.adapter
+            .append_tool_invoke_audit(details)
+            .await
+            .map_err(vault_error_to_mcp)?;
+
+        dispatch_result.map_err(vault_error_to_mcp)?;
         success_json_result(&serde_json::json!({ "deleted": p.id }))
     }
 }
@@ -503,17 +656,18 @@ const ERROR_CODE_ACCESS_DENIED: ErrorCode = ErrorCode(-32001);
 /// belongs in an existing arm (and update ADR-024's mapping table) or
 /// gets its own row.
 ///
-/// **Wording observation (non-blocking):** ADR-024 line 765 reads
-/// `"invalid params"` for the message string; the implementation
-/// (preserved across Step 3 + Step 4) uses `"invalid parameters"`.
-/// Both satisfy the no-info-leak invariant. Aligning the wording is
-/// out of Step 4 scope; left as a tiny ADR-024-amendment-or-test-tweak
-/// follow-up.
+/// **Wording (Step 5 reconciliation):** the message string is `"invalid
+/// params"` exactly — matches ADR-024 line 765 + the JSON-RPC 2.0 spec
+/// literal for code `-32602` ("Invalid params" lower-cased). Step 3's
+/// test was originally written against `"invalid parameters"`; Step 5
+/// reverted that drift in the same commit as the tool_write/update/
+/// delete wiring. Two-against-one to the locked artefacts (ADR-024 +
+/// JSON-RPC 2.0 spec) wins over one shipped test.
 fn vault_error_to_mcp(err: VaultError) -> McpError {
     match err {
-        // ADR-024 line 765: -32602, "invalid parameters".
+        // ADR-024 line 765: -32602, "invalid params".
         VaultError::DimensionMismatch { .. } | VaultError::InvalidInput(_) => {
-            McpError::invalid_params("invalid parameters", None)
+            McpError::invalid_params("invalid params", None)
         }
         // ADR-024 line 764: -32001, "access denied". Was -32602 before
         // Step 4 — Step 3's test pins DimensionMismatch only, so the
@@ -569,10 +723,37 @@ fn success_json_result<T: Serialize>(value: &T) -> Result<CallToolResult, McpErr
     Ok(CallToolResult::success(vec![content]))
 }
 
-/// Parse a UUID-string into `MemoryId`. Returns the generic
-/// `invalid parameters` error on parse failure (no-info-leak).
-fn parse_memory_id(id: &str) -> Result<MemoryId, McpError> {
-    id.parse::<uuid::Uuid>()
-        .map(MemoryId)
-        .map_err(|_| McpError::invalid_params("invalid parameters", None))
+/// Parse a UUID-string into `MemoryId`, emitting a
+/// `tracing::warn!(target: "vault_mcp::request_validation", ...)` event
+/// on parse failure for operational visibility.
+///
+/// **Audit contract (Step 5 design decision):** parse failures here
+/// do NOT append to the audit chain. The audit chain records vault
+/// dispatches (Q7 a handler-mediated audit) and a malformed-id
+/// request never reaches the vault. This is analogous to JSON
+/// deserialisation, which is also not audited. Tracing-level
+/// visibility on a separate target (`vault_mcp::request_validation`
+/// vs `vault_mcp::tool_invoke`) keeps the operational log filterable
+/// — operators can grep one target for tool dispatches and the other
+/// for malformed-request rejections.
+///
+/// `tool_name` is included in the warn event so operators can tell
+/// which tool received the malformed id (`memory.update` vs
+/// `memory.delete`).
+fn parse_memory_id_traced(id: &str, tool_name: &'static str) -> Result<MemoryId, McpError> {
+    match id.parse::<uuid::Uuid>() {
+        Ok(uuid) => Ok(MemoryId(uuid)),
+        Err(_) => {
+            // No `id` value or other content goes into the tracing
+            // event — only metadata. Same content-redaction discipline
+            // as the tool_invoke target (Q6).
+            tracing::warn!(
+                target: "vault_mcp::request_validation",
+                tool = tool_name,
+                reason = "uuid_parse_failed",
+                "malformed id in tool request"
+            );
+            Err(McpError::invalid_params("invalid params", None))
+        }
+    }
 }

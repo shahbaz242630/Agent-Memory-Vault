@@ -16,8 +16,9 @@
 //!
 //! - **Step 3 active test:** `dimension_mismatch_returns_generic_invalid_params_no_data_leak`
 //!   asserts (a) JSON-RPC code = -32602 InvalidParams, (b) message is
-//!   the static "invalid parameters" string with no leaked dim values
-//!   or type names, (d) `error.data` is `None`.
+//!   the static "invalid params" string (matches ADR-024 line 765 +
+//!   JSON-RPC 2.0 spec literal per the Step 5 wording reconciliation)
+//!   with no leaked dim values or type names, (d) `error.data` is `None`.
 //! - **Step 4 active test:** `dimension_mismatch_audit_row_pins_full_detail`
 //!   asserts (c) the audit-row shape per ADR-024 — both at the typed
 //!   Rust level (`ToolInvokeError::DimensionMismatch { expected: 384,
@@ -40,10 +41,12 @@ use vault_mcp::{SearchToolParams, ToolInvokeError};
 /// channel a future "helpful" change could leak through:
 ///
 /// - **(a)** JSON-RPC `error.code` is `-32602` (InvalidParams).
-/// - **(b)** `error.message` is the static "invalid parameters" string;
-///   none of the leaked-shape candidates appear (`384`, `256`,
-///   "dimension", "expected", "actual"). Prevents future regressions
-///   like `format!("dimension mismatch: expected {expected}, got {actual}")`.
+/// - **(b)** `error.message` is the static "invalid params" string
+///   (matches ADR-024 line 765 + JSON-RPC 2.0 spec literal per the
+///   Step 5 wording reconciliation); none of the leaked-shape
+///   candidates appear (`384`, `256`, "dimension", "expected",
+///   "actual"). Prevents future regressions like
+///   `format!("dimension mismatch: expected {expected}, got {actual}")`.
 /// - **(d)** `error.data` is `None`. A future "helpful" implementation
 ///   could populate `error.data` with `{ "expected": 384, "actual": 256 }`
 ///   and pass (a)(b); pinning the absence locks that hole.
@@ -75,8 +78,9 @@ async fn dimension_mismatch_returns_generic_invalid_params_no_data_leak() {
     // explicitly so a future regression can't slip through with a
     // creative variant.
     assert_eq!(
-        err.message, "invalid parameters",
-        "error.message must be the static 'invalid parameters' string"
+        err.message, "invalid params",
+        "error.message must be the static 'invalid params' string \
+         (ADR-024 line 765 + JSON-RPC 2.0 spec literal)"
     );
     let lower = err.message.to_lowercase();
     assert!(
