@@ -25,11 +25,17 @@
 //! `self.authorized_boundaries.clone()`.
 
 use std::sync::Arc;
+use std::time::Instant;
 
-use serde::Deserialize;
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{CallToolResult, Content, ErrorCode, ServerCapabilities, ServerInfo};
+use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
+use serde::{Deserialize, Serialize};
 use vault_core::{Boundary, MemoryId, MemoryType, NewMemory, VaultError, VaultResult};
 use vault_retrieval::{RetrievalOptions, RetrievalQuery};
 
+use crate::audit::{ToolInvokeDetails, ToolInvokeError};
 use crate::Adapter;
 
 // =============================================================================
@@ -45,11 +51,12 @@ use crate::Adapter;
 /// `StdioServer::new` time) — request-body data NEVER influences the
 /// auth gate.
 ///
-/// **NOTE (chrono pin / schemars deferral):** Phase 1 uses bare
-/// `serde::Deserialize` (no `schemars::JsonSchema`) per the chrono pin
-/// constraint documented in `vault-mcp/Cargo.toml`. Phase 2 may add
-/// schemars when the workspace chrono pin can advance.
-#[derive(Debug, Deserialize)]
+/// **NOTE (T0.1.9 Phase 2):** the `schemars::JsonSchema` derive is required
+/// by rmcp's `#[tool]` macro to generate the JSON Schema 2020-12 input
+/// schema published in `tools/list`. `rmcp::schemars` is re-exported via
+/// rmcp's `server` feature — no separate workspace `schemars` dep needed.
+/// Verified at runtime by `examples/macro_spike.rs`.
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SearchToolParams {
     /// Free-text query — embedded by the model and matched via cosine
     /// k-NN over the boundary-filtered vector store.
@@ -74,8 +81,8 @@ pub struct SearchToolParams {
 /// agent specifies which boundary to write to. The handler validates
 /// this field appears in `self.authorized_boundaries` BEFORE calling
 /// the adapter; if not, returns `VaultError::AccessDenied` (mapped to
-/// JSON-RPC `-32001` per ADR-024).
-#[derive(Debug, Deserialize)]
+/// JSON-RPC `-32602 InvalidParams` with a generic message per ADR-024).
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct WriteToolParams {
     pub content: String,
     pub boundary: String,
@@ -85,6 +92,29 @@ pub struct WriteToolParams {
     pub source_agent: Option<String>,
     #[serde(default)]
     pub confidence: Option<f32>,
+}
+
+/// JSON-RPC parameters for the `memory.update` tool — combines the target
+/// memory id with the full replacement payload (mirrors `WriteToolParams`).
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct UpdateToolParams {
+    /// UUID v7 of the existing memory to replace.
+    pub id: String,
+    pub content: String,
+    pub boundary: String,
+    #[serde(default)]
+    pub memory_type: Option<String>,
+    #[serde(default)]
+    pub source_agent: Option<String>,
+    #[serde(default)]
+    pub confidence: Option<f32>,
+}
+
+/// JSON-RPC parameters for the `memory.delete` tool — id-only.
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct DeleteToolParams {
+    /// UUID v7 of the memory to delete.
+    pub id: String,
 }
 
 // =============================================================================
@@ -104,8 +134,24 @@ pub struct WriteToolParams {
 pub struct StdioServer {
     adapter: Arc<dyn Adapter>,
     authorized_boundaries: Vec<Boundary>,
+    /// **Load-bearing — DO NOT remove as "dead code."** This field is
+    /// populated by the `#[tool_router]` macro on `impl StdioServer`
+    /// (which generates `Self::tool_router()`) and read at request
+    /// dispatch time by the `#[tool_handler]` macro on
+    /// `impl ServerHandler for StdioServer`. The macros connect through
+    /// this field; removing it would silently break tool routing.
+    ///
+    /// Dead-code analysis cannot see through the macro expansion (it
+    /// only sees the field declaration, not the macro-generated code
+    /// that uses it), so `#[allow(dead_code)]` is required. Same
+    /// suppression rmcp's own `tests/test_tool_macros.rs` applies; see
+    /// `examples/macro_spike.rs` (spike finding C) for runtime
+    /// confirmation that the chain works.
+    #[allow(dead_code)]
+    tool_router: ToolRouter<Self>,
 }
 
+#[tool_router]
 impl StdioServer {
     /// Construct a new server. Both arguments are application-supplied
     /// at startup and form the trust boundary per ADR-025.
@@ -113,6 +159,7 @@ impl StdioServer {
         Self {
             adapter,
             authorized_boundaries,
+            tool_router: Self::tool_router(),
         }
     }
 
@@ -243,4 +290,289 @@ impl StdioServer {
     pub async fn handle_delete(&self, id: MemoryId) -> VaultResult<()> {
         self.adapter.delete(id).await
     }
+
+    // -------------------------------------------------------------------------
+    // Phase 2 — `#[tool]`-decorated MCP tool surface
+    //
+    // These wrappers translate between the MCP wire layer (`Parameters<T>` +
+    // `Result<CallToolResult, McpError>`) and the existing internal
+    // `handle_*` methods (`VaultResult<...>`). The `handle_*` methods own
+    // the trust-boundary discipline + parameter validation; these wrappers
+    // own success-path JSON serialisation + error-path mapping per ADR-024.
+    //
+    // **Audit append + tracing emission lands in Step 4** (per
+    // T0.1.9_PLAN.md v1.1). Step 3's `dimension_mismatch_returns_*` test
+    // pins the protocol-level error contract today; Step 4 extends the
+    // test to assert the audit row shape once the audit append is wired.
+    // -------------------------------------------------------------------------
+
+    /// `memory.search` MCP tool — the agent-facing surface for the
+    /// `SemanticRetriever`-backed search pipeline.
+    ///
+    /// **Step 4 (Phase 2): audit + tracing wired.** Both success and
+    /// error paths emit one `tracing::info!(target: "vault_mcp::tool_invoke", ...)`
+    /// event AND one `mcp.tool_invoke` audit row via
+    /// [`Adapter::append_tool_invoke_audit`] per ADR-024 + Q7 (a)
+    /// handler-mediated audit. Tracing emits BEFORE audit-append so an
+    /// audit-storage failure still leaves the operational log; the
+    /// audit chain is the authoritative record, tracing is operational.
+    #[tool(
+        name = "memory.search",
+        description = "Search the user's memory vault by free-text query. \
+                       Returns relevant memories ranked by cosine similarity. \
+                       Authorization is mediated by the host application, \
+                       not by this tool's parameters."
+    )]
+    pub async fn tool_search(
+        &self,
+        params: Parameters<SearchToolParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let Parameters(p) = params;
+        // Snapshot the typed-param fields BEFORE handler dispatch so
+        // the audit/tracing record uses the agent-supplied values
+        // exactly (the handler moves `p` into a `RetrievalQuery`).
+        let max_results_recorded: u32 = p.max_results.unwrap_or(10) as u32;
+        let score_threshold_recorded: Option<f32> = p.score_threshold;
+        let include_archived_recorded: bool = p.include_archived.unwrap_or(false);
+        let query_length_recorded: u32 = p.query.len() as u32;
+        let boundary_count_recorded: u32 = self.authorized_boundaries.len() as u32;
+
+        let start = Instant::now();
+        let dispatch_result = self.handle_search(p).await;
+        let duration_ms: u64 = start.elapsed().as_millis() as u64;
+
+        let (result_count, error_for_audit) = match &dispatch_result {
+            Ok(memories) => (memories.len() as u32, None),
+            Err(e) => (0_u32, Some(ToolInvokeError::from_vault_error(e))),
+        };
+
+        let details = ToolInvokeDetails {
+            tool: "memory.search",
+            duration_ms,
+            result_count,
+            boundary_count: boundary_count_recorded,
+            max_results: Some(max_results_recorded),
+            score_threshold: score_threshold_recorded,
+            include_archived: Some(include_archived_recorded),
+            query_length: Some(query_length_recorded),
+            error: error_for_audit,
+        };
+
+        // Tracing first — always fires, independent of audit-store
+        // health. Q6: fields are audit details_json minus content
+        // (no query_text, no boundary names — only counts and
+        // metadata).
+        tracing::info!(
+            target: "vault_mcp::tool_invoke",
+            tool = details.tool,
+            duration_ms = details.duration_ms,
+            result_count = details.result_count,
+            boundary_count = details.boundary_count,
+            max_results = ?details.max_results,
+            score_threshold = ?details.score_threshold,
+            include_archived = ?details.include_archived,
+            query_length = ?details.query_length,
+            error = ?details.error,
+            "memory.search tool invocation completed"
+        );
+
+        // Audit append — authoritative record, propagates failures
+        // as MCP errors. Audit-storage failure is treated as a hard
+        // error on V0.1 (single-user local SQLite — failure is rare
+        // and signals a serious storage problem the user should know
+        // about). May revisit at V0.2.
+        self.adapter
+            .append_tool_invoke_audit(details)
+            .await
+            .map_err(vault_error_to_mcp)?;
+
+        let memories = dispatch_result.map_err(vault_error_to_mcp)?;
+        success_json_result(&memories)
+    }
+
+    /// `memory.write` MCP tool — create a new memory in a boundary the
+    /// host application has authorized.
+    #[tool(
+        name = "memory.write",
+        description = "Create a new memory in the user's vault. \
+                       The `boundary` field must name a boundary the host \
+                       application has authorized for this MCP session."
+    )]
+    pub async fn tool_write(
+        &self,
+        params: Parameters<WriteToolParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let Parameters(p) = params;
+        let id = self.handle_write(p).await.map_err(vault_error_to_mcp)?;
+        success_json_result(&serde_json::json!({ "id": id.to_string() }))
+    }
+
+    /// `memory.update` MCP tool — replace an existing memory's content.
+    #[tool(
+        name = "memory.update",
+        description = "Replace an existing memory's content. \
+                       The `id` field selects the target; the remaining \
+                       fields are the full replacement payload (same \
+                       shape as `memory.write`)."
+    )]
+    pub async fn tool_update(
+        &self,
+        params: Parameters<UpdateToolParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let Parameters(p) = params;
+        let id = parse_memory_id(&p.id)?;
+        let write_params = WriteToolParams {
+            content: p.content,
+            boundary: p.boundary,
+            memory_type: p.memory_type,
+            source_agent: p.source_agent,
+            confidence: p.confidence,
+        };
+        self.handle_update(id, write_params)
+            .await
+            .map_err(vault_error_to_mcp)?;
+        success_json_result(&serde_json::json!({ "updated": p.id }))
+    }
+
+    /// `memory.delete` MCP tool — remove a memory by id.
+    #[tool(
+        name = "memory.delete",
+        description = "Delete a memory by id. The vault verifies the \
+                       memory's stored boundary against the authorized \
+                       set before deletion."
+    )]
+    pub async fn tool_delete(
+        &self,
+        params: Parameters<DeleteToolParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let Parameters(p) = params;
+        let id = parse_memory_id(&p.id)?;
+        self.handle_delete(id).await.map_err(vault_error_to_mcp)?;
+        success_json_result(&serde_json::json!({ "deleted": p.id }))
+    }
+}
+
+// =============================================================================
+// ServerHandler impl — auto-routes `tools/list` + `tools/call` via #[tool_handler]
+// =============================================================================
+
+#[tool_handler]
+impl ServerHandler for StdioServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(rmcp::model::Implementation::new(
+                "vault-mcp",
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(
+                "Memory Vault — a user-owned, cross-agent persistent memory layer. \
+                 Tools: memory.search, memory.write, memory.update, memory.delete. \
+                 Authorization is host-mediated; tool args never override boundaries.",
+            )
+    }
+}
+
+// =============================================================================
+// Error mapping — VaultError → McpError per ADR-024
+// =============================================================================
+
+/// JSON-RPC code -32001 — implementation-defined "access denied" per
+/// ADR-024 (HANDOFF.md lines 764, 766). Used for `AccessDenied` and
+/// `ModelIntegrityFailed`; the latter intentionally collapses to the
+/// same wire shape so an attacker can't fingerprint which model file
+/// failed integrity (ADR-024 reasoning §793).
+const ERROR_CODE_ACCESS_DENIED: ErrorCode = ErrorCode(-32001);
+
+/// Map a `VaultError` into the JSON-RPC error shape ADR-024 specifies.
+///
+/// **No-info-leak invariant:** error messages are static / generic; no
+/// internal state (paths, dimensions, audit ids) leaks into the wire
+/// response. The `data` field is always `None` so a future "helpful"
+/// detail can't slip through. Detailed diagnostics live in the audit
+/// log + tracing emissions, never in the JSON-RPC error.
+///
+/// Step 3 (`dimension_mismatch_returns_generic_invalid_params_*`) pins
+/// this contract for `DimensionMismatch`. Step 4 (this function)
+/// converts the match to exhaustive AND aligns `AccessDenied` /
+/// `ModelIntegrityFailed` to ADR-024's `-32001` mapping (previously
+/// they routed via the `-32602` invalid_params arm and the catch-all
+/// internal_error arm respectively — both diverged from ADR-024).
+///
+/// **Exhaustive by design.** Adding a new `VaultError` variant becomes
+/// a compile error here. Decide deliberately whether the new variant
+/// belongs in an existing arm (and update ADR-024's mapping table) or
+/// gets its own row.
+///
+/// **Wording observation (non-blocking):** ADR-024 line 765 reads
+/// `"invalid params"` for the message string; the implementation
+/// (preserved across Step 3 + Step 4) uses `"invalid parameters"`.
+/// Both satisfy the no-info-leak invariant. Aligning the wording is
+/// out of Step 4 scope; left as a tiny ADR-024-amendment-or-test-tweak
+/// follow-up.
+fn vault_error_to_mcp(err: VaultError) -> McpError {
+    match err {
+        // ADR-024 line 765: -32602, "invalid parameters".
+        VaultError::DimensionMismatch { .. } | VaultError::InvalidInput(_) => {
+            McpError::invalid_params("invalid parameters", None)
+        }
+        // ADR-024 line 764: -32001, "access denied". Was -32602 before
+        // Step 4 — Step 3's test pins DimensionMismatch only, so the
+        // AccessDenied behaviour change is safe.
+        VaultError::AccessDenied(_) => {
+            McpError::new(ERROR_CODE_ACCESS_DENIED, "access denied", None)
+        }
+        // ADR-024 line 766: same wire shape as AccessDenied — denies
+        // attacker fingerprinting of which model file failed.
+        VaultError::ModelIntegrityFailed { .. } => {
+            McpError::new(ERROR_CODE_ACCESS_DENIED, "access denied", None)
+        }
+        // ADR-024 line 767: Storage / Embedding / Retrieval → -32603.
+        VaultError::Storage(_) | VaultError::Embedding(_) | VaultError::Retrieval(_) => {
+            McpError::internal_error("internal error", None)
+        }
+        // ADR-024 silent on NotFound — preserves prior behaviour
+        // (`-32602 invalid_params, "not found"`). MCP spec offers
+        // `RESOURCE_NOT_FOUND = -32002` which may be a better fit;
+        // out of Step 4 scope (no shipped test pins this), tracked
+        // for ADR-024 amendment when memory.update / memory.delete
+        // grow their own pin tests in Step 5.
+        VaultError::NotFound(_) => McpError::invalid_params("not found", None),
+        // ADR-024 silent on the remaining variants — preserves prior
+        // catch-all behaviour (`-32603 internal_error`). The grouping
+        // is deliberate and privacy-preserving: any of these leaking
+        // structural detail would be a regression. Audit row carries
+        // full per-variant detail via `ToolInvokeError::Internal`
+        // (see `audit::ToolInvokeError::from_vault_error`).
+        VaultError::Llm(_)
+        | VaultError::Consolidation(_)
+        | VaultError::Mcp(_)
+        | VaultError::Sync(_)
+        | VaultError::Connector(_)
+        | VaultError::Auth(_)
+        | VaultError::Crypto(_)
+        | VaultError::Config(_)
+        | VaultError::Io(_)
+        | VaultError::Serde(_) => McpError::internal_error("internal error", None),
+    }
+}
+
+/// Serialise a value to a `CallToolResult` with a single JSON content
+/// block — the canonical success shape for every vault tool.
+fn success_json_result<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
+    let content = Content::json(value).map_err(|e| {
+        // Content::json failures only happen on serialise errors, which
+        // shouldn't occur for our domain types. Map to a generic internal
+        // error rather than leaking the serde message.
+        let _ = e;
+        McpError::internal_error("response serialisation failed", None)
+    })?;
+    Ok(CallToolResult::success(vec![content]))
+}
+
+/// Parse a UUID-string into `MemoryId`. Returns the generic
+/// `invalid parameters` error on parse failure (no-info-leak).
+fn parse_memory_id(id: &str) -> Result<MemoryId, McpError> {
+    id.parse::<uuid::Uuid>()
+        .map(MemoryId)
+        .map_err(|_| McpError::invalid_params("invalid parameters", None))
 }

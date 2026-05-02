@@ -37,6 +37,7 @@
 //!   reject inputs > [`MAX_QUERY_BYTES`] bytes after trim.
 
 use async_trait::async_trait;
+use serde::Serialize;
 use vault_core::{Boundary, Memory, VaultResult};
 
 /// Hard upper bound on `max_results`. Rejecting values above this prevents
@@ -107,7 +108,16 @@ pub struct RetrievalOptions {
 
 /// One retrieved memory, with its similarity score and a stable
 /// human-readable explanation.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// **Wire format — load-bearing:** this struct is serialised into MCP
+/// `memory.search` tool responses (T0.1.9 Phase 2 — see
+/// `crates/vault-mcp/src/server.rs::tool_search`). Field renames are
+/// **breaking changes** to the MCP API contract; downstream agents
+/// (Claude Desktop, ChatGPT, Cursor, custom MCP clients) parse JSON
+/// keyed on these field names. See ADR-024 for the JSON-RPC response
+/// shape and the alpha-breaking-change policy (V0.x is alpha; wire
+/// changes allowed through V0.2, frozen at V1.0).
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct RetrievedMemory {
     /// The hydrated memory row. Always belongs to a boundary in
     /// `RetrievalQuery::authorized_boundaries` — boundary leakage is

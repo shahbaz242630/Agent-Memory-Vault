@@ -947,41 +947,113 @@ _(populated once V0.1 ships)_
 
 ## Notes for Next Session
 
-**Immediate state:** T0.1.9 Phase 1 fully shipped at `bbea59f` (committed + pushed 2026-05-01); `origin/main` clean. Working tree clean. Workspace **331 passing + 2 ignored** (vault-embedding test 6 + vault-retrieval `end_to_end` perf gates), build/clippy/fmt all clean. **Active task: T0.1.9 Phase 2** — handler bodies + rmcp `#[tool_router(server_handler)]` + `#[tool]` macro wiring + recording adapter + audit append at MCP layer per ADR-024 + the trust-boundary tests' `should_panic` → positive-assertion conversion.
+**Immediate state:** T0.1.9 Phase 1 fully shipped at `bbea59f` (committed + pushed 2026-05-01); `origin/main` clean. **Phase 2 IN FLIGHT on disk (uncommitted)** — Step 1 (macro spike at `crates/vault-mcp/examples/macro_spike.rs`, 6 contracts verified against rmcp 1.5.0), Step 2 (macro wiring on `StdioServer`: `tool_router` field + `#[tool_router]` impl + four `#[tool]`-decorated `tool_*` wrappers + `#[tool_handler] impl ServerHandler` with `get_info()` returning `server_info.name = "vault-mcp"` + `vault_error_to_mcp` centralised mapper + `parse_memory_id` + `success_json_result`), Step 3 (`tests/error_mapping.rs::dimension_mismatch_returns_generic_invalid_params_no_data_leak` active + `dimension_mismatch_audit_row_pins_full_detail` `#[ignore]`-marked as pinned-TODO for Step 4 per Option A). Workspace **332 passing + 3 ignored** (Step 3 added 1 active + 1 ignored; perf gates unchanged). Build/clippy/fmt all clean.
+
+**Step 2 boundary shift (logged per Shahbaz approval at Step 2 close):** Step 2 wired tool-layer dispatch end-to-end (beyond literal v1.1 stub guidance) so Step 3's error-mapping test exercises the real path. Audit/tracing/timing remain Step 4 scope. Trust-boundary tests stayed green throughout — `handle_*` methods preserved unchanged; new `tool_*` wrappers translate `Parameters<T>` ↔ `handle_*` ↔ `Result<CallToolResult, McpError>`. (F2) cross-crate change documented inline: `RetrievedMemory` gained `Serialize` derive + a wire-format doc comment in `crates/vault-retrieval/src/retriever.rs`; `serde` added to vault-retrieval workspace deps.
+
+**Next on disk:** Step 4 (audit append via `Adapter::append_tool_invoke_audit` + `tracing::info!(target: "vault_mcp::tool_invoke", ...)` per-tool emission + duration-ms timer brackets at handler entry/exit + un-ignore Step 3 (c) test + fill its body per ADR-024 schema + extend `vault_error_to_mcp` to exhaustive match per Step 3 sanity-check #4).
 
 **T0.1.9 ship plan progress (Phase 1 CLOSED):**
 - ✅ Plan v1.0 → v1.1 → v1.2 → v1.3 → **v1.3.1** (Phase-1-time amendment for `initialize` smoke scope reduction + chrono pin advance documentation, both approved at Phase 1 close).
 - ✅ Spike 1 (web-research methodology, runtime confirmation in Phase 1) — host-vs-server scope finding inverted plan v1.2's premise; Option A applied per Shahbaz; ADR-026 lands the stable identifiers (13 CVEs, OX Security advisory 2026-04-15, rmcp 1.5.0 release context, verbatim quote of host-vs-server distinction) + forward pointer to T0.1.11 vault-tauri or successor task introducing MCP-host functionality.
 - ✅ Phase 1 — `bbea59f` (workspace `rmcp = "=1.5.0"` exact-pin + chrono `=0.4.39` advance with compatible band `[0.4.39, 0.4.44)` documented in ADR-013 amendment; T0.1.8 audit-removal sub-phase as a single coherent diff per plan v1.3 §6.2 — `RetrievalQuery` → `McpToolInvoke` rename in vault-storage + audit append removed from `SemanticRetriever::retrieve` + replaced with `tracing::info!(target: "vault_retrieval::query", ...)`; ADRs 023/024/025/026 landed; vault-mcp scaffold — `Adapter` trait + `StdioServer` + 4 typed `handle_*` stubs + 2 typed param structs that deliberately omit `authorized_boundaries` per ADR-025; 6 trust-boundary tests + 3 API-surface initialize smoke tests; **331 passing + 2 ignored**, all four DoD gates clean).
-- ⏳ Phase 2 — handler bodies + macros + audit append + tests' `should_panic` removal (next session).
+- 🔄 Phase 2 — **IN FLIGHT on disk (Steps 1-3 done, UNCOMMITTED)**: macro spike (Step 1) + macro wiring on `StdioServer` (Step 2 with approved (F1) boundary shift) + `dimension_mismatch` error-mapping test (Step 3 with Option A on (c) — `(a)(b)(d)` active, `(c)` audit-row as `#[ignore]`-marked pinned-TODO). **Step 4 next session.** Workspace **332 passing + 3 ignored**, all four DoD gates clean.
 - ⏳ Phase 3 — adversarial hardening (oversized payloads, malformed JSON, framing edges, unicode/control-char) + Windows CI matrix entry per ADR-001 ("Add Windows in T0.1.9").
 
-### T0.1.9 Phase 2 — next session opener
+### T0.1.9 Phase 2 Step 4 — next session opener (READ THIS FIRST)
 
-T0.1.9 Phase 1 is **fully shipped** (`bbea59f`). Next up: **T0.1.9 Phase 2** (per `T0.1.9_PLAN.md` §7 Phase 2).
+**Where you are when you wake up:** working tree is **NOT clean** — Phase 2 Steps 1-3 are uncommitted on disk. Don't accidentally `git stash` / `git reset --hard` these. Run `git status --short` first to confirm the file list below matches.
 
-**Two carry-forward flags from Shahbaz Phase 1 close** (NOT blocking but shape Phase 2's structure):
+#### What's on disk uncommitted (Phase 2 Steps 1–3)
 
-1. **VaultAdapter location = vault-app** (clean separation: vault-mcp is protocol layer; vault-app wires storage + retrieval + audit). If T0.1.10 hasn't started by Phase 2 time, **create a minimal vault-app skeleton just for `VaultAdapter`**; that skeleton becomes T0.1.10's starting point. `vault-mcp/tests/` gets a `MockAdapter` (recording variant) so the trust-boundary `should_panic` markers can flip to positive assertions (assert the recorded `RetrievalQuery::authorized_boundaries` equals the trusted slice, NOT anything from the request body).
+```
+A crates/vault-mcp/examples/macro_spike.rs    (~210 LoC, kept as exec docs per Q4)
+M crates/vault-mcp/Cargo.toml                  (uuid workspace dep + comment refresh)
+M crates/vault-mcp/src/lib.rs                  (re-export DeleteToolParams + UpdateToolParams)
+M crates/vault-mcp/src/server.rs               (~150 LoC: tool_router field +
+                                                #[tool_router] impl + 4× #[tool]-decorated
+                                                tool_* wrappers + #[tool_handler]
+                                                ServerHandler with get_info() +
+                                                vault_error_to_mcp + parse_memory_id +
+                                                success_json_result helpers)
+M crates/vault-mcp/tests/common/mod.rs         (DimMismatchAdapter + make_dim_mismatch_server)
+A crates/vault-mcp/tests/error_mapping.rs      (1 active + 1 pinned-TODO ignored)
+M crates/vault-retrieval/src/retriever.rs      (Serialize derive on RetrievedMemory +
+                                                wire-contract doc per (F2))
+M crates/vault-retrieval/Cargo.toml            (serde workspace dep)
+M HANDOFF.md                                   (this file — Phase 2 in-flight state)
+```
 
-2. **`dimension_mismatch_returns_generic_invalid_params_with_full_audit_detail`** (per ADR-024 §5) **lands BEFORE macro-router wiring stabilizes**, not after. Reasoning: if the error mapping is wrong, all four tool handlers leak the same way; catching the class in one test is cheaper than catching it across four. Land this test early in Phase 2 so it pins the contract while the macros are still being shaped.
+#### Plan v1.1 status (locked, no further iteration needed for Steps 4-9)
 
-**Phase 2 work sketch:**
+- ✅ **Step 1** — Macro spike. `cargo run -p vault-mcp --example macro_spike` exit 0; 6 contracts verified against rmcp 1.5.0 (macro names `#[tool_router]` + `#[tool]` + `#[tool_handler]`, derive trio `Serialize+Deserialize+schemars::JsonSchema`, return-type `Result<CallToolResult, McpError>`, direct-method-invocation works for handler-mediated audit (Q7 a), custom `get_info()` coexists, `tool_attr()` helpers auto-generated). NO plan amendment.
+- ✅ **Step 2** — Macros wired on `StdioServer`. (F1) approved: tool-layer dispatch wired end-to-end (beyond literal v1.1 stub guidance) so Step 3's error-mapping test exercises the real path. Audit/tracing/timing remain Step 4 scope. Trust-boundary tests stayed green throughout (`handle_*` preserved unchanged; new `tool_*` wrappers translate `Parameters<T>` ↔ `handle_*` ↔ `Result<CallToolResult, McpError>`). (F2) approved with wire-contract doc landed.
+- ✅ **Step 3** — `dimension_mismatch_returns_generic_invalid_params_no_data_leak` active. Pins `(a)` code=-32602, `(b)` message=="invalid parameters" with explicit no-leak checks against "384"/"256"/"dimension"/"expected"/"actual", `(d)` `error.data.is_none()`. Pinned-TODO `dimension_mismatch_audit_row_pins_full_detail` `#[ignore]`-marked with `todo!()` body listing the 9 fields Step 4 must assert per ADR-024 schema.
+- ⏳ **Step 4 — NEXT.** See detailed work breakdown below.
+- ⏳ Step 5 — Fill `tool_write` / `tool_update` / `tool_delete` body internals (audit + tracing + timer per Step 4 pattern; success-path response shapes already wired in Step 2). **Carry-forward from Step 4:** ADR-024 line 765 reads `"invalid params"` (matching JSON-RPC 2.0 spec); shipped implementation + Step 3 test pin `"invalid parameters"`. Reconcile inside Step 5 alongside the tool_write/update/delete wiring — single-line message update in `vault_error_to_mcp` + Step 3 test message update. Tracked here so the wording follow-up doesn't drift past Step 5.
+- ⏳ Step 6 — Minimal `VaultAdapter` skeleton in `crates/vault-app/src/adapter.rs` (struct + `Adapter` impl + `append_tool_invoke_audit` method, NOT Application/config/lifecycle — that's T0.1.10).
+- ⏳ Step 7 — `MockAdapter` (recording variant) in `crates/vault-mcp/tests/common/mock_adapter.rs`.
+- ⏳ Step 8 — Convert `tests/trust_boundary.rs::handler_reaches_adapter_with_malicious_*` `should_panic` markers to positive assertions against `MockAdapter`.
+- ⏳ Step 9 — Full JSON-RPC `initialize` round-trip via `tokio::io::duplex()` ↔ `IntoTransport`. Tool-list pin assertion: count == 4 AND names == `{memory.search, memory.write, memory.update, memory.delete}`.
 
-1. **Read** `T0.1.9_PLAN.md` §7 Phase 2 + §5 (error model) + §6.2 rule 2 (locked `details_json` schema) + ADR-024 + ADR-025 — these are the contracts Phase 2 must honour.
-2. **Wire `#[tool_router(server_handler)]` + `#[tool]` macros** on `StdioServer` (or sibling `RmcpHandler` type if the macro layout cleaner separates from the handler logic). The Phase 1 scaffold's `handle_search` / `handle_write` / `handle_update` / `handle_delete` methods are the dispatch targets.
-3. **Replace stub `Adapter` with real `VaultAdapter`** in vault-app per flag #1. `VaultAdapter` holds `Arc<MetadataStore>` + `Arc<dyn Retriever>` + `Arc<StorageBackend>` and dispatches the four trait methods. vault-mcp/tests/ gets `MockAdapter` for trust-boundary positive assertions.
-4. **`dimension_mismatch` test lands EARLY** per flag #2.
-5. **Remove `should_panic` markers** from `tests/trust_boundary.rs::handler_reaches_adapter_with_malicious_*` — replace with positive assertions against `MockAdapter` recorded calls (the trusted slice was used; the request-body field was NOT).
-6. **Append `mcp.tool_invoke` audit events** at handler exit per ADR-024 schema (`{tool, duration_ms, result_count, boundary_count, max_results?, score_threshold?, include_archived?, query_length?, error?}`); per-tool `tracing::info!` observability emission alongside (per plan §3.5 — observability stays even though the rate-limit trait is deferred).
-7. **Full JSON-RPC `initialize` round-trip test** (replacing the Phase 1 API-surface compile-check). Drive `tokio::io::duplex()` ↔ `IntoTransport` end-to-end; assert response shape matches MCP spec. This is the deferred Phase 1 §7 step 8 work landing in its natural Phase 2 home.
-8. **Tests target:** ~25-35 new tests across handler unit tests + adapter wiring + audit append + the dimension-mismatch contract + initialize round-trip + trust-boundary positives.
+#### Step 4 work breakdown
 
-**Spike check (Phase 2):** rmcp 1.5.0's `#[tool_router(server_handler)]` + `#[tool]` + `Parameters<T>` macro contract — likely a brief mini-spike (compile-and-run methodology) to verify the macro shape against actual usage before the handler bodies depend on it. Phase 1's API-surface check already verified the imports + `tokio::io::duplex` ↔ `IntoTransport` interop, so the macro contract is the only remaining unknown.
+To un-ignore Step 3's `(c)` test + close the audit/observability infrastructure, Step 4 must:
 
-**ADRs likely needed in Phase 2:** none mandatory — the four ADRs (023/024/025/026) cover the architectural decisions. Possible amendment to ADR-024 if the locked `details_json` schema needs adjustment after handler bodies expose edge cases (e.g. write/update/delete don't have a `query_length` field — schema may need explicit `null` vs absent handling).
+1. **Define `ToolInvokeDetails` struct** in vault-mcp (`crates/vault-mcp/src/audit.rs`). Schema per ADR-024 (HANDOFF.md lines 770–790, T0.1.9_PLAN.md §5 line 161 + §6.2 rule 2 line 189) — *quote the ADR, do not paraphrase*:
+   - Common fields: `tool: &'static str`, `duration_ms: u64`, `result_count: u32`, `boundary_count: u32`, `error: Option<ToolInvokeError>`
+   - Search-only `Option<T>` fields with `#[serde(skip_serializing_if = "Option::is_none")]` so they're ABSENT (not `null`) on write/update/delete per Q1: `max_results: Option<u32>`, `score_threshold: Option<f32>`, `include_archived: Option<bool>`, `query_length: Option<u32>`.
+   - `ToolInvokeError` is `#[serde(tag = "type", content = "detail")]` enum with one variant per ADR-024's mapping table row (`AccessDenied` / `DimensionMismatch` / `ModelIntegrityFailed` / `Storage` / `Embedding` / `Retrieval` / `InvalidInput`). Variant idents PascalCase; serde uses them as-is for `"type"`. Per-variant detail shapes per ADR-024 lines 787–790. Plus an `Internal { category, message }` variant for ADR-024-silent VaultError variants (collapsing `Llm` / `Crypto` / `Io` / etc. — privacy-preserving default until ADR-024 is amended).
+   - Canonical sorted-key JSON via `ToolInvokeDetails::to_canonical_json` — uses `BTreeMap` at every nesting level so audit-chain hashing is deterministic per BRD §11.9.2.
+2. **Add `Adapter::append_tool_invoke_audit(details: ToolInvokeDetails) -> VaultResult<()>`** to the trait (`crates/vault-mcp/src/adapter.rs`).
+3. **Update `StubAdapter` + `DimMismatchAdapter`** in `tests/common/mod.rs` — add `Mutex<Vec<ToolInvokeDetails>>` recording field; `append_tool_invoke_audit` pushes into it; expose `recorded_audits()` method for assertions.
+4. **Wire `tool_search` body** with: snapshot typed-param fields BEFORE handler dispatch (the handler moves params into a `RetrievalQuery`) → `let start = Instant::now();` → handler dispatch → `let duration_ms = start.elapsed().as_millis() as u64;` → build `ToolInvokeDetails` (mapping `VaultError` to `error.type` + variant-specific `detail` fields per ADR-024 via `ToolInvokeError::from_vault_error`) → emit `tracing::info!(target: "vault_mcp::tool_invoke", ...)` FIRST per Q5/Q6 (operational log fires regardless of audit-store health) → `self.adapter.append_tool_invoke_audit(details).await?;` (authoritative audit chain) → return result. The tracing-before-audit ordering is a small (F1)-style refinement vs the original work-breakdown ordering (audit-then-tracing); preserves the contract while ensuring tracing fires on audit-store failure.
+5. **Un-ignore `dimension_mismatch_audit_row_pins_full_detail`**, replace `todo!()` with assertions on `recorded_audits()` at BOTH the typed-Rust level (`ToolInvokeError::DimensionMismatch { expected: 384, actual: 256 }`) AND the canonical-JSON wire level (`error.type == "DimensionMismatch"`, `error.detail.expected == 384`, `error.detail.actual == 256`) per ADR-024 nested shape. Also pin the absent-vs-null invariant for `score_threshold` (search call passed `None` → must NOT serialise as `"score_threshold": null`).
+6. **Convert `vault_error_to_mcp` to exhaustive match** per Step 3 sanity-check #4 carryover. Read every `VaultError` variant; map each deliberately per ADR-024 mapping table — `AccessDenied` and `ModelIntegrityFailed` advance from the prior `-32602`-via-catch-all to ADR-024 line 764/766's locked `-32001` access-denied code. ADR-024-silent variants (`NotFound` / `Llm` / `Crypto` / `Io` / etc.) preserve prior catch-all behaviour with explicit per-variant arms, so adding a new `VaultError` variant becomes a compile error here.
 
-**Remaining V0.1 tasks after T0.1.9 Phase 1:** T0.1.9 Phase 2 + Phase 3 (active), T0.1.10 (vault-app wiring — *now expected to absorb the minimal vault-app skeleton from Phase 2 flag #1; also lands the deferred Phase 4 integration smoke from T0.1.7 + the post-T0.1.10 retrieval perf-gate investigation candidate from T0.1.8 Phase 3 — vault-app is where `BgeSmallProvider × StorageBackend × LanceDB` get wired and where realistic workload data surfaces*), T0.1.11 (vault-tauri minimal UI + ADR-010 compensating controls + Tauri resource bundling per ADR-019 + integrity-failure fatal dialog per ADR-020 + **April 15 RCE class threat-surface revisit per ADR-026 forward pointer if vault-tauri introduces MCP-host functionality**), T0.1.12 (founder dogfood end-to-end test).
+**Step 4 expected test delta**: +1 active (un-ignored from Step 3) + 6 new audit unit tests in `audit::tests` → workspace **339 passing + 2 ignored** (perf gates). The +6 audit unit tests pin the wire format at the type level (canonical key ordering, search-fields-absent on write, DimensionMismatch nested shape, from-VaultError mapping) so future changes to the typed struct can't silently break ADR-024 conformance.
+
+**Reconciliation note (2026-05-02):** the prior text of this work breakdown described `ToolInvokeError` as a flat `{ kind, expected, actual }` shape — that paraphrase drifted from ADR-024's locked nested `{ type, detail }` shape (HANDOFF.md lines 786–790 + T0.1.9_PLAN.md §5 line 161 + §6.2 rule 2 line 189). ADR-024 stays unchanged; the work-breakdown text was reconciled to quote the ADR contract directly. New feedback memory: "Quote locked artefacts, don't paraphrase" — operational doc text saying "per ADR-X" must match the cited artefact verbatim or quote it, never paraphrase.
+
+#### Carry-forward decisions already locked (DO NOT re-litigate)
+
+- **Q1** per-variant `details_json` shape, fields **absent** (not null) for tools that don't carry them. Step 4 audit-row tests assert absence on write/update/delete.
+- **Q2** VaultAdapter scope: minimal-just-the-type at Step 6. T0.1.10 inherits Application/config/lifecycle.
+- **Q3** MockAdapter at `crates/vault-mcp/tests/common/mock_adapter.rs`.
+- **Q4** Spike artefact retained at `crates/vault-mcp/examples/macro_spike.rs`.
+- **Q5** Tracing target = `vault_mcp::tool_invoke`.
+- **Q6** Tracing fields = audit `details_json` minus content (no `query_text`, no boundary names).
+- **Q7** **(a) Handler-mediated audit.** `tool_*` handler builds `ToolInvokeDetails` + calls `adapter.append_tool_invoke_audit(details)`. Adapter is pure work-doer.
+- **(F1)** Step 2 wired tool-layer dispatch end-to-end. Audit/tracing/timing remain Step 4 scope.
+- **(F2)** `RetrievedMemory` gained `Serialize` + wire-contract doc. Field renames are MCP API breaking changes per ADR-024.
+- **Option A on (c)** — pinned-TODO ignored test in Step 3; Step 4 un-ignores + fills.
+- **Sanity #1-#5** applied at Step 3: macro placement confirmed, `tool_router` field doc expanded as load-bearing, `parse_memory_id` generic, `vault_error_to_mcp` exhaustive-cleanup is Step 4 carryover, `get_info()` server name = "vault-mcp" exact.
+
+#### Commit policy reminder (CLAUDE.md, project-scoped)
+
+Phase 2 is uncommitted across multiple steps. Two paths:
+- **Per-step commits** (Step 4 commits independently). Cleaner history; more confirm cycles for Shahbaz.
+- **Single Phase 2 commit at the end** (after Step 9 ships). One confirm cycle; bigger diff.
+
+Shahbaz hasn't picked yet. **Ask at session open before commit time.** No commits without per-action approval per the standing rule.
+
+#### Plan v1.1 reference
+
+Full plan: `T0.1.9_PLAN.md` + the Phase 2 v1.1 amendments captured inline in the session that landed Step 1-3. Q1-Q7 answers + (F1)/(F2) decisions are in the carry-forward block above so no plan re-read needed for Step 4.
+
+#### Stale doc-hygiene note (not blocking)
+
+The `**Last updated:**` header at the top of HANDOFF.md still says "Phase 1 implementation complete on disk … Holding for Shahbaz Phase 1 review before commit" — that's stale; Phase 1 shipped at `bbea59f`. Refresh as part of the Phase 2 close commit (header updates tied to commit time).
+
+#### Spike check (Step 4)
+
+None needed. Step 1 spike already verified the macro contract; Step 4 work is wiring inside the verified surface (timer brackets + audit append + tracing emission). If anything in Step 4 surfaces unexpected — particularly around `Adapter::append_tool_invoke_audit` trait signature ergonomics, or `ToolInvokeDetails` per-variant serialization shape — **stop and escalate** per the standing rule.
+
+#### ADRs likely needed in Step 4
+
+None mandatory. Possible ADR-024 amendment if `ToolInvokeDetails` modelling reveals an edge case (e.g. "absent" vs "null" needs explicit serde annotation). Land amendment inline if so; flag in commit message.
+
+**Remaining V0.1 tasks after T0.1.9 Phase 2 closes:** T0.1.9 Phase 3 (adversarial hardening + Windows CI per ADR-001), T0.1.10 (vault-app wiring — *absorbs the Step 6 minimal `VaultAdapter` skeleton; also lands the deferred Phase 4 integration smoke from T0.1.7 + the post-T0.1.10 retrieval perf-gate investigation candidate from T0.1.8 Phase 3 — vault-app is where `BgeSmallProvider × StorageBackend × LanceDB` get wired and where realistic workload data surfaces*), T0.1.11 (vault-tauri minimal UI + ADR-010 compensating controls + Tauri resource bundling per ADR-019 + integrity-failure fatal dialog per ADR-020 + **April 15 RCE class threat-surface revisit per ADR-026 forward pointer if vault-tauri introduces MCP-host functionality**), T0.1.12 (founder dogfood end-to-end test).
 
 ### Locked-into-code invariants any V0.2+ work must respect
 

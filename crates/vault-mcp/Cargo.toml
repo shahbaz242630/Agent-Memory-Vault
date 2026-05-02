@@ -20,6 +20,10 @@ tokio = { workspace = true }
 # with `{tool, duration_ms, result, boundary_count}` per ADR-024 + plan §3.5.
 tracing.workspace = true
 
+# UUID parsing for `memory.update` / `memory.delete` tool params
+# (the agent supplies the memory id as a string; we parse → MemoryId).
+uuid = { workspace = true }
+
 # Domain types: Boundary (mandatory auth-gate input per ADR-025),
 # MemoryId, VaultError, VaultResult.
 vault-core = { path = "../vault-core" }

@@ -18,6 +18,12 @@ async-trait.workspace = true
 # this crate emits operational logging only.
 tracing.workspace = true
 
+# serde — `RetrievedMemory` derives `Serialize` so vault-mcp's
+# `memory.search` tool (T0.1.9 Phase 2) can serialise the wire response
+# directly. Memory (vault-core) is already Serialize; this carries the
+# wire-friendliness through to the retrieval result type.
+serde = { workspace = true }
+
 # Domain types: Memory, Boundary, MemoryId, VaultError, VaultResult.
 vault-core = { path = "../vault-core" }
 

@@ -23,6 +23,8 @@ use async_trait::async_trait;
 use vault_core::{MemoryId, NewMemory, VaultResult};
 use vault_retrieval::{RetrievalQuery, RetrievedMemory};
 
+use crate::audit::ToolInvokeDetails;
+
 /// Domain-level interface for the four MCP tools. Implementations are
 /// expected to be cheap-to-clone (`Arc`-shared internal state) so the
 /// stdio server can hand them off across the request boundary without
@@ -57,4 +59,20 @@ pub trait Adapter: Send + Sync {
     /// has already verified the memory's boundary against the trusted
     /// authorization slice before this is called.
     async fn delete(&self, id: MemoryId) -> VaultResult<()>;
+
+    /// Append one `mcp.tool_invoke` audit event to the local audit
+    /// chain. Called by the `tool_*` handlers in [`crate::server`] at
+    /// invocation exit (success and error paths both append) per
+    /// Q7 (a) — handler-mediated audit, the adapter is the work-doer.
+    ///
+    /// Implementations MUST serialise `details` to canonical sorted-key
+    /// JSON via [`ToolInvokeDetails::to_canonical_json`] before persisting
+    /// — direct `serde_json::to_string` uses struct field declaration
+    /// order, which is fine for tracing/debug but would silently break
+    /// audit chain hashing (BRD §11.9.2).
+    ///
+    /// The schema of `details` is locked by ADR-024 (HANDOFF.md +
+    /// T0.1.9_PLAN.md §5 / §6.2 rule 2). Search-only fields are
+    /// `Option<T>` and absent (not null) on write/update/delete per Q1.
+    async fn append_tool_invoke_audit(&self, details: ToolInvokeDetails) -> VaultResult<()>;
 }

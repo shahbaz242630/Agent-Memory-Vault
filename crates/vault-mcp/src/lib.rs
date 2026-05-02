@@ -57,7 +57,11 @@
 #![forbid(unsafe_code)]
 
 mod adapter;
+mod audit;
 mod server;
 
 pub use adapter::Adapter;
-pub use server::{SearchToolParams, StdioServer, WriteToolParams};
+pub use audit::{ToolInvokeDetails, ToolInvokeError};
+pub use server::{
+    DeleteToolParams, SearchToolParams, StdioServer, UpdateToolParams, WriteToolParams,
+};
