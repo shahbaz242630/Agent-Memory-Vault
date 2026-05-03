@@ -9,3 +9,40 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Async traits — VaultAdapter implements vault_mcp::Adapter (async).
+async-trait.workspace = true
+
+# chrono — Utc::now() for last_accessed advancement on update per ADR-028.
+chrono = { workspace = true }
+
+# Tokio — async runtime for the Adapter impls + audit append paths.
+tokio = { workspace = true }
+
+# tracing — structured logs at the application boundary.
+tracing.workspace = true
+
+# Domain types: Memory, MemoryId, NewMemory, Boundary, VaultError.
+vault-core = { path = "../vault-core" }
+
+# vault-mcp Adapter trait — VaultAdapter is the production impl.
+vault-mcp = { path = "../vault-mcp" }
+
+# Retriever trait — VaultAdapter::search delegates to the wired
+# `Arc<dyn Retriever>` (typically `SemanticRetriever` at T0.1.10).
+vault-retrieval = { path = "../vault-retrieval" }
+
+# StorageBackend orchestrator + MetadataStore + audit primitives —
+# VaultAdapter holds StorageBackend + MetadataStore (separate handle
+# for `append_tool_invoke_audit`; both share the same `Arc<Inner>`
+# SQLCipher connection so no duplicate opens).
+vault-storage = { path = "../vault-storage" }
+
+# EmbeddingProvider trait — VaultAdapter::write / ::update embed the
+# new content before calling StorageBackend::write_memory /
+# update_memory (StorageBackend takes a pre-computed embedding).
+vault-embedding = { path = "../vault-embedding" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+tempfile.workspace = true
+serde_json = { workspace = true }

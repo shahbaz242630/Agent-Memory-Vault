@@ -144,6 +144,33 @@ impl Memory {
         Ok(memory)
     }
 
+    /// Construct a memory with a caller-supplied id, sharing the
+    /// validation and default behaviour of [`Self::try_new`]. Used
+    /// by the MCP `memory.update` path in vault-app: the existing
+    /// memory's id must be preserved across the update per ADR-028,
+    /// but `try_new` always generates a fresh id. This is the
+    /// canonical entry point — vault-app does NOT manually
+    /// construct `Memory` from struct literals (which would bypass
+    /// validation).
+    ///
+    /// `valid_from` / `valid_until` / `confidence` / etc. follow
+    /// `try_new`'s defaults: `valid_from` defaults to `now` if
+    /// omitted, system-managed fields (`created_at`, `last_accessed`,
+    /// `access_count`, `superseded_by`, `embedding`) get the same
+    /// defaults as `try_new`. Callers that need to preserve those
+    /// (per ADR-028) read the existing memory first and then mutate
+    /// the relevant fields on the returned struct.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::try_new`] — returns [`VaultError::InvalidInput`]
+    /// if any of the invariants listed on [`Memory`] are violated.
+    pub fn try_new_with_id(id: MemoryId, args: NewMemory) -> VaultResult<Self> {
+        let mut memory = Self::try_new(args)?;
+        memory.id = id;
+        Ok(memory)
+    }
+
     /// Re-check all invariants. Storage layers must call this before write
     /// (BRD §11.7.1: validate at every public API boundary).
     pub fn validate(&self) -> VaultResult<()> {
@@ -222,6 +249,44 @@ mod tests {
         assert!(!memory.is_superseded());
         assert_eq!(memory.created_at, memory.valid_from);
         assert_eq!(memory.created_at, memory.last_accessed);
+    }
+
+    #[test]
+    fn try_new_with_id_uses_supplied_id_not_generated() {
+        // Buggy impl that ignores the supplied id and calls
+        // MemoryId::new() must fail this — pin the contract.
+        let supplied = MemoryId::new();
+        let memory = Memory::try_new_with_id(supplied, sample_args()).unwrap();
+        assert_eq!(
+            memory.id, supplied,
+            "try_new_with_id MUST use the caller-supplied id, not generate fresh"
+        );
+    }
+
+    #[test]
+    fn try_new_with_id_applies_same_validation_as_try_new() {
+        // Pick a representative validation case (empty content) and
+        // assert try_new_with_id rejects identically to try_new.
+        // Pinning the validation parity matters because vault-app's
+        // update path is the only consumer; if validation diverges
+        // here, MCP-driven updates could write content shapes that
+        // direct write paths reject.
+        let mut args = sample_args();
+        args.content = String::new();
+        let id = MemoryId::new();
+        assert!(
+            matches!(
+                Memory::try_new_with_id(id, args.clone()),
+                Err(VaultError::InvalidInput(_))
+            ),
+            "try_new_with_id must reject empty content like try_new does"
+        );
+        // Same shape: oversized content rejected.
+        args.content = "x".repeat(MAX_MEMORY_CONTENT_BYTES + 1);
+        assert!(matches!(
+            Memory::try_new_with_id(id, args),
+            Err(VaultError::InvalidInput(_))
+        ));
     }
 
     #[test]

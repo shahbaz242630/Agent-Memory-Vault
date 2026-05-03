@@ -1,9 +1,9 @@
 # Memory Vault — Build Handoff
 
-**Last updated:** 2026-05-02 (T0.1.9 Phase 2 Steps 1–5 shipped — vault-mcp tool layer fully wired with ADR-024 audit contract enforced at the type level. Steps 1–4 shipped at `6515f31`; Step 5 shipped at this commit (tool_write / tool_update / tool_delete bodies wired with timer + audit + tracing per Step 4 pattern, `SuccessAdapter` test fixture sibling to StubAdapter + DimMismatchAdapter, 7 new integration tests covering all four tools' success + error paths, "invalid params" wording reconciliation aligning impl + Step 3 test to ADR-024 line 765 + JSON-RPC 2.0 spec literal, `parse_memory_id_traced` design decision: pre-dispatch parse failures emit `vault_mcp::request_validation` tracing event but do NOT append to the audit chain — handler-mediated audit per Q7(a) records vault dispatches, malformed-id requests don't reach the vault). Workspace 346 passing + 2 ignored. Steps 6–9 in flight (per-step commits from Step 5 onward).)
+**Last updated:** 2026-05-02 (T0.1.9 Phase 2 Steps 1–5 shipped at `5505110`; **Step 6 work complete on disk, commit DEFERRED to next session for fresh DoD-gate re-verification**. Step 6 deliverables on disk: production `vault_app::VaultAdapter` impl of `vault_mcp::Adapter` (4 deps — `Arc<dyn Retriever>` / `Arc<dyn EmbeddingProvider>` / `StorageBackend` / `MetadataStore` — implementing all 5 Adapter methods); `Memory::try_new_with_id` in vault-core for the update path; ADR-028 locking update semantics with full 14-field Memory classification table in HANDOFF.md; ADR-025 Phase 2 Step 6 application subsection pinning `actor_kind = ActorKind::Agent` in HANDOFF.md. **In-session DoD result: 357 passing + 2 ignored across per-crate test runs (depth-first j=1 due to a system hang + linker memory pressure mid-session); fmt clean; clippy clean (`Finished` in 23m 32s on rebuild from `cargo clean`).** Why deferred: a system hang mid-session cascaded into a `cargo clean` overreach + 30+ min depth-first rebuild; gates passed but the partner asked to re-run gates fresh next session before commit, per the DoD-gates-clean-at-commit-time discipline. Steps 7–9 still in flight (per-step commits) AFTER Step 6 commits next session.)
 **Updated by:** Claude (Opus 4.7)
 **Current version:** V0.1 — Internal Alpha
-**Current phase:** V0.1 in progress — **T0.1.6 fully shipped (`f2d7cae`); T0.1.7 fully shipped (`a8c5e8e`); monthly tech-debt CI workflow shipped (`66f3097`); T0.1.8 fully shipped across three commits (`6d4e339` / `32befe5` / `c8987e4`); T0.1.9 Phase 1 shipped (`bbea59f`); T0.1.9 Phase 2 Steps 1–4 shipped (`6515f31`); T0.1.9 Phase 2 Step 5 shipped (this commit). Phase 2 Steps 6–9 in flight (per-step commits from Step 5 onward).**
+**Current phase:** V0.1 in progress — **T0.1.6 fully shipped (`f2d7cae`); T0.1.7 fully shipped (`a8c5e8e`); monthly tech-debt CI workflow shipped (`66f3097`); T0.1.8 fully shipped across three commits (`6d4e339` / `32befe5` / `c8987e4`); T0.1.9 Phase 1 shipped (`bbea59f`); T0.1.9 Phase 2 Steps 1–4 shipped (`6515f31`); T0.1.9 Phase 2 Step 5 shipped (`5505110`). T0.1.9 Phase 2 Step 6: WORK COMPLETE ON DISK, commit deferred to next session for fresh DoD-gate re-verification. Steps 7–9 in flight (per-step commits) after Step 6 commits.**
 
 ---
 
@@ -826,6 +826,10 @@ Two related items locked together (both about V0.1 cascade failure surfaces) for
   - When a new tool is added that legitimately needs to take a boundary as an argument (e.g. an admin-only tool that opens a boundary for inspection) — the design must explicitly carve out a separate trusted-args path; do not relax the default rule.
 - **Cross-link:** T0.1.9_PLAN.md §3.3 (surface (3) — prompt injection trust boundary) + Phase 2 step 2 (where the adversarial tests transition from `should_panic` to real assertions) + ADR-015 + ADR-018 (pattern parity).
 
+#### Phase 2 Step 6 application — `actor_kind` for `mcp.tool_invoke` audit rows (2026-05-02)
+
+`vault_app::VaultAdapter::append_tool_invoke_audit` (Step 6) records every `mcp.tool_invoke` audit-chain row with `actor_kind = ActorKind::Agent`. This is a near-trivial application of the ADR-025 trust-boundary contract above — the MCP client is an untrusted agent per ADR-025 §"UNTRUSTED" — but pinning it explicitly here matters because the audit chain is the long-lived forensic record and `actor_kind` is the field a future operator (or future-Claude) reads to triage "who did this." User attribution lives in the **boundary scope** (the `authorized_boundaries` slice the Application unlocked at startup, recorded indirectly through the audit row's resource/boundary fields), not in the `actor_kind` field. Conflating "the agent that invoked the tool" with "the user that owns the vault" by writing `User` would silently destroy the trust-boundary distinction in the forensic record. Pinned in `vault-app/src/adapter.rs::tests::append_tool_invoke_audit_records_actor_as_agent_per_adr_025`.
+
 ### ADR-026 — 2026-05-01 — rmcp pinned version + April 15 RCE class scope analysis (T0.1.9 Phase 1, post-Spike 1)
 
 - **Context:** T0.1.9 vault-mcp consumes `rmcp` (the official Anthropic Model Context Protocol Rust SDK). Spike 1 (web research, methodology declared per the saved spike-methodology rule) was tasked with: (1) pinning the rmcp version, (2) understanding the **April 15 stdio RCE class** (a security disclosure that prompted the spike), and (3) capturing canonical adversarial payload shape for a runtime-confirmation test. Spike 1 ran 2026-05-01 and surfaced a finding that materially diverged from plan v1.2's premise — surfaced via the stop-and-escalate discipline; v1.3 plan applied Option A.
@@ -882,6 +886,51 @@ Two related items locked together (both about V0.1 cascade failure surfaces) for
   - ADR-025 (trust-boundary contract — pre-dispatch validation is at the transport boundary, post-dispatch handler validation is at the application boundary; this ADR specifies that audit-append happens at the application boundary, not the transport boundary).
   - BRD §11.7 (input validation at every public API boundary) + BRD §11.9 (tamper-evident audit log scope).
   - Feedback memory: "Inline architectural decisions produce an ADR in the same commit" (this ADR is itself an instance of that pattern — surfaced during Step 5 implementation, locked in the same commit).
+
+### ADR-028 — 2026-05-02 — Memory update semantics: preserve provenance, overwrite content + classification (T0.1.9 Phase 2 Step 6)
+
+- **Context:** `vault_storage::cascading::StorageBackend::update_memory` overwrites every field of `Memory` (per `tx_update_memory`'s `UPDATE memories SET content=?, memory_type=?, source_agent=?, boundary=?, created_at=?, valid_from=?, valid_until=?, confidence=?, access_count=?, last_accessed=?, superseded_by=?, metadata_json=?`). MCP-driven update (Step 6 `VaultAdapter::update`), future connector ingestion, and the V0.2 sync engine all need an update path that preserves provenance + lineage and only overwrites content + classification metadata. Naive overwrite from a freshly-constructed `Memory::try_new(NewMemory)` would silently destroy `created_at` (provenance), `access_count` (read-history → consolidation signal), and `superseded_by` (consolidation lineage — would break the V0.2 consolidator's chain). The decision needs to be locked at the contract layer, not embedded in one consumer's code.
+- **Decision (rule statement):** **OVERWRITE only what the MCP write/update tool wire schema exposes** per ADR-024's tool-param contract — `content`, `memory_type`, `boundary`, `confidence` — **plus system-managed fields that update is expected to advance** (`last_accessed = Utc::now()`; `embedding` re-computed from new content). **Everything else PRESERVES** across update.
+- **Decision (per-field classification table — Memory has 14 fields per `crates/vault-core/src/memory.rs:85-100` at this commit):**
+
+  | # | Field | Type | Class | Reasoning |
+  |---|---|---|---|---|
+  | 1 | `id` | `MemoryId` | **PRESERVE** | Identity invariant — id IS the row, can't change across update. |
+  | 2 | `content` | `String` | **OVERWRITE** | The literal change target — what the agent is updating. |
+  | 3 | `memory_type` | `MemoryType` | **OVERWRITE** | Classification metadata; agent reclassification valid (semantic ↔ episodic ↔ procedural). |
+  | 4 | `source_agent` | `Option<String>` | **PRESERVE** | Genesis attribution. The audit chain records per-invocation actor (`actor_kind = Agent` per ADR-025 Step 6 application) so "which agent did the update" is captured forensically without overwriting genesis. Conflating genesis with most-recent-author destroys the distinction silently. |
+  | 5 | `boundary` | `Boundary` | **OVERWRITE** | Agent-supplied via `NewMemory`; subject to the StdioServer auth-gate check against the trusted `authorized_boundaries` slice (ADR-025). The agent CAN move a memory to a different authorized boundary. |
+  | 6 | `created_at` | `DateTime<Utc>` | **PRESERVE** | Provenance. Destroying creation timestamp on update destroys the audit/forensic trail and the consolidator's age-based decay signal. |
+  | 7 | `valid_from` | `DateTime<Utc>` | **PRESERVE** | Bi-temporal validity window. The MCP write/update wire schema does NOT expose `valid_from` (per ADR-024 `WriteToolParams` shape: `content` / `boundary` / `memory_type` / `source_agent` / `confidence` only). MCP can't update what MCP doesn't expose; preserving avoids silent reset to "now" on every MCP-driven update. |
+  | 8 | `valid_until` | `Option<DateTime<Utc>>` | **PRESERVE** | Same shape as `valid_from` — MCP wire doesn't expose it. |
+  | 9 | `confidence` | `f32` | **OVERWRITE** | Agent's assessment of the new content; updating content typically updates confidence. |
+  | 10 | `access_count` | `u32` | **PRESERVE** | Read-history counter; consolidation signal. Resetting to 0 on update destroys consolidation input. (V0.1 has no read-side increment yet; the field is preserved for V0.2 consolidator readiness.) |
+  | 11 | `last_accessed` | `DateTime<Utc>` | **OVERWRITE → `Utc::now()`** | Update IS an access; advancing `last_accessed` reflects the touch. |
+  | 12 | `superseded_by` | `Option<MemoryId>` | **PRESERVE** | Consolidation lineage. Resetting on update breaks the V0.2 consolidator's chain. |
+  | 13 | `embedding` | `Option<Vec<f32>>` | **OVERWRITE → re-computed** | Stale embedding is a correctness bug — content changed, vector must reflect new content. The re-compute fires through the same `EmbeddingProvider` used at write. |
+  | 14 | `metadata` | `serde_json::Value` | **PRESERVE** | MCP wire schema does NOT expose `metadata`. Same shape as `valid_from` / `valid_until` — preserve to avoid silent wipe of metadata populated through other channels (manual entry, future connector ingestion). |
+
+- **Reasoning:**
+  - **(i) Provenance/lineage is irreversibly destroyed by naive overwrite.** Once `created_at` resets to "now," the original creation moment is gone — no audit row records the old value (ADR-024 logs the update event but not the old field values; the field is overwritten in-place). Same for `access_count` and `superseded_by`. The asymmetry is the right asymmetry: PRESERVE is reversible (a future ADR amendment can add OVERWRITE classification when a concrete consumer forces the question); OVERWRITE is not (once a destructive update path ships, every consumer downstream has to assume it can fire and write defensive code around it).
+  - **(ii) MCP wire-schema-driven OVERWRITE keeps the classification rule contract-anchored and refactor-safe.** Naming the rule against the wire schema (ADR-024 tool-param contract — `content` / `memory_type` / `boundary` / `confidence`) rather than against a Rust struct name (`WriteToolParams`) means future Rust refactors don't break the ADR; future wire-schema extensions trigger ADR-028 amendment per the revisit triggers below.
+  - **(iii) System-managed fields (`last_accessed`, `embedding`) advance because update IS a touch event.** Update without advancing `last_accessed` would mean "Tuesday's update doesn't show up in 'when was this last touched?'" Update without re-computing `embedding` is a correctness bug (stale vector against new content).
+  - **(iv) The audit chain captures the per-invocation activity log via `mcp.tool_invoke` rows** (ADR-024 schema). The memory row's `source_agent` is genesis attribution; the audit chain's per-invocation `actor_kind` (ADR-025 Step 6 application) is current activity. Two distinct facts, two distinct fields, no conflation.
+  - **(v) Bi-temporal + metadata fields preserve because MCP can't update what it doesn't expose.** A future MCP wire-schema extension that exposes `valid_from` / `valid_until` / `metadata` would trigger an ADR-028 amendment classifying those fields explicitly; until then, preserve avoids accidental data loss.
+- **Alternatives considered:**
+  - *Naive overwrite (overwrite all fields from the supplied `NewMemory` via `Memory::try_new_with_id`).* Rejected — destroys provenance + lineage as enumerated above. Same correctness anti-pattern that vault-app would have to defensively work around at every consumer.
+  - *TODO-marked err-stub deferring to T0.1.10.* Rejected — creates a known-incorrect state someone has to remember to fix; same anti-pattern as the work-breakdown drift catches at Step 4 and Step 5. T0.1.10 owns lifecycle/config, not contracts; update semantics is a contract decision and lives at the contract layer (this ADR), not the consumer's TODO list.
+  - *Partial-merge semantics for `metadata` (deep-merge incoming keys into existing, instead of preserve).* Rejected — fails the forward-compat-pull test (no concrete consumer requires partial-merge today; manual entry and future connectors populate via different code paths, neither blocked by Step 6's preserve default). Partial-merge has real semantic complexity (merge strategy: deep / shallow / key-collision rules / null-as-delete) deserving its own ADR if and when a concrete consumer forces the question. Preserve today is reversible; locking partial-merge today is not.
+- **When to revisit:**
+  - **(i) MCP write/update tool wire schema extension adds a new field** — classify the new field in an ADR-028 amendment; align the implementation in the same commit as the schema extension.
+  - **(ii) `Memory` struct gains a new field in `vault-core`** — classify in an ADR-028 amendment with reasoning. **Default to PRESERVE if classification is non-obvious** and surface for review; the safe direction is the easy direction. The default-to-PRESERVE-on-new-field rule makes the failure mode (new field leaks through naive overwrite) hard to introduce silently; OVERWRITE classification requires explicit approval.
+  - **(iii) BRD provenance or temporal-validity contracts update** — re-confirm the classification still aligns with the updated provenance/temporal model.
+  - **(iv) V0.2 introduces concurrent MCP dispatch or sync-engine writes** — re-evaluate the read-before-write race surface (currently V0.1 single-user serial MCP doesn't fire the race; V0.2+ may need read-update inside one SQLite transaction, which would extend ADR-016 connection-ownership / ADR-017 cascade-FIFO).
+- **Cross-link:**
+  - ADR-024 (audit row schema — update events appear in `audit_log` per the existing chain; the `mcp.tool_invoke` row records the update invocation, this ADR governs what the row's target memory looks like after update).
+  - ADR-025 (trust-boundary contract — `boundary` overwrite is allowed per this ADR but must pass the StdioServer auth-gate check; the auth-gate site is at the handler layer, not the adapter).
+  - ADR-027 (audit-vs-tracing scope — update preservation is a vault-state concern, audited per ADR-024 `mcp.tool_invoke` event).
+  - Q2 carry-forward (VaultAdapter minimal-at-Step-6 — this ADR is the contract VaultAdapter implements at Step 6).
+- **Phase 2 test that proves it (Step 6):** `vault_app::adapter::tests::update_preserves_provenance_per_adr_028` — pre-populate a memory with non-default `created_at` (2025-01-15), `access_count = 42`, `superseded_by = Some(other_id)`, custom `metadata`, `source_agent = "genesis-agent"`, `valid_from = 2024-06-01`. Call `Adapter::update` with new `content` + `memory_type` + `boundary` + `confidence` + a different `source_agent` (`"update-agent"`) + a different `metadata`. Assert (a) PRESERVED fields (`source_agent`, `created_at`, `valid_from`, `access_count`, `superseded_by`, `metadata`) unchanged; (b) OVERWRITTEN fields (`content`, `memory_type`, `boundary`, `confidence`) match input; (c) `last_accessed` advanced past the pre-update timestamp; (d) embedder called once during update (re-compute pinned).
 
 ---
 
@@ -971,32 +1020,122 @@ _(populated once V0.1 ships)_
 
 ## Notes for Next Session
 
-**Immediate state:** T0.1.9 Phase 2 Steps 1–5 shipped (Steps 1–4 at `6515f31` committed + pushed 2026-05-01; Step 5 at this commit); `origin/main` clean. Workspace **346 passing + 2 ignored** (perf gates). Build/clippy/fmt all clean.
+**Immediate state:** T0.1.9 Phase 2 Steps 1–5 shipped (Steps 1–4 at `6515f31`, Step 5 at `5505110`); `origin/main` matches Step 5 commit. **Step 6 work is COMPLETE ON DISK but UNCOMMITTED** — commit deferred to this session for fresh DoD-gate re-verification per the DoD-gates-clean-at-commit-time discipline.
 
-**Phase 2 progress, 5 of 9 steps shipped.** Step 6 next (minimal `VaultAdapter` skeleton in `crates/vault-app/src/adapter.rs` — struct + `Adapter` impl + `append_tool_invoke_audit` method only; Application/config/lifecycle is T0.1.10). After Step 6: Step 7 MockAdapter recording variant, Step 8 convert trust-boundary `should_panic` markers to positive assertions, Step 9 full JSON-RPC initialize round-trip via `tokio::io::duplex()`.
+**Working tree at session open is NOT clean.** Run `git status --short` to confirm the file list matches what's documented in the next-session opener block below. **DO NOT** `git stash` / `git reset --hard` these — they're Step 6's deliverables.
 
-**Step 5 ship summary:** all four tool bodies (search + write + update + delete) wired with timer + audit + tracing per Step 4 pattern; `SuccessAdapter` fixture added to `tests/common/mod.rs`; `DimMismatchAdapter::delete` extended to return `NotFound` (Internal-collapse audit-row coverage); 7 new integration tests in `tests/tool_invoke.rs` (4 success + 3 error); "invalid params" wording reconciliation landed (impl + Step 3 test now match ADR-024 line 765 + JSON-RPC 2.0 spec literal); `parse_memory_id_traced` introduced — pre-dispatch parse failures emit `tracing::warn!(target: "vault_mcp::request_validation", ...)` but do NOT append audit (handler-mediated audit per Q7(a) records vault dispatches; malformed-id requests don't reach the vault).
+**Phase 2 progress, 5 of 9 steps shipped on origin/main + Step 6 on disk.** This-session-first action: complete Step 6 commit (re-run DoD gates, commit, push). Then open Step 7 (`MockAdapter` recording variant in `crates/vault-mcp/tests/common/mock_adapter.rs`). After Step 7: Step 8 convert trust-boundary `should_panic` markers to positive assertions against MockAdapter, Step 9 full JSON-RPC initialize round-trip via `tokio::io::duplex()` ↔ `IntoTransport` with tool-list pin assertion.
 
-**T0.1.9 ship plan progress (Phase 1 + Phase 2 Steps 1–5 SHIPPED):**
+**Step 6 on-disk summary:** `Memory::try_new_with_id` added to vault-core (canonical entry point for update-path Memory construction; preserves the validation invariant centralised in `try_new`); production `VaultAdapter` impl in `vault-app/src/adapter.rs` with 4 trait deps wired (`Arc<dyn Retriever>` for search delegation, `Arc<dyn EmbeddingProvider>` for write/update embedding, `StorageBackend` for cascade, separate `MetadataStore` handle for `append_tool_invoke_audit`); `Adapter::update` implements ADR-028 read-before-write preserving 8 of 14 Memory fields and overwriting 4 from the wire schema + 2 system-managed advancements; `append_tool_invoke_audit` writes `mcp.tool_invoke` rows with `actor_kind = ActorKind::Agent` per ADR-025 Step 6 application + canonical sorted-key `details_json` per BRD §11.9.2. 8 vault-app unit tests + 2 vault-core try_new_with_id tests (357 total, +10 over Step 5 close at 347). ADR-028 enumerates the full 14-field classification table in HANDOFF.md; ADR-025 extended with the Phase 2 Step 6 application subsection in HANDOFF.md.
+
+**Prior-session DoD gate result (informational, NOT a substitute for fresh re-verification):** per-crate test runs all green (vault-core 49 + 1 doc; vault-cli 18; vault-storage 213; vault-embedding 4 + 9; vault-retrieval 13 + 15 + 2; vault-mcp 6 + 2 + 3 + 8 + 6; vault-app 8 = **357 active + 2 ignored**). `cargo fmt --all --check` clean. `cargo clippy --workspace --all-targets -j 1 -- -D warnings` finished `Finished \`dev\` profile [unoptimized + debuginfo] target(s) in 23m 32s` with no warnings. Workspace-level `cargo test --workspace --no-run` (final test-binary-link assurance) was NOT run last session — re-run as part of fresh gate verification this session.
+
+### T0.1.9 Phase 2 Step 6 — commit-readiness checklist (THIS SESSION'S FIRST ACTION)
+
+Before opening Step 7, complete Step 6's commit per the per-step commit contract. Sequence:
+
+1. **Confirm working tree state.** Run `git status --short` and confirm the file list matches:
+   ```
+    M Cargo.lock
+    M HANDOFF.md
+    M crates/vault-app/Cargo.toml
+    M crates/vault-app/src/lib.rs
+    M crates/vault-core/src/memory.rs
+   ?? crates/vault-app/src/adapter.rs
+   ```
+   If the list differs, STOP and surface the mismatch — do not proceed without explanation.
+
+2. **Re-run DoD gates fresh** (the prior-session results above are informational; the discipline requires fresh gate-passing at commit time):
+   - `cargo build --workspace -j 1` — zero warnings.
+   - `cargo test -p vault-core` then `-p vault-cli` then `-p vault-storage` then `-p vault-embedding` then `-p vault-retrieval` then `-p vault-mcp` then `-p vault-app` — all `-j 1`. Per-crate is the recovery posture from the prior-session linker memory-pressure incident; if the workspace target/ is intact this session and `cargo test --workspace` runs without resource pressure, that's preferred (one command, single result). Fall back to per-crate if workspace fails.
+   - `cargo clippy --workspace --all-targets -j 1 -- -D warnings` — zero warnings.
+   - `cargo fmt --all --check` — clean.
+   - `cargo test --workspace --no-run -j 1` — final test-binary-link assurance (the gate that the prior session did not complete).
+
+3. **If any gate fails, STOP and escalate.** Do not commit pre-failure state. The DoD-gates-clean-at-commit-time rule is non-negotiable per Phase 2's locked discipline.
+
+4. **If all gates pass, surface to Shahbaz the staging summary** (file list + test count + brief commit message draft) and request commit + push approval. Combined-approval rule (`feedback_confirm_before_commit_push.md`) applies once approval is given: commit + push without re-asking.
+
+5. **Suggested commit message structure** (Step 5 / Step 4 pattern — lead with the contract):
+
+   ```
+   T0.1.9 Phase 2 Step 6: vault-app VaultAdapter + ADR-028 update semantics
+
+   Lands the production vault_mcp::Adapter impl for vault-app with 4
+   trait deps wired and ADR-028 locking memory-update semantics
+   (preserve provenance, overwrite content + classification). T0.1.10
+   inherits Application/config/lifecycle wiring; Step 6 is the
+   minimal-just-the-type landing per Q2 carry-forward.
+
+   Contracts locked:
+   - ADR-028 (NEW) memory update semantics — full 14-field classification
+     table; OVERWRITE only what the MCP write/update wire schema exposes
+     + system-managed advancement fields; PRESERVE everything else.
+     Pinning test update_preserves_provenance_per_adr_028 exercises the
+     full preservation invariant end-to-end.
+   - ADR-025 extension (Phase 2 Step 6 application) — actor_kind =
+     ActorKind::Agent for mcp.tool_invoke audit rows. Pinned in
+     append_tool_invoke_audit_records_actor_as_agent_per_adr_025.
+
+   What landed:
+   - Memory::try_new_with_id (vault-core) — canonical entry point for
+     update-path Memory construction, preserves validation invariant.
+   - VaultAdapter (vault-app) — 4 deps, all 5 Adapter methods.
+   - 8 vault-app unit tests + 2 vault-core try_new_with_id tests.
+
+   Behavioral changes:
+   - Update path now reads existing memory via metadata.get_memory(id),
+     preserves 8 of 14 fields per ADR-028, overwrites 4 wire-schema +
+     2 system-managed. NotFound on missing id maps to -32602 "not
+     found" at MCP wire layer per ADR-024 mapping.
+
+   Tests: workspace 357 passing + 2 ignored (perf gates).
+   +2 over the 355 floor. Justified per floor-not-ceiling: ADR-028
+   preservation pin + 2 try_new_with_id contract pins (validation
+   parity + caller-supplied-id-not-generated).
+
+   Operational note: prior-session system hang triggered a cargo clean
+   overreach + 30+ min depth-first rebuild; new feedback memory
+   "Surgical cargo clean -p <crate> first; full cargo clean is
+   escalation" added to discipline backlog. Sixth pattern queued for
+   CLAUDE.md promotion at Phase 2 close.
+
+   DoD gates clean: build + test + clippy + fmt + workspace test-link.
+
+   Step 7 next: MockAdapter recording variant (see Step 7 opener block
+   in HANDOFF.md). Step 7 commit message must explicitly flag MockAdapter
+   ahead of its first user (Step 8) per the per-step contract.
+
+   Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+   ```
+
+**T0.1.9 ship plan progress (Phase 1 + Phase 2 Steps 1–5 SHIPPED on origin/main; Step 6 COMPLETE ON DISK pending fresh DoD-gate re-verification + commit this session):**
 - ✅ Plan v1.0 → v1.1 → v1.2 → v1.3 → **v1.3.1** (Phase-1-time amendment for `initialize` smoke scope reduction + chrono pin advance documentation, both approved at Phase 1 close).
 - ✅ Spike 1 (web-research methodology, runtime confirmation in Phase 1) — host-vs-server scope finding inverted plan v1.2's premise; Option A applied per Shahbaz; ADR-026 lands the stable identifiers (13 CVEs, OX Security advisory 2026-04-15, rmcp 1.5.0 release context, verbatim quote of host-vs-server distinction) + forward pointer to T0.1.11 vault-tauri or successor task introducing MCP-host functionality.
 - ✅ Phase 1 — `bbea59f` (workspace `rmcp = "=1.5.0"` exact-pin + chrono `=0.4.39` advance with compatible band `[0.4.39, 0.4.44)` documented in ADR-013 amendment; T0.1.8 audit-removal sub-phase as a single coherent diff per plan v1.3 §6.2 — `RetrievalQuery` → `McpToolInvoke` rename in vault-storage + audit append removed from `SemanticRetriever::retrieve` + replaced with `tracing::info!(target: "vault_retrieval::query", ...)`; ADRs 023/024/025/026 landed; vault-mcp scaffold — `Adapter` trait + `StdioServer` + 4 typed `handle_*` stubs + 2 typed param structs that deliberately omit `authorized_boundaries` per ADR-025; 6 trust-boundary tests + 3 API-surface initialize smoke tests; **331 passing + 2 ignored**, all four DoD gates clean).
 - ✅ Phase 2 Steps 1–4 — `6515f31` (Step 1 macro spike + Step 2 macros wired on StdioServer with (F1)/(F2) boundary shifts + Step 3 dimension-mismatch error-mapping test + Step 4 ToolInvokeDetails/ToolInvokeError per ADR-024 nested {type, detail} shape + canonical sorted-key JSON via to_canonical_json + Adapter::append_tool_invoke_audit + tool_search audit/timer/tracing wiring + exhaustive vault_error_to_mcp with AccessDenied + ModelIntegrityFailed advanced to ADR-024's locked -32001. **339 passing + 2 ignored**, all four DoD gates clean. +6 over forecast: floor-not-ceiling defensive pins for canonical key ordering, Q1 absent-not-null on write, per-variant ADR-024 mapping coverage).
-- ✅ Phase 2 Step 5 — this commit (tool_write / tool_update / tool_delete bodies wired with same Step 4 audit/timer/tracing pattern + SuccessAdapter fixture + DimMismatchAdapter::delete extension + "invalid params" wording reconciliation aligning impl + Step 3 test to ADR-024 line 765 + JSON-RPC 2.0 spec literal + parse_memory_id_traced separating pre-dispatch parse failures (vault_mcp::request_validation tracing target) from audit-chain dispatch records (vault_mcp::tool_invoke target) per Q7(a). **346 passing + 2 ignored**, all four DoD gates clean. +0 over the 346 floor — Step 5's defensive coverage was already absorbed by Step 4's structural pins).
-- 🔄 Phase 2 Steps 6–9 — **NEXT.** Step 6 minimal VaultAdapter skeleton; Step 7 MockAdapter; Step 8 trust-boundary should_panic conversion; Step 9 full JSON-RPC initialize round-trip.
+- ✅ Phase 2 Step 5 — `5505110` (tool_write / tool_update / tool_delete bodies wired with same Step 4 audit/timer/tracing pattern + SuccessAdapter fixture + DimMismatchAdapter::delete extension + "invalid params" wording reconciliation + parse_memory_id_traced + ADR-027 pre-dispatch validation scope. **347 passing + 2 ignored**, all four DoD gates clean. +1 over the 346 floor for the ADR-027 pinning test).
+- 🔄 Phase 2 Step 6 — **COMPLETE ON DISK, COMMIT DEFERRED to this session for fresh DoD-gate re-verification** (production `VaultAdapter` impl in `vault-app/src/adapter.rs` with 4 trait deps wired — Retriever / EmbeddingProvider / StorageBackend / MetadataStore; Adapter::update implements ADR-028 read-before-write preserving 8 of 14 Memory fields; Memory::try_new_with_id added to vault-core for the update path; ADR-028 locks update semantics with full classification table; ADR-025 extended with Phase 2 Step 6 application subsection pinning actor_kind = ActorKind::Agent. **In-session DoD result: 357 passing + 2 ignored across per-crate test runs, fmt clean, clippy `Finished` clean in 23m 32s on rebuild. Workspace `cargo test --workspace --no-run` final-link gate NOT run last session — must run this session before commit.** +2 over the 355 floor — ADR-028's full preservation pin + 2 try_new_with_id unit tests).
+- ⏳ Phase 2 Steps 7–9 — **AFTER Step 6 commits.** Step 7 MockAdapter; Step 8 trust-boundary should_panic conversion; Step 9 full JSON-RPC initialize round-trip.
 - ⏳ Phase 3 — adversarial hardening (oversized payloads, malformed JSON, framing edges, unicode/control-char) + Windows CI matrix entry per ADR-001 ("Add Windows in T0.1.9").
 
-### T0.1.9 Phase 2 Step 6 — next session opener (READ THIS FIRST)
+### T0.1.9 Phase 2 Step 7 — next session opener (READ THIS FIRST)
 
-**Where you are when you wake up:** working tree clean, `origin/main` at the Step 5 commit. Run `git status --short` to confirm clean tree before starting Step 6.
+**Where you are when you wake up:** working tree clean, `origin/main` at the Step 6 commit. Run `git status --short` to confirm clean tree before starting Step 7.
 
-**Step 6 scope (per Q2 carry-forward, locked):** minimal `VaultAdapter` skeleton in `crates/vault-app/src/adapter.rs` — struct + `Adapter` impl (5 methods: search / write / update / delete / append_tool_invoke_audit) + the type-level wiring needed to construct it. **NOT** Application / config / lifecycle — that's T0.1.10.
+**Step 7 scope (per Q3 carry-forward, locked):** `MockAdapter` recording variant in `crates/vault-mcp/tests/common/mock_adapter.rs`. Sibling to `StubAdapter` (panics) / `DimMismatchAdapter` (deterministic-error fixture) / `SuccessAdapter` (deterministic-success fixture). MockAdapter's purpose: capture every call argument verbatim so Step 8 trust-boundary tests can assert positively that the trusted slice was used (NOT a malicious body field).
 
-The skeleton's job at Step 6 is to be a real `Adapter` impl that vault-app can instantiate at startup, holding `Arc<dyn Retriever>` + `Arc<MetadataStore>` + `Arc<dyn StorageBackend>` (or whatever the right shape is — TBD at Step 6 plan time depending on what vault-storage exposes). Step 6 does NOT need to land Application::start / Application::shutdown / config loading / lifecycle wiring; those bind together at T0.1.10.
+**Step 7 commit message MUST flag MockAdapter ahead of its first user** (per the standing per-step contract carry-forward locked at Step 4 close): *"MockAdapter defined here; first exercised in Step 8 when the trust-boundary should_panic markers convert to positive assertions. Intermediate state is green-but-unexercised by design — same scaffold-ahead-of-user pattern as Step 3's pinned-TODO ignored test."*
 
-**Floor forecast (per the floor-not-ceiling rule):** Step 6 lands ~5 unit tests at the vault-app crate (one per Adapter method exercising the real implementation against in-memory test fixtures). The crate currently has 0 lib tests (`vault_app: 0 passed`); Step 6 brings that to ~5. Workspace floor: 351 passing + 2 ignored. Surplus possible if integration coverage surfaces additional defensive pins.
+**Anticipated Step 7 contract surfaces (pre-empting per the prior bigger-picture note about Step 7's likely contract decisions):**
+- **(a) Recording shape — full ToolInvokeDetails struct, hash-stable canonical-JSON, or partial fields?** Recommendation surfaces at Step 7 plan time. Initial lean: record the full typed struct (`ToolInvokeDetails`) for audit + the full request shape (`RetrievalQuery` / `NewMemory` / `MemoryId`) for trust-boundary assertions. Canonical-JSON serialisation isn't needed for in-memory test assertions — type-level matching is more ergonomic. Decide at plan time.
+- **(b) Per-method recording vs single recording stream?** Per-method (`recorded_searches: Vec<RetrievalQuery>` + `recorded_writes: Vec<NewMemory>` + ...) is more ergonomic for assertions; single stream is more compact but requires enum-tagging. Recommendation: per-method.
+- **(c) Thread-safety primitive choice (Mutex vs RwLock vs Atomic)?** V0.1 strictly serial → Mutex matches existing fixtures. Don't over-engineer for V0.2 concurrent dispatch.
+- **(d) MockAdapter return values?** For Step 7's scaffold-ahead state, return `unimplemented!()` from CRUD methods or return deterministic Ok values? Step 8 will exercise these via trust-boundary tests; if Step 8 only checks "the call arguments reached the adapter" (not "the adapter returned something specific"), unimplemented panics work and match StubAdapter's pattern. If Step 8 needs a specific return shape, deterministic Ok is needed. Decide at Step 7 plan time alongside Step 8 test shape pre-emption.
 
-**Step 6 likely escalation surfaces (standing rule):** (a) what concrete deps `VaultAdapter` holds — vault-storage's `StorageBackend` is the natural shape but Step 6 plan time should verify against current vault-storage exports; (b) how `append_tool_invoke_audit` writes to `MetadataStore::append_audit_event` (canonicalisation via `ToolInvokeDetails::to_canonical_json`, then construct `PendingAuditEvent` with `event_type = AuditEventType::McpToolInvoke`, `result = AuditResult::Success`/`Error` based on `details.error.is_some()`); (c) whether VaultAdapter's CRUD methods need to construct any additional types not already in scope. Stop and escalate if any of these surface unexpectedly.
+**Floor forecast (per the floor-not-ceiling rule):** Step 7's MockAdapter is structural (no behavior change yet — Step 8 wires the assertions). Likely **0 new tests** at Step 7 close — MockAdapter is green-but-unexercised by design until Step 8. Workspace stays at **357 passing + 2 ignored** unless Step 7 surfaces a defensive pin (e.g. recording-shape contract test). Surplus probable only if (a) above surfaces a contract decision warranting an inline ADR.
+
+**Step 7 likely escalation surfaces (standing rule):** any of (a)–(d) above if the plan-time recommendation feels wrong; the recording-shape contract if it's non-obvious from the existing fixture pattern; thread-safety if V0.1's strict-serial assumption needs revisiting at MockAdapter scope. Stop and escalate.
 
 #### Plan v1.1 status (locked, no further iteration needed for Steps 6–9)
 
@@ -1005,8 +1144,8 @@ The skeleton's job at Step 6 is to be a real `Adapter` impl that vault-app can i
 - ✅ **Step 3** (shipped at `6515f31`) — `dimension_mismatch_returns_generic_invalid_params_no_data_leak` active. Pins `(a)` code=-32602, `(b)` message=="invalid params" (Step 5 reconciliation aligned to ADR-024 line 765 + JSON-RPC 2.0 spec literal) with explicit no-leak checks against "384"/"256"/"dimension"/"expected"/"actual", `(d)` `error.data.is_none()`. Pinned-TODO `dimension_mismatch_audit_row_pins_full_detail` un-ignored at Step 4.
 - ✅ **Step 4** (shipped at `6515f31`) — ToolInvokeDetails + ToolInvokeError per ADR-024 nested {type, detail} shape via #[serde(tag, content)]. Adapter::append_tool_invoke_audit trait method. tool_search audit/timer/tracing wiring. Step 3 pinned-TODO un-ignored against the 9 ADR-024 fields. vault_error_to_mcp converted to exhaustive match — AccessDenied + ModelIntegrityFailed advanced from prior -32602-via-catch-all to ADR-024 line 764/766's locked -32001 access-denied. +6 over forecast: floor-not-ceiling defensive pins (canonical key ordering / Q1 absent-not-null / per-variant ADR-024 mapping). HANDOFF.md drift reconciled (lines 1003–1011 rewritten to quote ADR-024's nested shape directly per the new "Quote locked artefacts, don't paraphrase" feedback memory).
 - ✅ **Step 5** (shipped at this commit) — tool_write / tool_update / tool_delete bodies wired with timer + audit + tracing per Step 4 pattern. SuccessAdapter fixture in tests/common/mod.rs (sibling to StubAdapter + DimMismatchAdapter). DimMismatchAdapter::delete extended to return NotFound (Internal-collapse audit-row coverage). 7 new integration tests in tests/tool_invoke.rs (4 success bundling response shape + audit row + Q1 absent-not-null serialisation + 3 error: tool_write/update AccessDenied via unauthorized boundary, tool_delete NotFound via DimMismatchAdapter). "invalid params" wording reconciliation: impl + Step 3 test now match ADR-024 line 765 + JSON-RPC 2.0 spec literal. parse_memory_id_traced design decision (logged inline + here): pre-dispatch parse failures emit `tracing::warn!(target: "vault_mcp::request_validation", ...)` but do NOT append audit — handler-mediated audit per Q7(a) records vault dispatches; malformed-id requests don't reach the vault, analogous to JSON deserialisation. Floor was 346 passing + 2 ignored; landed at exactly 346 (no surplus — Step 4's structural defensive pins covered Step 5's needs without additional unit tests).
-- ⏳ **Step 6 — NEXT.** See "next session opener" above.
-- ⏳ Step 7 — `MockAdapter` (recording variant) in `crates/vault-mcp/tests/common/mock_adapter.rs`. **Note (Step 7+ commit message):** when Step 7 lands, its commit message must explicitly flag MockAdapter ahead of its first user per the per-step contract: "MockAdapter defined here; first exercised in Step 8 when the trust-boundary should_panic markers convert to positive assertions. Intermediate state is green-but-unexercised by design — same scaffold-ahead-of-user pattern as Step 3's pinned-TODO ignored test."
+- 🔄 **Step 6 — COMPLETE ON DISK, COMMIT DEFERRED to this session.** Production `VaultAdapter` impl of `vault_mcp::Adapter` in `crates/vault-app/src/adapter.rs` with 4 trait deps (`Arc<dyn Retriever>` + `Arc<dyn EmbeddingProvider>` + `StorageBackend` + separate `MetadataStore` handle for audit appends, sharing the `Arc<Inner>` SQLCipher connection pattern). All five methods implemented: search delegates to retriever; write embeds new content then cascades; update implements ADR-028 read-before-write preserving 8 of 14 Memory fields and overwriting 4 wire-schema fields + 2 system-managed advancements; delete cascades idempotently; append_tool_invoke_audit writes mcp.tool_invoke rows with actor_kind = ActorKind::Agent per ADR-025 Step 6 application + canonical sorted-key details_json per BRD §11.9.2. `Memory::try_new_with_id` added to vault-core (canonical entry for update-path Memory construction). 8 vault-app unit tests + 2 vault-core try_new_with_id tests; **in-session result 357 passing + 2 ignored** across per-crate test runs (depth-first j=1 due to a system hang + linker memory pressure mid-session); fmt clean; clippy `Finished` clean in 23m 32s on rebuild from `cargo clean`. **Workspace `cargo test --workspace --no-run` final test-binary-link assurance NOT run last session — must run this session before commit.** +2 over the 355 floor for the ADR-028 preservation pin (3 tests collapsed into one preservation pin per Shahbaz refinement) and the try_new_with_id contract pins. ADR-028 locks update semantics with the full 14-field classification table in HANDOFF.md; ADR-025 extended with Phase 2 Step 6 application subsection in HANDOFF.md.
+- ⏳ **Step 7 — AFTER Step 6 commits.** See "next session opener" above.
 - ⏳ Step 8 — Convert `tests/trust_boundary.rs::handler_reaches_adapter_with_malicious_*` `should_panic` markers to positive assertions against `MockAdapter`.
 - ⏳ Step 9 — Full JSON-RPC `initialize` round-trip via `tokio::io::duplex()` ↔ `IntoTransport`. Tool-list pin assertion: count == 4 AND names == `{memory.search, memory.write, memory.update, memory.delete}`.
 
