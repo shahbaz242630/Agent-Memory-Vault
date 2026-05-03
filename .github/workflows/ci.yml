@@ -68,5 +68,21 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Cache vault-embedding test fixtures (~165 MB total: model.onnx ~133 MB
+      # + tokenizer.json ~711 KB + libonnxruntime.so ~30 MB). Key fingerprints
+      # both the setup script (which hardcodes EXPECTED_MODEL_SHA256 +
+      # ORT_VERSION + download URLs) AND integrity.rs (which holds the
+      # canonical model + tokenizer SHA-256 constants per ADR-020). Either
+      # changing busts the cache and forces a fresh provisioning. Per-OS
+      # cache key isolates Linux vs. Windows fixtures (Step 2c).
+      - name: Cache vault-embedding test fixtures
+        uses: actions/cache@v4
+        id: vault-embedding-fixtures
+        with:
+          path: crates/vault-embedding/test-fixtures
+          key: vault-embedding-fixtures-${{ runner.os }}-${{ hashFiles('scripts/setup-dev-env.sh', 'crates/vault-embedding/src/integrity.rs') }}
+      - name: Provision vault-embedding test fixtures
+        if: steps.vault-embedding-fixtures.outputs.cache-hit != 'true'
+        run: bash scripts/setup-dev-env.sh
       - run: cargo build --workspace --all-targets
       - run: cargo test --workspace
