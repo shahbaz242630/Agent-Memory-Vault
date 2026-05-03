@@ -25,17 +25,22 @@ jobs:
 
   clippy:
     name: cargo clippy
-    runs-on: ubuntu-latest
+    strategy:
+      # fail-fast: false so a Windows-only failure (or vice versa) surfaces
+      # both conclusions instead of cancelling the surviving runner. Important
+      # for matrix verification — we need to see EACH OS's outcome.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
-      # Free ~15-20GB by removing unused tooling on the GitHub-hosted runner
-      # (dotnet, ghc, android, docker images). Required since T0.1.6 C1a:
-      # libduckdb-sys archive step (libduckdb.a) exhausts disk on the default
-      # ~14GB free margin. Pre-checkout so cleanup runs on a fresh runner.
-      # @main is a deliberate floating-tag exception for CI-only infra
-      # (security-patches-auto-apply); does NOT shift the @vN pinning
-      # precedent for first-party action references. See HANDOFF.md
-      # "CI Discipline Recovery — 2026-05-03 finding".
-      - uses: jlumbroso/free-disk-space@main
+      # Linux-only: free ~15-20GB by removing unused tooling. Windows runners
+      # ship ~85 GB free, no equivalent pressure; the action itself is
+      # Linux-only by design (uses apt-get / rm -rf /usr/share/dotnet etc.).
+      # See HANDOFF.md "CI Discipline Recovery — 2026-05-03 finding" for the
+      # 22-commit silent-failure context that landed this in Step 2a.
+      - if: runner.os == 'Linux'
+        uses: jlumbroso/free-disk-space@main
         with:
           large-packages: true
           docker-images: true
@@ -54,10 +59,16 @@ jobs:
 
   build-and-test:
     name: cargo build + test
-    runs-on: ubuntu-latest
+    strategy:
+      # fail-fast: false — see clippy job above for rationale.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
-      # Mirror of clippy job — see comment block there for full context.
-      - uses: jlumbroso/free-disk-space@main
+      # Linux-only — see clippy job above for rationale.
+      - if: runner.os == 'Linux'
+        uses: jlumbroso/free-disk-space@main
         with:
           large-packages: true
           docker-images: true
@@ -80,9 +91,24 @@ jobs:
         id: vault-embedding-fixtures
         with:
           path: crates/vault-embedding/test-fixtures
-          key: vault-embedding-fixtures-${{ runner.os }}-${{ hashFiles('scripts/setup-dev-env.sh', 'crates/vault-embedding/src/integrity.rs') }}
-      - name: Provision vault-embedding test fixtures
-        if: steps.vault-embedding-fixtures.outputs.cache-hit != 'true'
+          # Cache key fingerprints BOTH setup scripts (.sh and .ps1) plus
+          # integrity.rs so any change to model SHA / ORT_VERSION / download
+          # URLs in either platform's setup script busts cache for both OSes.
+          # Per-OS isolation preserved via runner.os in the key prefix —
+          # Linux fixtures (libonnxruntime.so) and Windows fixtures
+          # (onnxruntime.dll) don't collide.
+          key: vault-embedding-fixtures-${{ runner.os }}-${{ hashFiles('scripts/setup-dev-env.sh', 'scripts/setup-dev-env.ps1', 'crates/vault-embedding/src/integrity.rs') }}
+      - name: Provision vault-embedding test fixtures (Linux)
+        if: steps.vault-embedding-fixtures.outputs.cache-hit != 'true' && runner.os == 'Linux'
         run: bash scripts/setup-dev-env.sh
+      - name: Provision vault-embedding test fixtures (Windows)
+        # Strawberry Perl is preinstalled on windows-latest (Windows Server
+        # 2022) and required by ADR-006's bundled-sqlcipher-vendored-openssl
+        # rusqlite feature for the SQLCipher build. If a future runner image
+        # drops Strawberry Perl, add `shogo82148/actions-setup-perl@v1` step
+        # before rust-toolchain — see HANDOFF.md tech-debt for the watchpoint.
+        if: steps.vault-embedding-fixtures.outputs.cache-hit != 'true' && runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/setup-dev-env.ps1
       - run: cargo build --workspace --all-targets
       - run: cargo test --workspace
