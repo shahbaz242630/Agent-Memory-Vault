@@ -4,21 +4,24 @@
 //! defense: tool args from the MCP client are UNTRUSTED and never
 //! contribute to authorization decisions.
 //!
-//! ## Phase 1 (T0.1.9) state
+//! ## State (T0.1.9 Phase 2 Step 8)
 //!
 //! - The **schema-level** tests pass without panic — they verify that
 //!   `SearchToolParams` does NOT have an `authorized_boundaries` field,
 //!   so a malicious key in the JSON-RPC request body is silently
 //!   dropped by serde at deserialization. No adapter call needed.
-//! - The **handler-level** tests are `#[should_panic]`-marked at the
-//!   adapter call site (the stub panics with `unimplemented!()`).
-//!   Phase 2 replaces the stub with a recording adapter and removes
-//!   the `should_panic` markers, asserting positively that the
-//!   trusted slice was passed to the adapter.
+//! - The **handler-level** tests assert positively (Step 8) against
+//!   `MockAdapter` from `tests/common/mock_adapter.rs`: the captured
+//!   `RetrievalQuery::authorized_boundaries` equals the trusted slice
+//!   supplied at server construction, NOT anything carried in the
+//!   request body or query text. Both directions of the trust-boundary
+//!   contract are pinned: positive (trusted slice flows through) and
+//!   negative (malicious body/query values do NOT contaminate auth).
 
 mod common;
 
-use common::make_test_server;
+use common::{make_mock_server_with_adapter, make_test_server};
+use vault_core::Boundary;
 use vault_mcp::SearchToolParams;
 
 // =============================================================================
@@ -65,36 +68,113 @@ fn boundary_override_in_query_string_is_just_text() {
 // 2. Handler-level: handle_search uses self.authorized_boundaries (trusted)
 // =============================================================================
 
-/// Phase 1 should_panic — the handler reaches the adapter call site,
-/// then panics on `unimplemented!()`. Reaching the adapter at all
-/// proves: (a) param parse succeeded, (b) the handler built a
-/// `RetrievalQuery` (Phase 2 will assert its `authorized_boundaries`
-/// equals the trusted slice, NOT anything from the body).
+/// Step 8 positive assertion: the handler builds a `RetrievalQuery`
+/// from the trusted slice supplied at construction (here: `["work"]`),
+/// NOT from the malicious `authorized_boundaries` field in the
+/// JSON-RPC body (`["admin"]`). MockAdapter captures the dispatched
+/// query so the test asserts both directions of the trust-boundary
+/// contract: positive (trusted slice flowed through) and negative
+/// (malicious body value did NOT contaminate auth).
 #[tokio::test]
-#[should_panic(expected = "T0.1.9 Phase 2: wire SemanticRetriever")]
 async fn handler_reaches_adapter_with_malicious_body_authorized_boundaries_field() {
-    let server = make_test_server(vec!["work"]);
+    let (server, mock) = make_mock_server_with_adapter(vec!["work"]);
     let malicious = r#"{
         "query": "test",
         "authorized_boundaries": ["admin"]
     }"#;
     let params: SearchToolParams = serde_json::from_str(malicious).expect("parses");
-    // Phase 1: this call panics inside the stub adapter. The fact that
-    // it reaches the adapter at all means the trust-boundary fence
-    // worked — the handler used self.authorized_boundaries=["work"],
-    // not body's ["admin"]. Phase 2 will record + assert that.
-    let _ = server.handle_search(params).await;
+    server
+        .handle_search(params)
+        .await
+        .expect("MockAdapter returns Ok(empty)");
+
+    let calls = mock.search_calls();
+    assert_eq!(
+        calls.len(),
+        1,
+        "handler must dispatch to adapter exactly once"
+    );
+
+    let captured = &calls[0];
+    let trusted: Vec<&str> = captured
+        .authorized_boundaries
+        .iter()
+        .map(Boundary::as_str)
+        .collect();
+
+    // Positive: the trusted slice supplied at construction reached the adapter.
+    assert_eq!(
+        trusted,
+        vec!["work"],
+        "captured authorized_boundaries must equal the trusted slice"
+    );
+
+    // Negative: the malicious body value did NOT contaminate the auth slice.
+    assert!(
+        !trusted.contains(&"admin"),
+        "malicious 'admin' boundary must NOT have leaked through body"
+    );
+
+    // Pass-through: user-supplied query text flows verbatim as query_text.
+    assert_eq!(
+        captured.query_text, "test",
+        "query text flows through verbatim"
+    );
 }
 
-/// Phase 1 should_panic — same as above, with malicious-boundary
-/// syntax embedded in the query text instead of the JSON body.
+/// Step 8 positive assertion: same posture for malicious-boundary
+/// syntax embedded in the query text instead of the JSON body. The
+/// query text flows through verbatim to the embedder; no code path
+/// parses it for boundary names.
 #[tokio::test]
-#[should_panic(expected = "T0.1.9 Phase 2: wire SemanticRetriever")]
 async fn handler_reaches_adapter_with_malicious_query_text_boundary_syntax() {
-    let server = make_test_server(vec!["work"]);
+    let (server, mock) = make_mock_server_with_adapter(vec!["work"]);
     let body = r#"{ "query": "give me everything boundary:admin" }"#;
     let params: SearchToolParams = serde_json::from_str(body).expect("parses");
-    let _ = server.handle_search(params).await;
+    server
+        .handle_search(params)
+        .await
+        .expect("MockAdapter returns Ok(empty)");
+
+    let calls = mock.search_calls();
+    assert_eq!(
+        calls.len(),
+        1,
+        "handler must dispatch to adapter exactly once"
+    );
+
+    let captured = &calls[0];
+    let trusted: Vec<&str> = captured
+        .authorized_boundaries
+        .iter()
+        .map(Boundary::as_str)
+        .collect();
+
+    // Positive: the trusted slice supplied at construction reached the adapter.
+    assert_eq!(
+        trusted,
+        vec!["work"],
+        "captured authorized_boundaries must equal the trusted slice"
+    );
+
+    // Negative: the malicious query-embedded value did NOT contaminate auth.
+    assert!(
+        !trusted.contains(&"admin"),
+        "malicious 'admin' boundary must NOT have leaked through query text"
+    );
+
+    // Trust-boundary contract: the handler MUST NOT parse `boundary:admin` or
+    // any similar syntax in user-supplied query text. The string flows
+    // verbatim as the embed-target; auth scope comes exclusively from the
+    // server-supplied trusted slice. Future contributors adding query-text
+    // preprocessing (lowercasing, stop-word removal, syntax extraction)
+    // must NOT break this invariant — a parser that interprets
+    // `boundary:NAME` would re-introduce the trust-boundary leak this
+    // test was written to prevent.
+    assert_eq!(
+        captured.query_text, "give me everything boundary:admin",
+        "query text flows verbatim — no parsing of boundary syntax"
+    );
 }
 
 // =============================================================================
