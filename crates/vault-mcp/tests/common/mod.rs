@@ -4,9 +4,10 @@
 //!
 //! Panics on every CRUD adapter call with `unimplemented!()`. Trust-boundary
 //! tests are `#[should_panic]`-marked at the panic site. Step 7
-//! replaces this with a `RecordingAdapter` (mock variant) that captures
+//! lands [`MockAdapter`] (see `mock_adapter.rs`) which captures
 //! call arguments so the trust-boundary invariant can be asserted
 //! positively (the trusted slice was used, NOT the malicious body field).
+//! Step 8 swaps the `should_panic` markers for those positive assertions.
 //!
 //! ## Phase 2 Step 3 — `DimMismatchAdapter`
 //!
@@ -32,6 +33,14 @@
 //! is fine).
 
 #![allow(dead_code)]
+
+mod mock_adapter;
+
+// `MockAdapter` + `UpdateCall` are exposed for Step 8's positive-assertion
+// trust-boundary tests; intermediate state at Step 7 is green-but-unexercised
+// by design — see the scaffold-ahead-of-user note in `mock_adapter.rs`.
+#[allow(unused_imports)]
+pub use mock_adapter::{MockAdapter, UpdateCall};
 
 use std::sync::{Arc, Mutex};
 
@@ -294,4 +303,18 @@ pub fn make_dim_mismatch_server_with_adapter(
 pub fn make_dim_mismatch_server(trusted: Vec<&str>) -> StdioServer {
     let (server, _adapter) = make_dim_mismatch_server_with_adapter(trusted);
     server
+}
+
+/// Build a `StdioServer` paired with a shared `Arc<MockAdapter>`,
+/// returning both so Step 8 trust-boundary tests can invoke the server
+/// AND inspect captured call arguments via the recording snapshots.
+/// Defined at Step 7; first exercised in Step 8.
+pub fn make_mock_server_with_adapter(trusted: Vec<&str>) -> (StdioServer, Arc<MockAdapter>) {
+    let trusted_boundaries: Vec<Boundary> = trusted
+        .into_iter()
+        .map(|s| Boundary::new(s).expect("valid trusted boundary"))
+        .collect();
+    let adapter = Arc::new(MockAdapter::new());
+    let server = StdioServer::new(adapter.clone(), trusted_boundaries);
+    (server, adapter)
 }
