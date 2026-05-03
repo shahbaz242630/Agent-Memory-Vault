@@ -72,3 +72,10 @@ tempfile.workspace = true
 # tracing-test — used by tool-call observability tests + the audit-append
 # tests in Phase 2.
 tracing-test.workspace = true
+# rmcp `client` feature — Phase 2 Step 9 needs the client-side `ServiceExt::serve`
+# impl to drive the JSON-RPC initialize round-trip in `tests/initialize_smoke.rs`
+# (`impl ClientHandler for ()` lives in `rmcp::handler::client`, but the
+# `ServiceExt::serve` method for the client role is gated behind this feature).
+# Cargo unifies dev-dep features with the production `[dependencies]` entry at
+# test-build time only — production builds remain `client`-feature-free.
+rmcp = { workspace = true, features = ["client"] }

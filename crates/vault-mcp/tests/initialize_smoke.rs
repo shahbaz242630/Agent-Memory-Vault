@@ -109,3 +109,120 @@ fn empty_trusted_slice_is_valid_construction() {
     let server = make_test_server(vec![]);
     assert_eq!(server.authorized_boundaries().len(), 0);
 }
+
+// =============================================================================
+// 5. Phase 2 Step 9 — full JSON-RPC initialize round-trip + tools/list pin
+// =============================================================================
+
+/// Phase 2 close: drives the rmcp 1.5.0 server through a real JSON-RPC
+/// `initialize` handshake via `tokio::io::duplex()`, then issues
+/// `tools/list` and asserts the four-tool contract. This proves the
+/// macro chain — `#[tool_router]` on `impl StdioServer` (populates the
+/// `tool_router: ToolRouter<Self>` field) → 4× `#[tool]` decorators on
+/// the `tool_search` / `tool_write` / `tool_update` / `tool_delete`
+/// methods → `#[tool_handler]` on `impl ServerHandler for StdioServer`
+/// (auto-routes `tools/list` and `tools/call`) — wires up correctly
+/// end-to-end.
+///
+/// **Set comparison on tool names** (BTreeSet) — rmcp's emit ordering
+/// is internal, NOT a public contract. Pinning order would couple this
+/// test to rmcp internals (1.5.0 → 1.5.1 patch could reorder without
+/// semantic change and break us). The contract this test pins is "the
+/// 4 tools exist with these names."
+///
+/// **Narrow `ServerInfo` assertion shape** — only `server_info.name`
+/// (the `vault-mcp` Implementation contract from `get_info()`) and the
+/// presence of the `tools` capability. Server version is
+/// `env!("CARGO_PKG_VERSION")` — pinning ties tests to the bump cycle.
+/// Protocol version is rmcp's choice. Instructions text is free-form.
+/// All three are deliberately NOT asserted.
+#[tokio::test]
+async fn full_initialize_round_trip_lists_four_tools_with_expected_names() {
+    use std::collections::BTreeSet;
+
+    use rmcp::ServiceExt;
+
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+    // Empty trusted slice + StubAdapter is correct here — `tools/list`
+    // never invokes the adapter's CRUD methods, only the macro-routed
+    // tool registry.
+    let server = make_test_server(vec![]);
+
+    // We `await` the spawned server's JoinHandle below (after client
+    // drop) so server-side panics — e.g. macro-chain regression,
+    // get_info crash, ServerHandler routing bug — surface as hard
+    // test failures with diagnostic value. Do NOT "simplify" the spawn
+    // body to a fire-and-forget `let _ = server.serve(server_io).await`
+    // — that swallows panics silently. The closure normalises to `()`
+    // because we only care about JoinError (panic) at the outer await;
+    // benign serve-startup or waiting-side errors get dropped here
+    // because they would already have surfaced as client-side failures
+    // earlier in the test (failed handshake / failed list_tools).
+    let server_handle = tokio::spawn(async move {
+        if let Ok(running) = server.serve(server_io).await {
+            let _ = running.waiting().await;
+        }
+    });
+
+    // Client side: `()` is a no-op `ClientHandler` (rmcp 1.5.0
+    // `handler/client.rs:263 — impl ClientHandler for ()`).
+    // `.serve(...).await` runs the initialize handshake; returning Ok
+    // proves the handshake completed.
+    let client = ().serve(client_io).await.expect("initialize handshake completes");
+
+    // ServerInfo (= InitializeResult) arrives during initialize and is
+    // stored on the peer. Narrow assertion: pin only what the public
+    // contract actually requires.
+    let server_info = client
+        .peer_info()
+        .expect("server_info populated post-initialize");
+    assert_eq!(
+        server_info.server_info.name, "vault-mcp",
+        "ServerInfo.name pins the get_info() Implementation contract"
+    );
+    assert!(
+        server_info.capabilities.tools.is_some(),
+        "tools capability must be advertised"
+    );
+
+    // tools/list — exercises `#[tool_handler]` auto-routing through
+    // the `tool_router` field that `#[tool_router]` populates from
+    // the four `#[tool]` decorators in `server.rs`. End-to-end macro
+    // chain verification.
+    let listed = client
+        .peer()
+        .list_tools(Default::default())
+        .await
+        .expect("list_tools succeeds");
+
+    assert_eq!(listed.tools.len(), 4, "expected exactly 4 tools advertised");
+
+    let names: BTreeSet<&str> = listed.tools.iter().map(|t| t.name.as_ref()).collect();
+    let expected: BTreeSet<&str> = [
+        "memory.search",
+        "memory.write",
+        "memory.update",
+        "memory.delete",
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        names, expected,
+        "tool names must match the 4-tool contract — set comparison so emit order is not pinned"
+    );
+
+    // Drop the client to close the duplex; the spawned server task
+    // exits on EOF.
+    drop(client);
+
+    // Server-side panic surfaces here as a `JoinError` (hard test
+    // failure with diagnostic value). Clean exits give `Ok(())`. This
+    // is the lower-fidelity-but-robust shape: we don't try to match
+    // rmcp/tokio error-text strings (those aren't a stable contract),
+    // we just guarantee that a server panic doesn't get silently
+    // swallowed.
+    if let Err(join_err) = server_handle.await {
+        panic!("server task panicked: {join_err}");
+    }
+}
