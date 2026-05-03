@@ -1,9 +1,9 @@
 # Memory Vault — Build Handoff
 
-**Last updated:** 2026-05-03 (T0.1.9 Phase 2 fully shipped (`6515f31` / `5505110` / `f5cd8b5` / `cbd3fec` / `18edc19` / `ad49ddc`); **T0.1.9 Phase 3 Step 1 shipped at this commit** — `crates/vault-mcp/tests/adversarial.rs` (NEW, 6 tests pinning vault-mcp's defense surface against oversized content + boundary length/charset + unicode passthrough byte-identity). Verify-before-write discipline ran clean pre-scaffold: `MAX_MEMORY_CONTENT_BYTES` and NUL query policy both already exist as named constants; no inline ADR needed. Architecture-review escalation surfaced + resolved before scaffolding: Tests 2/3/6 (oversized query / max_results / NUL in query) dropped from Phase 3 Step 1 because those defenses live inside `vault_retrieval::SemanticRetriever::retrieve()` and aren't reachable through any vault-mcp test fixture; vault-retrieval's own adversarial coverage at `semantic.rs:482` already pins them at the right layer. Workspace **364 + 2 ignored** (+6, floor hit exactly). Five DoD gates clean: build, `cargo test -p vault-mcp` (whole-crate, 32/30), `cargo test -p vault-mcp --test adversarial` (targeted, 6/6), clippy, fmt. T0.1.9 Phase 3 Step 2 next session — Windows CI matrix entry per ADR-001 (closes T0.1.9).)
+**Last updated:** 2026-05-03 (**HANDOFF capture commit — documents the 22-commit CI silent-failure finding surfaced during Phase 3 Step 2 priority-zero verify-before-write.** Last green CI run: `T0.1.6b: data-layer modules` at 2026-04-30 11:48 UTC. First red: `T0.1.6 C1a: orchestrator foundations` at 2026-04-30 13:40 UTC. Pattern across all 22 failures: GitHub ubuntu-latest runner disk exhaustion during `libduckdb-sys` archive step (`cargo:warning=ar: … No space left on device`); build phase fails before any test runs. **BRD §0.1 DoD discipline gap:** every per-step commit message from Phase 1 review through Phase 3 Step 1 claimed "DoD gates clean" — true for local Windows dev gates, NOT true for CI green on push. Local DoD gates and CI green are two distinct verifications; we conflated them. T0.1.9 Phase 3 Step 2 reframed into three commits: **Step 2a** (fix Linux CI disk-space), **Step 2b** (verify vault-embedding actual test behavior on Linux now that build succeeds), **Step 2c** (Windows matrix entry — original Step 2 plan). **No further commits to vault code (vault-core / storage / retrieval / embedding / mcp / app / cli) until Step 2a verifies CI green.** This commit is doc-only HANDOFF capture, exempt from that rule because it documents the gap rather than extending it.)
 **Updated by:** Claude (Opus 4.7)
 **Current version:** V0.1 — Internal Alpha
-**Current phase:** V0.1 in progress — **T0.1.6 fully shipped (`f2d7cae`); T0.1.7 fully shipped (`a8c5e8e`); monthly tech-debt CI workflow shipped (`66f3097`); T0.1.8 fully shipped across three commits (`6d4e339` / `32befe5` / `c8987e4`); T0.1.9 Phase 1 shipped (`bbea59f`); T0.1.9 Phase 2 fully shipped across 6 commits (`6515f31` / `5505110` / `f5cd8b5` / `cbd3fec` / `18edc19` / `ad49ddc`); T0.1.9 Phase 3 Step 1 shipped at this commit (vault-mcp adversarial defense surface). T0.1.9 Phase 3 Step 2 next session — Windows CI matrix entry per ADR-001 (closes T0.1.9).**
+**Current phase:** V0.1 in progress — **T0.1.6 fully shipped (`f2d7cae`); T0.1.7 fully shipped (`a8c5e8e`); monthly tech-debt CI workflow shipped (`66f3097`); T0.1.8 fully shipped across three commits (`6d4e339` / `32befe5` / `c8987e4`); T0.1.9 Phase 1 shipped (`bbea59f`); T0.1.9 Phase 2 fully shipped across 6 commits (`6515f31` / `5505110` / `f5cd8b5` / `cbd3fec` / `18edc19` / `ad49ddc`); T0.1.9 Phase 3 Step 1 shipped (`56775de`). **CI DISCIPLINE FINDING (2026-05-03):** all 22 commits since `T0.1.6 C1a` (2026-04-30 13:40 UTC) have been silently CI-red — local DoD gates were green, CI was failing on disk exhaustion at `libduckdb-sys` archive step. Recovery posture in flight via Phase 3 Step 2 reframe (2a → 2b → 2c). T0.1.9 closes after Step 2c with sustained CI green verified, NOT before.**
 
 ---
 
@@ -213,6 +213,73 @@ _None outstanding._
 
 **Resolved:**
 - ~~SQLCipher first-open cost vs. "BRD 50ms target."~~ Resolved 2026-04-29 by adding explicit BRD §6 V0.1.3 perf-budget criterion (`open + migrate + first audit insert ≤ 200ms`, ≤ 150ms first-open allowance). **Honest correction:** the prior session's reference to "BRD 50ms target" was a hallucinated constraint — no such line existed in BRD §6 V0.1.3. The fix is therefore *adding* explicit perf criteria, not revising a real prior target. PBKDF2 256k iterations stays as the security property; `kdf_iter` is not tuned down.
+
+---
+
+## CI Discipline Recovery — 2026-05-03 finding
+
+**The biggest discipline finding of T0.1.9.** A `gh run list` invoked during Phase 3 Step 2 priority-zero verify-before-write surfaced that every commit from T0.1.6 C1a (2026-04-30 13:40 UTC) through T0.1.9 Phase 3 Step 1 (2026-05-03 09:42 UTC) — **22 consecutive commits across ~3 days** — had failed CI on push without any of them being noticed. The local Windows DoD-gate discipline was satisfied throughout; the CI green check was not. We conflated the two verifications.
+
+### Timeline
+
+- **Last green CI run:** `T0.1.6b: data-layer modules (retry_queue + dead_letter + pending_sync)` — 2026-04-30 11:48 UTC, run `25163659770`.
+- **First red CI run:** `T0.1.6 C1a: orchestrator foundations (with_transaction + validate_readable + fault_injection + CascadeOperation collapse)` — 2026-04-30 13:40 UTC, run `25168706678`.
+- **Pattern across all 22 failures:** GitHub `ubuntu-latest` runner disk exhaustion during `libduckdb-sys` archive step. The exact stderr line repeats verbatim across runs:
+  ```
+  cargo:warning=ar: ... libduckdb.a: ... No space left on device
+  error occurred in cc-rs: command did not execute successfully
+  ##[error]Process completed with exit code 101.
+  ```
+- **What this means in practice:** the build phase fails before any test runs. `cargo test --workspace` is never invoked on CI for any of these commits. So the entire Phase 1 → Phase 2 → Phase 3 Step 1 work has zero CI test-coverage verification — only local-on-Windows verification.
+- **Likely root cause** (to confirm at Step 2a): DuckDB compiles a large static library (`libduckdb.a` is hundreds of `.o` files comprising a full SQL engine + extensions); combined with the rest of the workspace's `target/debug/` artefacts on a GitHub-hosted runner with ~14GB of free disk, the `ar` archive step cannot complete. The regression point at T0.1.6 C1a likely added enough additional compilation surface (orchestrator + `validate_readable` + `fault_injection` + LanceDB corruption-spike example) to push total disk usage over the edge.
+
+### Discipline gap acknowledgment
+
+Across **Phase 1 review, Phase 2 Steps 1–9 ships, and Phase 3 Step 1 ship** — every per-step commit message claimed "four DoD gates clean" or "five DoD gates clean." That claim was **true for local Windows dev gates** (build / test / clippy / fmt / `--no-run` link), and **NOT true for CI green on push**. The two verifications are distinct:
+
+| Verification | What it proves | Where we ran it | Where we missed it |
+|---|---|---|---|
+| Local DoD gates (Windows) | Code compiles + tests pass + lints clean on the founder's dev machine | Every per-step commit pre-push | — |
+| CI green on push (Linux) | Code compiles + tests pass + lints clean on a clean-room Linux runner | Implicitly assumed satisfied because workflows ran on push | 22 consecutive commits where this was actually red |
+
+**Going forward, per-step commit confirmation must include CI green verification, not just local gates green.** Local gates are necessary but not sufficient for shipped state. This becomes CLAUDE.md candidate #8 (queued for promotion at T0.1.9 close after CI is verified green for the first sustained stretch — see "CLAUDE.md candidate #8" entry below).
+
+### Why this wasn't caught sooner
+
+Honest reconstruction:
+
+- **The `ci.yml` workflow file is on the repo and triggers on every push.** No one disabled CI; CI was running. We just weren't checking the result.
+- **The previous time CI was checked was at T0.1.6b ship** (2026-04-30 11:48 UTC, last green run). Subsequent commits relied on local gates as the sole shipped-state verification.
+- **No notification mechanism flagged the failures.** GitHub sends email on first failure to the committing user but those got missed; no Slack / discord / push notification was wired.
+- **The seven CLAUDE.md candidate patterns matured during Phase 2 did NOT cover this.** Verify-before-write (#1) eventually caught it during Phase 3 Step 2 prep; that's the discipline working *eventually* but not *promptly*. Pattern #8 closes the gap by making CI verification explicit at every commit.
+
+### Recovery path — Phase 3 Step 2 reframe (3 commits)
+
+The original Phase 3 Step 2 plan (single commit: add Windows matrix entry) is invalidated. New shape:
+
+| Step | Scope | Why it has to come before its successor | Floor |
+|---|---|---|---|
+| **2a** | **Fix Linux CI disk-space.** Tactic: `jlumbroso/free-disk-space@main` action at top of `clippy` + `build-and-test` jobs (frees ~15-20GB by removing unused dotnet / ghc / android tooling). Possibly + `CARGO_PROFILE_DEV_DEBUG=line-tables-only` to shrink debug artefact size. Verify multiple consecutive green runs before declaring fixed (one green run could be flake — disk-pressure regressions historically tend to oscillate). | Without 2a, neither tests run on CI nor does Windows matrix make sense. | 0 new tests; success metric is sustained green CI on the 2a commit + at least 1 follow-up. |
+| **2b** | **Verify vault-embedding actual test behavior on Linux** now that build succeeds. The original priority-zero question that started this investigation: do `embedding_tests::*` tests actually run on Linux CI? `embedding_tests.rs:38-44` panics loudly on missing fixtures (no silent skip). Three sub-outcomes still possible: (i) tests run + pass somehow (need to understand mechanism), (ii) tests run + fail-loud — add Linux ORT-setup step (parallel to scripts/setup-dev-env.ps1), (iii) tests don't run — Cargo.toml `[lib]`/`[[test]]` gating or workflow `--exclude` flag — surface + decide. | This is the original question that started the investigation. It can't be answered until 2a fixes the build phase. | 0 new tests; success metric is `embedding_tests::*` test names appearing in CI green log with `ok` status. |
+| **2c** | **Windows CI matrix entry** — the original Step 2 plan. `.github/workflows/ci.yml` gets `strategy.matrix.os: [ubuntu-latest, windows-latest]`. ORT setup step gated on `runner.os == 'Windows'` invoking `scripts/setup-dev-env.ps1`. ORT dylib cache via `actions/cache` keyed on `ORT_VERSION`. All four DoD gates green on Windows runner. | Only after Linux is fully green per 2a + 2b. Adding Windows on broken Linux would multiply unknowns. | 0 new tests; success metric is green CI run with both `ubuntu-latest` AND `windows-latest` matrix entries on the 2c commit's push. |
+
+Standing rule live throughout: any Windows-only failure or Linux-only failure during 2a/2b/2c — root-cause investigation, NOT platform-gated `#[cfg(unix)]` / `#[cfg(windows)]` skip directives.
+
+### CLAUDE.md candidate #8 (queued for promotion at T0.1.9 close)
+
+**Provisional name:** `feedback_ci_green_distinct_from_local_dod_gates.md` (or similar — finalize at T0.1.9 close).
+
+**Rule:** Local DoD gates and CI green are two distinct verifications. Per-step commit confirmation must include explicit CI green check (`gh run list --workflow=ci.yml -L 1` showing `success` on the previous push), not just local gates green.
+
+**Why it earned candidacy:** the 22-commit silent-failure stretch happened because we treated CI green as implicit-from-the-fact-that-CI-runs. The seven existing CLAUDE.md candidate patterns (per-step commits, quote locked artefacts, floor-not-ceiling forecasts, inline-ADR on architectural decisions, plan-time-scope vs implementation-time-contracts, surgical cargo clean -p first, contract-surface anticipation in HANDOFF) didn't cover this gap. Pattern #8 closes it by making the verification explicit.
+
+**Promotion gate:** demonstrate the pattern works in practice. Phase 3 Step 2a's first green CI run is the first data point; Step 2b + Step 2c each add another. **Don't promote prematurely** — the pattern needs to demonstrate it holds across at least the 2a/2b/2c sequence + a few subsequent T0.1.10 commits before it's a documented default.
+
+### Forward concerns
+
+- **Tactical fix vs structural risk.** The `jlumbroso/free-disk-space` action recovers ~15-20GB, which should be ample for current workspace. But if `libduckdb-sys` or other heavy build deps continue to grow, we may need a more substantial intervention (cache strategy, build-feature trimming, larger CI runner). Track as forward concern; revisit if the disk margin tightens again.
+- **CI-green-verification cost.** A `gh` API call per commit adds ~5-10 seconds to the push workflow. For a two-person dev team this is fine; for a future contributor count, automation (push-hook that checks CI status on push) may be worth investing in.
+- **ADR-001 cross-link.** The "Add Windows in T0.1.9" decision in ADR-001 is the BRD-level driver for the matrix work. Step 2c's commit message should reference ADR-001 explicitly when it ships.
 
 ---
 
@@ -938,6 +1005,8 @@ Two related items locked together (both about V0.1 cascade failure surfaces) for
 
 Items noticed but not addressed in their originating task — picked up explicitly when scheduled, never as drive-by work.
 
+- [ ] **(T0.1.9 Phase 3 Step 2 — IN FLIGHT) Linux CI disk-space exhaustion at `libduckdb-sys` archive step** — Discovered 2026-05-03 during Phase 3 Step 2 priority-zero verify-before-write. Pattern: `cargo:warning=ar: ... libduckdb.a: ... No space left on device` followed by `error occurred in cc-rs: ... exit status: 1` and `##[error]Process completed with exit code 101.` Last green CI: T0.1.6b at 2026-04-30 11:48 UTC; first red: T0.1.6 C1a at 2026-04-30 13:40 UTC; **22 commits silently red until detection.** See "## CI Discipline Recovery — 2026-05-03 finding" section for full timeline + DoD gap acknowledgment + recovery path. **Resolution path:** Phase 3 Step 2a lands `jlumbroso/free-disk-space@main` action in `clippy` + `build-and-test` jobs; verify TWO consecutive green runs before declaring fixed. Cross-link to ADR-001 (BRD-level driver for the matrix work). **Forward concern:** if `libduckdb-sys` or other heavy build deps continue to grow, may need more substantial intervention (cache strategy, build-feature trimming, larger CI runner) — track as forward concern; revisit if disk margin tightens again post-Step-2a. (Noted 2026-05-03, files: `.github/workflows/ci.yml`, ADR-001 cross-link)
+- [ ] **(T0.1.9 Phase 3 Step 2) CI green is distinct from local DoD gates — verification required at every commit** — The 22-commit silent-failure stretch happened because we treated CI green as implicit-from-the-fact-that-CI-runs. Going forward, per-step commit confirmation must include explicit CI green check (`gh run list --workflow=ci.yml -L 1` showing `success` on the previous push), not just local gates green. Local DoD gates (build / test / clippy / fmt / `--no-run` link) prove the code passes on the founder's Windows dev machine; CI green proves it passes on a clean-room Linux runner. Both verifications are necessary; neither alone is sufficient. Queued as **CLAUDE.md candidate #8** (provisional name `feedback_ci_green_distinct_from_local_dod_gates.md`); promotion gate is sustained green CI across Step 2a + 2b + 2c plus a few subsequent T0.1.10 commits. **Don't promote prematurely** — pattern needs to demonstrate it works in practice. (Noted 2026-05-03, cross-link to "## CI Discipline Recovery" section)
 - [ ] **(T0.1.9 Phase 1) chrono pin advance 0.4.38 → 0.4.39** — bumped at T0.1.9 Phase 1 to satisfy `rmcp 1.5.0 → schemars 1.0`'s hard transitive `chrono ^0.4.39` requirement. ADR-013 amended. **Revisit at:** every chrono / arrow-arith / lance update (verify the underlying `Datelike::quarter()` ↔ `ChronoDateExt::quarter()` conflict surface hasn't migrated to chrono 0.4.39+; if arrow-arith fixes the qualified-call site upstream, we can drop the pin entirely). Same monthly cadence as ADR-013's existing chrono CVE check. (Noted 2026-05-01, file: `Cargo.toml` workspace `chrono` pin)
 - [ ] **(T0.1.9 Phase 1) `#[tool_router(server_handler)]` + `#[tool]` macro wiring on `vault-mcp::StdioServer`** — deferred from Phase 1 to Phase 2. Phase 1 `StdioServer` has plain async `handle_*` methods that exercise trust-boundary discipline + auth-gate validation; Phase 2 wraps them with rmcp's macros for actual tool dispatch over JSON-RPC. **Why deferred:** rmcp 1.5.0's macro contract (`Parameters<T>` wrapper, return-type mapping, `serde::Deserialize`-only-vs-`schemars::JsonSchema` requirement, error mapping into `CallToolResult`) isn't well-documented beyond a single README snippet; deciphering it correctly is best done alongside the real handler bodies in Phase 2 rather than against `unimplemented!()` stubs. **Phase 2 work:** wire macros, replace stub adapter with real `VaultAdapter` from vault-app (T0.1.10), remove should_panic markers, add full JSON-RPC `initialize` round-trip test + the `dimension_mismatch_returns_generic_invalid_params_with_full_audit_detail` ADR-024 test, append `mcp.tool_invoke` audit events at handler exit per ADR-024 schema. (Noted 2026-05-01, files: `crates/vault-mcp/src/server.rs`, `crates/vault-mcp/tests/initialize_smoke.rs`, `crates/vault-mcp/tests/trust_boundary.rs`)
 - [ ] **(T0.1.9 Phase 1) rmcp `schemars` cargo feature deliberately excluded** — Phase 1 lands `rmcp = "=1.5.0"` with features `["server", "macros", "transport-io", "transport-async-rw"]` only. The `schemars` feature pulls additional surface (the `JsonSchema` derive macro for our user code) but ALSO exposes new chrono surface that conflicts with our pin even at 0.4.39. The feature stays off until: (a) the chrono pin can advance further (post-arrow-arith fix), OR (b) Phase 2's macro wiring confirms it doesn't need user-side `JsonSchema` derives. Production `vault-mcp` Phase 1 uses bare `serde::Deserialize` for `SearchToolParams` / `WriteToolParams`. (Noted 2026-05-01, file: `crates/vault-mcp/Cargo.toml`)
@@ -1020,15 +1089,22 @@ _(populated once V0.1 ships)_
 
 ## Notes for Next Session
 
-**Immediate state:** T0.1.9 Phase 2 fully shipped on `origin/main` (6 commits: `6515f31` / `5505110` / `f5cd8b5` / `cbd3fec` / `18edc19` / `ad49ddc`). **T0.1.9 Phase 3 Step 1 shipped at this commit** — `crates/vault-mcp/tests/adversarial.rs` lands the 6-test taxonomy covering vault-mcp's defense surface (oversized content + boundary length/charset + unicode byte-passthrough). **Phase 3 Step 2 next session — Windows CI matrix entry per ADR-001 (closes T0.1.9).** Working tree at session open should be **clean**; run `git status --short` to confirm.
+**Immediate state:** T0.1.9 Phase 2 fully shipped (`6515f31` / `5505110` / `f5cd8b5` / `cbd3fec` / `18edc19` / `ad49ddc`); Phase 3 Step 1 shipped (`56775de`). **This commit is doc-only HANDOFF capture** documenting the 22-commit CI silent-failure finding (see "## CI Discipline Recovery — 2026-05-03 finding" section above). **Phase 3 Step 2 reframed into 2a/2b/2c — Step 2a in flight next session (fix Linux CI disk-space; closure prerequisite).** Working tree at session open should be **clean**; run `git status --short` to confirm.
 
-**This-session-first action:** open Phase 3 Step 2 plan. Step 2 is infra-only (single workflow-file edit); plan-time iteration depth should be one iteration unless Windows-specific surprises surface. Read `.github/workflows/` first to confirm the CI workflow file path (ci.yml / build.yml / rust.yml — verify before assuming). Then propose: matrix `[ubuntu-latest, windows-latest]`, ORT setup step gated on `runner.os == 'Windows'` invoking `scripts/setup-dev-env.ps1`, dylib cache via `actions/cache` keyed on `ORT_VERSION` (1.22.0 currently). All four DoD gates (build / test / clippy / fmt) must pass on Windows runner. Standing rule live: any Windows-only failure in any existing test is a stop-and-escalate (root-cause investigation, NOT platform-gated `#[cfg(unix)]` skip directives).
+**No further commits to vault code (vault-core / storage / retrieval / embedding / mcp / app / cli) until Step 2a verifies CI green.** Doc-only commits remain allowed because they don't extend the silent-failure stretch in vault code.
 
-**Step 2 outline:** edit `.github/workflows/<ci-file>.yml` to add Windows matrix entry. Likely Windows-specific surfaces to flag pre-emptively: CRLF line endings (we already see git warnings on every commit — could trip fmt or test golden files; probably benign); ORT dylib download size + caching; any path-separator assumption in test code (none visible from current grep, but worth verifying).
+**This-session-first action:** open Phase 3 Step 2a plan. Read `.github/workflows/ci.yml` (path confirmed during Phase 3 Step 1 close). Investigate `jlumbroso/free-disk-space@main` action — the standard tactic for this exact failure mode in CI. Draft a workflow patch adding it to the top of `clippy` + `build-and-test` jobs (gated on `runner.os == 'Linux'` so it doesn't run on the eventual Windows matrix entry). Possibly + `CARGO_PROFILE_DEV_DEBUG=line-tables-only` env if the disk-cleanup alone is borderline. Push as Step 2a commit; verify CI green; verify a follow-up commit also runs green (one green run could be flake at the disk-margin edge).
 
-**Floor forecast for Step 2 (per floor-not-ceiling):** **0 new tests** — Windows CI is verified by green CI run on push, not by new tests. Workspace stays at **364 + 2 ignored** at Step 2 close. T0.1.9 fully shipped at this point.
+**Step 2a → 2b → 2c sequence outline:**
+- **Step 2a:** fix Linux CI disk-space (closure prerequisite). 0 new tests; success = sustained green CI run.
+- **Step 2b:** verify vault-embedding actual test behavior on Linux now that build succeeds. The original priority-zero question that started this investigation. 0 new tests; success = `embedding_tests::*` test names appear in CI green log with `ok` status (and we understand HOW fixtures land or whether they're explicitly excluded).
+- **Step 2c:** Windows matrix entry (original Step 2 plan). 0 new tests; success = green CI on `[ubuntu-latest, windows-latest]` matrix.
 
-**After T0.1.9 closes (Step 2 ship):** T0.1.10 (vault-app Application/config/lifecycle wiring + integration-risk spike + deferred T0.1.7 Phase 4 smoke + retrieval perf-gate investigation candidate + **adversarial integration coverage tracing vault-mcp dispatch → vault-retrieval validation end-to-end** per the Phase 3 Step 1 forward-pointer), T0.1.11 (vault-tauri minimal UI + ADR-010 banners + April 15 RCE class threat-surface revisit per ADR-026 forward pointer), T0.1.12 (founder dogfood e2e). Path to V0.1 internal alpha stays clear.
+**T0.1.9 closes after Step 2c with sustained CI green verified, NOT before.**
+
+**Floor forecast for Step 2a + 2b + 2c (per floor-not-ceiling):** **0 new tests across all three steps.** Workspace stays at **364 + 2 ignored** at T0.1.9 close. Success metric for the entire sequence is a sustained green CI baseline — visible via `gh run list --workflow=ci.yml -L 5` showing `success` on the most recent runs.
+
+**After T0.1.9 closes:** T0.1.10 (vault-app Application/config/lifecycle wiring + integration-risk spike + deferred T0.1.7 Phase 4 smoke + retrieval perf-gate investigation candidate + **adversarial integration coverage tracing vault-mcp dispatch → vault-retrieval validation end-to-end** per the Phase 3 Step 1 forward-pointer), T0.1.11 (vault-tauri minimal UI + ADR-010 banners + April 15 RCE class threat-surface revisit per ADR-026 forward pointer), T0.1.12 (founder dogfood e2e). Path to V0.1 internal alpha stays clear once CI green is sustained.
 
 ### T0.1.9 Phase 2 Step 6 — commit-readiness checklist ✅ COMPLETED 2026-05-03 at `f5cd8b5` (preserved as canonical record)
 
@@ -1119,32 +1195,88 @@ Before opening Step 7, complete Step 6's commit per the per-step commit contract
 - ✅ Phase 2 Step 7 — `cbd3fec` (MockAdapter recording fixture in `crates/vault-mcp/tests/common/mock_adapter.rs`. Sibling to StubAdapter / DimMismatchAdapter / SuccessAdapter; per-method typed recording (RetrievalQuery / NewMemory / UpdateCall / MemoryId / ToolInvokeDetails) via `std::sync::Mutex<Vec<T>>`; deterministic Ok returns including const `MockAdapter::WRITE_RETURNS_ID`. **357 + 2 ignored** (no count change — green-but-unexercised by design until Step 8 per the scaffold-ahead-of-user pattern). One small surprise during gates: clippy flagged `unused_imports` on the `pub use mock_adapter::{MockAdapter, UpdateCall};` re-export because integration tests compile separately and not all reference these yet — fixed with targeted `#[allow(unused_imports)]`. Four DoD gates clean (build / per-crate test / clippy / fmt; workspace `--no-run` agreed overkill for tests-only scope).
 - ✅ Phase 2 Step 8 — `18edc19` (the two `tests/trust_boundary.rs::handler_reaches_adapter_with_malicious_*` `should_panic` markers converted to positive+negative assertions against MockAdapter — first runtime exercise of MockAdapter). Trust-boundary contract per ADR-025 pinned at runtime for the first time: positive `assert_eq!(trusted, vec!["work"])` + negative `assert!(!trusted.contains(&"admin"))` + query-text pass-through (test 2 carries a no-parser-invariant comment block). Module-level docstring updated past-tense per drift-fix-in-same-scope discipline. **357 + 2 ignored** (no count change). One small surprise: clippy `manual_contains` lint — mechanical fix. Five DoD gates clean.
 - ✅ Phase 2 Step 9 — shipped at this commit (full JSON-RPC `initialize` round-trip + `tools/list` pin in `tests/initialize_smoke.rs`). Drives `().serve(client_io)` ↔ `server.serve(server_io)` over a `tokio::io::duplex()` pair — proves the rmcp macro chain (`#[tool_router]` field population on `impl StdioServer` → 4× `#[tool]` decorators → `#[tool_handler]` on `impl ServerHandler for StdioServer`) routes correctly end-to-end. Plan-time decisions (a)–(d) all confirmed pre-implementation: BTreeSet set-comparison on tool names (rmcp emit order is internal, not a public contract); narrow ServerInfo assertion shape (`server_info.name == "vault-mcp"` + `capabilities.tools.is_some()` only — server version, protocol version, instructions text deliberately NOT pinned per floor-not-ceiling); same file as the 3 existing API-surface tests; (d) auto-routing wiring already done at Step 2 (verified via source-read pre-scaffold rather than inferred from docs). Server-handle-await refinement applied: `tokio::spawn` returns `JoinHandle`, awaited post-client-drop so server panics surface as JoinError (hard test fail with diagnostic value), not silently swallowed. **Two surprises during gates** (both fixable + flagged): (1) rmcp's `client` feature is required for the `().serve(...)` API surface — added as a vault-mcp `[dev-dependencies]` feature so the production rmcp dep stays `client`-feature-free; (2) initial spawn-closure shape didn't compile because `serve()` returns `RunningService<RoleServer, StdioServer>`, not `()` — simplified to `if let Ok(running) = ... { let _ = running.waiting().await; }` returning `()` so JoinError on panic still surfaces via the outer `.await`. Both fixes preserve the load-bearing requirement (server panic surfaces as test failure). **358 + 2 ignored** (+1 round-trip test, exactly hitting the floor). Five DoD gates clean. **PHASE 2 CLOSED.**
-- ⏳ Phase 3 — adversarial hardening (oversized payloads, malformed JSON, framing edges, unicode/control-char) + Windows CI matrix entry per ADR-001 ("Add Windows in T0.1.9").
+- ✅ Phase 3 Step 1 — `56775de` (vault-mcp adversarial defense surface: 6 tests in `crates/vault-mcp/tests/adversarial.rs` covering oversized content + boundary length/charset + unicode passthrough byte-identity. Architecture-review escalation surfaced + resolved before scaffolding: original 9-test taxonomy dropped to 6 because Tests 2/3/6 would have tested vault-retrieval defenses through bypass-fixtures, producing false-confidence passes; vault-retrieval's own adversarial coverage at `semantic.rs:482` already pins those at the right layer. Workspace **364 + 2 ignored**, +6 floor hit exactly. Five DoD gates clean **on local Windows dev** — but CI was silently red, see "## CI Discipline Recovery" section above. **NOTE: this commit's local-DoD-gates-only verification is the discipline gap the recovery posture addresses.**)
+- 🔄 Phase 3 Step 2a — **NEXT SESSION (T0.1.9 closure prerequisite).** Fix Linux CI disk-space exhaustion at `libduckdb-sys` archive step via `jlumbroso/free-disk-space@main`. See Step 2a opener block below.
+- ⏳ Phase 3 Step 2b — verify vault-embedding actual test behavior on Linux now that build succeeds. After 2a ships.
+- ⏳ Phase 3 Step 2c — Windows CI matrix entry per ADR-001 (original Step 2 plan). After 2b ships. **T0.1.9 closes here with sustained CI green.**
 
-### T0.1.9 Phase 3 Step 2 — next session opener (READ THIS FIRST)
+### T0.1.9 Phase 3 Step 2a — next session opener (READ THIS FIRST)
 
-**Where you are when you wake up:** working tree clean, `origin/main` at the Phase 3 Step 1 commit. Run `git status --short` to confirm clean tree before starting Step 2.
+**Where you are when you wake up:** working tree clean, `origin/main` at the HANDOFF capture commit (this commit). Run `git status --short` to confirm clean tree before starting Step 2a.
 
-**Step 2 scope (closes T0.1.9):** Windows CI matrix entry per ADR-001. Single-deliverable infra change: `.github/workflows/<ci-file>.yml` gains a `windows-latest` runner alongside the existing `ubuntu-latest`. Phase 3 Step 1 already shipped the adversarial test suite at the prior commit; Step 2 lands the CI matrix and closes T0.1.9.
+**Step 2a scope (closure prerequisite for T0.1.9):** Fix Linux CI disk-space exhaustion at the `libduckdb-sys` archive step. CI has been silently red for 22 commits since 2026-04-30 13:40 UTC; see "## CI Discipline Recovery — 2026-05-03 finding" section above for the full timeline + discipline-gap acknowledgment. Step 2a is the load-bearing prerequisite: until CI build succeeds on Linux, Step 2b (verify vault-embedding tests) and Step 2c (Windows matrix) cannot ship.
 
-**Pre-flight verify-before-write:** read `.github/workflows/` directory FIRST to confirm the CI workflow file path (could be `ci.yml`, `build.yml`, `rust.yml`, or other). Don't assume; verify against the actual repo state. The plan adjusts to whichever file holds the existing build/test/clippy/fmt jobs.
+**Pre-confirmed state (no verify-before-write needed for this step):**
+- Workflow file: `.github/workflows/ci.yml` (3 jobs: `fmt` / `clippy` / `build-and-test`).
+- Failure mode: `cargo:warning=ar: ... libduckdb.a: ... No space left on device` followed by `error occurred in cc-rs: ... exit status: 1` and `##[error]Process completed with exit code 101.`
+- Last green run: `T0.1.6b` at 2026-04-30 11:48 UTC (run `25163659770`).
+- Failure occurs in both `clippy` (via `cargo clippy --workspace --all-targets`) and `build-and-test` (via `cargo build --workspace --all-targets`) — same root cause; both compile `libduckdb-sys`.
 
-**Step 2 mechanics (proposed; confirm at plan time):**
-1. Edit the CI workflow file: change runner from `runs-on: ubuntu-latest` to `runs-on: ${{ matrix.os }}` with `strategy.matrix.os: [ubuntu-latest, windows-latest]`.
-2. Add a `Setup ONNX Runtime` step gated on `runner.os == 'Windows'` invoking `scripts/setup-dev-env.ps1`. The script already exists and downloads + SHA-256 verifies the ORT 1.22.0 dylib.
-3. Cache the ORT dylib via `actions/cache` keyed on `ORT_VERSION` (currently `1.22.0` per `scripts/setup-dev-env.ps1`) so the dylib download happens once per cache key, not every run.
-4. Run all four DoD gates on the Windows runner (build / test / clippy / fmt). Per the workspace-test memory-pressure history (T0.1.9 Phase 2 Step 6 prior session), consider whether per-crate test invocation is needed or if `cargo test --workspace` is fine on the GitHub-hosted Windows runner (16 GB RAM, more headroom than the dev box that hung).
+**Step 2a tactical fix (recommended):** add `jlumbroso/free-disk-space@main` action at the top of the `clippy` + `build-and-test` jobs. This is the standard tactic for GitHub-hosted ubuntu runners: removes unused tooling (~15-20GB recovered) — `/usr/share/dotnet` (~1.6GB), `/usr/share/swift`, `/opt/ghc`, `/usr/local/lib/android` (~14GB), `/usr/local/share/boost`, etc. Should provide ample headroom for `libduckdb.a` archive plus the rest of the workspace.
 
-**Anticipated Step 2 contract surfaces (pre-empting per the contract-surface-anticipation pattern proven across Phase 2):**
-- **(a) CI workflow file location.** Read first; plan adjusts. No contract change; just file-path resolution.
-- **(b) ORT dylib caching strategy.** Recommendation: `actions/cache` keyed on `ORT_VERSION` so a version bump invalidates the cache automatically. Alternative is fresh download every run (~150MB per run, slower CI but no cache-staleness risk). Recommendation favours cache; revisit if cache poisoning becomes a concern post-launch.
-- **(c) Per-crate vs workspace test invocation on Windows.** Recommendation: `cargo test --workspace` first; fall back to per-crate `-j 1` only if memory pressure surfaces (matches Phase 2 Step 6's recovery posture from the dev-box hang).
+**Step 2a workflow patch shape (proposed; confirm at plan time):**
+```yaml
+clippy:
+  runs-on: ubuntu-latest
+  steps:
+    - uses: jlumbroso/free-disk-space@main         # <-- NEW
+      with:
+        # large-package removals, keep tool-cache for actions/cache
+        large-packages: true
+        docker-images: true
+    - uses: actions/checkout@v6
+    # ... existing steps ...
 
-**Step 2 escalation surfaces (standing rule):** any existing test failing Windows-only — root-cause investigation, NOT a `#[cfg(unix)]` skip directive. CRLF line-ending issues with golden-file tests (none currently in the suite, but worth a grep before assuming). ORT dylib download flakiness in CI runners (mitigated by `actions/cache`). `tokio::io::duplex` round-trip from Step 9 producing different timing on Windows (unlikely but possible). Stop and escalate on any of these.
+build-and-test:
+  runs-on: ubuntu-latest
+  steps:
+    - uses: jlumbroso/free-disk-space@main         # <-- NEW (mirror of clippy)
+      with:
+        large-packages: true
+        docker-images: true
+    - uses: actions/checkout@v6
+    # ... existing steps ...
+```
 
-**Floor forecast for Step 2 (per floor-not-ceiling):** **0 new tests.** Workspace stays at **364 + 2 ignored** at Step 2 close. Success metric: green CI run with both `ubuntu-latest` and `windows-latest` matrix entries on the Step 2 commit's push to origin/main.
+The `fmt` job doesn't need it — it doesn't compile vault-storage / DuckDB.
 
-**Step 2 close metric:** T0.1.9 fully shipped. Three remaining V0.1 tasks: T0.1.10 (vault-app wiring + adversarial integration coverage forward-pointer), T0.1.11 (vault-tauri UI), T0.1.12 (founder dogfood e2e).
+**Step 2a fallback if disk-cleanup alone is insufficient:** add `CARGO_PROFILE_DEV_DEBUG=line-tables-only` to the workflow `env:` block. This shrinks debug-info artefact size dramatically (often 2-3× smaller `target/debug`), at the cost of slightly less verbose backtraces. Acceptable for CI; local dev keeps full debug info.
+
+**Step 2a verification protocol:**
+1. Push the workflow patch to `main` as the Step 2a commit.
+2. Watch CI: `gh run list --workflow=ci.yml -L 1` should show `success` within ~25-30 minutes.
+3. **Run a follow-up no-op commit** (e.g., a HANDOFF roll-forward marking 2a shipped) and verify CI also passes on that. **One green run is not sufficient** — disk-pressure regressions can oscillate; two consecutive greens indicate stable margin.
+4. Only after both green runs is Step 2a considered shipped + verified.
+
+**Anticipated Step 2a contract surfaces (pre-empting per the contract-surface-anticipation pattern):**
+- **(a) `jlumbroso/free-disk-space` step ordering.** Recommendation: BEFORE `actions/checkout@v6` so the cleanup runs on the freshly-allocated runner before any repo content lands. Alternative is after-checkout if there's a dependency (none expected). Decide at plan time only if a step ordering issue surfaces.
+- **(b) `CARGO_PROFILE_DEV_DEBUG` fallback gating.** Recommendation: don't include in initial patch; only add if 2a's first attempt fails. Reduces blast radius — if the disk-cleanup alone works, debug-info size stays full for CI parity with local dev.
+- **(c) `large-packages: true` + `docker-images: true` flags.** Recommendation: enable both; they're the heaviest categories in the action's removal list. Other flags (`tool-cache`, `swap-storage`) carry small risk of breaking other CI infrastructure — keep defaults.
+
+**Step 2a escalation surfaces (standing rule live):**
+- Disk-cleanup runs but the build still fails on disk space — escalate to fallback strategy (`CARGO_PROFILE_DEV_DEBUG`, or `cargo build --tests` instead of `--all-targets`, or `Swatinem/rust-cache@v2` configuration changes).
+- CI passes on the 2a commit but fails on the follow-up no-op commit — disk margin is borderline; escalate to fallback.
+- `jlumbroso/free-disk-space` itself fails (action breaks, deprecated, etc.) — research alternatives (`AdityaGarg8/remove-unwanted-software`, manual `rm -rf /opt/ghc /usr/local/lib/android` etc.).
+- ANY existing test fails on Linux CI now that build succeeds — that's a Step 2b finding (the original priority-zero question), but it surfacing during Step 2a means escalate immediately.
+
+**Floor forecast for Step 2a:** **0 new tests.** Workspace stays at **364 + 2 ignored**. Success metric: TWO consecutive green CI runs (the Step 2a commit + a follow-up).
+
+**Step 2a close → Step 2b begins:** Step 2b runs the original priority-zero investigation that started this whole thread — does vault-embedding's panic-loudly-on-missing-fixtures path actually fire on CI now that build succeeds? Three sub-outcomes from the original framing still apply at Step 2b time, but now answerable empirically because builds complete.
+
+#### T0.1.9 Phase 3 Step 2b — outline (after 2a ships)
+
+Verify vault-embedding actual test behavior on Linux now that build succeeds. Read the full CI test log post-Step-2a; search for `embedding_tests::*` names. Three sub-outcomes:
+- **(i)** Tests run + pass somehow. Need to understand HOW fixtures land on the runner (`.gitignore` excludes `test-fixtures/`, so they're not checked in). Document the mechanism.
+- **(ii)** Tests run + fail-loud on missing fixtures. Add a Linux ORT-setup step parallel to the Windows one (via `scripts/setup-dev-env.sh`).
+- **(iii)** Tests don't run at all. Check Cargo.toml `[lib]` / `[[test]]` gating in vault-embedding, or `--exclude` flags in workflow YAML. If excluded, decide: keep exclusion + ADR documenting why, OR remove + add fixture setup.
+
+#### T0.1.9 Phase 3 Step 2c — outline (after 2b ships)
+
+Windows CI matrix entry — original Step 2 plan. `.github/workflows/ci.yml` gets `strategy.matrix.os: [ubuntu-latest, windows-latest]` on `clippy` + `build-and-test` jobs (`fmt` is OS-agnostic). ORT setup step gated on `runner.os == 'Windows'` invoking `scripts/setup-dev-env.ps1`. ORT dylib cache via `actions/cache` keyed on `ORT_VERSION` (1.22.0 currently). All four DoD gates green on Windows runner.
+
+**Step 2c escalation surfaces:** any existing test failing Windows-only — root-cause, NOT `#[cfg(unix)]` skip. CRLF line-ending issues with golden files (none in suite currently, worth a grep). `tokio::io::duplex` round-trip from Step 9 producing different timing on Windows. Stop and escalate.
+
+**T0.1.9 close metric:** Step 2c ships, sustained CI green across `[ubuntu-latest, windows-latest]` matrix on at least 2 consecutive commits. T0.1.9 fully shipped at that point. Three remaining V0.1 tasks: T0.1.10 (vault-app wiring + adversarial integration forward-pointer), T0.1.11 (vault-tauri UI), T0.1.12 (founder dogfood e2e).
 
 #### Plan v1.1 status (locked, no further iteration needed for Steps 6–9)
 
