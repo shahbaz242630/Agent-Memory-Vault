@@ -98,6 +98,12 @@ struct TestApp {
     /// Fourth `MetadataStore` handle (separate from Application's three)
     /// used for read-back assertions in trigger (b) and elsewhere.
     metadata_for_assert: MetadataStore,
+    /// Phase 1b: Sender returned by `Application::start`. Held so the
+    /// spawned `RetryWorker` lives for the test's duration; on `TestApp`
+    /// drop the Sender drops, `cancel.changed()` returns `Err` in the
+    /// worker's `select!`, and the worker exits cleanly. Phase 2 will
+    /// replace this with an await-aware `Application::shutdown()`.
+    _shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 async fn setup_application() -> TestApp {
@@ -123,6 +129,12 @@ async fn setup_application() -> TestApp {
          Do NOT paper over with #[cfg] skips.",
     );
 
+    // Phase 1b: spawn the cascading retry worker. Without this, writes
+    // through VaultAdapter::write land in SQLite + retry_queue but never
+    // reach the vector store - SemanticRetriever queries return empty
+    // (the integration finding Phase 1 spike surfaced).
+    let shutdown = application.start();
+
     let metadata_for_assert = MetadataStore::open(&metadata_path, key)
         .await
         .expect("open assert handle");
@@ -131,6 +143,7 @@ async fn setup_application() -> TestApp {
         application,
         _tmp: tmp,
         metadata_for_assert,
+        _shutdown: shutdown,
     }
 }
 
@@ -154,6 +167,18 @@ fn make_query(text: &str, boundary: &str, max_results: usize) -> RetrievalQuery 
         max_results,
         options: RetrievalOptions::default(),
     }
+}
+
+/// Phase 1b: wait for the cascading retry worker to drain queued entries
+/// to the vector store. `StorageBackend::write_memory` is async w.r.t. the
+/// vector store — it commits to SQLite + retry_queue and returns; the
+/// worker drains retry_queue → `vector.upsert` on its next poll cycle
+/// (default 1s per `retry_worker.rs:59`). 3s margin covers up to two
+/// poll-interval cycles plus processing time. Phase 2 can replace this
+/// with a deterministic `Application::flush()` if/when such an API is
+/// justified by a concrete consumer.
+async fn wait_for_cascade_drain() {
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 }
 
 // ======================================================================
@@ -230,6 +255,30 @@ async fn trigger_b_audit_chain_consistent_across_composition() {
         .await
         .expect("write through composed chain MUST succeed");
 
+    // Phase 1b empirical H1 refutation (cross-handle SQLite visibility):
+    // confirm the write IS visible through a separate MetadataStore
+    // connection (`metadata_for_assert`, opened independently in
+    // `setup_application`). Refutes the multi-handle WAL visibility
+    // hypothesis at integration-test scope, not just by analogy to
+    // the existing vault-app unit test. Doubles as a regression check:
+    // if `cascading_write` ever stops writing to SQLite metadata, this
+    // line catches it before downstream retrievability assertions.
+    let stored = app
+        .metadata_for_assert
+        .get_memory(&id)
+        .await
+        .expect("get_memory must not error")
+        .expect(
+            "SQLite write through VaultAdapter::write MUST be visible to a \
+             separate MetadataStore handle (cross-connection visibility \
+             refutation; if this fails, multi-handle WAL visibility IS the \
+             root cause and the retry-worker hypothesis is misattributed)",
+        );
+    assert_eq!(
+        stored.content, "trigger-b probe content",
+        "round-tripped memory content must match the write payload"
+    );
+
     // Append a tool-invoke audit row via the adapter - exercises the
     // SECOND MetadataStore handle.
     let details = ToolInvokeDetails {
@@ -259,6 +308,11 @@ async fn trigger_b_audit_chain_consistent_across_composition() {
          MemoryCreate) and VaultAdapter's append_tool_invoke_audit handle \
          (which appended McpToolInvoke). Stop, surface, do not paper over.",
     );
+
+    // Phase 1b: wait for cascading worker to drain retry_queue → vector
+    // store. Without this wait, the retrievability check below races the
+    // worker.
+    wait_for_cascade_drain().await;
 
     // Also confirm the written memory is visible from the retriever path
     // through Application's wiring - proves StorageBackend writes are
@@ -406,6 +460,11 @@ async fn trigger_d_cross_boundary_write_invisible_in_other_boundary() {
         ))
         .await
         .expect("personal-boundary write MUST succeed");
+
+    // Phase 1b: wait for cascading worker to drain retry_queue → vector
+    // store. Without this wait, the negative-control search below races
+    // the worker and would fire spuriously.
+    wait_for_cascade_drain().await;
 
     // Confirm the write landed by querying from personal scope - this
     // proves the embedder + retriever path is functional, so a

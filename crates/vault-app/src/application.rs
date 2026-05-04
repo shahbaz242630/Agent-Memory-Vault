@@ -44,14 +44,21 @@ use std::sync::Arc;
 use vault_core::VaultResult;
 use vault_embedding::{BgeSmallProvider, EmbeddingProvider, EMBEDDING_DIM};
 use vault_retrieval::{Retriever, SemanticRetriever};
-use vault_storage::{MetadataStore, SqlCipherKey, StorageBackend};
+use vault_storage::{MetadataStore, RetryWorker, SqlCipherKey, StorageBackend};
 
 use crate::VaultAdapter;
 
-/// Composition root. Phase 1 holds only the wired adapter; Phase 2 adds
-/// retry-worker handle + shutdown signal + MCP-server lifecycle state.
+/// Composition root. Phase 1 wires the dep graph; Phase 1b adds the
+/// minimum lifecycle (retry-worker spawn) needed for write→search
+/// round-trips through the cascading orchestrator. Phase 2 adds full
+/// lifecycle (shutdown handling, MCP server bind, signal handlers).
 pub struct Application {
     adapter: Arc<VaultAdapter>,
+    /// Held for [`Self::start`] to clone into the spawned [`RetryWorker`].
+    /// `StorageBackend` is `#[derive(Clone)]` with `Arc<Inner>` semantics
+    /// (per `cascading.rs:149`), so this clone is cheap and shares state
+    /// with the [`VaultAdapter`]'s clone — both see the same retry_queue.
+    storage: StorageBackend,
 }
 
 impl Application {
@@ -148,11 +155,18 @@ impl Application {
         let retriever: Arc<dyn Retriever> = Arc::new(retriever);
 
         // 6. VaultAdapter — composes the four trait deps into the MCP
-        //    Adapter surface.
-        let adapter = VaultAdapter::new(retriever, embedder, storage, adapter_metadata);
+        //    Adapter surface. Clone the StorageBackend so Application
+        //    retains a handle for `start()` to construct the worker
+        //    against. The `#[derive(Clone)]` on StorageBackend is
+        //    `Arc<Inner>`-shallow per cascading.rs:149 — both clones
+        //    share the same retry_queue so writes via the adapter are
+        //    drained by the worker constructed from Application's clone.
+        let adapter_storage = storage.clone();
+        let adapter = VaultAdapter::new(retriever, embedder, adapter_storage, adapter_metadata);
 
         Ok(Self {
             adapter: Arc::new(adapter),
+            storage,
         })
     }
 
@@ -161,5 +175,38 @@ impl Application {
     /// tests in `tests/integration_smoke.rs` use it for direct dispatch.
     pub fn adapter(&self) -> &Arc<VaultAdapter> {
         &self.adapter
+    }
+
+    /// Spawn the cascading retry worker; return the [`tokio::sync::watch::Sender<bool>`]
+    /// that signals shutdown when dropped or when `send(true)` is called.
+    ///
+    /// # Phase 1b scope (locked)
+    ///
+    /// This is the **minimum lifecycle** needed for write→search round-trips
+    /// through the cascading orchestrator. `StorageBackend::write_memory`
+    /// writes to SQLite + `retry_queue` only; the vector store is updated
+    /// asynchronously by the worker draining `retry_queue` → `vector.upsert`.
+    /// Without `start()` called, writes never propagate to the vector store
+    /// and `SemanticRetriever` queries return empty (Phase 1 spike surfaced
+    /// this — triggers (b) and (d) failed deterministically until Phase 1b
+    /// added this method).
+    ///
+    /// **NOT included in Phase 1b** (each Phase 2 scope):
+    /// - Shutdown handling logic (caller drops the returned Sender;
+    ///   `RetryWorker::run`'s `cancel.changed()` arm at `retry_worker.rs:206`
+    ///   breaks the loop on Sender-drop or `send(true)`).
+    /// - MCP server bind / signal handler registration / `AppConfig`
+    ///   migration / error recovery for worker spawn failure / a
+    ///   corresponding `Application::shutdown()` await-aware path.
+    ///
+    /// Phase 2 wraps this in a proper `start/shutdown` pair with
+    /// `JoinHandle` tracking + signal handlers; for Phase 1b the integration
+    /// test holds the returned Sender on `TestApp` and lets it drop when
+    /// the test ends, signaling clean worker exit.
+    pub fn start(&self) -> tokio::sync::watch::Sender<bool> {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let worker = RetryWorker::new(self.storage.clone());
+        tokio::spawn(worker.run(rx));
+        tx
     }
 }
