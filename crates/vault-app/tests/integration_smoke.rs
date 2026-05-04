@@ -40,9 +40,9 @@ use std::time::Instant;
 use tempfile::TempDir;
 
 use vault_app::{AppConfig, Application, VaultAdapter};
-use vault_core::{Boundary, MemoryType, NewMemory};
+use vault_core::{Boundary, MemoryType, NewMemory, VaultError};
 use vault_mcp::{Adapter, ToolInvokeDetails};
-use vault_retrieval::{RetrievalOptions, RetrievalQuery};
+use vault_retrieval::{RetrievalOptions, RetrievalQuery, MAX_QUERY_BYTES, MAX_RESULTS_CAP};
 use vault_storage::{MetadataStore, SqlCipherKey};
 
 // ----------------------------------------------------------------------
@@ -503,5 +503,185 @@ async fn trigger_d_cross_boundary_write_invisible_in_other_boundary() {
          VaultAdapter -> SemanticRetriever -> MetadataStore boundary filter \
          chain. Got {} result(s).",
         work_results.len()
+    );
+}
+
+// ======================================================================
+// Phase 2c — Adversarial integration coverage (T0.1.9 Phase 3 Step 1
+// forward-pointer payoff)
+// ======================================================================
+//
+// The four tests below trace adversarial inputs end-to-end through the
+// **real composed adapter** — `Application::adapter().search(...)` —
+// rather than through fixture-bypass adapters (which don't reach
+// `SemanticRetriever::retrieve_inner` and thus can't exercise its
+// validation chain).
+//
+// Each test pins ONE of the four distinct defenses at
+// `crates/vault-retrieval/src/strategies/semantic.rs:118-142`. The
+// 1:1 test-to-defense mapping was located by source-reading 2026-05-04
+// per the `feedback_identify_test_source_before_framing.md` discipline
+// (an earlier Phase 2 plan paragraph mis-enumerated NUL-in-query as a
+// separate test from ASCII-control; the source-read corrected the
+// mapping to the four actual defenses).
+//
+// Original deferred-coverage block — verbatim quote from
+// `crates/vault-mcp/tests/adversarial.rs:24-46` (the T0.1.9 Phase 3
+// Step 1 architecture-review escalation that surfaced the bypass-
+// fixture false-confidence problem):
+//
+//     "Adversarial coverage of `query_text` validation (oversized,
+//      whitespace-only, ASCII control chars) and `max_results` bounds —
+//      these defenses live inside `vault_retrieval::SemanticRetriever::
+//      retrieve()` at `crates/vault-retrieval/src/strategies/semantic.rs:
+//      118-133`, NOT in vault-mcp. With any vault-mcp test fixture
+//      (SuccessAdapter / MockAdapter / DimMismatchAdapter), those
+//      validations never fire — the adapter bypasses SemanticRetriever.
+//      vault-retrieval's own adversarial suite already pins these cases
+//      at `semantic.rs:482` (...). Each crate owns its own adversarial
+//      coverage. Adversarial integration coverage that traces vault-mcp
+//      dispatch → vault-retrieval validation end-to-end against a real
+//      composed system lands at T0.1.10 alongside the integration-risk
+//      spike, NOT here at Phase 3."
+//
+// Phase 2c lands that integration coverage. All four tests are
+// `#[ignore]`-by-default per Phase 1 spike pattern.
+
+/// **Adversarial defense:** whitespace-only `query_text` (after `.trim()`).
+///
+/// Defense location: `semantic.rs:119-123` —
+/// `if trimmed.is_empty() { return Err(VaultError::InvalidInput("query text empty after trim".into())); }`.
+///
+/// Forward-pointer source: T0.1.9 Phase 3 Step 1 deferred-coverage
+/// block at `crates/vault-mcp/tests/adversarial.rs:24-46` ("whitespace-
+/// only" entry).
+///
+/// **Routing through real composed adapter** (NOT fixture-bypassed):
+/// the search call dispatches `Application::adapter()` →
+/// `VaultAdapter::search` → `SemanticRetriever::retrieve` →
+/// `retrieve_inner` where the defense fires.
+#[tokio::test]
+#[ignore]
+async fn adversarial_whitespace_only_query_rejected_through_composed_adapter() {
+    let app = setup_application().await;
+    let query = make_query("   \t\n   ", "work", 10);
+
+    let err =
+        app.application.adapter().search(query).await.expect_err(
+            "whitespace-only query MUST be rejected at SemanticRetriever::retrieve_inner",
+        );
+
+    let VaultError::InvalidInput(msg) = &err else {
+        panic!("expected VaultError::InvalidInput, got {err:?}");
+    };
+    assert!(
+        msg.contains("query text empty after trim"),
+        "InvalidInput message MUST cite the trim-empty defense (semantic.rs:119-123); got: {msg}"
+    );
+}
+
+/// **Adversarial defense:** ASCII control characters in `query_text`
+/// (caught by `b.is_ascii_control()` over the full 0x00–0x1F + 0x7F class).
+///
+/// Defense location: `semantic.rs:124-128`. Forward-pointer source:
+/// `crates/vault-mcp/tests/adversarial.rs:24-46` ("ASCII control chars"
+/// entry).
+///
+/// **NUL (0x00) is the canonical edge case** for this class but the
+/// defense is the broader `is_ascii_control()` check, NOT a NUL-specific
+/// check. A test using NUL exercises the defense via its most common
+/// entry point; assertion on the class-level error message pins the
+/// broader defense.
+#[tokio::test]
+#[ignore]
+async fn adversarial_ascii_control_chars_in_query_rejected_through_composed_adapter() {
+    let app = setup_application().await;
+    let query = make_query("hello\x00world", "work", 10);
+
+    let err = app.application.adapter().search(query).await.expect_err(
+        "query containing ASCII control char (NUL) MUST be rejected at \
+             SemanticRetriever::retrieve_inner",
+    );
+
+    let VaultError::InvalidInput(msg) = &err else {
+        panic!("expected VaultError::InvalidInput, got {err:?}");
+    };
+    assert!(
+        msg.contains("query text contains ASCII control characters"),
+        "InvalidInput message MUST cite the ASCII-control-class defense (semantic.rs:124-128); got: {msg}"
+    );
+}
+
+/// **Adversarial defense:** `query_text` length exceeds [`MAX_QUERY_BYTES`]
+/// (= 2048) after trim.
+///
+/// Defense location: `semantic.rs:129-133`. Forward-pointer source:
+/// `crates/vault-mcp/tests/adversarial.rs:24-46` ("oversized" entry).
+///
+/// **Test uses `MAX_QUERY_BYTES + 1`** (= 2049) — exactly one byte over
+/// the boundary, the canonical edge case. Pins off-by-one threshold
+/// semantics.
+#[tokio::test]
+#[ignore]
+async fn adversarial_oversized_query_rejected_through_composed_adapter() {
+    let app = setup_application().await;
+    let oversized = "x".repeat(MAX_QUERY_BYTES + 1);
+    let query = make_query(&oversized, "work", 10);
+
+    let err = app.application.adapter().search(query).await.expect_err(
+        "query_text > MAX_QUERY_BYTES MUST be rejected at SemanticRetriever::retrieve_inner",
+    );
+
+    let VaultError::InvalidInput(msg) = &err else {
+        panic!("expected VaultError::InvalidInput, got {err:?}");
+    };
+    assert!(
+        msg.contains("query length") && msg.contains("MAX_QUERY_BYTES"),
+        "InvalidInput message MUST cite the length / MAX_QUERY_BYTES defense (semantic.rs:129-133); got: {msg}"
+    );
+}
+
+/// **Adversarial defense:** `max_results` outside `1..=`[`MAX_RESULTS_CAP`]
+/// (= 100). Both edges (`0` below the floor, `MAX_RESULTS_CAP + 1` above
+/// the cap) collapse into one defense at one code path; this single
+/// test exercises both edges via two sub-assertions on the same defense.
+///
+/// Defense location: `semantic.rs:137-141`. Forward-pointer source:
+/// `crates/vault-mcp/tests/adversarial.rs:24-46` ("max_results bounds"
+/// entry).
+///
+/// **Single-test-two-edges pattern** approved at Phase 2c plan-paragraph
+/// review (single defense, single code path).
+#[tokio::test]
+#[ignore]
+async fn adversarial_max_results_out_of_range_rejected_through_composed_adapter() {
+    let app = setup_application().await;
+    let adapter = app.application.adapter();
+
+    // Below-floor edge: max_results = 0.
+    let query_zero = make_query("anything", "work", 0);
+    let err_zero = adapter
+        .search(query_zero)
+        .await
+        .expect_err("max_results=0 MUST be rejected at SemanticRetriever::retrieve_inner");
+    let VaultError::InvalidInput(msg_zero) = &err_zero else {
+        panic!("expected VaultError::InvalidInput for zero edge, got {err_zero:?}");
+    };
+    assert!(
+        msg_zero.contains("max_results") && msg_zero.contains("not in"),
+        "InvalidInput message for zero edge MUST cite the max_results-range defense (semantic.rs:137-141); got: {msg_zero}"
+    );
+
+    // Above-cap edge: max_results = MAX_RESULTS_CAP + 1.
+    let query_over = make_query("anything", "work", MAX_RESULTS_CAP + 1);
+    let err_over = adapter.search(query_over).await.expect_err(
+        "max_results > MAX_RESULTS_CAP MUST be rejected at SemanticRetriever::retrieve_inner",
+    );
+    let VaultError::InvalidInput(msg_over) = &err_over else {
+        panic!("expected VaultError::InvalidInput for over-cap edge, got {err_over:?}");
+    };
+    assert!(
+        msg_over.contains("max_results") && msg_over.contains("not in"),
+        "InvalidInput message for over-cap edge MUST cite the max_results-range defense (semantic.rs:137-141); got: {msg_over}"
     );
 }
