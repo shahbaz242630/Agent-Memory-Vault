@@ -120,6 +120,32 @@ pub enum VaultError {
     /// Serialization or deserialization failed (JSON, CRDT payload).
     #[error("serde error: {0}")]
     Serde(String),
+
+    /// Cascading retry worker failed to spawn during application
+    /// startup. T0.1.10 Phase 2a: distinct from `McpBindFailed` so
+    /// callers can pattern-match for startup-fatal vs degraded
+    /// reporting (per the user pre-flag at Phase 2 plan-paragraph
+    /// review — "minimum WorkerSpawnFailed + McpBindFailed as separate
+    /// pattern-matchable variants, NOT a generic StartupFailed bucket").
+    ///
+    /// **Currently unreachable as of Phase 2a**: `RetryWorker::new` is
+    /// infallible struct construction and `tokio::spawn` is infallible.
+    /// Reserved for future fallible spawn paths — e.g., bounded-thread-
+    /// pool spawning, config-driven worker startup, or worker-side
+    /// resource acquisition that returns `Result`.
+    ///
+    /// **Re-evaluation milestone**: if no consumer surfaces by V0.2
+    /// alpha cut, remove and re-add when concretely needed. Tracked
+    /// in HANDOFF.md tech-debt; concrete-vs-hypothetical test applied
+    /// to the variant's own existence.
+    #[error("worker spawn failed: {0}")]
+    WorkerSpawnFailed(String),
+
+    /// MCP server bind failed during application startup. T0.1.10
+    /// Phase 2: distinct from `WorkerSpawnFailed` per the same
+    /// pattern-matching pre-flag.
+    #[error("mcp server bind failed: {0}")]
+    McpBindFailed(String),
 }
 
 /// Standard result alias used throughout the workspace.

@@ -245,6 +245,20 @@ impl ToolInvokeError {
                 category: "Serde".to_string(),
                 message: message.clone(),
             },
+            // T0.1.10 Phase 2: WorkerSpawnFailed / McpBindFailed are
+            // startup errors. Collapsed to Internal with explicit
+            // category names so audit-row coverage stays exhaustive
+            // even though these variants should never reach the audit
+            // path in practice (startup failure aborts before MCP
+            // accepts requests).
+            VaultError::WorkerSpawnFailed(message) => Self::Internal {
+                category: "WorkerSpawnFailed".to_string(),
+                message: message.clone(),
+            },
+            VaultError::McpBindFailed(message) => Self::Internal {
+                category: "McpBindFailed".to_string(),
+                message: message.clone(),
+            },
         }
     }
 }

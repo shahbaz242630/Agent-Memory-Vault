@@ -706,7 +706,15 @@ fn vault_error_to_mcp(err: VaultError) -> McpError {
         | VaultError::Crypto(_)
         | VaultError::Config(_)
         | VaultError::Io(_)
-        | VaultError::Serde(_) => McpError::internal_error("internal error", None),
+        | VaultError::Serde(_)
+        // T0.1.10 Phase 2: WorkerSpawnFailed / McpBindFailed are startup
+        // errors that surface during Application::start before any MCP
+        // tool dispatch. They should never reach this function in
+        // practice — startup failure aborts the process before MCP
+        // accepts requests. Mapped to internal_error defensively to
+        // preserve privacy posture if they ever do leak.
+        | VaultError::WorkerSpawnFailed(_)
+        | VaultError::McpBindFailed(_) => McpError::internal_error("internal error", None),
     }
 }
 

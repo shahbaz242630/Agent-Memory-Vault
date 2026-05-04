@@ -28,4 +28,4 @@ mod adapter;
 mod application;
 
 pub use adapter::VaultAdapter;
-pub use application::Application;
+pub use application::{Application, ApplicationHandle};

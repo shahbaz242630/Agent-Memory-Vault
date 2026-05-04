@@ -27,6 +27,16 @@ vault-core = { path = "../vault-core" }
 # vault-mcp Adapter trait — VaultAdapter is the production impl.
 vault-mcp = { path = "../vault-mcp" }
 
+# rmcp — used directly by `Application::start_with_mcp` (T0.1.10 Phase 2)
+# to bind `rmcp::transport::stdio()` and call `ServiceExt::serve` on a
+# `StdioServer`. Already a transitive dep via vault-mcp; the direct
+# declaration here makes the use explicit. Features:
+# - `server`: enables ServerHandler-trait surface (StdioServer impls it
+#   via vault-mcp's macros) + ServiceExt::serve.
+# - `transport-io`: enables `rmcp::transport::stdio()` for process
+#   stdin/stdout transport. Same feature vault-mcp uses.
+rmcp = { workspace = true, features = ["server", "transport-io"] }
+
 # Retriever trait — VaultAdapter::search delegates to the wired
 # `Arc<dyn Retriever>` (typically `SemanticRetriever` at T0.1.10).
 vault-retrieval = { path = "../vault-retrieval" }

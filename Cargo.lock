@@ -6735,6 +6735,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "rmcp",
  "serde_json",
  "tempfile",
  "tokio",
