@@ -959,6 +959,45 @@ mod tests {
         let _store2 = DuckDbGraphStore::open(&path).await.unwrap();
     }
 
+    /// **T0.1.10 Phase 3b — ADR-010 (extended via ADR-014 / module
+    /// docstring at line 211-212) compensating-control #3 pin for
+    /// DuckDB.**
+    ///
+    /// Sibling pin to `vector_store.rs::open_emits_adr_010_plaintext_warn_log`.
+    /// The WARN itself has been live in `DuckDbGraphStore::open_blocking`
+    /// since T0.1.5 (`graph_store.rs:213-217`); this test pins it
+    /// against regression. Same regression vectors as the LanceDB
+    /// counterpart: a future change that drops the WARN, demotes its
+    /// level, or removes the ADR-010 / T0.2.0 references trips CI
+    /// immediately.
+    ///
+    /// Asserts the same three properties as the LanceDB counterpart:
+    /// (1) WARN fires on every `DuckDbGraphStore::open`, (2) message
+    /// contains "ADR-010", (3) message contains "T0.2.0".
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn open_emits_adr_010_plaintext_warn_log() {
+        let _ = open_tmp().await;
+
+        assert!(
+            tracing_test::internal::logs_with_scope_contain(
+                "vault_storage",
+                "DuckDB graph store data is PLAINTEXT",
+            ),
+            "ADR-010 (extended to DuckDB) compensating-control #3 WARN log MUST fire on \
+             every DuckDbGraphStore::open. If this fails, the WARN at graph_store.rs:213-217 \
+             has been removed, demoted, or its scope altered."
+        );
+        assert!(
+            tracing_test::internal::logs_with_scope_contain("vault_storage", "ADR-010",),
+            "ADR-010 reference MUST appear in the DuckDB WARN message"
+        );
+        assert!(
+            tracing_test::internal::logs_with_scope_contain("vault_storage", "T0.2.0",),
+            "T0.2.0 reference MUST appear in the DuckDB WARN message"
+        );
+    }
+
     // -------- create_entity --------
 
     #[tokio::test]

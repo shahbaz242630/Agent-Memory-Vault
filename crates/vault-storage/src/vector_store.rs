@@ -716,6 +716,59 @@ mod tests {
         );
     }
 
+    /// **T0.1.10 Phase 3b — ADR-010 compensating-control #3 PRIMARY pin.**
+    ///
+    /// Closes the T0.1.4 test gap that ADR-010 line 539 specified
+    /// (*"assert the WARN log fires on every open"*) but wasn't
+    /// implemented at T0.1.4. The WARN itself has been live in
+    /// `LanceVectorStore::open` since T0.1.4 (`vector_store.rs:240-244`);
+    /// this test pins it against regression at CI level so a future
+    /// "helpful" change that drops the WARN, demotes its level, or
+    /// removes the ADR-010 / T0.2.0 references trips CI immediately.
+    ///
+    /// Asserts three properties:
+    /// 1. A `tracing` event is emitted at any level under the
+    ///    `vault_storage` scope when `LanceVectorStore::open` runs.
+    /// 2. The event message contains the canonical "ADR-010" reference
+    ///    (regression check that the ADR citation isn't silently
+    ///    dropped from the message).
+    /// 3. The event message contains "T0.2.0" (regression check that
+    ///    the encryption-deferral milestone reference stays — that
+    ///    cross-link is what makes the WARN actionable for an alpha
+    ///    user reading their dev console).
+    ///
+    /// `tracing-test` captures events into a thread-local subscriber per
+    /// `#[traced_test]`; the `no-env-filter` workspace feature ensures
+    /// WARN events are captured regardless of `RUST_LOG`. Pattern matches
+    /// the existing usage at `vault-retrieval/src/strategies/semantic.rs:423-444`.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn open_emits_adr_010_plaintext_warn_log() {
+        let tmp = TempDir::new().unwrap();
+        let _store = LanceVectorStore::open(tmp.path(), 384).await.unwrap();
+
+        assert!(
+            tracing_test::internal::logs_with_scope_contain(
+                "vault_storage",
+                "LanceDB data dir is plaintext",
+            ),
+            "ADR-010 compensating-control #3 (PRIMARY) WARN log MUST fire on every \
+             LanceVectorStore::open. If this fails, the WARN at vector_store.rs:240-244 \
+             has been removed, demoted, or its scope altered. Per ADR-010 line 525, \
+             this WARN is the primary safety control while V0.1 ships plaintext-on-disk."
+        );
+        assert!(
+            tracing_test::internal::logs_with_scope_contain("vault_storage", "ADR-010",),
+            "ADR-010 reference MUST appear in the WARN message — alpha users reading \
+             their dev console need the cross-link to the ADR's full context"
+        );
+        assert!(
+            tracing_test::internal::logs_with_scope_contain("vault_storage", "T0.2.0",),
+            "T0.2.0 reference MUST appear in the WARN message — alpha users need to \
+             know which release closes the deviation (encryption layer)"
+        );
+    }
+
     /// ADR-014: if the ALPHA file write fails (read-only data dir, quota,
     /// FS error), `open()` must STILL succeed. The startup WARN log is the
     /// primary safety control; the file is secondary. We force the failure

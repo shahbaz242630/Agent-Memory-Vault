@@ -1,11 +1,12 @@
 # Agent Build Specification — Personal Memory Vault
 
 **Document type:** Agent BRD (read by Claude Code and Codex as the working spec)
-**Version:** 1.2
+**Version:** 1.3
 **Status:** Active — agents must read this end-to-end before writing any code
 **Last updated:** 2026-05-04
 
 **Changelog:**
+- **v1.3 (2026-05-04)** — Amended T0.2.7 (vault-retrieval Multi-Strategy + Reranker) to make the vector index intervention an explicit deliverable + acceptance bar, promoted from HANDOFF tech-debt cross-link to BRD task spec. Reason: T0.1.10 Phase 3a empirically confirmed 1K-memory retrieval at ~382ms median (vs BRD §5.5's 200ms ceiling) due to LanceDB fragmentation without an index; codifying the fix in the BRD removes the dependency on tech-debt-cross-link discipline at T0.2.7 planning time.
 - **v1.2 (2026-05-04)** — Clarified per-runtime adapter pattern in §1.4.1: MCP-native agents work automatically with no per-runtime work; runtimes with proprietary plugin systems get case-by-case thin adapters following the T1.0.16 Hermes pattern. T1.0.16 reframed as the first instance of a reusable pattern, not a one-off.
 - **v1.1 (2026-05-04)** — Added §1.4.1 ecosystem positioning (substrate vs. runtime); added Skills Hub compatibility note to §5.1 `MemoryType::Procedural`; added human-readable consolidation summary requirement to §5.6 + T0.2.3 acceptance criterion; added T1.0.16 Hermes memory provider plugin (post-V1.0 distribution channel).
 - **v1.0 (2026-04-28)** — Initial BRD.
@@ -1453,11 +1454,12 @@ V0.1 → V0.2 → V1.0. Build in order. Do not skip ahead.
 - Scheduler triggers nightly run at configured time
 - Acceptance: Consolidation runs at 3 AM local time, completes within 30 minutes for 1000 memories
 
-**T0.2.7 — vault-retrieval: Multi-Strategy + Reranker**
+**T0.2.7 — vault-retrieval: Multi-Strategy + Reranker + Vector Index Intervention**
 - Implement graph, temporal, keyword, frequency strategies
 - Query classifier routes to appropriate strategies
 - Reranker fuses scores
-- Acceptance: Retrieval quality measurably better than V0.1 (manual eval on 50 test queries)
+- **Vector index intervention (priority-zero per T0.1.10 Phase 3a finding):** add explicit vector index to LanceVectorStore (HNSW or IVF — pick at T0.2.7 plan time based on V0.1 dogfood vault-size distribution + recall/latency trade-off benchmarks). Optional compaction lifecycle (`LanceVectorStore::compact` periodic call) as complementary intervention. Without this, 1K-memory retrieval cannot meet the BRD §5.5 200ms ceiling — empirically confirmed at T0.1.10 Phase 3a (median 381.92ms across 5 runs, fragmentation hypothesis confirmed against T0.1.8's 412ms baseline).
+- Acceptance: Retrieval quality measurably better than V0.1 (manual eval on 50 test queries) AND 1K-memory retrieval median under 200ms per BRD §5.5 ceiling, measured per T0.1.7 methodology (5 consecutive runs, idle machine, fresh build cache between runs)
 
 **T0.2.8 — Boundary Enforcement**
 - Boundary field on every memory at write time

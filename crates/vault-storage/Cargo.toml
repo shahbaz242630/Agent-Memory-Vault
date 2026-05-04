@@ -37,3 +37,11 @@ zeroize = { workspace = true }
 proptest = { workspace = true }
 tempfile = { workspace = true }
 tokio-test = { workspace = true }
+# tracing-test — T0.1.10 Phase 3b: thread-local subscriber that captures
+# `tracing` events emitted during a test. Used to pin ADR-010
+# compensating-control #3 (the plaintext-on-disk WARN logs) against
+# regression. Closes the T0.1.4 test gap that ADR-010 line 539
+# specified ("assert the WARN log fires on every open") but wasn't
+# implemented at T0.1.4. `no-env-filter` feature already configured in
+# workspace deps.
+tracing-test = { workspace = true }
