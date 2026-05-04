@@ -38,16 +38,15 @@
 //! `trigger_b_audit_chain_consistent_across_composition` in
 //! `tests/integration_smoke.rs`).
 
-use std::path::Path;
 use std::sync::Arc;
 
 use vault_core::{Boundary, VaultError, VaultResult};
 use vault_embedding::{BgeSmallProvider, EmbeddingProvider, EMBEDDING_DIM};
 use vault_mcp::{Adapter, StdioServer};
 use vault_retrieval::{Retriever, SemanticRetriever};
-use vault_storage::{MetadataStore, RetryWorker, SqlCipherKey, StorageBackend};
+use vault_storage::{MetadataStore, RetryWorker, StorageBackend};
 
-use crate::VaultAdapter;
+use crate::{AppConfig, VaultAdapter};
 
 /// Composition root. Phase 1 wires the dep graph; Phase 1b adds the
 /// minimum lifecycle (retry-worker spawn) needed for write→search
@@ -66,16 +65,13 @@ impl Application {
     /// Construct the full V0.1 dependency graph and wire it into a
     /// [`VaultAdapter`].
     ///
-    /// # Path arguments
+    /// # Configuration
     ///
-    /// - `metadata_path` — SQLCipher database file (created if missing).
-    /// - `vector_dir` — LanceDB dataset directory (created if missing).
-    /// - `graph_path` — DuckDB graph file (created if missing).
-    /// - `model_path` — `bge-small-en-v1.5/model.onnx` (verified against
-    ///   pinned SHA-256 per ADR-019/020 — startup-fatal on mismatch).
-    /// - `tokenizer_path` — `bge-small-en-v1.5/tokenizer.json` (verified).
-    /// - `ort_lib_path` — `libonnxruntime.{dll,dylib,so}` for the host
-    ///   platform per ADR-019 `load-dynamic` strategy.
+    /// Takes the [`AppConfig`] composition-root configuration by
+    /// reference. See [`AppConfig`]'s module docs for the migration-
+    /// anchor history (T0.1.10 Phase 2b migrated the seven Phase 1
+    /// inline parameters to AppConfig fields with verbatim names per
+    /// rename-prohibition discipline).
     ///
     /// # Errors
     ///
@@ -87,50 +83,36 @@ impl Application {
     ///    ort dynamic load + ONNX session.
     ///
     /// All four failure modes propagate as [`VaultError`] variants
-    /// the caller (Phase 2 `Application::start`) can pattern-match for
-    /// startup-fatal vs degraded reporting.
-    ///
-    /// # Phase 2 migration anchor
-    ///
-    /// The seven inline parameters here (`metadata_path`, `vector_dir`,
-    /// `graph_path`, `key`, `model_path`, `tokenizer_path`,
-    /// `ort_lib_path`) are deliberate Phase 1 spike-level minimalism.
-    /// Phase 2 wraps them in a proper `AppConfig` struct; when that
-    /// lands, each Phase 1 parameter MUST be enumerated as an
-    /// `AppConfig` field with a doc-comment citing this function's
-    /// inline parameter as its migration anchor (so the schema's
-    /// provenance is auditable, not a clean-slate redesign).
+    /// the caller (Phase 2 `Application::start_with_mcp`) can pattern-
+    /// match for startup-fatal vs degraded reporting.
     ///
     /// [`VaultError`]: vault_core::VaultError
     #[tracing::instrument(skip_all, fields(
-        metadata_path = %metadata_path.display(),
-        vector_dir = %vector_dir.display(),
-        graph_path = %graph_path.display(),
+        metadata_path = %config.metadata_path.display(),
+        vector_dir = %config.vector_dir.display(),
+        graph_path = %config.graph_path.display(),
     ))]
-    pub async fn new(
-        metadata_path: &Path,
-        vector_dir: &Path,
-        graph_path: &Path,
-        key: SqlCipherKey,
-        model_path: &Path,
-        tokenizer_path: &Path,
-        ort_lib_path: &Path,
-    ) -> VaultResult<Self> {
+    pub async fn new(config: &AppConfig) -> VaultResult<Self> {
         // 1. StorageBackend — owns its own MetadataStore + LanceDB + DuckDB.
+        //    SqlCipherKey clone is cheap (clones inner String); cloning
+        //    inside the body is the canonical pattern for by-reference
+        //    config (per AppConfig module docs).
         let storage = StorageBackend::open(
-            metadata_path,
-            vector_dir,
-            graph_path,
-            key.clone(),
+            &config.metadata_path,
+            &config.vector_dir,
+            &config.graph_path,
+            config.key.clone(),
             EMBEDDING_DIM,
         )
         .await?;
 
         // 2. Second MetadataStore handle for VaultAdapter's audit appends.
-        let adapter_metadata = MetadataStore::open(metadata_path, key.clone()).await?;
+        let adapter_metadata =
+            MetadataStore::open(&config.metadata_path, config.key.clone()).await?;
 
         // 3. Third MetadataStore handle, Arc-shared for SemanticRetriever.
-        let retriever_metadata = Arc::new(MetadataStore::open(metadata_path, key).await?);
+        let retriever_metadata =
+            Arc::new(MetadataStore::open(&config.metadata_path, config.key.clone()).await?);
 
         // 4. BgeSmallProvider — sync open (verifies SHA-256 model+tokenizer
         //    integrity, idempotent ort init, loads ONNX session +
@@ -138,7 +120,11 @@ impl Application {
         //    vault-embedding test pattern; CPU-heavy work after this
         //    point goes through `EmbeddingProvider::embed` which itself
         //    handles `spawn_blocking` correctly.
-        let provider = BgeSmallProvider::open(model_path, tokenizer_path, ort_lib_path)?;
+        let provider = BgeSmallProvider::open(
+            &config.model_path,
+            &config.tokenizer_path,
+            &config.ort_lib_path,
+        )?;
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(provider);
 
         // 5. SemanticRetriever — shares storage's vector store Arc.

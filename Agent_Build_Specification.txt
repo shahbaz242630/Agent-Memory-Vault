@@ -1,9 +1,14 @@
 # Agent Build Specification — Personal Memory Vault
 
 **Document type:** Agent BRD (read by Claude Code and Codex as the working spec)
-**Version:** 1.0
+**Version:** 1.2
 **Status:** Active — agents must read this end-to-end before writing any code
-**Last updated:** 2026-04-28
+**Last updated:** 2026-05-04
+
+**Changelog:**
+- **v1.2 (2026-05-04)** — Clarified per-runtime adapter pattern in §1.4.1: MCP-native agents work automatically with no per-runtime work; runtimes with proprietary plugin systems get case-by-case thin adapters following the T1.0.16 Hermes pattern. T1.0.16 reframed as the first instance of a reusable pattern, not a one-off.
+- **v1.1 (2026-05-04)** — Added §1.4.1 ecosystem positioning (substrate vs. runtime); added Skills Hub compatibility note to §5.1 `MemoryType::Procedural`; added human-readable consolidation summary requirement to §5.6 + T0.2.3 acceptance criterion; added T1.0.16 Hermes memory provider plugin (post-V1.0 distribution channel).
+- **v1.0 (2026-04-28)** — Initial BRD.
 
 ---
 
@@ -100,8 +105,53 @@ Current memory systems (Mem0, Zep, Letta) fail because they treat memory as a da
 - Training our own models (never — we use open-weight Phi-4-mini)
 - Browser extension (potential later)
 - Voice interface (potential later)
+- Hermes Agent memory provider plugin (V1.0 post-launch, see T1.0.16 — distribution channel, not a V1.0 launch feature)
+- Skills Hub import/export tooling (V1.1+; V1.0 commits to schema compatibility only, see §5.1 forward note on `MemoryType::Procedural`)
 
 When implementing V1, do not attempt to build features marked V1.1+ or V2.0. Do not add hooks or scaffolding for future features unless explicitly required by the architecture spec.
+
+### 1.4.1 Ecosystem Positioning — Substrate, Not Runtime
+
+Memory Vault is a **memory substrate** that other AI agents read from via MCP. It is NOT an agent runtime, NOT a chat interface, NOT a competing assistant. This distinction is load-bearing — drift toward "make Memory Vault talk to users directly" or "Memory Vault as an agent that does tasks" breaks the thesis.
+
+**Adjacent products in the 2026 ecosystem (do not confuse our scope with theirs):**
+
+- **Agent runtimes** (Hermes Agent by Nous Research, OpenClaw, Claude Code, Codex) — these ARE the agent. Users talk to them; they do tasks. Each has its own memory, but each memory is siloed to that runtime.
+- **Memory provider plugins** (mem0, hindsight, honcho, openviking, holographic, retaindb, byterover, supermemory) — these are backends that runtimes plug into. None of them expose memory cross-agent via MCP; each is consumed by exactly one runtime at a time.
+- **Skills standards** (Skills Hub / agentskills.io) — open standard for procedural knowledge (how-to, reusable workflows) shared across runtimes. Cross-agent procedural memory is an emerging open standard.
+
+**Where Memory Vault sits:** the cross-agent memory layer that ALL of these are missing. Hermes Agent's open issue #10835 ("Expose Hermes memory via MCP server") explicitly describes the unsolved problem we solve. Users running Claude Code + Cursor + Hermes today have no memory bridge between them; they manually copy-paste. That is the durable wedge.
+
+**Implications for the build:**
+
+- Memory Vault should be **consumable as a memory provider** by any runtime (V1.0+ deliverable, see T1.0.16). Distribution channel, not feature creep.
+- `MemoryType::Procedural` (BRD §5.1) should be **Skills-Hub-compatible at the schema level** (V1.0 schema decision, see §5.1 forward note) — users bring existing skill libraries in, take Memory Vault procedurals out.
+- Consolidation outputs should produce **human-readable summary documents** (see §5.6 + T0.2.3) — same trust-through-transparency principle as the review queue. Hermes Agent's Curator REPORT.md is a directionally-correct pattern to learn from.
+
+**Two integration layers — universal core, per-runtime adapters:**
+
+Memory Vault integrates with agents at two distinct layers. Conflating them is a thesis error.
+
+**Layer 1 — Universal MCP server (Memory Vault core).** This is the universal layer. Any agent that speaks MCP can read/write Memory Vault out of the box, no per-agent work required. Claude Desktop, Claude Code, Cursor, ChatGPT (MCP-enabled), Codex, custom agents, and future agents that don't exist yet all benefit automatically the moment they point their MCP config at our binary. **This is the design payoff.** Protocol-level integration, not per-product integration. Investment in MCP compliance compounds across every MCP-speaking agent that exists or will exist.
+
+**Layer 2 — Per-runtime thin adapters (case-by-case).** Some agent runtimes have their own proprietary plugin systems that predate or run alongside MCP — Hermes Agent's memory-provider plugin trait is the canonical example. To plug Memory Vault into such a runtime's native memory slot, we write a small adapter package (typically a few hundred lines, in the runtime's own language) that translates the runtime's plugin calls into MCP calls to our server. **The adapter is just a translator** — runtime-shaped on one end, MCP-shaped on the other. It is NOT a fork of Memory Vault, NOT a Memory Vault feature, NOT part of the main workspace.
+
+**Decision rubric for any future per-runtime adapter:**
+
+For each runtime with a proprietary plugin system, ask:
+
+1. **Does the runtime have material adoption among our target users** (power users running 3+ AI tools per §1.5)? If no, skip — universal MCP coverage is sufficient.
+2. **Is there explicit demand for cross-agent memory in that runtime's community** (open issues, forum threads, GitHub discussions)? If no, skip — adapter without demand is push-not-pull marketing.
+3. **Has the runtime's plugin trait surface stabilized** enough that an adapter won't need rewriting every release? If no, defer until it stabilizes.
+4. **Does the runtime have first-party MCP support already** (or imminently)? If yes, skip the adapter — universal MCP coverage already works there.
+
+If all four answers favor building the adapter, scope it as a `Tx.y.z` task following the **T1.0.16 Hermes pattern**: separate repository, separate release cadence, runtime's own language, minimal scope (bridge only — no marketing partnership, no schema-translation tooling beyond the plugin trait), watch-points for re-evaluation at kickoff.
+
+**Hermes Agent (T1.0.16) is the first instance of this pattern, not a one-off.** Future per-runtime adapters (e.g., OpenClaw, hypothetical 2027-launch runtimes) follow the same shape, evaluated when each runtime crosses the rubric threshold. Do not pre-plan adapter tasks for runtimes that haven't yet justified them — pre-commitment to speculative adapters is scope drift.
+
+**Population trend matters:** the population of "runtimes with proprietary plugin systems and no MCP support" is shrinking over time as MCP becomes the de facto cross-agent standard. Per-runtime adapter work is a temporary distribution patch for the current ecosystem, not a permanent product line. The long-term bet is universal MCP coverage; adapters are the bridge during transition.
+
+**What we explicitly do NOT do:** build a runtime, add a chat interface, autonomously execute tasks, host scheduled cron jobs, build messaging-platform gateways. Those are runtime-shaped features. Drift into any of them is a thesis violation.
 
 ### 1.5 Target User for V1
 
@@ -513,7 +563,8 @@ pub struct MemoryId(pub Uuid);
 pub enum MemoryType {
     Episodic,    // Specific events with time
     Semantic,    // Facts, preferences, knowledge
-    Procedural,  // How-to, workflows, patterns
+    Procedural,  // How-to, workflows, patterns — V1.0 schema decision (see note below)
+                 // must preserve Skills-Hub-compatible round-trip per §1.4.1
 }
 
 pub struct Boundary(pub String);  // "work", "personal", "health", etc.
@@ -563,6 +614,17 @@ pub type VaultResult<T> = Result<T, VaultError>;
 - Unit tests for type construction and serialization
 - Round-trip serde tests for all public types
 - Property tests for `MemoryId` and `EntityId` uniqueness
+
+**Forward note — `MemoryType::Procedural` Skills-Hub compatibility (V1.0 schema decision):**
+
+Per §1.4.1, Memory Vault's procedural memories must round-trip cleanly to/from the Skills Hub open standard (agentskills.io) at V1.0 launch. This is a **schema-level decision** — easier to honor at V1.0 than retrofit later.
+
+- For V0.1 / V0.2: `Procedural` memories use the same `Memory` struct as Episodic/Semantic. No schema branching yet.
+- For V1.0: introduce `ProceduralMetadata` (a typed sub-shape of `Memory.metadata: serde_json::Value`) with fields aligned to Skills Hub's published schema (skill name, description, trigger conditions, steps, version). Decide at T1.0.x kickoff whether this is a separate sub-struct or a documented `metadata` JSON shape.
+- Import / export of Skills-Hub-format skills is a V1.1+ deliverable, NOT V1.0. V1.0's commitment is schema compatibility (the data we store can round-trip), not the import/export tooling.
+- **Re-evaluate at V0.2 close** whether Skills Hub's spec has stabilized enough to lock against. If the spec is still moving, defer the schema decision to V1.1 and document `Procedural` as schema-loose for V1.0.
+
+This is a forward-concern, not a V0.1 / V0.2 task. Do not implement Skills Hub compatibility ahead of V1.0 schema review.
 
 **Files:**
 - `src/lib.rs` — re-exports
@@ -856,6 +918,12 @@ pub struct ConsolidationReport {
     pub memories_archived: usize,
     pub duration: Duration,
     pub conflicts_for_user_review: Vec<ConflictReview>,
+    /// Human-readable Markdown summary of this run, designed for end-user reading.
+    /// Surfaced in the Tauri UI's Consolidation Report viewer (T0.2.15) and
+    /// optionally exported to disk as `REPORT.md` per consolidation run.
+    /// Generated alongside the structured fields above — same source of truth,
+    /// two presentations. See §5.6 "Human-readable summary" below for shape.
+    pub summary_markdown: String,
 }
 ```
 
@@ -887,11 +955,28 @@ The consolidation cycle has four phases, run in order:
 
 **Critical:** Every consolidation run creates a checkpoint. Users can roll back to a previous checkpoint via UI. Checkpoint is a snapshot of changed memory IDs and their pre-consolidation state.
 
+**Human-readable summary (`ConsolidationReport.summary_markdown`):**
+
+Per §1.4.1's trust-through-transparency principle (same as the connector review queue), every consolidation run produces a Markdown summary the user can actually read. Hermes Agent's Curator REPORT.md is a directionally-correct reference for the shape, though our content differs (memories, not skills).
+
+Required summary content:
+
+- **Run header** — date, duration, total memories processed.
+- **Merges section** — for each merge cluster: pre-merge memory IDs (truncated content snippets), post-merge consolidated text, LLM's reasoning for the merge. Empty section header if no merges.
+- **Contradictions section** — for each contradiction flagged: the conflicting memories, why the LLM flagged them, link to the user's review queue. Empty section header if no contradictions.
+- **Decay section** — count of memories that had confidence decayed, count archived. No per-memory detail (would be too long); link to "browse decayed/archived" UI.
+- **Footer** — checkpoint ID for rollback, "if this run looks wrong, roll back via [link]".
+
+The summary is content-faithful but boundary-respecting: a memory's content snippet appears in the summary ONLY if the user is the audience (which they always are, per the privacy model). No cross-boundary summarization — if a run touched both work and personal boundaries, generate two separate summaries, one per boundary, with clear boundary headers.
+
+Length budget: target ~500-2000 words depending on run size. Truncate per-merge snippets to keep the document scannable. The user should be able to read the whole summary in under 2 minutes.
+
 **Test requirements (Heavy):**
 - Unit tests for each phase
 - Integration test: feed in 100 memories with known duplicates, verify merge correctness
 - Integration test: feed in contradictory memories, verify contradiction detection (not auto-resolution)
 - Integration test: rollback restores pre-consolidation state exactly
+- Integration test: `summary_markdown` is non-empty for any non-trivial run, contains the required sections (Run header, Merges, Contradictions, Decay, Footer), respects boundary separation when a run spans multiple boundaries
 - Property test: consolidation is idempotent — running it twice on same data produces same result
 - Property test: no memory is ever lost — all input memories appear in output as either active, superseded, or archived
 
@@ -1347,11 +1432,12 @@ V0.1 → V0.2 → V1.0. Build in order. Do not skip ahead.
 - Identify candidate clusters via vector similarity
 - Acceptance: 100 memories with known duplicates produces correct clusters
 
-**T0.2.3 — vault-consolidator: Phase 2-3 (Merge)**
+**T0.2.3 — vault-consolidator: Phase 2-3 (Merge) + Human-Readable Summary**
 - LLM-driven merge decisions
 - Apply merges with supersession links
 - Re-embedding of merged memories
-- Acceptance: Merge produces consolidated memories, originals preserved as superseded, retrieval surfaces merged version
+- Generate `ConsolidationReport.summary_markdown` per §5.6 human-readable summary spec (Run header, Merges section, Contradictions section, Decay section header even if Decay phase ships at T0.2.4, Footer with checkpoint ID)
+- Acceptance: Merge produces consolidated memories, originals preserved as superseded, retrieval surfaces merged version, AND summary_markdown contains all required sections in scannable form for a 100-memory test run with known duplicates and one contradiction
 
 **T0.2.4 — vault-consolidator: Phase 4 (Decay & Archive)**
 - Confidence decay for unused memories
@@ -1416,7 +1502,7 @@ V0.1 → V0.2 → V1.0. Build in order. Do not skip ahead.
 - Polished but not pixel-perfect UI
 - Memory browse, search, edit
 - Boundary manager
-- Consolidation report viewer
+- Consolidation report viewer (renders `ConsolidationReport.summary_markdown` per §5.6)
 - Sync status indicator
 - Acceptance: 30 beta users can use the app without explicit instructions for basic flows
 
@@ -1539,6 +1625,18 @@ V0.1 → V0.2 → V1.0. Build in order. Do not skip ahead.
 - Monitor for issues, fix critical bugs same-day
 - Track first-100-paying-customer milestone
 - Acceptance: First 100 paying customers within 30 days of launch
+
+**T1.0.16 — Hermes Memory Provider Plugin (post-launch distribution channel — first instance of the per-runtime adapter pattern per §1.4.1)**
+
+- **Scope:** Ship Memory Vault as a `hermes-agent` memory provider plugin alongside the V1.0 launch (or within ~30 days of launch). Distribution channel work, NOT a product change. **This task is the first instance of the per-runtime adapter pattern defined in §1.4.1** — future adapters for other runtimes (OpenClaw, hypothetical future runtimes with proprietary plugin systems) follow this same shape, scoped as their own `Tx.y.z` tasks when each runtime crosses §1.4.1's four-question rubric threshold.
+- **Background:** Hermes Agent (Nous Research, MIT-licensed) ships with 8 external memory provider plugins (mem0, hindsight, honcho, openviking, holographic, retaindb, byterover, supermemory). Hermes users explicitly want cross-agent memory via MCP — see Hermes issue #10835. Memory Vault as a 9th provider gives us free distribution to a community already running self-hosted AI infrastructure.
+- **Implementation shape:** Python plugin (Hermes is Python) that points at a running Memory Vault MCP server. Plugin implements Hermes's memory-provider trait surface (retain / recall / optional reflect-style synthesis, mapped to our MCP tools). No changes to Memory Vault's MCP surface — the plugin is a Hermes-side adapter, not a Memory Vault feature.
+- **Repository:** separate repo (e.g. `memory-vault-hermes-plugin`), not part of the main `memory-vault` workspace. Different language, different release cadence, different audience.
+- **Distribution:** PR to `awesome-hermes-agent` curated list, plugin published to PyPI with the standard Hermes plugin manifest, documentation links from our marketing site as "Use Memory Vault with Hermes Agent."
+- **Acceptance:** A user running both Hermes Agent and Memory Vault can install the plugin, point it at their local Memory Vault, and have Hermes read/write memories that are simultaneously visible to Claude Code / Cursor / ChatGPT through the same Memory Vault.
+- **Out of scope:** OpenClaw migration tooling, Hermes-specific schema mappings beyond what their plugin trait requires, marketing co-promotion. Keep the plugin minimal — it's a bridge, not a partnership.
+- **Ordering:** lands AFTER T1.0.15 because (a) the V1.0 launch validates the core thesis before we invest in distribution channels, (b) the public launch produces signal on whether the cross-agent memory pitch resonates, (c) shipping a Hermes plugin pre-launch would dilute V1.0's "for users running 3+ AI tools" positioning into "for Hermes users specifically."
+- **Watch-points to evaluate at T1.0.16 kickoff:** has Hermes's memory-provider plugin trait stabilized? Has issue #10835 been resolved by Hermes themselves (would change the calculus — we'd no longer be filling a gap, we'd be competing with first-party support)? Does Hermes's adoption trajectory still justify the integration work?
 
 ---
 
@@ -2706,20 +2804,21 @@ You (the AI agent) are ready to start work when you can answer all of these:
 
 1. What is the product and why does it exist? (Section 1)
 2. What are the six engineering bets that make us 10x better? (Section 1.3)
-3. What architecture principles must every module follow? (Section 2)
-4. How is the code organized at the repo level? (Section 3.2)
-5. What is the dependency graph of crates? (Section 3.3)
-6. What exact versions of dependencies do we use? (Section 4)
-7. For the crate I'm working on, what is its public API? (Section 5)
-8. What version are we currently building, and what task is next? (Section 6, HANDOFF.md)
-9. What test level is required for this crate? (Section 7.1)
-10. When is a task complete? (Section 0.1)
-11. How do I update HANDOFF.md? (Section 8.2)
-12. What do I do when stuck? (Section 0.4)
-13. What is our threat model and what security property do we guarantee? (Section 11.1)
-14. What are the eight security principles that govern this product? (Section 11.2)
-15. What is the cryptographic key hierarchy? (Section 11.3.1)
-16. What security checklist applies to the crate I'm working on? (Section 11.12)
+3. What is Memory Vault NOT, and what adjacent ecosystem products should we not confuse our scope with? (Section 1.4.1)
+4. What architecture principles must every module follow? (Section 2)
+5. How is the code organized at the repo level? (Section 3.2)
+6. What is the dependency graph of crates? (Section 3.3)
+7. What exact versions of dependencies do we use? (Section 4)
+8. For the crate I'm working on, what is its public API? (Section 5)
+9. What version are we currently building, and what task is next? (Section 6, HANDOFF.md)
+10. What test level is required for this crate? (Section 7.1)
+11. When is a task complete? (Section 0.1)
+12. How do I update HANDOFF.md? (Section 8.2)
+13. What do I do when stuck? (Section 0.4)
+14. What is our threat model and what security property do we guarantee? (Section 11.1)
+15. What are the eight security principles that govern this product? (Section 11.2)
+16. What is the cryptographic key hierarchy? (Section 11.3.1)
+17. What security checklist applies to the crate I'm working on? (Section 11.12)
 
 If you cannot answer any of these without re-reading the document, re-read the relevant section before writing code.
 

@@ -39,7 +39,7 @@ use std::time::Instant;
 
 use tempfile::TempDir;
 
-use vault_app::{Application, VaultAdapter};
+use vault_app::{AppConfig, Application, VaultAdapter};
 use vault_core::{Boundary, MemoryType, NewMemory};
 use vault_mcp::{Adapter, ToolInvokeDetails};
 use vault_retrieval::{RetrievalOptions, RetrievalQuery};
@@ -113,17 +113,21 @@ async fn setup_application() -> TestApp {
     let graph_path = tmp.path().join("graph.duckdb");
     let key = SqlCipherKey::new("integration-smoke-test-key");
 
-    let application = Application::new(
-        &metadata_path,
-        &vector_dir,
-        &graph_path,
-        key.clone(),
-        &require_fixture("model.onnx"),
-        &require_fixture("tokenizer.json"),
-        &ort_lib_path(),
-    )
-    .await
-    .expect(
+    // Phase 2b: AppConfig migration. metadata_path + key are cloned
+    // into config because they're reused below for the assert-handle
+    // open. vector_dir + graph_path are moved (single-use). Path
+    // fixture lookups happen inline.
+    let config = AppConfig {
+        metadata_path: metadata_path.clone(),
+        vector_dir,
+        graph_path,
+        key: key.clone(),
+        model_path: require_fixture("model.onnx"),
+        tokenizer_path: require_fixture("tokenizer.json"),
+        ort_lib_path: ort_lib_path(),
+    };
+
+    let application = Application::new(&config).await.expect(
         "Application::new MUST compose the dep graph successfully. If this fails, \
          trigger (a) has fired - stop, surface, root-cause investigate. \
          Do NOT paper over with #[cfg] skips.",

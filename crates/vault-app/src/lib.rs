@@ -26,6 +26,8 @@
 
 mod adapter;
 mod application;
+mod config;
 
 pub use adapter::VaultAdapter;
 pub use application::{Application, ApplicationHandle};
+pub use config::AppConfig;
