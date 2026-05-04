@@ -12,12 +12,20 @@
 //!   Per Q2 carry-forward (`T0.1.9_PLAN.md`), this is the
 //!   minimal-just-the-type landing — Application / config / lifecycle
 //!   bind together at T0.1.10.
-//! - **T0.1.10 (pending):** `Application` struct + `Application::start` +
-//!   `Application::shutdown` + config loading. Wires VaultAdapter at
-//!   startup with concrete implementations of the four trait deps.
+//! - **T0.1.10 Phase 1:** [`Application::new`] — minimum composition-
+//!   root construction surface. Wires the full V0.1 dep graph
+//!   (`BgeSmallProvider × StorageBackend × LanceVectorStore ×
+//!   DuckDbGraphStore × MetadataStore × SemanticRetriever ×
+//!   VaultAdapter`) against real backends. No lifecycle, no MCP server
+//!   bind, no retry-worker spawn — those land in Phase 2. Exercised
+//!   end-to-end by `tests/integration_smoke.rs` per the four pre-
+//!   declared stop-and-escalate triggers (HANDOFF.md session-open
+//!   Decision 3).
 
 #![forbid(unsafe_code)]
 
 mod adapter;
+mod application;
 
 pub use adapter::VaultAdapter;
+pub use application::Application;
