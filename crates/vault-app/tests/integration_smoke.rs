@@ -1,6 +1,21 @@
 //! T0.1.10 Phase 1 integration-risk spike — **compile-and-run methodology**
 //! per session-open Decision 3 (HANDOFF.md, 2026-05-04).
 //!
+//! ## macOS deferral (ADR-033, T0.1.11 Phase 3 fix-forward, 2026-05-05)
+//!
+//! This test binary is **disabled on macOS** via the `#![cfg(...)]`
+//! attribute below per ADR-033 (same upstream ORT 1.21+ static-destructor
+//! mutex-race bug as `vault-embedding/tests/embedding_tests.rs`). Both
+//! test binaries instantiate `BgeSmallProvider` which loads
+//! `libonnxruntime.dylib`; both crash at process exit on macOS with
+//! `libc++abi mutex lock failed: Invalid argument` SIGABRT after all
+//! tests pass. Because integration_smoke.rs is `#[ignore]`-by-default,
+//! the cfg here is defensive — a `cargo test ... -- --ignored` run on
+//! macOS would crash the same way. See ADR-033 for full context +
+//! revisit triggers.
+
+#![cfg(not(target_os = "macos"))]
+//!
 //! Wires the full V0.1 dependency graph end-to-end against real LanceDB,
 //! SQLCipher, and ort. Each test exercises ONE of the four pre-declared
 //! stop-and-escalate triggers:

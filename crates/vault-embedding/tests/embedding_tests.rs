@@ -3,6 +3,33 @@
 //! `test_concurrent_init_succeeds` added in expanded Phase 1 to verify
 //! the `OnceLock`-based ort init wrapper.
 //!
+//! ## macOS deferral (ADR-033, T0.1.11 Phase 3 fix-forward, 2026-05-05)
+//!
+//! This test binary is **disabled on macOS** via the `#![cfg(...)]`
+//! attribute below per ADR-033. Reason: ONNX Runtime 1.21+ has an
+//! unresolved upstream bug in its `OrtEnv` static destructor that fires
+//! a `libc++abi: terminating due to uncaught exception of type
+//! std::__1::system_error: mutex lock failed: Invalid argument` SIGABRT
+//! during process exit on macOS — AFTER all tests have already passed.
+//!
+//! - **Microsoft tracker:** <https://github.com/microsoft/onnxruntime/issues/24579>
+//! - **ort tracker:** <https://github.com/pykeio/ort/issues/409>
+//! - **Status (2026-05-05):** unresolved in ORT 1.22.0 (our pin per ADR-019)
+//!   AND in 1.23.0; PR #26445 only fixes Node.js bindings, not the C++/Rust
+//!   path we use via `load-dynamic`.
+//! - **What's verified on macOS:** `cargo clippy` passes (compile + lint
+//!   clean); the embedding-code logic is platform-independent Rust, so
+//!   Linux + Windows test runs cover it. macOS coverage gap is the
+//!   process-exit teardown only, not the embedding logic itself.
+//! - **Revisit triggers** (per ADR-033): (i) ORT publishes a fix
+//!   confirmed against macOS arm64 + x86_64 in a release we adopt; (ii)
+//!   V0.2 alpha-distribution task plan time when external macOS users
+//!   become first-class; (iii) we implement the explicit-shutdown
+//!   workaround (`ort::shutdown()` in a custom test harness) and verify
+//!   it bypasses the destructor race.
+
+#![cfg(not(target_os = "macos"))]
+//!
 //! **Phase 1 (expanded) status.** Tests 1, 2, 5 + concurrent-init are
 //! ACTIVE — they exercise the runtime API surface end-to-end against
 //! real fixtures (the runtime confirmation that web-research spikes
