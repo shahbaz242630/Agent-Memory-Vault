@@ -75,6 +75,29 @@ pub enum AuditEventType {
     /// — timestamp lives in the audit row's `created_at` column,
     /// not in `details_json`.
     AlphaBannerAcknowledged,
+
+    /// **ADR-024 amendment 2026-05-05 (T0.1.11 Phase 4b — Decision 5(γ)).**
+    /// Recorded when vault-tauri dispatches a Tauri command (add_memory
+    /// / search_memories / update_memory / delete_memory) through
+    /// `Adapter`. Tauri commands are vault-state changes that don't go
+    /// through the MCP wire layer, so the existing `mcp.tool_invoke`
+    /// semantic doesn't apply. This variant gives Tauri commands their
+    /// own audit-chain shape per ADR-024 amendment Decision 5(γ): "ADR-024's
+    /// audit chain is the authoritative record of vault-state changes;
+    /// Tauri commands ARE vault-state changes; they belong in the audit
+    /// chain with their own discriminator." Reusing `mcp.tool_invoke`
+    /// would create semantic debt at V0.2 cloud sync where MCP vs UI
+    /// origin needs disambiguation.
+    /// `details_json` shape: same as `mcp.tool_invoke` (ToolInvokeDetails
+    /// schema) — duration_ms, result_count, boundary_count, max_results
+    /// / score_threshold / include_archived / query_length / error per
+    /// command type. Tools are the Tauri command names ("add_memory",
+    /// "search_memories", "update_memory", "delete_memory"). Reusing
+    /// ToolInvokeDetails keeps the audit-row schema simple; only the
+    /// event_type discriminates UI commands from MCP tools.
+    /// `acknowledge_alpha_banner` writes the SEPARATE
+    /// `AlphaBannerAcknowledged` variant above (UI state, not vault state).
+    TauriCommandInvoke,
 }
 
 impl AuditEventType {
@@ -93,6 +116,7 @@ impl AuditEventType {
             Self::CascadeQueueOverflow => "cascade.queue_overflow",
             Self::McpToolInvoke => "mcp.tool_invoke",
             Self::AlphaBannerAcknowledged => "ui.alpha_banner_acknowledged",
+            Self::TauriCommandInvoke => "ui.tauri_command_invoke",
         }
     }
 
@@ -116,6 +140,7 @@ impl AuditEventType {
             "cascade.queue_overflow" => Some(Self::CascadeQueueOverflow),
             "mcp.tool_invoke" => Some(Self::McpToolInvoke),
             "ui.alpha_banner_acknowledged" => Some(Self::AlphaBannerAcknowledged),
+            "ui.tauri_command_invoke" => Some(Self::TauriCommandInvoke),
             _ => None,
         }
     }

@@ -9027,6 +9027,8 @@ dependencies = [
  "tracing-subscriber",
  "vault-app",
  "vault-core",
+ "vault-mcp",
+ "vault-retrieval",
  "vault-storage",
 ]
 

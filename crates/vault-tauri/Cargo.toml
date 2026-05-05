@@ -32,6 +32,9 @@ tauri-plugin-dialog = { workspace = true }
 vault-core = { path = "../vault-core" }
 vault-app = { path = "../vault-app" }
 vault-storage = { path = "../vault-storage" }  # SqlCipherKey type for ADR-032 env-var path
+# Phase 4b: Tauri commands dispatch through Adapter (vault-mcp trait + ToolInvokeDetails / ToolInvokeError) and build RetrievalQuery (vault-retrieval).
+vault-mcp = { path = "../vault-mcp" }
+vault-retrieval = { path = "../vault-retrieval" }
 
 # Async runtime + tracing per workspace deps.
 tokio = { workspace = true }

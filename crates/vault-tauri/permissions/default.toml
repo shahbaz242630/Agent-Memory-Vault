@@ -1,0 +1,41 @@
+"$schema" = "schemas/schema.json"
+
+# Default permission set for vault-tauri Phase 4b — 5 Tauri commands
+# per BRD §5.11. Each command needs an explicit permission entry per
+# Tauri 2.5+ strict-permissions model. Capabilities reference these
+# in `capabilities/default.json::permissions`.
+
+[default]
+description = "Default permissions for vault-tauri commands"
+permissions = [
+  "allow-add-memory",
+  "allow-search-memories",
+  "allow-update-memory",
+  "allow-delete-memory",
+  "allow-acknowledge-alpha-banner",
+]
+
+[[permission]]
+identifier = "allow-add-memory"
+description = "Allow invoking the add_memory command (write a new memory to the vault)."
+commands.allow = ["add_memory"]
+
+[[permission]]
+identifier = "allow-search-memories"
+description = "Allow invoking the search_memories command (semantic search over the vault)."
+commands.allow = ["search_memories"]
+
+[[permission]]
+identifier = "allow-update-memory"
+description = "Allow invoking the update_memory command (replace an existing memory's content + classification per ADR-028)."
+commands.allow = ["update_memory"]
+
+[[permission]]
+identifier = "allow-delete-memory"
+description = "Allow invoking the delete_memory command (delete a memory by id)."
+commands.allow = ["delete_memory"]
+
+[[permission]]
+identifier = "allow-acknowledge-alpha-banner"
+description = "Allow invoking the acknowledge_alpha_banner command (records ADR-010 control #1 modal first-run banner acknowledgement to the audit chain)."
+commands.allow = ["acknowledge_alpha_banner"]

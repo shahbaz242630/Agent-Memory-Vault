@@ -5,34 +5,364 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Memory Vault — Alpha</title>
     <style>
+      * { box-sizing: border-box; }
       body {
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
         background: #1a1a1a;
         color: #e0e0e0;
         margin: 0;
-        padding: 2rem;
+        padding: 0;
+        font-size: 14px;
       }
-      h1 { color: #ff9800; margin-top: 0; }
+
+      /* ADR-010 control #2: persistent banner strip — always visible until V0.2 */
       .alpha-banner {
         background: #ff9800;
         color: #000;
         padding: 0.5rem 1rem;
-        margin: -2rem -2rem 1.5rem -2rem;
         font-weight: 600;
+        text-align: center;
       }
-      code { background: #2a2a2a; padding: 0.1rem 0.3rem; border-radius: 3px; }
+
+      /* ADR-010 control #1: modal first-run banner — blocks UI until acknowledged */
+      .modal-overlay {
+        display: none;
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.85);
+        z-index: 1000;
+        align-items: center;
+        justify-content: center;
+      }
+      .modal-overlay.active { display: flex; }
+      .modal {
+        background: #2a2a2a;
+        padding: 2rem;
+        max-width: 600px;
+        border: 2px solid #ff9800;
+        border-radius: 8px;
+      }
+      .modal h2 { color: #ff9800; margin-top: 0; }
+      .modal-body { line-height: 1.6; margin-bottom: 1.5rem; }
+      .modal-button {
+        background: #ff9800;
+        color: #000;
+        border: none;
+        padding: 0.75rem 1.5rem;
+        font-weight: 600;
+        cursor: pointer;
+        border-radius: 4px;
+        font-size: 14px;
+      }
+      .modal-button:hover { background: #ffa726; }
+
+      /* Tab navigation */
+      .tabs {
+        display: flex;
+        background: #222;
+        border-bottom: 1px solid #333;
+      }
+      .tab {
+        padding: 0.75rem 1.5rem;
+        cursor: pointer;
+        color: #999;
+        border-bottom: 2px solid transparent;
+      }
+      .tab:hover { color: #e0e0e0; background: #2a2a2a; }
+      .tab.active {
+        color: #ff9800;
+        border-bottom-color: #ff9800;
+        background: #1a1a1a;
+      }
+
+      /* View containers */
+      .view { display: none; padding: 1.5rem; }
+      .view.active { display: block; }
+
+      /* Form controls */
+      label { display: block; margin: 1rem 0 0.25rem; font-weight: 600; color: #ccc; }
+      input[type="text"], textarea, select {
+        width: 100%;
+        background: #2a2a2a;
+        color: #e0e0e0;
+        border: 1px solid #444;
+        padding: 0.5rem;
+        border-radius: 4px;
+        font-family: inherit;
+        font-size: inherit;
+      }
+      textarea { min-height: 100px; resize: vertical; }
+      input[type="text"]:focus, textarea:focus, select:focus {
+        outline: none;
+        border-color: #ff9800;
+      }
+      .button {
+        background: #ff9800;
+        color: #000;
+        border: none;
+        padding: 0.5rem 1.25rem;
+        font-weight: 600;
+        cursor: pointer;
+        border-radius: 4px;
+        margin-top: 1rem;
+      }
+      .button:hover { background: #ffa726; }
+      .button:disabled { background: #555; color: #888; cursor: not-allowed; }
+
+      /* Output area */
+      .output {
+        margin-top: 1rem;
+        padding: 0.75rem;
+        background: #2a2a2a;
+        border: 1px solid #333;
+        border-radius: 4px;
+        font-family: ui-monospace, "Cascadia Mono", "Consolas", monospace;
+        font-size: 12px;
+        white-space: pre-wrap;
+        max-height: 400px;
+        overflow-y: auto;
+      }
+      .output.success { border-color: #4caf50; }
+      .output.error { border-color: #f44336; }
+
+      /* Search results */
+      .search-result {
+        background: #222;
+        border: 1px solid #333;
+        border-radius: 4px;
+        padding: 0.75rem;
+        margin-bottom: 0.75rem;
+      }
+      .search-result-meta {
+        font-size: 11px;
+        color: #999;
+        margin-bottom: 0.25rem;
+      }
+      .search-result-content {
+        color: #e0e0e0;
+        line-height: 1.4;
+      }
+      .search-result-actions {
+        margin-top: 0.5rem;
+        display: flex;
+        gap: 0.5rem;
+      }
+      .button-small {
+        padding: 0.25rem 0.75rem;
+        font-size: 12px;
+        background: #444;
+        color: #e0e0e0;
+      }
+      .button-small.danger { background: #b71c1c; }
+      .button-small:hover { background: #555; }
+      .button-small.danger:hover { background: #c62828; }
+
+      /* Settings view */
+      .settings-row {
+        padding: 0.75rem 0;
+        border-bottom: 1px solid #333;
+      }
+      .settings-label { font-weight: 600; color: #ccc; margin-bottom: 0.25rem; }
+      .settings-value { color: #999; font-family: ui-monospace, "Cascadia Mono", monospace; font-size: 12px; }
+      .settings-value.set { color: #4caf50; }
+
+      h1 { margin-top: 0; color: #ff9800; }
     </style>
   </head>
   <body>
+    <!-- ADR-010 control #1: modal first-run banner. Blocks UI until ack. -->
+    <div id="alpha-modal" class="modal-overlay">
+      <div class="modal">
+        <h2>ALPHA BUILD — Read before continuing</h2>
+        <div class="modal-body">
+          <p><strong>Your vector data is stored UNENCRYPTED on disk.</strong></p>
+          <p>Do <strong>NOT</strong> put real personal data, credentials, or sensitive information into this vault. Encryption ships in V0.2 before any beta user receives the product.</p>
+          <p>Per ADR-010 (HANDOFF.md): this is a documented V0.1-only deviation from BRD §11.5.1.</p>
+        </div>
+        <button class="modal-button" id="modal-ack-btn">I understand — proceed</button>
+      </div>
+    </div>
+
+    <!-- ADR-010 control #2: persistent banner strip. -->
     <div class="alpha-banner">ALPHA — vector store is unencrypted. V0.2 fixes this.</div>
-    <h1>Memory Vault — Phase 3 boot</h1>
-    <p>vault-tauri Phase 3 dev-mode boot smoke. UI implementation lands at Phase 4 (memory CRUD views + ADR-010 banner controls).</p>
-    <p>Currently exercising:</p>
-    <ul>
-      <li>Tauri 2.11.0 main-runtime boot (this page renders → boot succeeded)</li>
-      <li>libonnxruntime path resolution via <code>app.path().resolve(BaseDirectory::Resource)</code></li>
-      <li>ADR-020 integrity-fatal-dialog wiring (mock-tested in <code>src/lib.rs::tests</code>)</li>
-      <li>ADR-032 SQLCipher key sourced from <code>VAULT_KEY</code> env var</li>
-    </ul>
+
+    <div class="tabs">
+      <div class="tab active" data-view="add">Add Memory</div>
+      <div class="tab" data-view="search">Search</div>
+      <div class="tab" data-view="settings">Settings</div>
+    </div>
+
+    <!-- Add view -->
+    <div id="add-view" class="view active">
+      <h1>Add Memory</h1>
+      <label for="add-content">Content</label>
+      <textarea id="add-content" placeholder="What do you want to remember?"></textarea>
+
+      <label for="add-memory-type">Memory Type</label>
+      <select id="add-memory-type">
+        <option value="semantic">Semantic (facts, knowledge)</option>
+        <option value="episodic">Episodic (events, experiences)</option>
+        <option value="procedural">Procedural (how-to, processes)</option>
+      </select>
+
+      <label for="add-boundary">Boundary</label>
+      <input type="text" id="add-boundary" value="default" />
+
+      <button class="button" id="add-submit">Add Memory</button>
+      <div id="add-output" class="output" style="display:none"></div>
+    </div>
+
+    <!-- Search view -->
+    <div id="search-view" class="view">
+      <h1>Search Memories</h1>
+      <label for="search-query">Query</label>
+      <input type="text" id="search-query" placeholder="What are you looking for?" />
+
+      <label for="search-limit">Max Results</label>
+      <input type="text" id="search-limit" value="10" />
+
+      <button class="button" id="search-submit">Search</button>
+      <div id="search-results" class="output" style="display:none"></div>
+    </div>
+
+    <!-- Settings view -->
+    <div id="settings-view" class="view">
+      <h1>Settings</h1>
+      <div class="settings-row">
+        <div class="settings-label">Alpha Banner Acknowledged</div>
+        <div class="settings-value" id="setting-banner-ack">Loading...</div>
+      </div>
+      <div class="settings-row">
+        <div class="settings-label">VAULT_KEY Environment Variable</div>
+        <div class="settings-value set">Set (required for vault to start)</div>
+      </div>
+      <div class="settings-row">
+        <div class="settings-label">Memory Vault Version</div>
+        <div class="settings-value">vault-tauri 0.1.0 (V0.1 internal alpha)</div>
+      </div>
+      <div class="settings-row">
+        <div class="settings-label">Boundary Management</div>
+        <div class="settings-value">V0.1 hardcoded "default"; multi-boundary UI deferred to V0.2 alpha-distribution</div>
+      </div>
+    </div>
+
+    <script type="module">
+      const { invoke } = window.__TAURI__.core;
+
+      // Tab switching
+      document.querySelectorAll(".tab").forEach((tab) => {
+        tab.addEventListener("click", () => {
+          const view = tab.dataset.view;
+          document.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
+          document.querySelectorAll(".view").forEach((v) => v.classList.remove("active"));
+          tab.classList.add("active");
+          document.getElementById(`${view}-view`).classList.add("active");
+        });
+      });
+
+      // ADR-010 control #1 modal — show on first launch (founder hasn't ack'd yet).
+      // For V0.1 minimal, always show modal on every launch unless ack'd in this session.
+      // V0.2 will read the audit chain to remember the ack across sessions.
+      const ackedThisSession = sessionStorage.getItem("vault.alpha.ack") === "1";
+      if (!ackedThisSession) {
+        document.getElementById("alpha-modal").classList.add("active");
+      }
+      document.getElementById("modal-ack-btn").addEventListener("click", async () => {
+        try {
+          await invoke("acknowledge_alpha_banner");
+          sessionStorage.setItem("vault.alpha.ack", "1");
+          document.getElementById("alpha-modal").classList.remove("active");
+        } catch (err) {
+          alert(`Failed to record acknowledgment: ${err}`);
+        }
+      });
+
+      // Add memory
+      document.getElementById("add-submit").addEventListener("click", async () => {
+        const btn = document.getElementById("add-submit");
+        const out = document.getElementById("add-output");
+        btn.disabled = true;
+        out.style.display = "block";
+        out.classList.remove("success", "error");
+        out.textContent = "Adding memory...";
+        try {
+          const id = await invoke("add_memory", {
+            content: document.getElementById("add-content").value,
+            memoryType: document.getElementById("add-memory-type").value,
+            boundary: document.getElementById("add-boundary").value,
+          });
+          out.classList.add("success");
+          out.textContent = `Added memory: ${id}`;
+          document.getElementById("add-content").value = "";
+        } catch (err) {
+          out.classList.add("error");
+          out.textContent = `Error: ${err}`;
+        } finally {
+          btn.disabled = false;
+        }
+      });
+
+      // Search memories
+      document.getElementById("search-submit").addEventListener("click", async () => {
+        const btn = document.getElementById("search-submit");
+        const out = document.getElementById("search-results");
+        btn.disabled = true;
+        out.style.display = "block";
+        out.classList.remove("success", "error");
+        out.textContent = "Searching...";
+        try {
+          const limit = parseInt(document.getElementById("search-limit").value, 10) || 10;
+          const results = await invoke("search_memories", {
+            query: document.getElementById("search-query").value,
+            limit,
+          });
+          out.classList.add("success");
+          if (results.length === 0) {
+            out.textContent = "No matching memories found.";
+          } else {
+            out.innerHTML = results
+              .map(
+                (r) => `
+              <div class="search-result">
+                <div class="search-result-meta">id: ${escapeHtml(r.id)} · score: ${r.score.toFixed(3)} · boundary: ${escapeHtml(r.boundary)} · type: ${escapeHtml(r.memory_type)} · ${escapeHtml(r.created_at)}</div>
+                <div class="search-result-content">${escapeHtml(r.content)}</div>
+                <div class="search-result-actions">
+                  <button class="button-small danger" data-id="${escapeHtml(r.id)}" data-action="delete">Delete</button>
+                </div>
+              </div>
+            `
+              )
+              .join("");
+            // Wire delete buttons
+            out.querySelectorAll('[data-action="delete"]').forEach((btn) => {
+              btn.addEventListener("click", async () => {
+                if (!confirm(`Delete memory ${btn.dataset.id}? This cannot be undone.`)) return;
+                try {
+                  await invoke("delete_memory", { id: btn.dataset.id });
+                  btn.closest(".search-result").remove();
+                } catch (err) {
+                  alert(`Delete failed: ${err}`);
+                }
+              });
+            });
+          }
+        } catch (err) {
+          out.classList.add("error");
+          out.textContent = `Error: ${err}`;
+        } finally {
+          btn.disabled = false;
+        }
+      });
+
+      // Settings: show banner-ack indicator
+      document.getElementById("setting-banner-ack").textContent =
+        ackedThisSession ? "Acknowledged this session" : "Not yet acknowledged";
+
+      function escapeHtml(s) {
+        return String(s).replace(/[&<>"']/g, (c) => ({
+          "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+        }[c]));
+      }
+    </script>
   </body>
 </html>

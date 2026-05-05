@@ -185,14 +185,24 @@ impl Adapter for VaultAdapter {
     }
 
     async fn append_tool_invoke_audit(&self, details: ToolInvokeDetails) -> VaultResult<()> {
-        // ADR-024 + ADR-025 Step 6 application + BRD §11.9.2:
-        // - event_type = McpToolInvoke
-        // - actor_kind = Agent (ADR-025: MCP client is an
-        //   untrusted agent; user attribution lives in boundary scope)
-        // - result = Success | Error based on details.error.is_some()
-        // - details_json = canonical sorted-key JSON via
-        //   ToolInvokeDetails::to_canonical_json (BRD §11.9.2 audit
-        //   chain hash determinism)
+        self.append_audit_with_event_type(AuditEventType::McpToolInvoke, details, ActorKind::Agent)
+            .await
+    }
+}
+
+impl VaultAdapter {
+    /// **ADR-024 amendment 2026-05-05 (T0.1.11 Phase 4b — Decision 5(γ)).**
+    /// Generic audit-write helper used by both the trait method
+    /// `append_tool_invoke_audit` (event_type = McpToolInvoke) AND the
+    /// inherent methods `append_tauri_command_audit` / `append_alpha_banner_acknowledged_audit`
+    /// below. Encapsulates the PendingAuditEvent construction shape per
+    /// ADR-024 + BRD §11.9.2 audit-chain hash determinism.
+    async fn append_audit_with_event_type(
+        &self,
+        event_type: AuditEventType,
+        details: ToolInvokeDetails,
+        actor_kind: ActorKind,
+    ) -> VaultResult<()> {
         let result = if details.error.is_some() {
             AuditResult::Error
         } else {
@@ -200,11 +210,11 @@ impl Adapter for VaultAdapter {
         };
         let details_json = details.to_canonical_json()?;
         let pending = PendingAuditEvent {
-            event_type: AuditEventType::McpToolInvoke,
+            event_type,
             resource_type: None,
             resource_id: None,
             boundary: None,
-            actor_kind: ActorKind::Agent,
+            actor_kind,
             actor_name: None,
             user_id: None,
             device_id: None,
@@ -213,6 +223,67 @@ impl Adapter for VaultAdapter {
         };
         self.metadata.append_audit_event(pending).await?;
         Ok(())
+    }
+
+    /// **ADR-024 amendment 2026-05-05 (T0.1.11 Phase 4b — Decision 5(γ)).**
+    /// Append a `TauriCommandInvoke` audit row for vault-state-changing
+    /// Tauri commands (add_memory / search_memories / update_memory /
+    /// delete_memory). Tauri commands aren't MCP — reusing
+    /// `mcp.tool_invoke` would create semantic debt at V0.2 cloud sync;
+    /// the new variant gives Tauri commands their own discriminator.
+    /// `actor_kind = User` (founder is the actor; not an untrusted agent
+    /// like ADR-025 specifies for MCP).
+    pub async fn append_tauri_command_audit(&self, details: ToolInvokeDetails) -> VaultResult<()> {
+        self.append_audit_with_event_type(
+            AuditEventType::TauriCommandInvoke,
+            details,
+            ActorKind::User,
+        )
+        .await
+    }
+
+    /// **ADR-024 amendment 2026-05-05.** Append an
+    /// `AlphaBannerAcknowledged` audit row when the founder acknowledges
+    /// the V0.1 alpha first-run banner per ADR-010 control #1. Presence
+    /// of the row enables alpha-review verification that compensating
+    /// control #1 fired.
+    ///
+    /// `AlphaBannerAcknowledged` variant landed at Phase 4a (vault-storage);
+    /// this writer lands at Phase 4b alongside the consuming
+    /// `acknowledge_alpha_banner` Tauri command. `details_json` is empty
+    /// `{}` (banner-ack is binary state; timestamp lives in `created_at`).
+    pub async fn append_alpha_banner_acknowledged_audit(&self) -> VaultResult<()> {
+        let pending = PendingAuditEvent {
+            event_type: AuditEventType::AlphaBannerAcknowledged,
+            resource_type: None,
+            resource_id: None,
+            boundary: None,
+            actor_kind: ActorKind::User,
+            actor_name: None,
+            user_id: None,
+            device_id: None,
+            result: AuditResult::Success,
+            details_json: "{}".to_string(),
+        };
+        self.metadata.append_audit_event(pending).await?;
+        Ok(())
+    }
+
+    /// **Phase 4b helper for ADR-010 control #1 modal banner.**
+    /// Returns whether the founder has acknowledged the alpha banner
+    /// by checking the audit chain for an `AlphaBannerAcknowledged`
+    /// row. Used by vault-tauri's startup hook to decide whether to
+    /// show the modal banner on first launch.
+    pub async fn is_alpha_banner_acknowledged(&self) -> VaultResult<bool> {
+        // Read the most recent N audit events; check if any has the
+        // AlphaBannerAcknowledged event_type. N=10000 is generous;
+        // V0.1 founder-only won't accumulate that many before ack.
+        // V0.2 multi-user will need indexed lookup; flagged in V0.2
+        // alpha-distribution task scope.
+        let events = self.metadata.list_audit_events(10000).await?;
+        Ok(events
+            .iter()
+            .any(|e| e.event_type == AuditEventType::AlphaBannerAcknowledged))
     }
 }
 
