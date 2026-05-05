@@ -101,6 +101,24 @@ jobs:
           large-packages: true
           docker-images: true
       - uses: actions/checkout@v6
+      # Tauri 2.x Linux native deps — same as clippy job (see comment there
+      # for full rationale). MUST be in BOTH jobs because GitHub Actions
+      # runners are per-job, not shared across the matrix; clippy job's
+      # apt installs don't carry over to build-and-test job's runner.
+      # Caught at T0.1.11 Phase 3 fix-forward 2: clippy passed Linux but
+      # build-and-test failed with "Package 'glib-2.0' not found" because
+      # only clippy had the install step.
+      - if: runner.os == 'Linux'
+        name: Install Tauri 2.x Linux native deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libglib2.0-dev \
+            libgtk-3-dev
       # See clippy job above — protoc needed by lancedb transitive deps.
       - uses: arduino/setup-protoc@v3
         with:
