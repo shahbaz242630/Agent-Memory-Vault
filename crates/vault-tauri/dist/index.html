@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Memory Vault — Alpha</title>
+    <style>
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+        background: #1a1a1a;
+        color: #e0e0e0;
+        margin: 0;
+        padding: 2rem;
+      }
+      h1 { color: #ff9800; margin-top: 0; }
+      .alpha-banner {
+        background: #ff9800;
+        color: #000;
+        padding: 0.5rem 1rem;
+        margin: -2rem -2rem 1.5rem -2rem;
+        font-weight: 600;
+      }
+      code { background: #2a2a2a; padding: 0.1rem 0.3rem; border-radius: 3px; }
+    </style>
+  </head>
+  <body>
+    <div class="alpha-banner">ALPHA — vector store is unencrypted. V0.2 fixes this.</div>
+    <h1>Memory Vault — Phase 3 boot</h1>
+    <p>vault-tauri Phase 3 dev-mode boot smoke. UI implementation lands at Phase 4 (memory CRUD views + ADR-010 banner controls).</p>
+    <p>Currently exercising:</p>
+    <ul>
+      <li>Tauri 2.11.0 main-runtime boot (this page renders → boot succeeded)</li>
+      <li>libonnxruntime path resolution via <code>app.path().resolve(BaseDirectory::Resource)</code></li>
+      <li>ADR-020 integrity-fatal-dialog wiring (mock-tested in <code>src/lib.rs::tests</code>)</li>
+      <li>ADR-032 SQLCipher key sourced from <code>VAULT_KEY</code> env var</li>
+    </ul>
+  </body>
+</html>

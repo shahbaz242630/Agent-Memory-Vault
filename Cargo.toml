@@ -133,9 +133,15 @@ rmcp = "=1.5.0"
 clap = { version = "=4.6.1", features = ["derive"] }
 rpassword = "=7.5.1"
 
-# Tauri (BRD §4.6) — caret pins; exact-pin at T0.1.11 (vault-tauri lib→bin conversion).
-tauri = { version = "2.10", features = [] }
-tauri-build = "2.10"
+# Tauri (BRD §4.6) — exact-pinned at T0.1.11 Phase 3 (vault-tauri lib→bin conversion).
+# Spike 1 (web-research methodology, T0.1.11 plan-paragraph v4): tauri 2.11.0 released
+# 2026-04-30, no 2.12.x line yet, monthly bump-cadence wired in monthly-tech-debt.yml.
+# tauri-build 2.6.0 is required by tauri 2.11.0 (^2.6.0 dep constraint). tauri-plugin-dialog 2.5.0
+# (verified 2026-05-05) wires ADR-020 fatal-error-dialog at vault-tauri main.rs setup
+# hook. Dialog API moved out of tauri core in v2 — must use plugin per Spike 1 finding.
+tauri = { version = "=2.11.0", features = [] }
+tauri-build = "=2.6.0"
+tauri-plugin-dialog = "=2.5.0"
 
 # Security primitives (BRD §11.5.3)
 zeroize = { version = "=1.8.2", features = ["derive"] }

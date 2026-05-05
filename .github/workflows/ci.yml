@@ -45,6 +45,23 @@ jobs:
           large-packages: true
           docker-images: true
       - uses: actions/checkout@v6
+      # Tauri 2.x Linux native deps (T0.1.11 Phase 3) — required by
+      # vault-tauri (and any test target that pulls vault-tauri's lib
+      # transitively for the `tauri` crate's webkit2gtk / appindicator
+      # FFI bindings). webkit2gtk-4.1 is the v2 line; -4.0 was v1.
+      # Per Tauri 2 prerequisites: libwebkit2gtk-4.1-dev, libxdo-dev,
+      # libayatana-appindicator3-dev, librsvg2-dev. libssl-dev is
+      # preinstalled on ubuntu-latest. macOS + Windows ship the
+      # equivalents preinstalled (Apple webkit + Microsoft WebView2).
+      - if: runner.os == 'Linux'
+        name: Install Tauri 2.x Linux native deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
       # protoc is required by lancedb's transitive deps (lance-encoding,
       # lance-file via prost-build) since T0.1.4. Local Windows installs
       # protoc via winget per ADR-011; CI installs it here.

@@ -1,0 +1,30 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Memory Vault",
+  "version": "0.1.0",
+  "identifier": "com.shahbaz242630.memory-vault",
+  "build": {
+    "frontendDist": "dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Memory Vault — Alpha",
+        "width": 900,
+        "height": 700,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' data: asset: http://asset.localhost; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": false,
+    "targets": "all",
+    "category": "Productivity",
+    "icon": ["icons/icon.ico", "icons/icon.png"],
+    "shortDescription": "Personal memory vault for AI agents — V0.1 alpha",
+    "longDescription": "Memory Vault is a personal, user-owned memory layer for AI agents. V0.1 internal alpha — see ADR-010 (LanceDB plaintext-on-disk) and ADR-031 (unsigned MSI) for V0.1 scope-discipline deviations from BRD §11."
+  }
+}

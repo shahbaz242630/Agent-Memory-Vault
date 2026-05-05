@@ -13,6 +13,10 @@ target/
 # ---------- Tauri ----------
 src-tauri/target/
 src-tauri/gen/
+# T0.1.11 Phase 3: vault-tauri lives under crates/ (not the default src-tauri/),
+# so the auto-generated gen/ schemas + capability files land under
+# crates/vault-tauri/gen/. Same exclusion intent as src-tauri/gen/ above.
+crates/vault-tauri/gen/
 ui/node_modules/
 ui/dist/
 ui/build/

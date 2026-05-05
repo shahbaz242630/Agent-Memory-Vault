@@ -8,7 +8,8 @@ name: Monthly Tech-Debt Check
 #   - rust-toolchain.toml: rustc pin (=1.92.0) — gated by lance trait-solver depth limit
 #   - ADR-019: ort RC-policy + ORT_VERSION coupling (ort=2.0.0-rc.10 ↔ ORT 1.22.0)
 #   - ADR-029 / Spike 1: tauri core pin (=2.11.0) — V0.1 alpha minimal UI bump-cadence
-#     (tauri-plugin-dialog extraction lands at T0.1.11 Phase 3 alongside the plugin pin)
+#   - ADR-029 / T0.1.11 Phase 3: tauri-build pin (=2.6.0) — tauri 2.11.0 requires ^2.6.0
+#   - ADR-020 / T0.1.11 Phase 3: tauri-plugin-dialog pin (=2.5.0) — fatal-dialog wiring
 #
 # Outputs a GitHub issue every run (even all-clean) so there's a visible
 # "did the monthly check fire?" trail in the issue tracker. Close manually
@@ -98,7 +99,17 @@ jobs:
             echo "- \`tauri\` crate version: \`$TAURI_CRATE_VER\`"
             echo "- **Verify:** advisories at https://rustsec.org/advisories/?keyword=tauri"
             echo "- **Verify:** new minor releases at https://crates.io/crates/tauri/versions"
-            echo "- Note: \`tauri-plugin-dialog\` extraction lands at T0.1.11 Phase 3 alongside that plugin's pin."
+            echo
+            echo "### tauri-build pin (ADR-029 / T0.1.11 Phase 3)"
+            TAURI_BUILD_VER=$(grep -A1 '^name = "tauri-build"' Cargo.lock | head -2 | grep '^version' | awk -F'"' '{print $2}' || echo 'not in Cargo.lock')
+            echo "- \`tauri-build\` crate version: \`$TAURI_BUILD_VER\`"
+            echo "- **Verify:** new releases at https://crates.io/crates/tauri-build/versions"
+            echo
+            echo "### tauri-plugin-dialog pin (ADR-020 wiring / T0.1.11 Phase 3)"
+            TAURI_DIALOG_VER=$(grep -A1 '^name = "tauri-plugin-dialog"' Cargo.lock | head -2 | grep '^version' | awk -F'"' '{print $2}' || echo 'not in Cargo.lock')
+            echo "- \`tauri-plugin-dialog\` crate version: \`$TAURI_DIALOG_VER\`"
+            echo "- **Verify:** new releases at https://crates.io/crates/tauri-plugin-dialog/versions"
+            echo "- Note: keyring/keyring-core ecosystem migration (Spike at T0.1.11 Phase 3) — revisit ADR-032 secret-source decision at V0.2 alpha-distribution task per ADR-032 forward-pointer."
             echo
             echo "### rustc pin (rust-toolchain.toml tech-debt entry)"
             RUSTC_VER=$(grep -E '^channel\s*=' rust-toolchain.toml | head -1 | awk -F'"' '{print $2}')

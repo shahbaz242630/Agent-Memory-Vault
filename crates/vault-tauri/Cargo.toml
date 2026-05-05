@@ -8,4 +8,37 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+# vault-tauri is BOTH a library (testable utility functions) AND a binary
+# (the Tauri shell). ADR-003 "converts to binary at T0.1.11" interpreted as
+# "add binary target" — keeping the lib target lets us unit-test env-var
+# parsing, OS-dispatch, and integrity-failure mapping without launching the
+# Tauri runtime. Standard Rust pattern for testable applications.
+[lib]
+name = "vault_tauri"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vault-tauri"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { workspace = true, features = [] }
+
 [dependencies]
+tauri = { workspace = true }
+tauri-plugin-dialog = { workspace = true }
+
+# Workspace types we wire through.
+vault-core = { path = "../vault-core" }
+vault-app = { path = "../vault-app" }
+vault-storage = { path = "../vault-storage" }  # SqlCipherKey type for ADR-032 env-var path
+
+# Async runtime + tracing per workspace deps.
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error types for ConfigError per ADR-032 + ADR-019 OS-dispatch errors.
+thiserror = { workspace = true }
