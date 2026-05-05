@@ -283,11 +283,38 @@ impl StdioServer {
         self.adapter.update(id, new_memory).await
     }
 
-    /// `memory.delete` Phase 1 stub. The adapter is responsible for
-    /// boundary verification on the existing memory's stored boundary
-    /// (the agent supplies only the id); Phase 2 wires this against
-    /// `vault-storage::StorageBackend::delete_memory`.
+    /// `memory.delete` handler. ADR-025 amendment 2026-05-05 (T0.1.11
+    /// Phase 4a): handler auth-gates against the trusted
+    /// `authorized_boundaries` slice using the memory's stored boundary
+    /// looked up via [`Adapter::lookup_boundary`]. The original
+    /// 2026-05-01 ADR-025 named all four tools but only specified HOW
+    /// to gate (use the trusted slice), not WHEN — multi-agent code
+    /// review at T0.1.11 Phase 4 plan time caught that `tool_delete`
+    /// shipped with no auth gate at all (CRITICAL finding, conf 97).
+    /// This handler enforces BRD §11.4.3 mandatory-access-control on
+    /// the delete path.
+    ///
+    /// Surfacing semantics:
+    /// - lookup returns `Ok(None)` → memory does not exist → `NotFound`
+    ///   (maps to `-32602 "not found"` per ADR-024)
+    /// - lookup returns `Ok(Some(b))` and `b ∉ authorized_boundaries`
+    ///   → `AccessDenied` (maps to `-32001 "access denied"` per ADR-024)
+    /// - lookup returns `Ok(Some(b))` and `b ∈ authorized_boundaries`
+    ///   → dispatch through to `Adapter::delete`
     pub async fn handle_delete(&self, id: MemoryId) -> VaultResult<()> {
+        let stored_boundary = self
+            .adapter
+            .lookup_boundary(id)
+            .await?
+            .ok_or_else(|| VaultError::NotFound(format!("memory {id} not found")))?;
+
+        if !self.authorized_boundaries.contains(&stored_boundary) {
+            return Err(VaultError::AccessDenied(format!(
+                "memory {id} stored in boundary '{}' which is not in the authorized set",
+                stored_boundary.as_str()
+            )));
+        }
+
         self.adapter.delete(id).await
     }
 

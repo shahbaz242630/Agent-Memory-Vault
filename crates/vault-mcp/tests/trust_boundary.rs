@@ -229,3 +229,75 @@ fn trusted_boundaries_preserved_through_clone() {
     );
     assert_eq!(server.authorized_boundaries().len(), 2);
 }
+
+// =============================================================================
+// 5. ADR-025 amendment 2026-05-05 — `memory.delete` boundary auth gate
+// =============================================================================
+
+/// **ADR-025 amendment pinning test (T0.1.11 Phase 4a).**
+///
+/// Multi-agent code review (2026-05-05) caught that `tool_delete`
+/// shipped with NO auth gate at all (CRITICAL finding, conf 97).
+/// `tool_write` and `tool_update` correctly gated on
+/// `authorized_boundaries`; `tool_delete` skipped the gate entirely.
+/// An MCP agent with a memory's UUID could delete it from boundaries
+/// it had NO authorization for.
+///
+/// The 2026-05-05 ADR-025 amendment expands explicit auth-gate
+/// requirement to all four tools. `handle_delete` now does a
+/// boundary lookup via `Adapter::lookup_boundary` and verifies
+/// against `self.authorized_boundaries` BEFORE dispatching `delete`.
+///
+/// This test pins the AccessDenied path: memory exists in boundary
+/// "personal", server is constructed with trusted slice `["work"]`,
+/// delete must fail closed with AccessDenied AND the adapter's
+/// `delete()` MUST NOT have been called (verified via the empty
+/// `delete_calls()` snapshot).
+#[tokio::test]
+async fn delete_unauthorized_boundary_returns_access_denied() {
+    let (server, mock) = make_mock_server_with_adapter(vec!["work"]);
+
+    // The memory exists in boundary "personal" (NOT in the trusted
+    // ["work"] slice). lookup_boundary will return Some(personal).
+    mock.set_lookup_boundary(Some(
+        Boundary::new("personal").expect("'personal' is a valid Boundary literal"),
+    ));
+
+    let id = vault_core::MemoryId::new();
+    let result = server.handle_delete(id).await;
+
+    // Auth gate must reject.
+    match result {
+        Ok(()) => panic!(
+            "ADR-025 amendment violation: handle_delete succeeded for memory \
+             stored in unauthorized boundary 'personal' (trusted: ['work']). \
+             Auth gate failed open."
+        ),
+        Err(vault_core::VaultError::AccessDenied(msg)) => {
+            // Plain assertion — VaultError doesn't impl Debug per ADR-007.
+            assert!(
+                msg.contains("personal"),
+                "AccessDenied message should reference the rejected boundary; got: {msg}"
+            );
+            assert!(
+                msg.contains(&id.to_string()),
+                "AccessDenied message should reference the rejected memory id; got: {msg}"
+            );
+        }
+        Err(_) => {
+            panic!("expected AccessDenied for unauthorized-boundary delete; got different error")
+        }
+    }
+
+    // Defense-in-depth assertion: the adapter's delete() MUST NOT
+    // have been reached. If the auth gate fired correctly, the call
+    // returned Err(AccessDenied) BEFORE Adapter::delete was invoked.
+    // delete_calls is empty.
+    assert!(
+        mock.delete_calls().is_empty(),
+        "ADR-025 amendment violation: Adapter::delete was called even though \
+         auth gate should have rejected. The handler must short-circuit BEFORE \
+         dispatching to delete(). Got delete_calls: {:?}",
+        mock.delete_calls()
+    );
+}

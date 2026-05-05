@@ -27,7 +27,9 @@
 mod adapter;
 mod application;
 mod config;
+pub mod process_exit;
 
 pub use adapter::VaultAdapter;
 pub use application::{Application, ApplicationHandle};
 pub use config::AppConfig;
+pub use process_exit::{LiveProcessExit, ProcessExit};

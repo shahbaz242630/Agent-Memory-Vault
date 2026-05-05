@@ -59,7 +59,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use vault_core::{Memory, MemoryId, NewMemory, VaultError, VaultResult};
+use vault_core::{Boundary, Memory, MemoryId, NewMemory, VaultError, VaultResult};
 use vault_embedding::EmbeddingProvider;
 use vault_mcp::{Adapter, ToolInvokeDetails};
 use vault_retrieval::{RetrievalQuery, RetrievedMemory, Retriever};
@@ -174,6 +174,14 @@ impl Adapter for VaultAdapter {
         // false. Pass through.
         self.storage.delete_memory(&id).await?;
         Ok(())
+    }
+
+    /// ADR-025 amendment 2026-05-05: returns the memory's stored
+    /// boundary so the StdioServer handler can auth-gate `memory.delete`
+    /// before dispatching to `delete`. Reads through the same
+    /// `MetadataStore` handle used by `update`'s read-before-write path.
+    async fn lookup_boundary(&self, id: MemoryId) -> VaultResult<Option<Boundary>> {
+        Ok(self.metadata.get_memory(&id).await?.map(|m| m.boundary))
     }
 
     async fn append_tool_invoke_audit(&self, details: ToolInvokeDetails) -> VaultResult<()> {

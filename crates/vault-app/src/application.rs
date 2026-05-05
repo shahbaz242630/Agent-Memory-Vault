@@ -46,6 +46,7 @@ use vault_mcp::{Adapter, StdioServer};
 use vault_retrieval::{Retriever, SemanticRetriever};
 use vault_storage::{MetadataStore, RetryWorker, StorageBackend};
 
+use crate::process_exit::{LiveProcessExit, ProcessExit};
 use crate::{AppConfig, VaultAdapter};
 
 /// Composition root. Phase 1 wires the dep graph; Phase 1b adds the
@@ -254,8 +255,15 @@ impl Application {
 
         // 4. Spawn signal handler — first Ctrl-C → graceful shutdown
         //    signal; second Ctrl-C → forced exit per locked semantics.
+        //    Production wires `LiveProcessExit` per ADR-locked
+        //    semantics (Phase 2a). Tests of `handle_signals` directly
+        //    construct `CapturingProcessExit` per
+        //    `feedback_inline_architectural_decisions_produce_adr_in_same_commit.md`
+        //    + Phase 4a Clarification 1 (testability of ADR-locked
+        //    force-exit-130 path).
         let signal_tx = shutdown_signal.clone();
-        let signal_handle = tokio::spawn(handle_signals(signal_tx));
+        let exit_impl: Arc<dyn ProcessExit> = Arc::new(LiveProcessExit);
+        let signal_handle = tokio::spawn(handle_signals(signal_tx, exit_impl));
 
         Ok(ApplicationHandle {
             shutdown_signal,
@@ -377,7 +385,10 @@ impl ApplicationHandle {
 /// between Unix and Windows, both platforms support receiving a signal
 /// on 'ctrl-c'. This function provides a portable API for receiving this
 /// notification."* No `cfg(unix)` / `cfg(windows)` gating needed.
-async fn handle_signals(shutdown_signal: tokio::sync::watch::Sender<bool>) {
+async fn handle_signals(
+    shutdown_signal: tokio::sync::watch::Sender<bool>,
+    exit: Arc<dyn ProcessExit>,
+) {
     // First Ctrl-C — graceful shutdown request.
     if tokio::signal::ctrl_c().await.is_err() {
         // Signal stream broken (rare; signal handler couldn't install
@@ -400,5 +411,5 @@ async fn handle_signals(shutdown_signal: tokio::sync::watch::Sender<bool>) {
         "[vault-app] forced exit triggered (second SIGINT received before graceful shutdown completed). \
          Exit code 130 (128 + SIGINT)."
     );
-    std::process::exit(130);
+    exit.exit(130);
 }

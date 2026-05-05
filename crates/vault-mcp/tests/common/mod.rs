@@ -94,6 +94,14 @@ impl Adapter for StubAdapter {
         unimplemented!("T0.1.9 Phase 2: wire StorageBackend::delete_memory via Application")
     }
 
+    /// ADR-025 amendment 2026-05-05: StubAdapter returns Ok(None) — no
+    /// memories exist in the stub. handle_delete will surface as NotFound
+    /// before reaching delete(); StubAdapter's delete() panic stays
+    /// unreachable.
+    async fn lookup_boundary(&self, _id: MemoryId) -> VaultResult<Option<Boundary>> {
+        Ok(None)
+    }
+
     async fn append_tool_invoke_audit(&self, details: ToolInvokeDetails) -> VaultResult<()> {
         self.audits
             .lock()
@@ -170,6 +178,17 @@ impl Adapter for DimMismatchAdapter {
     /// `error.detail.category = "NotFound"`).
     async fn delete(&self, id: MemoryId) -> VaultResult<()> {
         Err(VaultError::NotFound(format!("memory {id} not found")))
+    }
+
+    /// ADR-025 amendment 2026-05-05: DimMismatchAdapter returns
+    /// Ok(None) — handle_delete surfaces NotFound at the lookup layer
+    /// before reaching delete(). Existing
+    /// `tool_delete_not_found_pins_wire_message_and_internal_collapse_audit`
+    /// test still passes because the wire shape (NotFound + Internal-
+    /// collapse audit row) is identical whether NotFound originates at
+    /// lookup or at delete.
+    async fn lookup_boundary(&self, _id: MemoryId) -> VaultResult<Option<Boundary>> {
+        Ok(None)
     }
 
     async fn append_tool_invoke_audit(&self, details: ToolInvokeDetails) -> VaultResult<()> {
@@ -256,6 +275,19 @@ impl Adapter for SuccessAdapter {
 
     async fn delete(&self, _id: MemoryId) -> VaultResult<()> {
         Ok(())
+    }
+
+    /// ADR-025 amendment 2026-05-05: SuccessAdapter returns
+    /// Ok(Some(Boundary("work"))) — matches the conventional `vec!["work"]`
+    /// trusted slice all SuccessAdapter-using tests use. handle_delete's
+    /// new auth gate passes (boundary is in authorized list); delete()
+    /// proceeds to its existing Ok(()) success path. Existing
+    /// `tool_delete_success_records_audit_and_omits_search_only_keys`
+    /// test still passes — wire shape unchanged.
+    async fn lookup_boundary(&self, _id: MemoryId) -> VaultResult<Option<Boundary>> {
+        Ok(Some(
+            Boundary::new("work").expect("'work' is a valid Boundary literal"),
+        ))
     }
 
     async fn append_tool_invoke_audit(&self, details: ToolInvokeDetails) -> VaultResult<()> {

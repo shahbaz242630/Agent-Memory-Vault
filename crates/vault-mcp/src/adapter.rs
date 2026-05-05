@@ -20,7 +20,7 @@
 
 use async_trait::async_trait;
 
-use vault_core::{MemoryId, NewMemory, VaultResult};
+use vault_core::{Boundary, MemoryId, NewMemory, VaultResult};
 use vault_retrieval::{RetrievalQuery, RetrievedMemory};
 
 use crate::audit::ToolInvokeDetails;
@@ -59,6 +59,22 @@ pub trait Adapter: Send + Sync {
     /// has already verified the memory's boundary against the trusted
     /// authorization slice before this is called.
     async fn delete(&self, id: MemoryId) -> VaultResult<()>;
+
+    /// Look up the stored boundary of a memory by id, returning `Ok(None)`
+    /// if no memory with that id exists.
+    ///
+    /// Added at T0.1.11 Phase 4a per ADR-025 amendment 2026-05-05 to
+    /// enable handler-mediated auth-gating on `memory.delete` (see
+    /// HANDOFF.md ADR-025 amendment + multi-agent code review CRITICAL
+    /// finding 2026-05-05). The handler MUST verify the returned
+    /// boundary against `self.authorized_boundaries` before dispatching
+    /// `delete`. Implementations MUST NOT enforce any auth themselves —
+    /// the lookup is purely a stored-boundary read.
+    ///
+    /// Returns the boundary the memory was stored against, or `None` if
+    /// the memory does not exist (caller surfaces as
+    /// `VaultError::NotFound`).
+    async fn lookup_boundary(&self, id: MemoryId) -> VaultResult<Option<Boundary>>;
 
     /// Append one `mcp.tool_invoke` audit event to the local audit
     /// chain. Called by the `tool_*` handlers in [`crate::server`] at

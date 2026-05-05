@@ -29,7 +29,7 @@
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use vault_core::{MemoryId, NewMemory, VaultResult};
+use vault_core::{Boundary, MemoryId, NewMemory, VaultResult};
 use vault_mcp::{Adapter, ToolInvokeDetails};
 use vault_retrieval::{RetrievalQuery, RetrievedMemory};
 
@@ -55,6 +55,13 @@ pub struct MockAdapter {
     updates: Mutex<Vec<UpdateCall>>,
     deletes: Mutex<Vec<MemoryId>>,
     audits: Mutex<Vec<ToolInvokeDetails>>,
+    /// Configurable result for `lookup_boundary` calls. Default `None`
+    /// means handle_delete surfaces NotFound at the lookup layer.
+    /// ADR-025 amendment 2026-05-05 trust-boundary delete pinning
+    /// test sets this to `Some(Boundary("personal"))` while the server
+    /// is constructed with `trusted: vec!["work"]` to pin the
+    /// AccessDenied path.
+    lookup_result: Mutex<Option<Boundary>>,
 }
 
 impl MockAdapter {
@@ -109,6 +116,16 @@ impl MockAdapter {
             .expect("MockAdapter audits mutex poisoned")
             .clone()
     }
+
+    /// Configure the result returned by [`MockAdapter::lookup_boundary`].
+    /// Used by the ADR-025-amendment trust-boundary delete pinning test
+    /// to inject a memory-exists-but-in-unauthorized-boundary scenario.
+    pub fn set_lookup_boundary(&self, boundary: Option<Boundary>) {
+        *self
+            .lookup_result
+            .lock()
+            .expect("MockAdapter lookup_result mutex poisoned") = boundary;
+    }
 }
 
 #[async_trait]
@@ -143,6 +160,18 @@ impl Adapter for MockAdapter {
             .expect("MockAdapter deletes mutex poisoned")
             .push(id);
         Ok(())
+    }
+
+    /// ADR-025 amendment 2026-05-05: MockAdapter returns the configured
+    /// [`MockAdapter::lookup_result`], default `None`. The trust-boundary
+    /// delete pinning test sets this to `Some(Boundary("personal"))`
+    /// against a `vec!["work"]` trusted slice to pin AccessDenied.
+    async fn lookup_boundary(&self, _id: MemoryId) -> VaultResult<Option<Boundary>> {
+        Ok(self
+            .lookup_result
+            .lock()
+            .expect("MockAdapter lookup_result mutex poisoned")
+            .clone())
     }
 
     async fn append_tool_invoke_audit(&self, details: ToolInvokeDetails) -> VaultResult<()> {
