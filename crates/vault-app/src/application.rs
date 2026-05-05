@@ -63,7 +63,6 @@ pub struct Application {
     storage: StorageBackend,
 }
 
-
 impl Application {
     /// Construct the full V0.1 dependency graph and wire it into a
     /// [`VaultAdapter`].
