@@ -31,7 +31,7 @@ jobs:
       # for matrix verification — we need to see EACH OS's outcome.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       # Linux-only: free ~15-20GB by removing unused tooling. Windows runners
@@ -63,7 +63,7 @@ jobs:
       # fail-fast: false — see clippy job above for rationale.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       # Linux-only — see clippy job above for rationale.
@@ -110,5 +110,13 @@ jobs:
         if: steps.vault-embedding-fixtures.outputs.cache-hit != 'true' && runner.os == 'Windows'
         shell: pwsh
         run: ./scripts/setup-dev-env.ps1
+      - name: Provision vault-embedding test fixtures (macOS)
+        # macOS provisioning invokes the existing setup-dev-env.sh — the
+        # Darwin branch at scripts/setup-dev-env.sh:131-135 was already
+        # written at T0.1.7 (sets ORT_ASSET=onnxruntime-osx-arm64-${ORT_VERSION}.tgz,
+        # ORT_LIB_NAME=libonnxruntime.dylib). No script change needed; CI
+        # just invokes the same script as Linux (uname -s routes the case).
+        if: steps.vault-embedding-fixtures.outputs.cache-hit != 'true' && runner.os == 'macOS'
+        run: bash scripts/setup-dev-env.sh
       - run: cargo build --workspace --all-targets
       - run: cargo test --workspace

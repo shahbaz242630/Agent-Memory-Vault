@@ -7,6 +7,8 @@ name: Monthly Tech-Debt Check
 #   - ADR-013: chrono pin (=0.4.38)
 #   - rust-toolchain.toml: rustc pin (=1.92.0) — gated by lance trait-solver depth limit
 #   - ADR-019: ort RC-policy + ORT_VERSION coupling (ort=2.0.0-rc.10 ↔ ORT 1.22.0)
+#   - ADR-029 / Spike 1: tauri core pin (=2.11.0) — V0.1 alpha minimal UI bump-cadence
+#     (tauri-plugin-dialog extraction lands at T0.1.11 Phase 3 alongside the plugin pin)
 #
 # Outputs a GitHub issue every run (even all-clean) so there's a visible
 # "did the monthly check fire?" trail in the issue tracker. Close manually
@@ -90,6 +92,13 @@ jobs:
             CHRONO_VER=$(grep -E '^chrono\s*=' Cargo.toml | head -1 | awk -F'"' '{print $2}')
             echo "- Pinned: \`chrono = \"$CHRONO_VER\"\`"
             echo "- **Verify:** advisories at https://rustsec.org/advisories/?keyword=chrono"
+            echo
+            echo "### Tauri core pin (ADR-029 / Spike 1, T0.1.11 Phase 1)"
+            TAURI_CRATE_VER=$(grep -A1 '^name = "tauri"' Cargo.lock | head -2 | grep '^version' | awk -F'"' '{print $2}' || echo 'not in Cargo.lock')
+            echo "- \`tauri\` crate version: \`$TAURI_CRATE_VER\`"
+            echo "- **Verify:** advisories at https://rustsec.org/advisories/?keyword=tauri"
+            echo "- **Verify:** new minor releases at https://crates.io/crates/tauri/versions"
+            echo "- Note: \`tauri-plugin-dialog\` extraction lands at T0.1.11 Phase 3 alongside that plugin's pin."
             echo
             echo "### rustc pin (rust-toolchain.toml tech-debt entry)"
             RUSTC_VER=$(grep -E '^channel\s*=' rust-toolchain.toml | head -1 | awk -F'"' '{print $2}')

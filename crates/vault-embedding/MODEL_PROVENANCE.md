@@ -51,6 +51,7 @@ shipping a community-converted artefact. ADR-022 was therefore NOT created
 | Linkage | Dynamic via `ort` crate's `load-dynamic` feature (Spike 1) |
 | Init pattern | `ort::init_from(dylib_path)` — MUST be called once before any other ort use; idempotent via `std::sync::Once` (see Phase 1 implementation note in plan) |
 | License | MIT |
+| **SHA-256 (macOS arm64)** | `2b885992d3d6fa4130d39ec84a80d7504ff52750027c547bb22c86165f19406a` (`libonnxruntime.1.22.0.dylib` extracted from `onnxruntime-osx-arm64-1.22.0.tgz`; computed locally 2026-05-05 at T0.1.11 Phase 1 step-execution time, same methodology as model + tokenizer SHA capture above. **Linux `libonnxruntime.so` and Windows `onnxruntime.dll` SHA-256 entries explicitly NOT added** — γ literal-third-row scope-discipline at T0.1.11 Phase 1; symmetric per-platform chain (δ) deferred to V0.2 hardening as a discrete "MODEL_PROVENANCE.md schema upgrade" task per ADR-029 commit body. Asymmetry intentional.) |
 
 The ORT dylib is loaded at runtime, not link-time. Choosing `load-dynamic` over
 the default `download-binaries` (which fetches at build time) gives us:
