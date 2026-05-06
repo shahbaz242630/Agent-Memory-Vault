@@ -7,6 +7,7 @@
     "frontendDist": "dist"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
         "title": "Memory Vault — Alpha",
@@ -20,11 +21,19 @@
     }
   },
   "bundle": {
-    "active": false,
-    "targets": "all",
+    "active": true,
+    "targets": ["msi"],
     "category": "Productivity",
     "icon": ["icons/icon.ico", "icons/icon.png"],
     "shortDescription": "Personal memory vault for AI agents — V0.1 alpha",
-    "longDescription": "Memory Vault is a personal, user-owned memory layer for AI agents. V0.1 internal alpha — see ADR-010 (LanceDB plaintext-on-disk) and ADR-031 (unsigned MSI) for V0.1 scope-discipline deviations from BRD §11."
+    "longDescription": "Memory Vault is a personal, user-owned memory layer for AI agents. V0.1 internal alpha — see ADR-010 (LanceDB plaintext-on-disk) and ADR-031 (unsigned MSI) for V0.1 scope-discipline deviations from BRD §11.",
+    "resources": {
+      "../vault-embedding/test-fixtures/bge-small-en-v1.5/onnxruntime.dll": "libs/onnxruntime.dll",
+      "../vault-embedding/test-fixtures/bge-small-en-v1.5/model.onnx": "models/model.onnx",
+      "../vault-embedding/test-fixtures/bge-small-en-v1.5/tokenizer.json": "models/tokenizer.json"
+    },
+    "windows": {
+      "wix": {}
+    }
   }
 }

@@ -18,16 +18,24 @@
 //! - **ADR-029:** branch (2) Windows-dogfood lock; founder runs
 //!   `cargo run -p vault-tauri` on Windows 11 dev machine for V0.1
 //!   founder-only dogfood (T0.1.12).
-//! - **ADR-030:** vault-tauri spawns ONLY our own vault-mcp child via
-//!   `Application::start_with_mcp` (which embeds the rmcp stdio server
-//!   in-process) — no user-controlled StdioServerParameters surface,
-//!   no external-MCP-server-config UI in V0.1. Outcome shape (a) per
-//!   ADR-026 forward-pointer. Phase 4b adds source-grep regression
-//!   test in `lib.rs::tests::main_rs_does_not_register_external_mcp_spawn_command_per_adr_030`.
+//! - **ADR-030:** vault-tauri spawns no external child MCP process — no
+//!   user-controlled StdioServerParameters surface, no external-MCP-
+//!   server-config UI in V0.1. Outcome shape (a) per ADR-026 forward-
+//!   pointer. Phase 4b adds source-grep regression test in
+//!   `lib.rs::tests::main_rs_does_not_register_external_mcp_spawn_command_per_adr_030`.
 //! - **ADR-032:** SQLCipher passphrase sourced from `VAULT_KEY` env var
 //!   for V0.1 founder-only dogfood. Branch (B) per Spike 1
 //!   (keyring-core ecosystem mid-migration; multi-user cohort secret
 //!   source revisits at V0.2 alpha-distribution task).
+//! - **ADR-034 (Phase 5b fix-forward, 2026-05-05):** V0.1 vault-tauri is
+//!   UI-only — no MCP server bound inside the Tauri process. Phase 5
+//!   founder smoke surfaced that `Application::start_with_mcp` calls
+//!   `rmcp::ServiceExt::serve(server, stdio()).await` which blocks on
+//!   JSON-RPC `initialize` from a non-existent peer when launched as a
+//!   Tauri UI app, hanging Tauri's setup() hook. Phase 5b replaces the
+//!   call with `Application::start()` (worker-only, no MCP transport
+//!   bind). AI-client MCP integration deferred to V0.2 alpha-distribution
+//!   subcommand-split task. T0.1.12 founder dogfood is UI-only for V0.1.
 //! - **Phase 4a HIGH findings cleared at Phase 4b:** line 170
 //!   `Boundary::default_name()` swap; line 191 `tauri::Builder::run`
 //!   match + `eprintln!` + `std::process::exit`; lines 122-131
@@ -35,12 +43,6 @@
 //!   phantom `_force_sqlcipher_key_import_visible` deletion;
 //!   `resolve_*` + `format_config_error_dialog` extracted to lib.rs
 //!   for testability.
-//!
-//! ## V0.1 authorized_boundaries
-//!
-//! Hardcoded `vec![Boundary::default_name()]` — V0.1 founder-only
-//! single-user, single boundary. Multi-boundary management UI lands at
-//! Phase 4 / V0.2 per BRD §5.11 settings-view evolution.
 
 #![forbid(unsafe_code)]
 
@@ -49,7 +51,6 @@ use std::path::PathBuf;
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 use vault_app::{AppConfig, Application};
-use vault_core::Boundary;
 use vault_tauri::{
     dylib_filename_for_os, env_override_for, format_config_error_dialog,
     format_startup_failure_dialog, parse_vault_key,
@@ -171,16 +172,26 @@ fn main() {
                 ort_lib_path,
             };
 
-            // 6 + 7. Construct Application and start the MCP-host
-            // lifecycle. Phase 4b: manage BOTH Application + handle so
-            // Tauri commands (which need Adapter access via
-            // Application::adapter()) AND shutdown logic (which needs
-            // ApplicationHandle) can coexist.
+            // 6. Construct Application and spawn the cascading retry
+            //    worker. Per ADR-034 (T0.1.11 Phase 5b): V0.1 vault-tauri
+            //    is UI-only — no MCP server bound inside the Tauri
+            //    process. `start_with_mcp` would call rmcp's
+            //    `ServiceExt::serve(server, stdio()).await` which blocks
+            //    on JSON-RPC `initialize` from a peer that doesn't exist
+            //    when launched as a Tauri UI app, hanging Tauri's setup()
+            //    hook indefinitely. `start()` spawns only the retry
+            //    worker (no rmcp transport bind), keeping the UI
+            //    responsive. AI-client MCP integration deferred to V0.2
+            //    alpha-distribution task (subcommand-split design per
+            //    ADR-034 cross-link).
             //
-            // start_with_mcp takes &self (NOT consume), so application
-            // lives on after returning the handle.
+            //    `start()` is sync but spawns `tokio::spawn(worker.run)`
+            //    which requires a tokio runtime in scope. Tauri provides
+            //    one inside `tauri::async_runtime::block_on`, which we
+            //    enter just to construct Application::new (async) and
+            //    call start() within the runtime context.
             let app_handle = app.handle().clone();
-            let (application, handle) = tauri::async_runtime::block_on(async move {
+            let (application, _shutdown_sender) = tauri::async_runtime::block_on(async move {
                 let application = match Application::new(&config).await {
                     Ok(a) => a,
                     Err(e) => show_fatal_dialog_and_exit(
@@ -191,25 +202,18 @@ fn main() {
                     ),
                 };
 
-                let boundaries = vec![Boundary::default_name()];
-                let handle = match application.start_with_mcp(boundaries).await {
-                    Ok(h) => h,
-                    Err(e) => show_fatal_dialog_and_exit(
-                        &app_handle,
-                        "Memory Vault — Fatal Error",
-                        &format_startup_failure_dialog(&e),
-                        EXIT_STARTUP_FAILURE,
-                    ),
-                };
-
-                (application, handle)
+                let shutdown_sender = application.start();
+                (application, shutdown_sender)
             });
 
-            // 8. Manage Application (for Tauri commands) + ApplicationHandle
-            //    (for graceful shutdown). Per ADR-003 register-shape pick:
-            //    register both directly, Tauri auto-Arc-wraps internally.
+            // 7. Manage Application (for Tauri commands) + the worker
+            //    shutdown Sender (held to keep the watch channel alive
+            //    for the worker's lifetime; dropping it signals worker
+            //    exit via the watch::changed() Err arm — which is fine
+            //    on Tauri close, but holding it explicitly is the
+            //    deliberate lifecycle).
             app.manage(application);
-            app.manage(handle);
+            app.manage(_shutdown_sender);
 
             Ok(())
         });
