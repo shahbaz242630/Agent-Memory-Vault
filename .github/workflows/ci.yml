@@ -83,6 +83,22 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      # Phase 5a's tauri.conf.json bundle.resources references three files in
+      # crates/vault-embedding/test-fixtures/bge-small-en-v1.5/. tauri-build's
+      # build.rs validates these paths exist at compile time on every platform
+      # (not just at MSI bundle time). clippy doesn't actually USE the fixtures
+      # — empty `touch` placeholders satisfy the existence check. V0.2 alpha-
+      # distribution will introduce per-platform bundle.windows.resources /
+      # bundle.macOS.resources / bundle.linux.resources via Tauri 2's per-
+      # bundler syntax, eliminating the need for these cross-platform
+      # placeholder hacks. (T0.1.11 Phase 5d fix-forward, 2026-05-06.)
+      - name: Create test-fixture placeholders for tauri-build resource validation
+        shell: bash
+        run: |
+          mkdir -p crates/vault-embedding/test-fixtures/bge-small-en-v1.5
+          touch crates/vault-embedding/test-fixtures/bge-small-en-v1.5/onnxruntime.dll
+          touch crates/vault-embedding/test-fixtures/bge-small-en-v1.5/model.onnx
+          touch crates/vault-embedding/test-fixtures/bge-small-en-v1.5/tokenizer.json
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   build-and-test:
@@ -164,5 +180,18 @@ jobs:
         # just invokes the same script as Linux (uname -s routes the case).
         if: steps.vault-embedding-fixtures.outputs.cache-hit != 'true' && runner.os == 'macOS'
         run: bash scripts/setup-dev-env.sh
+      # Phase 5a's tauri.conf.json bundle.resources references onnxruntime.dll
+      # (Windows-specific). setup-dev-env.sh's Linux + Darwin branches download
+      # libonnxruntime.so / libonnxruntime.dylib respectively, NOT
+      # onnxruntime.dll. tauri-build validates ALL bundle.resources paths exist
+      # at compile time regardless of platform. Empty touch placeholder on
+      # non-Windows satisfies the check; V0.1 only ships Windows MSI per
+      # ADR-031, so non-Windows never USES the DLL. V0.2 alpha-distribution
+      # will replace via per-platform bundle.windows.resources syntax.
+      # (T0.1.11 Phase 5d fix-forward, 2026-05-06.)
+      - name: Placeholder onnxruntime.dll on non-Windows for tauri-build cross-platform validation
+        if: runner.os != 'Windows'
+        shell: bash
+        run: touch crates/vault-embedding/test-fixtures/bge-small-en-v1.5/onnxruntime.dll
       - run: cargo build --workspace --all-targets
       - run: cargo test --workspace
