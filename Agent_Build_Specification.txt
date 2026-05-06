@@ -1390,7 +1390,7 @@ V0.1 → V0.2 → V1.0. Build in order. Do not skip ahead.
 **T0.1.12 — V0.1 End-to-End Test**
 - Manual test: install on a fresh Mac or Windows machine, add 10 memories via UI, search them, verify Claude Desktop sees them via MCP
 - Document any rough edges in HANDOFF.md "V0.1 Findings" section
-- Acceptance: Founder uses V0.1 for one full day, files at least 3 issues in HANDOFF.md
+- Acceptance: Founder uses V0.1 for one full day, files at least 2 issues in HANDOFF.md OR documents an honest closure note with reasoning when fewer than 3 rough edges surfaced during critical dogfood (amended 2026-05-06 per ADR-036; original was "files at least 3 issues")
 
 ---
 

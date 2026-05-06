@@ -45,6 +45,15 @@
 //!   for testability.
 
 #![forbid(unsafe_code)]
+// Phase 5e fix-forward (T0.1.12 dogfood Finding #2): mark the binary as
+// Windows GUI subsystem (not console subsystem) for release builds. Without
+// this attribute, Windows allocates a console window alongside the Tauri
+// UI on every launch — a stray "black terminal" window that looks broken to
+// any user. Standard Tauri 2 starter-template line that was dropped during
+// T0.1.11 Phase 3 lib→bin conversion. `cfg_attr(not(debug_assertions), ...)`
+// preserves the console for debug builds (so println / tracing is visible
+// during dev) while hiding it for release/MSI distribution.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::path::PathBuf;
 

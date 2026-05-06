@@ -219,7 +219,13 @@
       <input type="text" id="search-query" placeholder="What are you looking for?" />
 
       <label for="search-limit">Max Results</label>
-      <input type="text" id="search-limit" value="10" />
+      <!-- Phase 5e fix-forward (T0.1.12 dogfood Finding #1): default lowered from 10 to 3
+           to reduce visible-noise UX issue in V0.1. Underlying score_threshold filter is
+           None per commands.rs::search_memories_inner; lowering max_results caps the
+           visible result-card noise without picking an arbitrary score threshold without
+           empirical bge-small distribution data. V0.2 alpha-distribution adds proper
+           score_threshold UI input + result-card score color-coding + match-snippet rendering. -->
+      <input type="text" id="search-limit" value="3" />
 
       <button class="button" id="search-submit">Search</button>
       <div id="search-results" class="output" style="display:none"></div>
