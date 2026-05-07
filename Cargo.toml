@@ -55,28 +55,30 @@ serde_json = "=1.0.149"
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "json"] }
 
-# Time (BRD §4.1). Pinned to "=0.4.39" to keep below chrono 0.4.44 which
-# added Datelike::quarter() (conflicts with arrow-arith 52.x's
-# ChronoDateExt::quarter() — "multiple `quarter` found" in arrow-arith
-# via lancedb's transitive deps). Bumped from 0.4.38 → 0.4.39 at T0.1.9
-# Phase 1 because rmcp 1.5.0 → schemars 1.0 → requires chrono ^0.4.39
-# (a hard dep, not gated by the schemars cargo feature). 0.4.39 satisfies
-# schemars's lower bound while staying safely below 0.4.44's conflict.
-# Tracked in HANDOFF.md tech-debt; revisit when arrow updates past 0.4.44
-# (or when we drop chrono entirely in favour of std::time).
-chrono = { version = "=0.4.39", features = ["serde"] }
+# Time (BRD §4.1). T0.2.0 Phase 0a (2026-05-XX): bumped from =0.4.39 →
+# =0.4.44 because lancedb 0.27.2 pulls arrow-array 57.2.0 which requires
+# chrono ^0.4.40. The original ADR-013 lock to 0.4.39 was to avoid arrow
+# 52.x's ChronoDateExt::quarter() conflict — that conflict no longer
+# applies because arrow 57.x reworked the trait. ADR-013 superseded by
+# ADR-037 (lancedb upgrade record). schemars 1.0's ^0.4.39 lower bound
+# is still satisfied.
+chrono = { version = "=0.4.44", features = ["serde"] }
 
 # UUIDs (BRD §4.1)
 uuid = { version = "=1.23.1", features = ["v4", "v7", "serde"] }
 
 # Storage (BRD §4.2)
-lancedb = "=0.8.0"
-# arrow pinned to lancedb 0.8's resolved transitive 52.2 (workspace declared
-# "52.1", caret resolved to 52.2.0). Required for direct use of RecordBatch /
-# RecordBatchIterator / Float32Array / FixedSizeListArray in vault-storage;
-# lancedb 0.8 only re-exports arrow_schema. Added in T0.1.4.
-arrow-array = "=52.2.0"
-arrow-schema = "=52.2.0"
+# T0.2.0 Phase 0a (2026-05-XX): bumped from =0.8.0 → =0.27.2 to gain
+# lance-io 4.x's ObjectStoreProvider/Registry API needed for at-rest
+# encryption integration. ADR-037 records the upgrade scope. Direct
+# pins for lance/object_store/bytes/url removed — Phase 0c re-adds
+# them at lancedb 0.27's transitive versions for the rewritten spike.
+lancedb = "=0.27.2"
+# arrow bumped 52.2.0 → 57.2.0 to match lancedb 0.27.2's transitive.
+# Phase 0a (2026-05-XX) confirmed arrow 57.x reworked ChronoDateExt
+# (no more quarter() conflict with chrono 0.4.44).
+arrow-array = "=57.2.0"
+arrow-schema = "=57.2.0"
 duckdb = { version = "=1.2.2", features = ["bundled"] }
 # rusqlite uses bundled-sqlcipher-vendored-openssl instead of bundled-sqlcipher
 # (deviation from BRD §4.2 — see HANDOFF.md ADR-006). Vendoring OpenSSL avoids

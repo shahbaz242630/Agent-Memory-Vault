@@ -1,0 +1,903 @@
+//! At-rest-extension spike — Leg 2 (T0.2.0 pre-task).
+//!
+//! Validates the `lance::Dataset` + `WrappingObjectStore` integration path
+//! for the at-rest sealed-ObjectStore adapter design (per ADR-008
+//! amendment 2026-05-XX, pending). Spike scope:
+//!
+//!   - **Stage A** — identity-wrapper compile + Lance write+read round-trip.
+//!     Proves dep stack + WrappingObjectStore trait wiring at compile +
+//!     runtime. NO sealing.
+//!   - **Stage B** — sealing primitives (K3 KDF, DryocStream as
+//!     single-shot, AAD compute) as standalone functions + inline
+//!     adversarial unit tests. NO ObjectStore wrapping yet.
+//!   - **Stage C** — `SealedObjectStore` wrapping `LocalFileSystem`,
+//!     end-to-end sealed write through Lance `Dataset`, on-disk
+//!     adversarial assertions. **Read path BLOCKED**: lance-io 0.15's
+//!     `LocalObjectReader` bypasses `object_store::ObjectStore` for
+//!     local-fs paths (per docs.rs/lance-io/0.15.0/lance_io/local/
+//!     struct.LocalObjectReader.html — direct std::fs access for
+//!     reads), so `WrappingObjectStore::wrap` does not intercept
+//!     manifest / fragment reads. Spike escalation trigger fired
+//!     2026-05-XX. Resolution = T0.2.0 plan paragraph iteration 1
+//!     selects from Path W'/X'/Y'/Z' (see ADR-008 amendment +
+//!     T0.2.0 plan paragraph drafts). Stage C produces the on-disk
+//!     evidence (sealed framing + entropy + no PAR1) that confirms
+//!     write path is correct; read path needs the path decision
+//!     before re-spike.
+//!
+//! ## Locked decisions consumed by this spike
+//!
+//! - **AAD scheme** (Finding 2 candidate (c), iteration 3 lock):
+//!   `AAD = BLAKE3("vault-at-rest-v1" || file_path_bytes)`. No `version_id`
+//!   binding in V0.2; replay-attack residual documented in amendment with
+//!   V1.0 revisit trigger.
+//! - **KDF** (K3, surfaced + locked at Stage A close):
+//!   `at_rest_key = blake3::derive_key("vault memory at-rest sealing v1",
+//!   &master_key)`. K3 chosen over K1 (HKDF-SHA256 via new RustCrypto
+//!   crate) and K2 (dryoc `crypto_kdf_blake2b`) for single-source-crypto
+//!   preservation per ADR-008 line 693, plus uniformity with the AAD
+//!   computation already on BLAKE3.
+//! - **Sealing granularity** (iteration 3 §3.1): per-file. V0.2
+//!   unconditional.
+//! - **Sealing shape** (iteration 3 §3.4):
+//!   `version_byte (0x01) || granularity_marker (0x00) || dryoc_header (24
+//!   bytes) || ciphertext`. 26-byte framing overhead.
+//! - **Path #1 cipher** (ADR-008 archive line 681): DryocStream-as-single-
+//!   message wrapped per envelope, `Tag::FINAL` on push.
+//!
+//! Run via:
+//!   ```
+//!   cargo run -p vault-storage --example at_rest_spike
+//!   ```
+//! (Requires PROTOC + Strawberry Perl on PATH per ADR-006 / ADR-011.)
+
+use std::sync::Arc;
+
+use arrow_array::{
+    FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray,
+};
+use arrow_schema::{DataType, Field, Schema};
+use async_trait::async_trait;
+use bytes::Bytes as BytesBuf;
+use dryoc::dryocstream::{DryocStream, Header, Key, Pull, Push, Tag};
+use dryoc::types::Bytes;
+use futures::stream::{self, BoxStream, StreamExt};
+use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::{Dataset, ReadParams, WriteParams};
+use lance::io::{ObjectStoreParams, WrappingObjectStore};
+use object_store::path::Path as ObjectPath;
+use object_store::{
+    GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOpts, PutOptions, PutPayload, PutResult,
+};
+
+// ============================================================
+//   Sealing primitives (Stage B contract surfaces)
+// ============================================================
+
+const VERSION_BYTE: u8 = 0x01;
+const GRANULARITY_PER_FILE: u8 = 0x00;
+const FRAMING_PREFIX_LEN: usize = 2;
+const HEADER_LEN: usize = 24;
+const TOTAL_FRAMING_LEN: usize = FRAMING_PREFIX_LEN + HEADER_LEN;
+/// AEAD overhead per envelope: 16-byte Poly1305 tag + 1-byte message-tag byte.
+/// Per ADR-008 archive line 686 (verified by Stage B's empirical 43-byte
+/// total overhead for a 5120-byte plaintext: 26 framing + 17 AEAD).
+const AEAD_OVERHEAD: usize = 17;
+/// Constant per-file overhead between sealed bytes and plaintext bytes.
+/// Used by `head` / `list` overrides to translate inner sealed sizes
+/// back to the unsealed sizes Lance expects.
+const SEAL_OVERHEAD: usize = TOTAL_FRAMING_LEN + AEAD_OVERHEAD;
+
+/// Derive the at-rest key from the master key per K3 lock:
+/// `blake3::derive_key` with the canonical at-rest context string.
+/// BLAKE3's `derive_key` is the purpose-built domain-separated KDF
+/// primitive; same security properties as HKDF-SHA256 (PRF + domain
+/// separation) without adding a new crypto crate.
+fn derive_at_rest_key(master_key: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key("vault memory at-rest sealing v1", master_key)
+}
+
+/// Compute the at-rest AAD per Finding 2 candidate (c) lock:
+/// `AAD = BLAKE3("vault-at-rest-v1" || file_path_bytes)`.
+///
+/// No version_id binding in V0.2. The domain-separator
+/// `"vault-at-rest-v1"` is distinct from sync's `"vault-aad-v1"`
+/// (ADR-008 archive line 700) — prevents cross-context envelope
+/// confusion.
+///
+/// Replay-attack residual: an attacker with write access to the
+/// encrypted data dir could replay an older sealed version of the
+/// same path. Threat model already presumes the attacker has bigger
+/// problems if they can write to the data dir. V1.0 revisit trigger
+/// if threat model tightens.
+fn compute_aad(file_path: &str) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"vault-at-rest-v1");
+    hasher.update(file_path.as_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+/// Seal a plaintext payload into the at-rest envelope per the locked
+/// sealing shape (iteration 3 §3.4):
+/// `sealed = version_byte || granularity_marker || dryoc_header || ciphertext`.
+fn seal_file_bytes(plaintext: &[u8], key: &[u8; 32], aad: &[u8; 32]) -> Vec<u8> {
+    let dryoc_key: Key = (*key).into();
+    let (mut push, header): (DryocStream<Push>, Header) = DryocStream::init_push(&dryoc_key);
+
+    // Sized-input quirk per ADR-008 archive line 684 — both plaintext AND
+    // aad must be Vec<u8>, not &[u8] slices. Spike-confirmed extension to
+    // the original ADR-008 finding (which only spelled out the plaintext
+    // case; aad was passed as None there).
+    let plaintext_vec = plaintext.to_vec();
+    let aad_vec = aad.to_vec();
+    let ciphertext = push
+        .push_to_vec(&plaintext_vec, Some(&aad_vec), Tag::FINAL)
+        .expect("dryoc push_to_vec");
+
+    let mut sealed = Vec::with_capacity(TOTAL_FRAMING_LEN + ciphertext.len());
+    sealed.push(VERSION_BYTE);
+    sealed.push(GRANULARITY_PER_FILE);
+    sealed.extend_from_slice(header.as_slice());
+    sealed.extend_from_slice(&ciphertext);
+    sealed
+}
+
+/// Unseal the at-rest envelope. Returns Err on framing mismatch or
+/// AEAD authenticity failure (wrong key, tampered ciphertext, wrong
+/// AAD, or malformed framing).
+fn unseal_file_bytes(sealed: &[u8], key: &[u8; 32], aad: &[u8; 32]) -> Result<Vec<u8>, String> {
+    if sealed.len() < TOTAL_FRAMING_LEN {
+        return Err(format!(
+            "sealed envelope too short ({} bytes < {} framing)",
+            sealed.len(),
+            TOTAL_FRAMING_LEN
+        ));
+    }
+    if sealed[0] != VERSION_BYTE {
+        return Err(format!("unexpected version_byte: {:#x}", sealed[0]));
+    }
+    if sealed[1] != GRANULARITY_PER_FILE {
+        return Err(format!("unexpected granularity_marker: {:#x}", sealed[1]));
+    }
+
+    let header_bytes = &sealed[FRAMING_PREFIX_LEN..FRAMING_PREFIX_LEN + HEADER_LEN];
+    let header: Header = header_bytes
+        .try_into()
+        .map_err(|e: dryoc::Error| format!("header recovery: {e}"))?;
+
+    let ciphertext: Vec<u8> = sealed[TOTAL_FRAMING_LEN..].to_vec();
+
+    let dryoc_key: Key = (*key).into();
+    let mut pull: DryocStream<Pull> = DryocStream::init_pull(&dryoc_key, &header);
+
+    let aad_vec = aad.to_vec();
+    let (plaintext, tag) = pull
+        .pull_to_vec(&ciphertext, Some(&aad_vec))
+        .map_err(|e| format!("dryoc pull_to_vec: {e}"))?;
+
+    if !matches!(tag, Tag::FINAL) {
+        return Err(format!("unexpected tag: {tag:?}"));
+    }
+
+    Ok(plaintext)
+}
+
+/// Shannon entropy in bits per byte. For a uniformly random byte
+/// stream, H ≈ 8.0; AEAD ciphertexts should be very close.
+fn shannon_entropy(bytes: &[u8]) -> f64 {
+    if bytes.is_empty() {
+        return 0.0;
+    }
+    let mut counts = [0usize; 256];
+    for &b in bytes {
+        counts[b as usize] += 1;
+    }
+    let len = bytes.len() as f64;
+    counts
+        .iter()
+        .filter(|&&c| c > 0)
+        .map(|&c| {
+            let p = c as f64 / len;
+            -p * p.log2()
+        })
+        .sum()
+}
+
+// ============================================================
+//   Stage A — identity wrapper compile + Lance round-trip
+// ============================================================
+
+/// Stage A: identity wrapper. Returns the original ObjectStore unmodified.
+/// Proves the `WrappingObjectStore` trait wiring compiles and Lance
+/// threads it through both write and read paths.
+#[derive(Debug)]
+struct IdentityWrapper;
+
+impl WrappingObjectStore for IdentityWrapper {
+    fn wrap(&self, original: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+        original
+    }
+}
+
+async fn run_stage_a() {
+    eprintln!("===== At-rest-extension spike: Stage A =====");
+    eprintln!();
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let uri = tmp.path().to_str().expect("temp path utf-8");
+    eprintln!("dataset URI: {uri}");
+
+    let batch = make_test_batch(100, 384);
+    let schema = batch.schema();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+    let wrapper: Arc<dyn WrappingObjectStore> = Arc::new(IdentityWrapper);
+
+    let write_params = WriteParams {
+        store_params: Some(ObjectStoreParams {
+            object_store_wrapper: Some(wrapper.clone()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    eprintln!("step 1 — writing 100 rows × 384-dim through identity wrapper...");
+    let _ds = Dataset::write(reader, uri, Some(write_params))
+        .await
+        .expect("dataset write");
+    eprintln!("        write OK");
+
+    let read_params = ReadParams {
+        store_options: Some(ObjectStoreParams {
+            object_store_wrapper: Some(wrapper),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    eprintln!("step 2 — reading back through identity wrapper...");
+    let ds = DatasetBuilder::from_uri(uri)
+        .with_read_params(read_params)
+        .load()
+        .await
+        .expect("dataset load");
+
+    let count = ds.count_rows(None).await.expect("count_rows");
+    eprintln!("        count: {count}");
+    assert_eq!(count, 100, "round-trip row count mismatch");
+
+    eprintln!();
+    eprintln!("Stage A: PASS — lance::Dataset + WrappingObjectStore compile + round-trip OK");
+}
+
+// ============================================================
+//   Stage B — sealing primitives + adversarial assertions
+// ============================================================
+
+fn run_stage_b() {
+    eprintln!();
+    eprintln!("===== At-rest-extension spike: Stage B (sealing primitives) =====");
+
+    // Fixed test inputs for deterministic spike output.
+    let master_key: [u8; 32] = *b"this is a 32-byte test mkey-vlt!";
+    let at_rest_key = derive_at_rest_key(&master_key);
+    eprintln!("derived at_rest_key (K3 = blake3::derive_key)");
+
+    let file_path = "memories.lance/data/abc12345.lance";
+    let aad = compute_aad(file_path);
+    eprintln!("computed AAD for file_path: {file_path}");
+
+    // Synthetic Parquet-shaped plaintext: 5KB starting + ending with `PAR1`
+    // magic, representative of what a small Parquet fragment looks like on
+    // disk. The middle is filled with 0xCD so any decryption-without-key
+    // would visibly fail the entropy check too.
+    let mut plaintext: Vec<u8> = Vec::with_capacity(5120);
+    plaintext.extend_from_slice(b"PAR1");
+    plaintext.extend(std::iter::repeat(0xCDu8).take(5112));
+    plaintext.extend_from_slice(b"PAR1");
+    eprintln!(
+        "plaintext: {} bytes (begins+ends with PAR1 magic)",
+        plaintext.len()
+    );
+
+    // Seal.
+    let sealed = seal_file_bytes(&plaintext, &at_rest_key, &aad);
+    eprintln!(
+        "sealed: {} bytes (overhead = {} bytes)",
+        sealed.len(),
+        sealed.len() - plaintext.len()
+    );
+
+    // Round-trip identity.
+    let unsealed = unseal_file_bytes(&sealed, &at_rest_key, &aad).expect("unseal round-trip");
+    assert_eq!(unsealed, plaintext, "round-trip identity violated");
+    eprintln!("✓ round-trip identity OK");
+
+    // Adversarial (a) — bit-flip in ciphertext body fails closed.
+    let mut tampered = sealed.clone();
+    let flip_offset = TOTAL_FRAMING_LEN + 100; // well into ciphertext body
+    tampered[flip_offset] ^= 0x01;
+    assert!(
+        unseal_file_bytes(&tampered, &at_rest_key, &aad).is_err(),
+        "(a) bit-flip MUST fail closed (AEAD authenticity check)"
+    );
+    eprintln!("✓ (a) bit-flip in ciphertext body fails closed");
+
+    // Adversarial (b) — wrong key fails closed.
+    let wrong_master: [u8; 32] = *b"WRONG MASTER KEY for the spk-vlt";
+    let wrong_at_rest_key = derive_at_rest_key(&wrong_master);
+    assert!(
+        unseal_file_bytes(&sealed, &wrong_at_rest_key, &aad).is_err(),
+        "(b) wrong-key decryption MUST fail closed"
+    );
+    eprintln!("✓ (b) wrong-key decryption fails closed");
+
+    // Adversarial (b') — wrong AAD (different file_path) fails closed.
+    // Confirms the file_path binding actually fires.
+    let wrong_aad = compute_aad("memories.lance/data/different.lance");
+    assert!(
+        unseal_file_bytes(&sealed, &at_rest_key, &wrong_aad).is_err(),
+        "wrong-AAD decryption MUST fail closed (AEAD AAD-binding check)"
+    );
+    eprintln!("✓ (b') wrong-AAD (different file_path) decryption fails closed");
+
+    // Adversarial (c.1) — no PAR1 magic anywhere in sealed envelope.
+    assert!(
+        !sealed.windows(4).any(|w| w == b"PAR1"),
+        "(c.1) sealed envelope MUST NOT contain Parquet magic"
+    );
+    eprintln!("✓ (c.1) no PAR1 magic anywhere in sealed envelope");
+
+    // Adversarial (c.2) — entropy of the ciphertext body ≥ 7.9 bits/byte.
+    // Skip the framing prefix + header (which contain deterministic /
+    // nonce bytes that aren't representative of bulk-payload entropy).
+    let body_entropy = shannon_entropy(&sealed[TOTAL_FRAMING_LEN..]);
+    eprintln!(
+        "ciphertext body entropy: {:.4} bits/byte (require ≥ 7.9)",
+        body_entropy
+    );
+    assert!(
+        body_entropy >= 7.9,
+        "(c.2) ciphertext body entropy must approach 8.0 bits/byte; got {body_entropy:.4}"
+    );
+    eprintln!("✓ (c.2) ciphertext body entropy ≥ 7.9 bits/byte");
+
+    eprintln!();
+    eprintln!("Stage B: PASS — sealing primitives work; all adversarial assertions hold");
+}
+
+// ============================================================
+//   Stage C — SealedObjectStore + Lance Dataset round-trip
+// ============================================================
+
+/// Stage C wrapper: returns a `SealedObjectStore` decorating the
+/// inner store, with sealing keyed by the at-rest key.
+struct SealingWrapper {
+    key: [u8; 32],
+}
+
+impl std::fmt::Debug for SealingWrapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealingWrapper").finish_non_exhaustive()
+    }
+}
+
+impl WrappingObjectStore for SealingWrapper {
+    fn wrap(&self, original: Arc<dyn ObjectStore>) -> Arc<dyn ObjectStore> {
+        // Spike trace — kept long-term to document the
+        // LocalObjectReader-bypass finding: this fires during BOTH
+        // write and read flows, but read flows then bypass our
+        // wrapper entirely (no get_opts/head/list traces fire).
+        eprintln!("  [trace] SealingWrapper::wrap called (inner={original})");
+        Arc::new(SealedObjectStore {
+            inner: original,
+            key: self.key,
+        })
+    }
+}
+
+/// Sealed wrapper over an inner `ObjectStore`. Intercepts `put_opts`
+/// to seal payloads + `get_opts` to unseal results. Other methods
+/// delegate to inner. AAD per-call is computed from the location
+/// path (Finding 2 candidate (c)).
+struct SealedObjectStore {
+    inner: Arc<dyn ObjectStore>,
+    key: [u8; 32],
+}
+
+impl std::fmt::Debug for SealedObjectStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealedObjectStore").finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Display for SealedObjectStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SealedObjectStore({})", self.inner)
+    }
+}
+
+impl SealedObjectStore {
+    fn aad_for_path(&self, location: &ObjectPath) -> [u8; 32] {
+        compute_aad(location.as_ref())
+    }
+}
+
+#[async_trait]
+impl ObjectStore for SealedObjectStore {
+    async fn put_opts(
+        &self,
+        location: &ObjectPath,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        eprintln!("  [trace] put_opts({}, len={})", location, payload.content_length());
+        // Aggregate all Bytes chunks from PutPayload into a single
+        // contiguous Vec<u8> for sealing. PutPayload is internally a
+        // collection of Bytes; the spike materialises everything in
+        // memory which is acceptable for the per-file granularity
+        // locked at iteration 3 §3.1.
+        let plaintext: Vec<u8> = payload
+            .iter()
+            .flat_map(|b| b.iter().copied())
+            .collect();
+        let aad = self.aad_for_path(location);
+        let sealed = seal_file_bytes(&plaintext, &self.key, &aad);
+        let sealed_payload: PutPayload = sealed.into();
+        self.inner.put_opts(location, sealed_payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        _location: &ObjectPath,
+        _opts: PutMultipartOpts,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        // Per-file sealing requires the full plaintext at seal time;
+        // streaming multipart writes don't fit that model without
+        // complex buffering. For spike scope, fail loudly — Lance
+        // will surface the limitation if it tries multipart writes
+        // for our small dataset (likely it falls back to put_opts
+        // for sub-100KB payloads).
+        Err(object_store::Error::NotSupported {
+            source: "SealedObjectStore: put_multipart not implemented in spike (per-file granularity locked at iteration 3 §3.1; multipart streaming would need block-level granularity)".into(),
+        })
+    }
+
+    async fn get_opts(
+        &self,
+        location: &ObjectPath,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        eprintln!(
+            "  [trace] get_opts({}, range={:?}, head={})",
+            location, options.range, options.head
+        );
+        // Always fetch the WHOLE sealed file — per-file granularity
+        // requires whole-file decryption. If Lance requested a byte
+        // range OR head-only, fetch full body anyway and slice/strip
+        // from the unsealed plaintext below. Spike-cost: every head
+        // becomes a full-file read; T0.2.0 Phase 1+ can store
+        // unsealed_size in a sidecar / framing extension to optimise.
+        let mut full_options = options;
+        let requested_range = full_options.range.take();
+        let was_head_only = full_options.head;
+        full_options.head = false;
+
+        let sealed_get = self.inner.get_opts(location, full_options).await?;
+        let sealed_meta = sealed_get.meta.clone();
+        let sealed_attributes = sealed_get.attributes.clone();
+        let sealed_bytes = sealed_get.bytes().await?;
+
+        let aad = self.aad_for_path(location);
+        let plaintext = unseal_file_bytes(&sealed_bytes, &self.key, &aad).map_err(|e| {
+            object_store::Error::Generic {
+                store: "SealedObjectStore",
+                source: e.into(),
+            }
+        })?;
+
+        let plaintext_len = plaintext.len();
+        let (range, body): (std::ops::Range<usize>, Vec<u8>) = match requested_range {
+            None => (0..plaintext_len, plaintext),
+            Some(object_store::GetRange::Bounded(r)) => {
+                let start = (r.start as usize).min(plaintext_len);
+                let end = (r.end as usize).min(plaintext_len);
+                let slice = plaintext[start..end].to_vec();
+                (start..end, slice)
+            }
+            Some(object_store::GetRange::Offset(o)) => {
+                let start = (o as usize).min(plaintext_len);
+                let slice = plaintext[start..].to_vec();
+                (start..plaintext_len, slice)
+            }
+            Some(object_store::GetRange::Suffix(suffix)) => {
+                let start = plaintext_len.saturating_sub(suffix as usize);
+                let slice = plaintext[start..].to_vec();
+                (start..plaintext_len, slice)
+            }
+        };
+
+        // For head-only requests, return an empty payload but the
+        // correctly-sized meta. Some object_store consumers won't
+        // touch the body on a HEAD; spike returns empty rather than
+        // re-streaming the unsealed body to avoid surprise consumers.
+        let body_bytes = if was_head_only {
+            BytesBuf::new()
+        } else {
+            BytesBuf::from(body)
+        };
+        let payload_stream: BoxStream<'static, object_store::Result<BytesBuf>> =
+            stream::once(async move { Ok(body_bytes) }).boxed();
+
+        let unsealed_meta = ObjectMeta {
+            location: sealed_meta.location,
+            last_modified: sealed_meta.last_modified,
+            size: plaintext_len,
+            e_tag: sealed_meta.e_tag,
+            version: sealed_meta.version,
+        };
+
+        Ok(GetResult {
+            payload: GetResultPayload::Stream(payload_stream),
+            meta: unsealed_meta,
+            range,
+            attributes: sealed_attributes,
+        })
+    }
+
+    async fn head(&self, location: &ObjectPath) -> object_store::Result<ObjectMeta> {
+        // Subtract the constant per-file sealing overhead so Lance
+        // sees the unsealed Parquet/Lance file size — matches
+        // get_opts's unsealed_meta.size convention.
+        let mut meta = self.inner.head(location).await?;
+        let inner_size = meta.size;
+        meta.size = meta.size.saturating_sub(SEAL_OVERHEAD);
+        eprintln!(
+            "  [trace] head({}) sealed={} unsealed={}",
+            location, inner_size, meta.size
+        );
+        Ok(meta)
+    }
+
+    async fn delete(&self, location: &ObjectPath) -> object_store::Result<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&ObjectPath>,
+    ) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
+        eprintln!("  [trace] list(prefix={:?})", prefix);
+        // Translate sealed sizes back to unsealed sizes inline so
+        // Lance-internal consumers that read meta.size from list
+        // results see the same view as head() / get_opts().
+        self.inner
+            .list(prefix)
+            .map(|res| {
+                res.map(|mut meta| {
+                    meta.size = meta.size.saturating_sub(SEAL_OVERHEAD);
+                    meta
+                })
+            })
+            .boxed()
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&ObjectPath>,
+    ) -> object_store::Result<ListResult> {
+        let mut result = self.inner.list_with_delimiter(prefix).await?;
+        for meta in &mut result.objects {
+            meta.size = meta.size.saturating_sub(SEAL_OVERHEAD);
+        }
+        Ok(result)
+    }
+
+    async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> object_store::Result<()> {
+        // AAD-binding caveat: a sealed file at `from` has AAD bound
+        // to from's path; a raw byte-copy to `to` produces a sealed
+        // blob whose AAD doesn't match its new location, and reads
+        // from `to` will fail closed. Spike scope doesn't exercise
+        // this path; T0.2.0 Phase 1+ will need unseal-reseal copy.
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(
+        &self,
+        from: &ObjectPath,
+        to: &ObjectPath,
+    ) -> object_store::Result<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+async fn run_stage_c() {
+    eprintln!();
+    eprintln!("===== At-rest-extension spike: Stage C (SealedObjectStore + Lance) =====");
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let uri = tmp.path().to_str().expect("temp path utf-8");
+    eprintln!("dataset URI: {uri}");
+
+    let master_key: [u8; 32] = *b"this is a 32-byte test mkey-vlt!";
+    let at_rest_key = derive_at_rest_key(&master_key);
+
+    let wrapper: Arc<dyn WrappingObjectStore> = Arc::new(SealingWrapper { key: at_rest_key });
+
+    let batch = make_test_batch(100, 384);
+    let schema = batch.schema();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+    let write_params = WriteParams {
+        store_params: Some(ObjectStoreParams {
+            object_store_wrapper: Some(wrapper.clone()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    eprintln!("step 1 — writing 100 rows × 384-dim through SealedObjectStore...");
+    let _ds = Dataset::write(reader, uri, Some(write_params))
+        .await
+        .expect("dataset write through sealed store");
+    eprintln!("        write OK");
+
+    // Assertion (c.1) on actual on-disk bytes — find any .lance fragment
+    // file under the dataset URI and confirm no PAR1 magic + entropy
+    // ≥ 7.9 bits/byte.
+    let fragments = find_all_fragments(tmp.path());
+    assert!(
+        !fragments.is_empty(),
+        "expected at least one .lance fragment file under {}",
+        tmp.path().display()
+    );
+    let fragment = &fragments[0];
+    let on_disk = std::fs::read(fragment).expect("read fragment");
+    eprintln!(
+        "step 2 — inspecting sealed fragment on disk: {} ({} bytes)",
+        fragment.display(),
+        on_disk.len()
+    );
+
+    // Verify framing prefix is the locked sealing shape.
+    assert_eq!(
+        on_disk[0], VERSION_BYTE,
+        "sealed file must start with locked version_byte 0x01"
+    );
+    assert_eq!(
+        on_disk[1], GRANULARITY_PER_FILE,
+        "sealed file must have granularity_marker 0x00 (per-file)"
+    );
+    eprintln!("✓ framing prefix matches locked sealing shape");
+
+    assert!(
+        !on_disk.windows(4).any(|w| w == b"PAR1"),
+        "sealed Parquet fragment on disk MUST NOT contain PAR1 magic"
+    );
+    eprintln!("✓ no PAR1 magic in sealed fragment on disk");
+
+    let body_entropy = shannon_entropy(&on_disk[TOTAL_FRAMING_LEN..]);
+    eprintln!(
+        "        ciphertext body entropy: {:.4} bits/byte (require ≥ 7.9)",
+        body_entropy
+    );
+    assert!(
+        body_entropy >= 7.9,
+        "sealed ciphertext body entropy must approach 8.0; got {body_entropy:.4}"
+    );
+    eprintln!("✓ ciphertext body entropy ≥ 7.9 bits/byte");
+
+    // Reopen via DatasetBuilder with the same wrapper installed and
+    // verify the round-trip: count_rows must return 100.
+    let read_params = ReadParams {
+        store_options: Some(ObjectStoreParams {
+            object_store_wrapper: Some(wrapper.clone()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    eprintln!();
+    eprintln!("Stage C: PARTIAL PASS — write path through SealedObjectStore + on-disk evidence OK.");
+    eprintln!("                        Read path BLOCKED: lance-io 0.15's LocalObjectReader bypasses");
+    eprintln!("                        object_store::ObjectStore for local-fs paths. Escalation");
+    eprintln!("                        trigger fired per iteration-3 plan §2 ('integration ergonomic");
+    eprintln!("                        blocks'). T0.2.0 plan paragraph iteration 1 selects from");
+    eprintln!("                        Path W'/X'/Y'/Z' before re-spike.");
+}
+
+// ============================================================
+//   Stage D — Path W' direct ObjectStore injection
+// ============================================================
+//
+// Stage C surfaced that lance-io 0.15's LocalObjectReader bypasses
+// the WrappingObjectStore for `file://` paths. Stage D tests Path W':
+// inject the SealedObjectStore DIRECTLY via ObjectStoreParams.object_store
+// rather than via the wrapper field. If lance routes reads through the
+// directly-injected store regardless of LocalObjectReader's fast-path,
+// full PASS is achievable in this Leg 2.
+
+async fn run_stage_d() {
+    eprintln!();
+    eprintln!("===== At-rest-extension spike: Stage D (Path W' — direct ObjectStore injection) =====");
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let uri = tmp.path().to_str().expect("temp path utf-8");
+    eprintln!("dataset URI: {uri}");
+
+    let master_key: [u8; 32] = *b"this is a 32-byte test mkey-vlt!";
+    let at_rest_key = derive_at_rest_key(&master_key);
+
+    // Construct SealedObjectStore directly wrapping a fresh LocalFileSystem.
+    let local_fs: Arc<dyn ObjectStore> = Arc::new(object_store::local::LocalFileSystem::new());
+    let sealed: Arc<dyn ObjectStore> = Arc::new(SealedObjectStore {
+        inner: local_fs,
+        key: at_rest_key,
+    });
+
+    // URL for the injected store. Use file:// scheme matching the temp dir.
+    // Path W' tests whether direct injection forces lance through ObjectStore
+    // even on file:// (vs LocalObjectReader fast-path bypass).
+    let url_str = format!("file:///{}", uri.replace('\\', "/"));
+    let url = url::Url::parse(&url_str).expect("url parse");
+    eprintln!("injected URL: {url}");
+
+    let batch = make_test_batch(100, 384);
+    let schema = batch.schema();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+    // Required when a custom object_store is injected: lance demands an
+    // explicit CommitHandler. RenameCommitHandler is the local-fs
+    // standard ("write to .tmp_X then atomic-rename to X").
+    let commit_handler: Arc<dyn lance_table::io::commit::CommitHandler> =
+        Arc::new(lance_table::io::commit::RenameCommitHandler);
+
+    let write_params = WriteParams {
+        store_params: Some(ObjectStoreParams {
+            object_store: Some((sealed.clone(), url.clone())),
+            ..Default::default()
+        }),
+        commit_handler: Some(commit_handler.clone()),
+        ..Default::default()
+    };
+
+    eprintln!("step 1 — writing through directly-injected SealedObjectStore...");
+    let _ds = Dataset::write(reader, uri, Some(write_params))
+        .await
+        .expect("Stage D dataset write");
+    eprintln!("        write OK");
+
+    let read_params = ReadParams {
+        store_options: Some(ObjectStoreParams {
+            object_store: Some((sealed.clone(), url)),
+            ..Default::default()
+        }),
+        commit_handler: Some(commit_handler),
+        ..Default::default()
+    };
+
+    eprintln!("step 2 — reading back through directly-injected SealedObjectStore...");
+    let load_result = DatasetBuilder::from_uri(uri)
+        .with_read_params(read_params)
+        .load()
+        .await;
+
+    let ds = load_result.expect("Stage D load (note: success here is misleading)");
+    let count = ds.count_rows(None).await.expect("Stage D count_rows");
+    eprintln!("        count: {count}");
+
+    // CRITICAL: even though count succeeds, we must verify that our
+    // SealedObjectStore was actually engaged. If no traces fired
+    // during write/read, lance bypassed our store entirely and the
+    // round-trip is over plaintext — vacuously "successful" and
+    // misleading.
+    eprintln!();
+    eprintln!("step 3 — verifying SealedObjectStore was actually engaged...");
+
+    let fragments = find_all_fragments(tmp.path());
+    assert!(!fragments.is_empty(), "Stage D: expected fragment files");
+    let on_disk = std::fs::read(&fragments[0]).expect("read fragment");
+    let first_byte = on_disk[0];
+    eprintln!(
+        "        on-disk fragment first byte: {:#04x} (expected {:#04x} = VERSION_BYTE)",
+        first_byte, VERSION_BYTE
+    );
+
+    if first_byte == VERSION_BYTE && on_disk[1] == GRANULARITY_PER_FILE {
+        eprintln!("✓ on-disk fragment IS sealed (framing prefix present)");
+        eprintln!();
+        eprintln!("Stage D: PASS — Path W' (direct ObjectStore injection) achieves full at-rest");
+        eprintln!("                round-trip through Lance, with on-disk AEAD sealing intact.");
+    } else {
+        eprintln!("✗ on-disk fragment IS NOT sealed — first byte {:#04x} != VERSION_BYTE {:#04x}", first_byte, VERSION_BYTE);
+        eprintln!("  This means lance bypassed SealedObjectStore for both write AND read in Stage D.");
+        eprintln!("  The 'count: 100' success is over PLAINTEXT, not sealed bytes — meaningless.");
+        eprintln!("  Confirmed by absence of put_opts/get_opts/head/list traces during Stage D.");
+        eprintln!();
+        eprintln!("Stage D: FAIL — Path W' (direct ObjectStore injection via");
+        eprintln!("                ObjectStoreParams.object_store) is ALSO bypassed by lance-io");
+        eprintln!("                0.15's LocalObjectReader/LocalObjectWriter for file:// URIs.");
+        eprintln!();
+        eprintln!("=== SPIKE FORMALLY FAILS ===");
+        eprintln!("Both attempted integration approaches (WrappingObjectStore + direct injection)");
+        eprintln!("are bypassed by lance-io's local-fs fast-paths. Per iteration-3 §6 PASS criteria,");
+        eprintln!("this is FAIL — full at-rest round-trip through Lance not achieved on local fs.");
+        eprintln!();
+        eprintln!("Escalation: T0.2.0 plan paragraph iteration 1 must pick from:");
+        eprintln!("  - Path X' (vendor / [patch] lance-io to honour custom ObjectStore)");
+        eprintln!("  - Path Y' (whole-data-dir sealing OUTSIDE Lance, tmpfs/memfs at runtime)");
+        eprintln!("  - Path Z' (drop LanceDB for V0.2; SQLCipher BLOB vectors + brute-force cosine)");
+        eprintln!("  - Path W'' (untested in this spike: non-file:// URI scheme to force");
+        eprintln!("              CloudObjectReader path through ObjectStore — needs separate spike)");
+        std::process::exit(2);
+    }
+}
+
+/// Walk `data_dir/*.lance/data/*.lance` and return every fragment file.
+/// Mirrors the helper in vector_store.rs's corruption test.
+fn find_all_fragments(data_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    fn walk(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, found);
+            } else if path.extension().and_then(|s| s.to_str()) == Some("lance")
+                && path
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n == "data")
+                    .unwrap_or(false)
+            {
+                found.push(path);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(data_dir, &mut found);
+    found
+}
+
+// ============================================================
+//   Helpers
+// ============================================================
+
+fn make_test_batch(rows: usize, dim: usize) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new(
+            "embedding",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dim as i32,
+            ),
+            false,
+        ),
+    ]));
+
+    let ids: Vec<String> = (0..rows).map(|i| format!("id-{i:04}")).collect();
+    let id_array = Arc::new(StringArray::from(ids));
+
+    let values: Vec<f32> = (0..rows * dim).map(|i| ((i as f32) * 0.001).fract()).collect();
+    let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+    let embedding_array = Arc::new(FixedSizeListArray::new(
+        item_field,
+        dim as i32,
+        Arc::new(Float32Array::from(values)),
+        None,
+    ));
+
+    RecordBatch::try_new(schema, vec![id_array, embedding_array]).expect("record batch")
+}
+
+#[tokio::main]
+async fn main() {
+    run_stage_a().await;
+    run_stage_b();
+    run_stage_c().await;
+    run_stage_d().await;
+}

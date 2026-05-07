@@ -1,0 +1,147 @@
+# Cargo configuration for Memory Vault.
+#
+# Scope: applies to every `cargo {build,test,run,clippy,...}` invocation
+# from anywhere inside the workspace. The `[env]` block below sets
+# environment variables in every cargo-spawned child process — including
+# rustc, build scripts, and the `cargo test` test runner.
+#
+# Reference: https://doc.rust-lang.org/cargo/reference/config.html#env
+
+[build]
+# jobs = 4 caps cargo's intra-build parallelism at 4 concurrent rustc /
+# linker processes. Default is `num_cpus()` which on Shahbaz's 16-logical-
+# core dev box defaults to 16 — empirically too high for the lance 4.0
+# dep tree's link-time peak memory.
+#
+# Why this exists: T0.2.0 Phase 0a bumped lancedb 0.8 → 0.27.2, pulling
+# in lance 4.0 + datafusion 52 + arrow 57 + transitive crates (lance-io,
+# lance-table, lance-datafusion, lance-file, lance-encoding, lance-index,
+# lance-namespace, datafusion-{datasource,catalog,optimizer,...}, etc.).
+# Peak per-rustc link-time memory roughly tripled vs the lancedb 0.8 era
+# (vault-tauri's link step alone hits ~3-4 GB on lance 4.0). At 16 parallel
+# link jobs × ~3 GB peak each = ~48 GB peak demand, which exhausts a 16 GB
+# RAM + 12.8 GB pagefile = 28 GB virtual memory budget. The failure modes
+# observed during Phase 0a-fix iteration:
+#
+#   (a) At default jobs = 16: memory allocation aborts during compile —
+#       `memory allocation of 17301520 bytes failed` +
+#       `error[E0786]: failed to mmap 'libtokio-...rlib': The paging file
+#        is too small for this operation to complete. (os error 1455)`
+#       (Windows ERROR_COMMITMENT_LIMIT — committed virtual memory
+#       exhausted during a different rustc's mmap of a freshly-emitted
+#       rlib while the linker is hogging RAM.)
+#
+#   (b) At jobs = 8 (first cap attempt): compile succeeds, linker fails
+#       on vault-tauri's binary (Tauri + WebView2 + vault-app + entire
+#       transitive graph) with `error: linking with link.exe failed:
+#       LNK1102: out of memory`. Cascades into E0463 / E0282 follow-on
+#       errors in dependent crates that can't resolve types from the
+#       failed-to-link rlibs.
+#
+#   (c) At jobs = 4 (current setting): both compile and link fit in
+#       virtual memory budget with ~12 GB headroom for the OS + editor
+#       + browser. Build wall-clock is ~50% slower than 16-job
+#       over-subscription would have been in optimal RAM conditions
+#       — the trade-off chosen for build-correctness.
+#
+# CI is unaffected: GitHub Actions Linux + Windows runners have 4 logical
+# CPUs each (as of 2026-05); jobs = 4 is the default there, so this is
+# a no-op ceiling on CI.
+#
+# Future revisits: drop this entirely if (a) we shrink the lance dep tree
+# (LanceDB 0.30+ is exploring this per upstream chatter), (b) Shahbaz
+# upgrades to a higher-RAM dev box, (c) we switch from MSVC link.exe to
+# the lower-memory `lld` linker via `[target.x86_64-pc-windows-msvc]
+# linker = "lld"`, or (d) cargo gains a memory-aware scheduler. Until
+# then this stays. See ADR-038 Layer 3 for the full Phase 0a-fix
+# narrative including both jobs = 8 and jobs = 4 iteration data points.
+jobs = 4
+
+[env]
+
+# LANCE_MEM_POOL_SIZE — bound the memory pool that lance/datafusion uses
+# for `merge_insert` (and any other datafusion-routed lance operation) to
+# 256 MiB (268435456 bytes).
+#
+# Why this exists: lancedb 0.27.2 (lance 4.0-rc.3) routes `merge_insert`
+# through datafusion's full JOIN planner — `HashJoinExec` + `ExternalSorter`
+# + `RepartitionExec`. Each call independently spawns a physical plan with
+# `target_partitions = get_num_compute_intensive_cpus().min(8)` and, by
+# default, NO RAM ceiling. Under the V0.1→V0.2 lancedb 0.8→0.27.2 dep-bump
+# (Phase 0a, 2026-05-07), the `concurrent_upserts_all_succeed` test
+# allocated 8 GB and aborted the process with STATUS_STACK_BUFFER_OVERRUN
+# on Windows. lancedb 0.8 had implicit per-table serialisation that
+# masked the unbounded allocation; lance 4.0's V2 path does not.
+#
+# Defense-in-depth pairing:
+#   1. (Rust-side) `LanceVectorStore::upsert_lock` — mutex serialises
+#      concurrent calls within a single store, bounding to one plan at a
+#      time. See ADR-038 + struct-field doc in
+#      `crates/vault-storage/src/vector_store.rs`.
+#   2. (Shell-side, this entry) — caps the per-process datafusion memory
+#      pool so even if a future caller bypasses the mutex, datafusion
+#      spills to disk under pressure instead of OOM-aborting the process.
+#
+# Why we cannot set this from Rust: ADR-002 mandates
+# `#![forbid(unsafe_code)]` workspace-wide; rustc 1.80+ marked
+# `std::env::set_var` as `unsafe`. The shell-level launcher layer is
+# the correct semantic home for env-var configuration that must precede
+# all in-process threads (lance reads this var lazily on first
+# datafusion-plan construction).
+#
+# `force = true` makes this config-set value WIN over any pre-existing
+# shell `LANCE_MEM_POOL_SIZE` — a developer accidentally exporting an
+# absurdly high value cannot override the ceiling. To deliberately
+# override (e.g. for a benchmark spike), edit this file or use a
+# separate `--config 'env.LANCE_MEM_POOL_SIZE.value="..."'` flag.
+#
+# Upstream tracking:
+#   - https://github.com/lance-format/lance/issues/1983
+#     (configurable RAM limit — foundational ticket from westonpace)
+#   - https://github.com/lance-format/lance/issues/3601
+#     (spill configuration too small with many cores)
+#   - https://github.com/lance-format/lance/issues/6151
+#     ("Migrate away from Merge" — the deeper structural fix)
+#
+# Sibling landing sites (must stay in sync — see ADR-038):
+#   - `.github/workflows/ci.yml` `env:` block (CI matrix enforcement)
+#   - `crates/vault-tauri/src/main.rs` doc comment (launcher requirement)
+#   - V0.2 alpha-distribution platform launchers (T0.2.14): WiX MSI
+#     pre-args, macOS .app Info.plist `LSEnvironment`, Linux .desktop
+#     `Exec` wrapper.
+LANCE_MEM_POOL_SIZE = { value = "268435456", force = true }
+
+# RUST_TEST_THREADS — cap libtest's intra-test parallelism at 4 (matching
+# the [build] jobs cap above for the same reason: lance 4.0's heavier
+# per-test memory footprint).
+#
+# Why this exists: libtest defaults `RUST_TEST_THREADS` to `num_cpus()`
+# (16 on Shahbaz's dev box). `cargo test --workspace` then runs up to 16
+# `#[test]` functions concurrently inside each test binary, each of which
+# may open its own `LanceVectorStore` (TempDir + lancedb connection +
+# datafusion session). Per-test peak memory under lance 4.0 is roughly
+# 700 MB-1 GB; 16 parallel tests × ~1 GB = ~16 GB peak, which collides
+# with the same 28 GB virtual-memory budget that bit the build phase.
+# Empirical signature: stderr output interleaves "memory allocation of
+# 17179869184 bytes failed" lines from MULTIPLE concurrent test crashes
+# at once — distinct from the single-test OOM that the ADR-038 Layer 1
+# mutex resolved.
+#
+# Layer 1 (mutex) bounds INTRA-test concurrency: 20 spawned tokio tasks
+# inside `concurrent_upserts_all_succeed` serialise to one merge_insert
+# at a time. But the mutex is per-store; INTER-test parallelism (16
+# different tests, each with its own store) is uncoordinated.
+# RUST_TEST_THREADS = 4 caps that.
+#
+# CI is unaffected: GitHub Actions runners have 4 logical CPUs each, so
+# `RUST_TEST_THREADS = 4` matches the natural ceiling there. No-op on CI.
+#
+# `force = true`: same rationale as LANCE_MEM_POOL_SIZE — a developer
+# accidentally exporting `RUST_TEST_THREADS=16` in their shell cannot
+# silently override the cap. Deliberate override via
+# `cargo test --test-threads=N` still works (CLI arg wins over env var
+# in libtest's resolution order).
+#
+# See ADR-038 Layer 3 (build-time jobs cap) for the sibling build-time
+# constraint that this entry mirrors at test-runtime.
+RUST_TEST_THREADS = { value = "4", force = true }

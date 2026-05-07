@@ -11,6 +11,15 @@ env:
   RUST_BACKTRACE: 1
   # Definition of Done (BRD §0.1) requires zero warnings everywhere.
   RUSTFLAGS: "-D warnings"
+  # ADR-038: bound lance/datafusion memory pool to 256 MiB so concurrent
+  # merge_insert calls don't trigger 8 GB allocation aborts on the runner
+  # (Phase 0a regression, 2026-05-07). Mirrors `.cargo/config.toml` `[env]`
+  # but set here too because (a) ci.yml env survives even if .cargo/config
+  # is ignored by future workflows that don't run via cargo, and (b) makes
+  # the CI enforcement explicit at the workflow level for auditability.
+  # See `crates/vault-storage/src/vector_store.rs` upsert_lock doc and
+  # upstream lance-format/lance#1983 + #3601.
+  LANCE_MEM_POOL_SIZE: "268435456"
 
 jobs:
   fmt:

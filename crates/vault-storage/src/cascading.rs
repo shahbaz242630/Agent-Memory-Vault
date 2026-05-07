@@ -730,12 +730,27 @@ mod tests {
         // Drop the backend (releases the LanceDB connection's file locks).
 
         // Find a Lance fragment file under the vector_dir and clobber its
-        // first 64 bytes with 0xAB. Mirrors the spike's corruption shape.
+        // last 64 bytes with 0xAB. Mirrors the spike's corruption shape.
+        //
+        // Why the FOOTER, not the header: lance v1 (0.8 era) used a
+        // header-based file format — the magic + version bytes were at
+        // offset 0, so corrupting the first 64 bytes tripped magic-check
+        // fast-fail. Lance v2 (4.0+) moved to a footer-based format —
+        // the magic ("LANC") + length-prefixed metadata live at the END
+        // of the file. Phase 0a-fix (2026-05-07) discovered that
+        // header-corruption on a lance v2 file does NOT fail fast: the
+        // first 64 bytes are interpreted as data, and a corrupted size
+        // field downstream triggers a 32 GB allocation attempt that
+        // OOM-aborts the test process. Footer-corruption fails
+        // lance's magic-check immediately, no allocation. Same intent
+        // (file is unreadable), different offset for the format change.
+        // ADR-018's `validate_readable` path still surfaces the
+        // corruption regardless.
         let lance_path = find_first_lance_fragment(&vector_dir)
             .expect("expected at least one .lance fragment under the vector data dir");
         {
             let mut f = OpenOptions::new().write(true).open(&lance_path).unwrap();
-            f.seek(SeekFrom::Start(0)).unwrap();
+            f.seek(SeekFrom::End(-64)).unwrap();
             f.write_all(&[0xAB; 64]).unwrap();
             f.sync_all().unwrap();
         }

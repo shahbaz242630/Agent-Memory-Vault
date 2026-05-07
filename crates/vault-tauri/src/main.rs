@@ -36,6 +36,22 @@
 //!   call with `Application::start()` (worker-only, no MCP transport
 //!   bind). AI-client MCP integration deferred to V0.2 alpha-distribution
 //!   subcommand-split task. T0.1.12 founder dogfood is UI-only for V0.1.
+//! - **ADR-038 (T0.2.0 Phase 0a fix-forward, 2026-05-07):** the binary's
+//!   process environment MUST have `LANCE_MEM_POOL_SIZE=268435456` (256
+//!   MiB) set BEFORE this binary launches, so lance/datafusion's
+//!   `merge_insert` JOIN path is bounded. This cannot be set inside Rust
+//!   code — ADR-002 forbids `unsafe_code` workspace-wide, and rustc 1.80+
+//!   marks `std::env::set_var` as `unsafe`. The shell-level launcher is
+//!   the correct semantic home: lance reads the var lazily on first
+//!   datafusion-plan construction, so it must already be in the
+//!   environment when the binary starts. Dev runs via `cargo` pick this
+//!   up from `.cargo/config.toml`'s `[env]` block; CI runs pick it up
+//!   from `.github/workflows/ci.yml`'s top-level `env:` block; V0.2
+//!   alpha-distribution launchers (T0.2.14) MUST set it via WiX MSI
+//!   pre-args (Windows), Info.plist `LSEnvironment` (macOS .app), or a
+//!   `.desktop` `Exec` wrapper (Linux). See ADR-038 in HANDOFF.md and
+//!   the struct-field doc on
+//!   `vault_storage::vector_store::LanceVectorStore::upsert_lock`.
 //! - **Phase 4a HIGH findings cleared at Phase 4b:** line 170
 //!   `Boundary::default_name()` swap; line 191 `tauri::Builder::run`
 //!   match + `eprintln!` + `std::process::exit`; lines 122-131

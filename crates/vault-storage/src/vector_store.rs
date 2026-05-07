@@ -56,6 +56,7 @@ use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::table::Table;
 use lancedb::DistanceType;
+use tokio::sync::Mutex;
 use tracing::{info, instrument, warn};
 
 use vault_core::{Boundary, MemoryId, VaultError, VaultResult};
@@ -189,6 +190,22 @@ pub trait VectorStore: Send + Sync {
 pub struct LanceVectorStore {
     table: Table,
     dimension: usize,
+    /// Serialises concurrent [`VectorStore::upsert`] calls to bound the
+    /// peak memory of lancedb 0.27's `merge_insert` path. lance 4.0 routes
+    /// `merge_insert` through datafusion's full JOIN planner
+    /// (`HashJoinExec` + `ExternalSorter` + `RepartitionExec`); each
+    /// concurrent call independently spawns its own physical plan with
+    /// `target_partitions = get_num_compute_intensive_cpus().min(8)` and
+    /// no RAM ceiling — 20 concurrent calls allocated 8 GB and aborted
+    /// the process on Windows in the V0.1→V0.2 lancedb 0.8→0.27.2
+    /// dep-bump (Phase 0a). See ADR-038, plus upstream:
+    /// lance-format/lance#1983 (configurable RAM limit) and
+    /// lance-format/lance#3601 (spill config too small with many cores).
+    /// Defense-in-depth pairs with the `LANCE_MEM_POOL_SIZE=268435456`
+    /// shell-level ceiling enforced at every process-launch site
+    /// (`.cargo/config.toml`, CI workflow, V0.2 alpha-distribution
+    /// launchers).
+    upsert_lock: Arc<Mutex<()>>,
 }
 
 impl LanceVectorStore {
@@ -257,7 +274,11 @@ impl LanceVectorStore {
         // reference to keep the connection alive for the store's lifetime.
         let _ = connection;
 
-        Ok(Self { table, dimension })
+        Ok(Self {
+            table,
+            dimension,
+            upsert_lock: Arc::new(Mutex::new(())),
+        })
     }
 }
 
@@ -276,6 +297,12 @@ impl VectorStore for LanceVectorStore {
                 actual: embedding.len(),
             });
         }
+
+        // ADR-038: bound peak memory by serialising concurrent merge_insert
+        // calls. Held across the merge_insert await so only one lance
+        // datafusion plan runs at a time per store. See struct-field doc
+        // for the full rationale + upstream cross-links.
+        let _guard = self.upsert_lock.lock().await;
 
         let schema = Arc::new(make_schema(self.dimension));
         let batch = build_record_batch(schema.clone(), id, embedding, boundary)?;
@@ -677,6 +704,37 @@ mod tests {
     }
 
     // ============================================================
+    //   ADR-038 Layer 2 — env-var ceiling reaches the test runner
+    // ============================================================
+
+    /// Pins the `.cargo/config.toml` `[env]` block (per ADR-038 layer 2):
+    /// `LANCE_MEM_POOL_SIZE` MUST be set to `268435456` (256 MiB) in every
+    /// `cargo test` process. If the `[env]` block is ever accidentally
+    /// removed, modified, or the `force = true` clause is dropped (so a
+    /// shell override silently wins), this test fails loudly.
+    ///
+    /// Companion enforcement: CI's `.github/workflows/ci.yml` `env:` block
+    /// sets the same value at the workflow level — this test asserts it
+    /// reaches Rust on both dev (via cargo config) and CI (via workflow
+    /// env). Failure mode caught: refactor that drops the cargo config
+    /// `[env]` entry would let dev runs hit the lance#1983 unbounded-RAM
+    /// path while CI passes (CI has its own env: block) — masking the
+    /// regression locally.
+    #[test]
+    fn lance_mem_pool_size_env_var_ceiling_reaches_test_process() {
+        let actual = std::env::var("LANCE_MEM_POOL_SIZE").expect(
+            "LANCE_MEM_POOL_SIZE missing from test process env — \
+             check `.cargo/config.toml` `[env]` block (ADR-038 layer 2)",
+        );
+        assert_eq!(
+            actual, "268435456",
+            "LANCE_MEM_POOL_SIZE expected 268435456 (256 MiB) per ADR-038 \
+             but found {actual:?} — check `.cargo/config.toml` `[env]` \
+             block; `force = true` should be set so config wins over shell"
+        );
+    }
+
+    // ============================================================
     //   Phase 2 — open() semantics + ADR-010 compensating controls
     // ============================================================
 
@@ -1047,6 +1105,24 @@ mod tests {
         );
     }
 
+    /// 20 concurrent upserts must all be visible to a subsequent search.
+    /// Pins the ADR-038 Layer 1 mutex contract — without serialisation,
+    /// this test would either OOM (pre-fix lancedb 0.27 with no RAM
+    /// ceiling) or surface fragment-flush races.
+    ///
+    /// **Why we use embeddings starting from 1.0, not 0.0** (Phase 0a-fix
+    /// finding, 2026-05-07): lance 4.0 introduced a Cosine-search NaN
+    /// regression where zero-magnitude vectors are excluded from results
+    /// (cosine of `[0,0,0,0]` against any other vector is `0/(0*||v||)`
+    /// = NaN, and lance 4.0's plan filters NaN rows out — lancedb 0.8 did
+    /// not). Three sibling diagnostic tests during Phase 0a-fix confirmed
+    /// the bug is metric-specific: same data + zero query + L2 distance
+    /// passes; same data + zero query + Cosine fails. Production is
+    /// unaffected (BGE-small-en-v1.5 produces L2-normalised non-zero
+    /// embeddings); this is a test-only adjustment. Filed as upstream
+    /// tech-debt — see HANDOFF.md "Phase 0a-fix Cosine NaN-vector
+    /// upstream issue" entry. See ADR-038 Layer 4 sub-section for full
+    /// finding narrative.
     #[tokio::test]
     async fn concurrent_upserts_all_succeed() {
         let tmp = TempDir::new().unwrap();
@@ -1059,8 +1135,10 @@ mod tests {
             let work = work.clone();
             handles.push(tokio::spawn(async move {
                 let id = MemoryId(uuid::Uuid::now_v7());
+                // Non-zero embeddings (1.0..=20.0) avoid the lance 4.0
+                // Cosine-NaN regression on zero-magnitude vectors.
                 store
-                    .upsert(&id, &embedding(4, i as f32), &work)
+                    .upsert(&id, &embedding(4, (i + 1) as f32), &work)
                     .await
                     .unwrap();
                 id
@@ -1073,9 +1151,10 @@ mod tests {
 
         assert_eq!(ids.len(), 20);
         assert_eq!(store.count(None).await.unwrap(), 20);
-        // Every id must be searchable under "work".
+        // Every id must be searchable under "work". Non-zero query for
+        // the same lance 4.0 Cosine-NaN reason as the inserts above.
         let hits = store
-            .search(&embedding(4, 0.0), 100, std::slice::from_ref(&work))
+            .search(&embedding(4, 1.0), 100, std::slice::from_ref(&work))
             .await
             .unwrap();
         let hit_ids: std::collections::HashSet<MemoryId> =
@@ -1254,8 +1333,19 @@ mod tests {
             }
         }
 
-        // Corrupt every fragment file's header — destroys the row-decode
-        // path while leaving the manifest intact (per spike findings).
+        // Corrupt every fragment file's FOOTER (last 64 bytes) — see
+        // matching corruption shape in
+        // `cascading::tests::open_on_corrupted_lance_fragments_returns_lance_unreadable`
+        // for the lance v1 (header) → v2 (footer) format change rationale.
+        // Lance v2 (4.0) holds magic + manifest at the END of the file;
+        // header-corruption no longer fail-fasts and triggers a 32 GB
+        // OOM allocation downstream. Footer-corruption destroys both
+        // manifest AND row-decode paths, so `validate_readable` MUST
+        // surface an Err either way (the original test's intent was
+        // "decode-path corruption surfaces"; lance v2's footer-based
+        // layout means manifest-and-decode share the same magic check,
+        // so corrupting the footer is the only reliable way to signal
+        // an unreadable fragment without OOM-aborting first).
         let fragments = find_all_fragments(&data_dir);
         assert!(
             !fragments.is_empty(),
@@ -1263,8 +1353,10 @@ mod tests {
         );
         for fragment in &fragments {
             let mut bytes = std::fs::read(fragment).unwrap();
-            let n = 64.min(bytes.len());
-            for byte in bytes.iter_mut().take(n) {
+            let len = bytes.len();
+            let n = 64.min(len);
+            let start = len.saturating_sub(n);
+            for byte in bytes.iter_mut().skip(start).take(n) {
                 *byte = 0xAB;
             }
             std::fs::write(fragment, &bytes).unwrap();
