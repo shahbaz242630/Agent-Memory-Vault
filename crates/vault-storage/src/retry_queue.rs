@@ -254,7 +254,23 @@ pub fn is_permanent(err: &VaultError) -> bool {
     match err {
         VaultError::DimensionMismatch { .. } => true,
         VaultError::AccessDenied(_) => true,
-        VaultError::Storage(msg) if msg.contains("schema") => true,
+        // Substring patterns recognised as permanent-class lance errors.
+        // Each variant was observed in the wild on lancedb 0.27.2 / lance
+        // 4.0 issues for related schema-shape faults — the audit (Phase 0b,
+        // 2026-05-07) found "schema mismatch", "CastError", "dimension"
+        // mismatches, and "No vector column found to match" all coexist
+        // for the same fault class. Without all four, a permanent fault
+        // would retry 8 times before dead-lettering instead of going
+        // straight there. Substring matching is a workaround until the
+        // structured-variant refactor (HANDOFF tech-debt T0.2.x) lands.
+        VaultError::Storage(msg)
+            if msg.contains("schema")
+                || msg.contains("CastError")
+                || msg.contains("dimension")
+                || msg.contains("No vector column found") =>
+        {
+            true
+        }
         _ => false,
     }
 }
@@ -818,6 +834,44 @@ mod tests {
             "caller passed bad data — but the contract is grey enough that we retry".into()
         )));
         assert!(!is_permanent(&VaultError::NotFound("memory".into())));
+    }
+
+    /// Phase 0b audit (2026-05-07): classifier must recognise the lance
+    /// 4.0 error-wording variants the audit identified, not just the
+    /// literal "schema" substring. Lance 4.0 emits "CastError",
+    /// "dimension mismatch", and "No vector column found to match"
+    /// for related permanent-class faults — without these, the
+    /// classifier would retry 8 times before dead-lettering.
+    #[test]
+    fn is_permanent_recognises_lance_4_0_wording_variants() {
+        // CastError variant — lance 4.0 issue lance-format/lance#3136.
+        assert!(is_permanent(&VaultError::Storage(
+            "merge_insert: CastError: cannot cast Float64 to FixedSizeList".into()
+        )));
+        // "dimension" variant — appears in many lance 4.0 schema faults.
+        assert!(is_permanent(&VaultError::Storage(
+            "merge_insert: dimension mismatch: expected 384, got 256".into()
+        )));
+        // "No vector column found to match" variant — lancedb 0.27 issue
+        // lancedb#2464 surfaces this for vector-dimension mismatches.
+        assert!(is_permanent(&VaultError::Storage(
+            "query execute: No vector column found to match with the query \
+             vector dimension: 4"
+                .into()
+        )));
+        // Double-check the original "schema" path still matches.
+        assert!(is_permanent(&VaultError::Storage(
+            "merge_insert: schema incompatible".into()
+        )));
+
+        // Non-permanent storage errors (transient) must still classify as
+        // retryable — the widened match must not over-classify.
+        assert!(!is_permanent(&VaultError::Storage(
+            "merge_insert: lock contention, retry".into()
+        )));
+        assert!(!is_permanent(&VaultError::Storage(
+            "io error: connection reset".into()
+        )));
     }
 
     #[test]

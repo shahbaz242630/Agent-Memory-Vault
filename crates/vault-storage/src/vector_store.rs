@@ -50,11 +50,11 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{TimeDelta, Utc};
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
-use lancedb::table::Table;
+use lancedb::table::{OptimizeAction, Table};
 use lancedb::DistanceType;
 use tokio::sync::Mutex;
 use tracing::{info, instrument, warn};
@@ -336,10 +336,54 @@ impl VectorStore for LanceVectorStore {
         // defense-in-depth: a future refactor that changes MemoryId's inner
         // type cannot accidentally introduce SQL injection here.
         let predicate = format!("id = {}", quote_sql_string(&id.0.to_string()));
+
+        // ADR-039 (Phase 0b finding, 2026-05-07): hold the ADR-038 upsert
+        // mutex across delete + Prune so the prune cannot race a concurrent
+        // upsert (the prune removes old version files; an in-flight upsert
+        // creating a new version is left untouched, but holding the mutex
+        // is defense-in-depth for the privacy contract).
+        let _guard = self.upsert_lock.lock().await;
+
         self.table
             .delete(&predicate)
             .await
             .map_err(|e| VaultError::Storage(format!("delete: {e}")))?;
+
+        // ADR-039 hard-delete privacy property — Memory Vault sells "user
+        // owns and controls their memories, including deletion" as
+        // differentiator vs cloud-AI-memory products. lance 4.0 tombstones
+        // on `delete()` by default; the row's bytes remain in old version
+        // files until cleanup_old_versions runs. Without the explicit prune
+        // below, an authorised reader (future agent with token, current
+        // agent overstepping scope) could recover content the user thought
+        // was deleted via low-level fragment inspection. Encryption at rest
+        // (T0.2.0) helps against stolen-disk attackers; does nothing
+        // against authorised key holders.
+        //
+        // Verified empirically during Phase 0b (2026-05-07):
+        // `OptimizeAction::All` is INSUFFICIENT (default 7-day retention
+        // preserves old version files containing deleted data; the audit
+        // measured 5 files still containing the probe string post-cleanup);
+        // only `OptimizeAction::Prune { older_than: zero, delete_unverified:
+        // true, error_if_tagged_old_versions: false }` achieves full
+        // physical removal (`prune.bytes_removed: 12162`, 0 probe-files
+        // post-prune). Regression pin lives in `delete_physically_removes_content_per_adr_039`
+        // — fails CI loudly if this prune call is ever removed or if
+        // lance changes its retention semantics.
+        //
+        // Trade-off: lose lance time-travel undo capability — accepted as
+        // correct for a privacy-property memory vault. Latency cost: each
+        // delete pays a prune operation (~0.3s in test fixture; scales
+        // with old version count).
+        self.table
+            .optimize(OptimizeAction::Prune {
+                older_than: Some(TimeDelta::zero()),
+                delete_unverified: Some(true),
+                error_if_tagged_old_versions: Some(false),
+            })
+            .await
+            .map_err(|e| VaultError::Storage(format!("delete: hard-delete prune: {e}")))?;
+
         Ok(())
     }
 
@@ -1190,6 +1234,275 @@ mod tests {
             build_boundary_filter(&[work.clone(), personal.clone()]),
             "boundary IN ('work', 'personal')"
         );
+    }
+
+    // ============================================================
+    //   Phase 0b memory-system invariant verifications
+    //   (lance 0.8 → 0.27.2 dep upgrade, 2026-05-07)
+    // ============================================================
+
+    /// Phase 0b verification 1 — `merge_insert` last-write-wins for the
+    /// embedding column, not just for the boundary column.
+    ///
+    /// The pre-existing test
+    /// `upsert_with_same_id_different_boundary_updates_existing_no_duplicate`
+    /// verifies the COUNT and BOUNDARY-membership semantics of repeat
+    /// upsert on the same id, but its search query
+    /// (`embedding(4, 1.0) = [1,1,1,1]`) gives the SAME cosine distance
+    /// to both `[1,1,1,1]` and `[0.5,0.5,0.5,0.5]` (both are scalar
+    /// multiples of the same direction), so it cannot distinguish
+    /// whether the embedding column was actually overwritten. This
+    /// gap was found during Phase 0b audit. Without this regression
+    /// pin, a lance 4.0 change to "first wins" instead of "last wins"
+    /// in `when_matched_update_all(None)` would silently corrupt
+    /// memory-vault data on duplicate-id upserts.
+    ///
+    /// Probe: insert id=X with embedding `[1, 0, 0, 0]`; re-upsert with
+    /// `[0, 1, 0, 0]`; query with `[1, 0, 0, 0]`. Cosine distance is 0
+    /// to the FIRST embedding (overwritten state) and 1 to the SECOND
+    /// (post-update state) — distinguishable. After re-upsert the row's
+    /// distance to `[1,0,0,0]` MUST be ≥ 0.5 (i.e. closer to the
+    /// post-update embedding than the original).
+    #[tokio::test]
+    async fn merge_insert_last_write_wins_for_embedding_column() {
+        let tmp = TempDir::new().unwrap();
+        let store = LanceVectorStore::open(tmp.path(), 4).await.unwrap();
+        let work = Boundary::new("work").unwrap();
+        let id = new_id();
+
+        let original_emb = vec![1.0_f32, 0.0, 0.0, 0.0];
+        let updated_emb = vec![0.0_f32, 1.0, 0.0, 0.0];
+
+        store.upsert(&id, &original_emb, &work).await.unwrap();
+        store.upsert(&id, &updated_emb, &work).await.unwrap();
+
+        // Query with the ORIGINAL embedding direction. If
+        // `when_matched_update_all(None)` is "last wins" (correct
+        // semantics), the row's stored embedding is now `updated_emb`,
+        // and cosine distance to `original_emb` should be ~1.0
+        // (orthogonal vectors). If "first wins" (regression), the row's
+        // stored embedding is still `original_emb` and cosine distance
+        // would be ~0.0.
+        let hits = store
+            .search(&original_emb, 5, std::slice::from_ref(&work))
+            .await
+            .unwrap();
+        let (rid, distance) = hits
+            .iter()
+            .find(|(rid, _)| *rid == id)
+            .copied()
+            .expect("re-upserted id must be present in search results");
+        assert_eq!(rid, id);
+        assert!(
+            distance > 0.5,
+            "merge_insert MUST be last-write-wins for embedding column; \
+             expected cosine distance to original_emb > 0.5 (vectors now \
+             orthogonal), got {distance} — lance 4.0 may have regressed \
+             when_matched_update_all semantics"
+        );
+    }
+
+    /// ADR-039 regression pin: `delete()` MUST physically remove the
+    /// row's content from disk, not just tombstone it.
+    ///
+    /// Memory Vault sells "user owns and controls their memories,
+    /// including deletion" as the differentiator vs cloud-AI-memory
+    /// products. Tombstoned-recoverable-with-key fails this contract
+    /// for the realistic threat model — authorised readers (future
+    /// agent with token, current agent overstepping scope) can recover
+    /// content the user thought was deleted via low-level fragment
+    /// inspection. Encryption at rest (T0.2.0) helps against
+    /// stolen-disk attackers; does nothing against authorised key
+    /// holders.
+    ///
+    /// Phase 0b verification (2026-05-07) discovered lance 4.0
+    /// tombstones on delete by default and `OptimizeAction::All` is
+    /// insufficient (default 7-day retention preserves old version
+    /// files containing deleted data); only
+    /// `OptimizeAction::Prune { older_than: TimeDelta::zero(), ... }`
+    /// achieves physical removal. ADR-039 modifies
+    /// `LanceVectorStore::delete()` to call zero-retention Prune
+    /// immediately after the lance-side delete; this test pins the
+    /// privacy-contract invariant in code so any future regression
+    /// (lance API change, accidental Prune-call removal) fails CI
+    /// loudly.
+    ///
+    /// Probe pattern: write rows with a distinctive boundary string,
+    /// delete them, then scan every file under the data dir for the
+    /// raw bytes of that string. Assertion: 0 files contain the
+    /// string. If this test ever fails, the privacy contract is
+    /// broken and a beta cohort cannot receive the build.
+    #[tokio::test]
+    async fn delete_physically_removes_content_per_adr_039() {
+        let tmp = TempDir::new().unwrap();
+        let store = LanceVectorStore::open(tmp.path(), 4).await.unwrap();
+        // Distinctive boundary string. Stays within Boundary's
+        // [a-zA-Z0-9_-]{1,64} charset (ADR-005). Long + unique enough
+        // that random byte collisions are negligible.
+        let boundary = Boundary::new("ADR_039_HARD_DELETE_PRIVACY_PROBE").unwrap();
+        let probe_str = "ADR_039_HARD_DELETE_PRIVACY_PROBE";
+
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            let id = new_id();
+            store
+                .upsert(&id, &embedding(4, (i + 1) as f32), &boundary)
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+        assert_eq!(store.count(None).await.unwrap(), 5);
+
+        // Delete every row. ADR-039 requires this to physically remove
+        // the content from disk via the prune call inside `delete()`.
+        for id in &ids {
+            store.delete(id).await.unwrap();
+        }
+
+        // User-facing semantic: count reflects the deletion.
+        assert_eq!(
+            store.count(None).await.unwrap(),
+            0,
+            "delete must remove rows from query-visible state"
+        );
+
+        // Privacy-contract assertion: walk every file under the data
+        // dir; NONE may still contain the probe string.
+        fn walk_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(read) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in read.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk_files(&path, out);
+                } else if path.is_file() {
+                    out.push(path);
+                }
+            }
+        }
+        let mut all_files = Vec::new();
+        walk_files(tmp.path(), &mut all_files);
+        let mut tombstoned_in: Vec<std::path::PathBuf> = Vec::new();
+        for f in &all_files {
+            if let Ok(bytes) = std::fs::read(f) {
+                if bytes
+                    .windows(probe_str.len())
+                    .any(|w| w == probe_str.as_bytes())
+                {
+                    tombstoned_in.push(f.clone());
+                }
+            }
+        }
+        assert!(
+            tombstoned_in.is_empty(),
+            "ADR-039 privacy-contract VIOLATION: deleted boundary string \
+             {probe_str:?} found in {n} file(s) post-delete: {paths:?}. \
+             `LanceVectorStore::delete()` is supposed to call \
+             `optimize(OptimizeAction::Prune {{ older_than: zero, ... }})` \
+             to physically remove tombstoned bytes — has the prune call \
+             been removed, or has lance changed its retention semantics?",
+            n = tombstoned_in.len(),
+            paths = tombstoned_in
+                .iter()
+                .map(|p| p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("?")
+                    .to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Phase 0b verification 3 — read-during-write isolation.
+    ///
+    /// ADR-038 Layer 1 mutex serialises WRITES; reads aren't serialised.
+    /// Lance v2 (4.0) MVCC should give snapshot reads — each reader
+    /// sees a consistent manifest version, never partial/torn state.
+    /// This test verifies the invariant under concurrent load: while a
+    /// writer is doing N upserts, multiple readers calling count() must
+    /// see monotonically non-decreasing values within each reader's
+    /// observation sequence (no "saw 50, then saw 30" inversions).
+    ///
+    /// If lance 4.0's V2 path regressed read isolation, this would
+    /// surface as: a reader observes a higher count, then a lower count,
+    /// then a higher count again — indicating non-snapshot reads.
+    #[tokio::test]
+    async fn read_during_write_returns_monotonic_consistent_snapshots() {
+        let tmp = TempDir::new().unwrap();
+        let store = LanceVectorStore::open(tmp.path(), 4).await.unwrap();
+        let work = Boundary::new("work").unwrap();
+
+        // Initial state: 0 rows in "work".
+        assert_eq!(store.count(Some(&work)).await.unwrap(), 0);
+
+        let writer_count: usize = 30;
+        let reader_count: usize = 4;
+
+        // Writer task: upserts `writer_count` rows sequentially. Each
+        // upsert acquires the ADR-038 mutex, holds it across
+        // merge_insert. Other writers (none here) would queue.
+        let writer_store = store.clone();
+        let writer_work = work.clone();
+        let writer = tokio::spawn(async move {
+            for i in 0..writer_count {
+                let id = MemoryId(uuid::Uuid::now_v7());
+                writer_store
+                    .upsert(&id, &embedding(4, (i + 1) as f32), &writer_work)
+                    .await
+                    .unwrap();
+            }
+        });
+
+        // Reader tasks: each calls count() repeatedly until the writer
+        // finishes. Records the sequence of observed counts.
+        let mut readers = Vec::new();
+        for _ in 0..reader_count {
+            let reader_store = store.clone();
+            let reader_work = work.clone();
+            readers.push(tokio::spawn(async move {
+                let mut observations = Vec::new();
+                // Sample for at least as long as the writer; ~50 reads.
+                for _ in 0..50 {
+                    let n = reader_store.count(Some(&reader_work)).await.unwrap();
+                    observations.push(n);
+                    tokio::task::yield_now().await;
+                }
+                observations
+            }));
+        }
+
+        writer.await.unwrap();
+
+        // Final count must equal writer_count.
+        assert_eq!(
+            store.count(Some(&work)).await.unwrap(),
+            writer_count,
+            "post-writer count must equal writer_count={writer_count}"
+        );
+
+        // Every reader's observations must be:
+        //   (a) within [0, writer_count] — never out of bounds
+        //   (b) monotonically non-decreasing — no torn reads
+        for (idx, reader) in readers.into_iter().enumerate() {
+            let observations = reader.await.unwrap();
+            for (i, &n) in observations.iter().enumerate() {
+                assert!(
+                    n <= writer_count,
+                    "reader {idx} observation {i}: count {n} exceeds \
+                     writer_count {writer_count} — torn read / phantom row"
+                );
+                if i > 0 {
+                    assert!(
+                        n >= observations[i - 1],
+                        "reader {idx} observed count {n} after seeing \
+                         {} — count went BACKWARDS, indicates non-snapshot \
+                         read isolation under concurrent write",
+                        observations[i - 1]
+                    );
+                }
+            }
+        }
     }
 
     // ============================================================
