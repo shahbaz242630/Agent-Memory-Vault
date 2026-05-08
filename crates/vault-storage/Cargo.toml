@@ -32,6 +32,15 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 blake3 = { workspace = true }
 zeroize = { workspace = true }
+# T0.2.0 Phase 0d (2026-05-08): at-rest sealed-storage path. Promoted from
+# spike-local dev-deps after Phase 0c spike v2 runtime-confirmed the
+# ObjectStoreProvider integration shape. See `sealed_object_store.rs`.
+lance-io = { workspace = true }
+lance-core = { workspace = true }
+object_store = { workspace = true }
+dryoc = { workspace = true }
+bytes = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
@@ -45,16 +54,10 @@ tokio-test = { workspace = true }
 # implemented at T0.1.4. `no-env-filter` feature already configured in
 # workspace deps.
 tracing-test = { workspace = true }
-# T0.2.0 Phase 0c — at-rest spike v2 dev-deps. Re-added at lancedb
-# 0.27.2's resolved transitive versions (verified 2026-05-08 via
-# `cargo tree -p lancedb`). Spike-local only; promotion to
-# [workspace.dependencies] happens at Phase 0d when production code
-# consumes them. Versions match Cargo.lock pre-flight snapshot
-# captured in at_rest_spike.rs's top-of-file comment.
-lance-io = "=4.0.0"
-lance-core = "=4.0.0"
-object_store = "=0.12.5"
-dryoc = { workspace = true }
-bytes = "=1.11.1"
-url = "=2.5.8"
+# T0.2.0 Phase 0d (2026-05-08): walkdir stays spike-local — production
+# code uses std::fs::read_dir recursion (already in vector_store.rs's
+# existing tests). lance-io / lance-core / object_store / dryoc / bytes /
+# url were promoted to [workspace.dependencies] in Phase 0d when the
+# sealed_object_store production module landed; they appear in this
+# crate's main `[dependencies]` block above.
 walkdir = "=2.5.0"

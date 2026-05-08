@@ -27,6 +27,7 @@ pub(crate) mod migrations_graph;
 pub mod pending_sync;
 pub mod retry_queue;
 pub mod retry_worker;
+pub mod sealed_object_store;
 pub mod vector_store;
 
 pub use audit::{
@@ -50,4 +51,7 @@ pub use retry_queue::{
     LAST_ERROR_MAX_BYTES, MAX_ATTEMPTS, PAYLOAD_FORMAT_VERSION,
 };
 pub use retry_worker::{RetryWorker, StepResult, DEFAULT_POLL_INTERVAL};
+pub use sealed_object_store::{
+    derive_at_rest_key, make_vault_sealed_uri, SealedFileStoreProvider, VAULT_SEALED_SCHEME,
+};
 pub use vector_store::{LanceVectorStore, VectorStore, ALPHA_WARNING_FILENAME};

@@ -79,6 +79,17 @@ lancedb = "=0.27.2"
 # (no more quarter() conflict with chrono 0.4.44).
 arrow-array = "=57.2.0"
 arrow-schema = "=57.2.0"
+# T0.2.0 Phase 0d (2026-05-08): at-rest sealed-storage path consumes lance-io's
+# ObjectStoreProvider trait + lance-core's Error/Result, plus object_store's
+# DynObjectStore + LocalFileSystem + path::Path types, plus dryoc/bytes/url for
+# AEAD framing + URL handling. Versions match lancedb 0.27.2's transitive
+# resolution (verified 2026-05-08 via cargo tree -p lancedb). Promoted from
+# vault-storage spike-local dev-deps — production code now consumes them.
+lance-io = "=4.0.0"
+lance-core = "=4.0.0"
+object_store = "=0.12.5"
+bytes = "=1.11.1"
+url = "=2.5.8"
 duckdb = { version = "=1.2.2", features = ["bundled"] }
 # rusqlite uses bundled-sqlcipher-vendored-openssl instead of bundled-sqlcipher
 # (deviation from BRD §4.2 — see HANDOFF.md ADR-006). Vendoring OpenSSL avoids

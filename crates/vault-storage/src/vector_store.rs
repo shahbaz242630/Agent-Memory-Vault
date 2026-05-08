@@ -55,11 +55,16 @@ use futures::TryStreamExt;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::table::{CompactionOptions, OptimizeAction, Table};
-use lancedb::DistanceType;
+use lancedb::{DistanceType, ObjectStoreRegistry, Session};
 use tokio::sync::Mutex;
 use tracing::{info, instrument, warn};
+use zeroize::Zeroizing;
 
 use vault_core::{Boundary, MemoryId, VaultError, VaultResult};
+
+use crate::sealed_object_store::{
+    derive_at_rest_key, make_vault_sealed_uri, SealedFileStoreProvider, VAULT_SEALED_SCHEME,
+};
 
 /// Filename of the V0.1 alpha-warning file written into the data directory
 /// on every [`LanceVectorStore::open`]. Removed by T0.2.0 when encryption
@@ -206,6 +211,19 @@ pub struct LanceVectorStore {
     /// (`.cargo/config.toml`, CI workflow, V0.2 alpha-distribution
     /// launchers).
     upsert_lock: Arc<Mutex<()>>,
+    /// Owned [`Session`] for the at-rest sealed-storage path. `None`
+    /// when [`Self::open`] (the V0.1 plaintext path) constructs the
+    /// store; `Some(_)` when [`Self::open_with_at_rest_key`] (the
+    /// T0.2.0 sealed path) constructs it. The [`SealedFileStoreProvider`]
+    /// registered in the session's [`ObjectStoreRegistry`] holds the
+    /// at-rest key and is invoked lazily by Lance on first I/O. Holding
+    /// this `Arc` here keeps the provider alive for the lifetime of the
+    /// store — without it, Lance might reach a registered provider that
+    /// has been dropped.
+    ///
+    /// The leading underscore is intentional: the field is never read
+    /// after construction. Its sole purpose is the lifetime guarantee.
+    _session: Option<Arc<Session>>,
 }
 
 impl LanceVectorStore {
@@ -278,6 +296,105 @@ impl LanceVectorStore {
             table,
             dimension,
             upsert_lock: Arc::new(Mutex::new(())),
+            _session: None,
+        })
+    }
+
+    /// Open or create a LanceDB store at `data_dir` with at-rest AEAD
+    /// sealing keyed off `master_key` (32 bytes — typically the user's
+    /// vault root key, T0.2.0 alpha-distribution will hand this in from
+    /// the keychain per ADR-032 amendment).
+    ///
+    /// Routes ALL of Lance's I/O through [`SealedFileStoreProvider`] via
+    /// the custom `vault-sealed://` URI scheme registered with a
+    /// [`Session`]'s [`ObjectStoreRegistry`]. Per ADR-008 amendment
+    /// (Phase 0e) and the Phase 0c spike v2 runtime confirmation, this
+    /// is the production at-rest-encryption path; the existing
+    /// [`Self::open`] (plaintext) constructor remains for V0.1 alpha
+    /// backwards compatibility and is removed at the formal at-rest
+    /// gate close.
+    ///
+    /// Differences from [`Self::open`]:
+    /// - Does NOT write the V0.1 ALPHA warning file (ADR-010 banners
+    ///   are removed at the formal at-rest gate close).
+    /// - Does NOT emit the V0.1 plaintext-on-disk WARN log.
+    /// - URI scheme is `vault-sealed://` not the bare absolute path.
+    /// - Connection is opened with a session whose registry routes
+    ///   `vault-sealed://` to a [`SealedFileStoreProvider`].
+    ///
+    /// Key handling:
+    /// - The caller's `master_key` is consumed by reference; this
+    ///   function does not retain or zeroize it (the caller is
+    ///   responsible for the master key's lifecycle).
+    /// - The K3-derived `at_rest_key` is wrapped in [`Zeroizing`] and
+    ///   held inside the [`SealedFileStoreProvider`] for the store's
+    ///   lifetime; on drop it zeroes.
+    #[instrument(
+        skip(data_dir, master_key),
+        fields(data_dir = %data_dir.display(), dimension)
+    )]
+    pub async fn open_with_at_rest_key(
+        data_dir: &Path,
+        dimension: usize,
+        master_key: &[u8; 32],
+    ) -> VaultResult<Self> {
+        if dimension == 0 {
+            return Err(VaultError::InvalidInput(
+                "vector dimension must be greater than zero".into(),
+            ));
+        }
+
+        fs::create_dir_all(data_dir)?;
+
+        // Derive the K3 at-rest key. Wrapped in Zeroizing inside the
+        // provider; the master_key reference is the caller's to manage.
+        let at_rest_key: Zeroizing<[u8; 32]> = derive_at_rest_key(master_key);
+
+        // Build a registry with our SealedFileStoreProvider registered
+        // for the vault-sealed:// scheme. `default()` registers the
+        // built-in providers (file://, s3://, az://, gs://, memory://);
+        // we add ours alongside.
+        let registry = ObjectStoreRegistry::default();
+        registry.insert(
+            VAULT_SEALED_SCHEME,
+            Arc::new(SealedFileStoreProvider::new(at_rest_key)),
+        );
+        let session = Arc::new(Session::new(0, 0, Arc::new(registry)));
+
+        // Canonicalise the path before URL-encoding. `Url::from_directory_path`
+        // (called inside make_vault_sealed_uri) requires absolute. Most
+        // callers pass absolute already, but `data_dir.canonicalize()`
+        // handles the edge case where a relative path slipped through.
+        let abs = if data_dir.is_absolute() {
+            data_dir.to_path_buf()
+        } else {
+            std::fs::canonicalize(data_dir)?
+        };
+        let uri = make_vault_sealed_uri(&abs);
+
+        let connection = lancedb::connect(&uri)
+            .session(session.clone())
+            .execute()
+            .await
+            .map_err(|e| VaultError::Storage(format!("lancedb sealed connect: {e}")))?;
+
+        let table = open_or_create_table(&connection, dimension).await?;
+
+        info!(
+            table = TABLE_NAME,
+            dimension, "LanceVectorStore opened (at-rest sealed path)"
+        );
+
+        // The `Connection` is dropped here; `Table` holds its own internal
+        // reference to keep it alive. We retain the `Session` so the
+        // registered provider stays alive for the store's lifetime.
+        let _ = connection;
+
+        Ok(Self {
+            table,
+            dimension,
+            upsert_lock: Arc::new(Mutex::new(())),
+            _session: Some(session),
         })
     }
 }
@@ -1873,5 +1990,312 @@ mod tests {
         let mut found = Vec::new();
         walk(data_dir, &mut found);
         found
+    }
+
+    // ============================================================
+    //   T0.2.0 Phase 0d — production at-rest sealed-path tests
+    // ============================================================
+
+    /// Walk every regular file under `dir`, recursively. Used by the
+    /// sealed-path tests below to inspect on-disk bytes after Lance
+    /// has written through `SealedFileStoreProvider`.
+    fn walk_every_file(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        fn walk(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+            let Ok(read) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in read.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, found);
+                } else if path.is_file() {
+                    found.push(path);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        walk(dir, &mut found);
+        found
+    }
+
+    /// Phase 0d test 1: round-trip through `open_with_at_rest_key`.
+    /// Upsert 4 orthogonal unit vectors + search; assert count + that
+    /// the exact-match search returns the matching id as top hit.
+    /// Confirms the sealed path's write+read flows compose end-to-end
+    /// with the rest of `LanceVectorStore`'s API surface unchanged.
+    ///
+    /// Uses orthogonal unit vectors (not the `embedding(dim, fill)`
+    /// all-same-fill helper) because cosine distance between collinear
+    /// vectors is 0 — `[1,1,1,1]` and `[2,2,2,2]` are identical under
+    /// Cosine, so a top-hit assertion would be non-deterministic. Per
+    /// ADR-038 Layer 4 Memory Vault uses Cosine in production and BGE
+    /// vectors are L2-normalised non-collinear; orthogonal unit vectors
+    /// here give the test the same uniqueness property.
+    #[tokio::test]
+    async fn sealed_open_round_trip_returns_inserted_rows() {
+        let tmp = TempDir::new().unwrap();
+        let key: [u8; 32] = *b"phase-0d-test-key-32-bytes-A1B2C";
+        let store = LanceVectorStore::open_with_at_rest_key(tmp.path(), 4, &key)
+            .await
+            .unwrap();
+
+        let boundary = Boundary::new("sealed_round_trip").unwrap();
+        let unit_vectors: [[f32; 4]; 4] = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let mut ids = Vec::new();
+        for v in &unit_vectors {
+            let id = new_id();
+            store.upsert(&id, v, &boundary).await.unwrap();
+            ids.push(id);
+        }
+
+        assert_eq!(store.count(None).await.unwrap(), 4);
+
+        // Search for the third axis: only ids[2] is on that axis, all
+        // other vectors are orthogonal (cosine distance = 1) — top hit
+        // is unambiguous.
+        let target_idx = 2;
+        let hits = store
+            .search(
+                &unit_vectors[target_idx],
+                4,
+                std::slice::from_ref(&boundary),
+            )
+            .await
+            .unwrap();
+        assert!(!hits.is_empty(), "search MUST return at least one hit");
+        assert_eq!(
+            hits[0].0, ids[target_idx],
+            "exact-match search MUST return the matching id as top hit through the sealed path"
+        );
+    }
+
+    /// Phase 0d test 2: wrong-key reopen fails closed.
+    /// Open with K1, write rows, drop the store. Re-open the SAME
+    /// data_dir with K2 and confirm we get an error (not silent-empty,
+    /// not silent-corrupted-data). The dryoc DryocStream pull will fail
+    /// AEAD authentication when the K3-derived at-rest key doesn't
+    /// match the one used to seal the manifest; lancedb surfaces this
+    /// as a generic ObjectStore error wrapping our SealedObjectStore
+    /// "Generic" variant.
+    #[tokio::test]
+    async fn sealed_open_with_wrong_key_fails_closed() {
+        let tmp = TempDir::new().unwrap();
+        let key1: [u8; 32] = *b"phase-0d-correct-key-32-bytes-K1";
+        let key2: [u8; 32] = *b"phase-0d-WRONG-key-32-bytes----X";
+
+        // Write phase: open with K1 + upsert + drop.
+        {
+            let store = LanceVectorStore::open_with_at_rest_key(tmp.path(), 4, &key1)
+                .await
+                .unwrap();
+            let b = Boundary::new("wrong_key_test").unwrap();
+            for i in 0..3 {
+                store
+                    .upsert(&new_id(), &embedding(4, (i + 1) as f32), &b)
+                    .await
+                    .unwrap();
+            }
+        } // store dropped
+
+        // Re-open with K2: MUST fail somewhere along the open or first
+        // read. If both succeed silently, AEAD authentication is broken
+        // and the privacy contract is violated.
+        let reopen = LanceVectorStore::open_with_at_rest_key(tmp.path(), 4, &key2).await;
+        let first_read_result = match reopen {
+            Err(_) => Err::<(), ()>(()), // open failed — pass
+            Ok(store) => match store.count(None).await {
+                Err(_) => Err::<(), ()>(()),
+                Ok(_) => Ok::<(), ()>(()),
+            },
+        };
+        assert!(
+            first_read_result.is_err(),
+            "Wrong-key reopen MUST fail closed (AEAD authentication mismatch). \
+             If this passes silently, the sealing wrapper is not actually \
+             enforcing per-file AEAD."
+        );
+    }
+
+    /// Phase 0d test 3: every file written through the sealed path has
+    /// the locked sealing-shape framing bytes (`0x01 || 0x00`) AND
+    /// contains no Parquet magic. This is the single strongest on-disk
+    /// signal that bytes Lance wrote actually went through
+    /// `SealedObjectStore::put_opts` — combined with test 2's wrong-key
+    /// fail-closed, it rules out the v1 LocalObjectReader-bypass class
+    /// of regression in production.
+    #[tokio::test]
+    async fn sealed_open_writes_framing_bytes_to_disk() {
+        let tmp = TempDir::new().unwrap();
+        let key: [u8; 32] = *b"phase-0d-framing-key-32-bytes-3F";
+        let store = LanceVectorStore::open_with_at_rest_key(tmp.path(), 4, &key)
+            .await
+            .unwrap();
+
+        let b = Boundary::new("framing_check").unwrap();
+        for i in 0..5 {
+            store
+                .upsert(&new_id(), &embedding(4, (i + 1) as f32), &b)
+                .await
+                .unwrap();
+        }
+        // Drop is necessary to release any internal buffering before we
+        // walk the disk — Lance flushes on table drop.
+        drop(store);
+
+        let files = walk_every_file(tmp.path());
+        assert!(
+            !files.is_empty(),
+            "no files written under {} — Lance wrote nothing OR temp tree shape changed",
+            tmp.path().display()
+        );
+        for path in &files {
+            let bytes = std::fs::read(path).unwrap();
+            // (a) framing bytes
+            if bytes.len() >= 2 {
+                assert_eq!(
+                    bytes[0],
+                    crate::sealed_object_store::VERSION_BYTE,
+                    "sealed-path file {} first byte {:#x} != VERSION_BYTE — Lance \
+                     bypassed SealedObjectStore::put_opts for this write",
+                    path.display(),
+                    bytes[0]
+                );
+                assert_eq!(
+                    bytes[1],
+                    crate::sealed_object_store::GRANULARITY_PER_FILE,
+                    "sealed-path file {} second byte {:#x} != GRANULARITY_PER_FILE",
+                    path.display(),
+                    bytes[1]
+                );
+            }
+            // (b) zero PAR1 anywhere — full inspection, not just first 4
+            assert!(
+                !bytes.windows(4).any(|w| w == b"PAR1"),
+                "sealed-path file {} contains plaintext PAR1 magic — sealing was \
+                 bypassed mid-write OR a code path is writing plaintext through \
+                 the sealed connection",
+                path.display()
+            );
+        }
+    }
+
+    /// Phase 0d test 4: ADR-039 partial-fragment physical removal works
+    /// through the sealed wrapper. Sealed-path companion to
+    /// [`delete_partial_fragment_physically_removes_content_per_adr_039`]
+    /// (which exercises the same invariant on the plaintext path).
+    /// Write 10 rows in one fragment, single-id-delete 5 of them, then
+    /// confirm via BLAKE3 content-hash-set-difference that no pre-delete
+    /// data file's exact bytes survive post-Compact+Prune. With sealing,
+    /// every file is unique-by-construction (per-file random AEAD nonce)
+    /// so the content-hash check is the cleanest signal available.
+    #[tokio::test]
+    async fn sealed_delete_partial_fragment_physically_removes_content() {
+        let tmp = TempDir::new().unwrap();
+        let key: [u8; 32] = *b"phase-0d-delete-key-32-bytes-D44";
+        let store = LanceVectorStore::open_with_at_rest_key(tmp.path(), 4, &key)
+            .await
+            .unwrap();
+        let b = Boundary::new("sealed_partial_delete").unwrap();
+
+        let mut ids = Vec::new();
+        for i in 0..10 {
+            let id = new_id();
+            store
+                .upsert(&id, &embedding(4, (i + 1) as f32), &b)
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+        assert_eq!(store.count(None).await.unwrap(), 10);
+
+        let is_data_file = |p: &std::path::Path| -> bool {
+            p.components()
+                .any(|c| c.as_os_str().eq_ignore_ascii_case("data"))
+        };
+        let file_hash = |bytes: &[u8]| -> [u8; 32] { *blake3::hash(bytes).as_bytes() };
+
+        let pre_files = walk_every_file(tmp.path());
+        let pre_data: std::collections::HashMap<[u8; 32], std::path::PathBuf> = pre_files
+            .iter()
+            .filter(|p| is_data_file(p))
+            .filter_map(|p| std::fs::read(p).ok().map(|b| (file_hash(&b), p.clone())))
+            .collect();
+        assert!(
+            !pre_data.is_empty(),
+            "no sealed data files found pre-delete"
+        );
+
+        for id in &ids[..5] {
+            store.delete(id).await.unwrap();
+        }
+        assert_eq!(store.count(None).await.unwrap(), 5);
+
+        let post_files = walk_every_file(tmp.path());
+        let post_hashes: std::collections::HashSet<[u8; 32]> = post_files
+            .iter()
+            .filter_map(|p| std::fs::read(p).ok().map(|b| file_hash(&b)))
+            .collect();
+
+        let surviving: Vec<&std::path::PathBuf> = pre_data
+            .iter()
+            .filter(|(hash, _)| post_hashes.contains(*hash))
+            .map(|(_, path)| path)
+            .collect();
+
+        assert!(
+            surviving.is_empty(),
+            "ADR-039-through-sealing FAIL: {n} pre-delete sealed data file(s) \
+             still BIT-FOR-BIT identical post-Compact+Prune. The encrypted bytes \
+             of deleted rows survive on disk through the sealed wrapper, \
+             violating the privacy contract. Surviving: {paths:?}",
+            n = surviving.len(),
+            paths = surviving
+                .iter()
+                .map(|p| p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("?")
+                    .to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Phase 0d test 5: the sealed path emits its OWN distinguishable
+    /// INFO log (`"at-rest sealed path"` substring) — the positive
+    /// dual to `open_emits_adr_010_plaintext_warn_log`. Pins that the
+    /// sealed-path INFO is wired AND that the constructor that emits
+    /// it is reached.
+    ///
+    /// This is a positive assertion (substring present) rather than a
+    /// negative one (no plaintext WARN) because tracing-test's
+    /// `#[traced_test]` shares a process-local subscriber across
+    /// concurrent tests — a negative assertion would suffer from
+    /// `open_emits_adr_010_plaintext_warn_log` running in parallel and
+    /// emitting "plaintext"/"ADR-010" strings into the shared log
+    /// buffer. The positive marker `"at-rest sealed path"` is unique
+    /// to this code path and bleed-resistant.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn sealed_open_emits_distinguishing_info_log() {
+        let tmp = TempDir::new().unwrap();
+        let key: [u8; 32] = *b"phase-0d-no-warn-key-32-bytes-NW";
+        let _store = LanceVectorStore::open_with_at_rest_key(tmp.path(), 384, &key)
+            .await
+            .unwrap();
+
+        assert!(
+            tracing_test::internal::logs_with_scope_contain("vault_storage", "at-rest sealed path",),
+            "Sealed-path open MUST emit its distinguishing INFO log \
+             ('at-rest sealed path' substring at vector_store.rs's \
+             open_with_at_rest_key info!(...) site). Failure here means \
+             either (a) the INFO log was removed/refactored, or (b) the \
+             sealed-path constructor was never reached (open_with_at_rest_key \
+             returned Err before logging)."
+        );
     }
 }

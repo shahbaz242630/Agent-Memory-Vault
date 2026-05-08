@@ -1520,6 +1520,10 @@ V0.1 → V0.2 → V1.0. Build in order. Do not skip ahead.
 - Track issues in HANDOFF.md "V0.2 Beta Feedback"
 - Acceptance: At least 70% of beta users still active at end of week 2
 
+### Competitive-intelligence forward-pointer
+
+Memory Vault's privacy contract differentiation (encryption at rest per T0.2.0, hard-delete physical removal per ADR-039, boundary-as-access-control primitive, concurrent-write safety per ADR-038) is positioned against MemPalace and similar local-AI-memory tools that run locally but don't enforce a privacy contract. LongMemEval competitive benchmark + privacy-differentiator benchmarks (boundary-correctness, delete-durability) are V0.2 deliverables before T0.2.16 beta onboarding for marketing/positioning use. See HANDOFF.md "Competitive intelligence — MemPalace (April 2026)" section for full gap analysis, 7 candidate items (none locked as V0.2 scope without further plan-paragraph iteration), and lessons-learned guardrails.
+
 ---
 
 ### V1.0 — Public Launch (Weeks 15-22)
