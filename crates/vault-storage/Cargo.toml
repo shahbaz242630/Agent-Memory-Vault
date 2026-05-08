@@ -45,9 +45,16 @@ tokio-test = { workspace = true }
 # implemented at T0.1.4. `no-env-filter` feature already configured in
 # workspace deps.
 tracing-test = { workspace = true }
-# T0.2.0 Phase 0c (post-lancedb-bump) will re-add lance / object_store /
-# dryoc / bytes / url here at versions matching lancedb 0.27's transitives,
-# for the rewritten ObjectStoreProvider-based at_rest_spike.rs. Removed
-# during Phase 0a to keep the dep-bump exploration clean — old spike
-# preserved at crates/vault-storage/examples/at_rest_spike.rs.v1_fail_disabled
-# as executable documentation of the LocalObjectReader-bypass FAIL.
+# T0.2.0 Phase 0c — at-rest spike v2 dev-deps. Re-added at lancedb
+# 0.27.2's resolved transitive versions (verified 2026-05-08 via
+# `cargo tree -p lancedb`). Spike-local only; promotion to
+# [workspace.dependencies] happens at Phase 0d when production code
+# consumes them. Versions match Cargo.lock pre-flight snapshot
+# captured in at_rest_spike.rs's top-of-file comment.
+lance-io = "=4.0.0"
+lance-core = "=4.0.0"
+object_store = "=0.12.5"
+dryoc = { workspace = true }
+bytes = "=1.11.1"
+url = "=2.5.8"
+walkdir = "=2.5.0"

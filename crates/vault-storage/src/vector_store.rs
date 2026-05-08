@@ -54,7 +54,7 @@ use chrono::{TimeDelta, Utc};
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
-use lancedb::table::{OptimizeAction, Table};
+use lancedb::table::{CompactionOptions, OptimizeAction, Table};
 use lancedb::DistanceType;
 use tokio::sync::Mutex;
 use tracing::{info, instrument, warn};
@@ -353,28 +353,52 @@ impl VectorStore for LanceVectorStore {
         // owns and controls their memories, including deletion" as
         // differentiator vs cloud-AI-memory products. lance 4.0 tombstones
         // on `delete()` by default; the row's bytes remain in old version
-        // files until cleanup_old_versions runs. Without the explicit prune
-        // below, an authorised reader (future agent with token, current
-        // agent overstepping scope) could recover content the user thought
-        // was deleted via low-level fragment inspection. Encryption at rest
-        // (T0.2.0) helps against stolen-disk attackers; does nothing
-        // against authorised key holders.
+        // files AND in the original data file fragment until both compaction
+        // (rewrites partial fragments dropping tombstoned rows) and prune
+        // (removes orphaned old files) run. Without the explicit
+        // Compact-then-Prune sequence below, an authorised reader (future
+        // agent with token, current agent overstepping scope) could recover
+        // content the user thought was deleted via low-level fragment
+        // inspection. Encryption at rest (T0.2.0) helps against stolen-disk
+        // attackers; does nothing against authorised key holders.
         //
-        // Verified empirically during Phase 0b (2026-05-07):
-        // `OptimizeAction::All` is INSUFFICIENT (default 7-day retention
-        // preserves old version files containing deleted data; the audit
-        // measured 5 files still containing the probe string post-cleanup);
-        // only `OptimizeAction::Prune { older_than: zero, delete_unverified:
-        // true, error_if_tagged_old_versions: false }` achieves full
-        // physical removal (`prune.bytes_removed: 12162`, 0 probe-files
-        // post-prune). Regression pin lives in `delete_physically_removes_content_per_adr_039`
-        // — fails CI loudly if this prune call is ever removed or if
-        // lance changes its retention semantics.
+        // ADR-039 amendment (Phase 0c spike Stage E, 2026-05-08): the
+        // earlier Phase 0b verification (Prune-alone) covered only the
+        // FULL-fragment-delete case (delete every row in a fragment → Lance
+        // can drop the empty fragment via Prune alone). Memory Vault's
+        // actual delete API is single-memory-id, which is a PARTIAL-fragment
+        // delete; under that pattern Lance's `OptimizeAction::Prune` with
+        // zero retention reports `data_files_removed: 0` (verified by spike
+        // Stage E's 2×2 matrix on both plain file:// and vault-sealed:// —
+        // confirmed identical behaviour, ruling out sealing-wrapper
+        // interference). The fragment-rewrite work is in `OptimizeAction::
+        // Compact`, which drops tombstoned rows from partial fragments;
+        // Prune-after-Compact then removes the now-orphaned old data file.
+        // Spike Stage E reports `compaction.fragments_removed: 1,
+        // fragments_added: 1, files_removed: 2, files_added: 1` followed by
+        // `prune.bytes_removed: 159379, data_files_removed: 1` for a 50/100
+        // partial-delete on 384-dim embeddings.
         //
         // Trade-off: lose lance time-travel undo capability — accepted as
         // correct for a privacy-property memory vault. Latency cost: each
-        // delete pays a prune operation (~0.3s in test fixture; scales
-        // with old version count).
+        // delete pays Compact + Prune (~0.5-2s on test fixture; scales with
+        // fragment size, not old-version count). Acceptable for the
+        // privacy property.
+        //
+        // Regression pin: `delete_physically_removes_content_per_adr_039`
+        // covers full-fragment delete (boundary-wide). Companion test
+        // `delete_partial_fragment_physically_removes_content_per_adr_039`
+        // covers single-id partial-fragment delete (the actual API pattern)
+        // — fails CI loudly if Compact or Prune is ever removed, or if
+        // lance changes its compaction/retention semantics.
+        self.table
+            .optimize(OptimizeAction::Compact {
+                options: CompactionOptions::default(),
+                remap_options: None,
+            })
+            .await
+            .map_err(|e| VaultError::Storage(format!("delete: hard-delete compact: {e}")))?;
+
         self.table
             .optimize(OptimizeAction::Prune {
                 older_than: Some(TimeDelta::zero()),
@@ -1399,11 +1423,145 @@ mod tests {
             "ADR-039 privacy-contract VIOLATION: deleted boundary string \
              {probe_str:?} found in {n} file(s) post-delete: {paths:?}. \
              `LanceVectorStore::delete()` is supposed to call \
+             `optimize(OptimizeAction::Compact {{ ... }})` followed by \
              `optimize(OptimizeAction::Prune {{ older_than: zero, ... }})` \
-             to physically remove tombstoned bytes — has the prune call \
-             been removed, or has lance changed its retention semantics?",
+             to physically remove tombstoned bytes — has either call been \
+             removed, or has lance changed its compaction/retention semantics?",
             n = tombstoned_in.len(),
             paths = tombstoned_in
+                .iter()
+                .map(|p| p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("?")
+                    .to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// ADR-039 partial-fragment regression pin (Phase 0c spike Stage E,
+    /// 2026-05-08).
+    ///
+    /// The full-fragment pin above (`delete_physically_removes_content_per_adr_039`)
+    /// passes even if `delete()` only calls Prune (without Compact) because
+    /// deleting EVERY row in a boundary's fragment empties the fragment and
+    /// Lance can drop it via Prune alone. Memory Vault's actual delete API is
+    /// single-memory-id — each `delete()` call is a PARTIAL-fragment delete.
+    /// Under that pattern Lance's Prune-alone leaves the original data file
+    /// unchanged on disk (`OptimizeStats { compaction: None, prune:
+    /// RemovalStats { data_files_removed: 0, ... } }` — empirically verified
+    /// by spike Stage E's 2×2 matrix on both plain file:// and vault-sealed://).
+    /// Compact-then-Prune is the correct sequence: Compact rewrites the
+    /// fragment with surviving rows only, Prune then removes the orphaned
+    /// original.
+    ///
+    /// This test pins that exact pattern. It writes 10 rows to one boundary,
+    /// deletes 5 by id (leaving 5 surviving rows in the same fragment),
+    /// snapshots pre-delete data file content-hashes, and asserts that
+    /// every pre-delete data file's content-hash is gone post-delete. With
+    /// Compact-then-Prune, the original 10-row data file is removed and a
+    /// new 5-row data file is written → set-difference non-empty. With
+    /// Prune-alone, the original 10-row data file persists bit-for-bit →
+    /// set-difference empty → assertion fails loudly.
+    ///
+    /// Companion to the full-fragment pin; both must hold for the privacy
+    /// contract to survive any future `delete()` refactor.
+    #[tokio::test]
+    async fn delete_partial_fragment_physically_removes_content_per_adr_039() {
+        let tmp = TempDir::new().unwrap();
+        let store = LanceVectorStore::open(tmp.path(), 4).await.unwrap();
+        let boundary = Boundary::new("ADR_039_PARTIAL_FRAGMENT_PROBE").unwrap();
+
+        // Write 10 rows in the same boundary — one fragment.
+        let mut ids = Vec::new();
+        for i in 0..10 {
+            let id = new_id();
+            store
+                .upsert(&id, &embedding(4, (i + 1) as f32), &boundary)
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+        assert_eq!(store.count(None).await.unwrap(), 10);
+
+        // Helper: walk every file in the data dir.
+        fn walk_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(read) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in read.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk_files(&path, out);
+                } else if path.is_file() {
+                    out.push(path);
+                }
+            }
+        }
+        let is_data_file = |p: &std::path::Path| -> bool {
+            p.components()
+                .any(|c| c.as_os_str().eq_ignore_ascii_case("data"))
+        };
+        let file_hash = |bytes: &[u8]| -> [u8; 32] { *blake3::hash(bytes).as_bytes() };
+
+        // Snapshot pre-delete data files by content-hash.
+        let mut pre_files = Vec::new();
+        walk_files(tmp.path(), &mut pre_files);
+        let pre_data: std::collections::HashMap<[u8; 32], std::path::PathBuf> = pre_files
+            .iter()
+            .filter(|p| is_data_file(p))
+            .filter_map(|p| std::fs::read(p).ok().map(|b| (file_hash(&b), p.clone())))
+            .collect();
+        assert!(
+            !pre_data.is_empty(),
+            "spike-shape regression: no data files found pre-delete"
+        );
+
+        // Delete the FIRST 5 rows by single-id call — partial-fragment delete.
+        // Leaves 5 surviving rows in the original fragment, exercising the
+        // exact pattern Memory Vault's delete API produces.
+        for id in &ids[..5] {
+            store.delete(id).await.unwrap();
+        }
+
+        // User-facing semantic: count reflects partial deletion.
+        assert_eq!(
+            store.count(None).await.unwrap(),
+            5,
+            "partial delete must leave 5 surviving rows visible to query"
+        );
+
+        // Privacy-contract assertion: every pre-delete data file's
+        // content-hash MUST be gone post-delete. Compact-then-Prune
+        // ensures the original fragment file is rewritten; Prune-alone
+        // would leave it bit-for-bit unchanged.
+        let mut post_files = Vec::new();
+        walk_files(tmp.path(), &mut post_files);
+        let post_hashes: std::collections::HashSet<[u8; 32]> = post_files
+            .iter()
+            .filter_map(|p| std::fs::read(p).ok().map(|b| file_hash(&b)))
+            .collect();
+
+        let surviving: Vec<&std::path::PathBuf> = pre_data
+            .iter()
+            .filter(|(hash, _)| post_hashes.contains(*hash))
+            .map(|(_, path)| path)
+            .collect();
+
+        assert!(
+            surviving.is_empty(),
+            "ADR-039 PARTIAL-FRAGMENT privacy-contract VIOLATION: \
+             {n} pre-delete data file(s) still BIT-FOR-BIT identical \
+             post-delete. The encrypted/plaintext bytes of deleted rows \
+             remain on disk. `LanceVectorStore::delete()` MUST call \
+             `optimize(OptimizeAction::Compact {{ ... }})` BEFORE \
+             `optimize(OptimizeAction::Prune {{ older_than: zero, ... }})` \
+             — Prune-alone is insufficient for partial-fragment deletes \
+             (verified via OptimizeStats `data_files_removed: 0` in spike \
+             Stage E 2×2 matrix). Has Compact been removed, or has lance \
+             changed compaction semantics? Surviving files: {paths:?}",
+            n = surviving.len(),
+            paths = surviving
                 .iter()
                 .map(|p| p
                     .file_name()
