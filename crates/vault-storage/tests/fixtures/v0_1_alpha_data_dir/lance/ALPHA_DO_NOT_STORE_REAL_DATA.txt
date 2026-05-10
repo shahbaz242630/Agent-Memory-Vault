@@ -1,0 +1,9 @@
+ALPHA BUILD — vector data is stored UNENCRYPTED on disk.
+
+Do NOT put real personal data, credentials, or sensitive
+information into this vault. Encryption ships in V0.2 (task
+T0.2.0) before any beta user receives the product.
+
+See ADR-010 in HANDOFF.md for full context.
+
+File last refreshed (UTC): 2026-05-10T13:24:14.013869600+00:00

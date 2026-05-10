@@ -22,6 +22,7 @@ pub(crate) mod fault_injection;
 pub mod graph_store;
 pub mod key;
 pub mod metadata_store;
+pub mod migration;
 pub(crate) mod migrations;
 pub(crate) mod migrations_graph;
 pub mod pending_sync;
@@ -44,6 +45,9 @@ pub use graph_store::{
 };
 pub use key::SqlCipherKey;
 pub use metadata_store::{MemoryFilter, MetadataStore};
+pub use migration::{
+    detect_v0_1_state, migrate_v0_1_to_sealed_if_needed, MigrationDetectorOutcome, MigrationOutcome,
+};
 pub use pending_sync::{PendingSync, PendingSyncEntry};
 pub use retry_queue::{
     base_backoff_secs, compute_next_attempt, is_permanent, CascadeOperation, DeadLetterReason,

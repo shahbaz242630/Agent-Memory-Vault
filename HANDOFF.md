@@ -1,7 +1,7 @@
 # Memory Vault — Build Handoff
 
 **Current version:** V0.2 Closed Beta (BRD §6.2 — sleep consolidator, boundaries hardening, cross-device sync, 30 beta users)
-**Last updated:** 2026-05-10 (T0.2.0 Phase 1 COMPLETED in working tree — keychain helper module + ADR-040 + ADR-040 amendment + production wiring at vault-tauri main.rs + master_key derivation tree (option β) + VAULT_KEY env var retirement + workspace dep promotion. Two test-driven fixes landed in same working tree: NotFound classifier widened for Windows variant `"No matching credential found"` per saved-memory `feedback_runtime_confirmation_after_web_spike.md` discipline; KeychainProvenance dialog text capitalisation matched to spec-pin test. Full DoD green: build (59m 26s from clean state) / 384+ workspace tests / clippy `-D warnings` / fmt --check. Plus session-discipline learnings captured: HANDOFF.md tech-debt note for parallel-cargo-on-16-GB-Windows OOM + saved-memory `feedback_surgical_cargo_clean_first.md` escalation-trigger amendment. Next code commit bundles all Phase 1 + Phase 0e doc-only edits + 6 deleted T0.1.x plan files per `feedback_admin_changes_ride_with_code.md`. Phase 0d landed CI-green at run `25565477569`.)
+**Last updated:** 2026-05-10 session close (T0.2.0 Phase 1 SHIPPED at commit `9c3c24f`; CI run `25628476966` GREEN matrix-wide. **Phase 2 progress this session — detector + scaffolding milestone HOLDS:** iteration 3 spike PASS (lance 4.0 reads V0.1 fragments end-to-end) + detector layer COMPLETE (4 actionable + 2 no-op tests + Tier 2 fixture-replay = 7 tests, all PASS) + migration loop scaffolding HOLDS (6 tests `#[ignore]`'d with contract-class removal commitment for next-session impl). Floor amendments surfaced: +2 detector + +2 migration loop = +4 over iteration 1+2 forecast (defense-in-depth pinning all 6 named outcomes from iteration 2.1 §1). All scoped DoD gates green per per-step discipline. Working tree: `HANDOFF.md` modified + 23 untracked fixture files + 1 spike example + 1 migration module + 1 test file + `lib.rs` M = ready for first Phase 2 code commit per `feedback_admin_changes_ride_with_code.md`. See "## T0.2.0 Phase 2 — implementation milestone checkpoint (2026-05-10 session close)" section below for full session deliverables + per-layer test-count breakdown.)
 **Updated by:** Claude (Opus 4.7)
 
 > **📁 V0.1 historical record:** `HANDOFF_V0.1_ARCHIVE.md` — frozen as of 2026-05-06. Full T0.1.1 → T0.1.12 phase narratives, ADRs 001-036 full text, tech-debt closures, plan-iteration histories. Cross-link out to that file when V0.2 work needs V0.1 detail; do NOT paraphrase.
@@ -10,7 +10,17 @@
 
 ## Current Status
 
-**Active task:** **T0.2.0 Phase 2 — V0.1 plaintext data migration (per T0.2.0 close-out plan iteration 1 + iteration 2 three-tier fixture strategy).** Phase 1 completed 2026-05-10 with full DoD green; bundle commit pending (this commit lands all Phase 1 production code + Phase 0e doc edits + 6 deleted T0.1.x plan files + 2 test-driven fixes + tech-debt + saved-memory discipline updates). Phase 2 inherits a locked master_key flow (vault-tauri main.rs reads keychain → derives both subkeys → AppConfig forwards) and a staged `at_rest_key` field on AppConfig with `#[allow(dead_code)]` waiting for Phase 2's V0.1-plaintext-migration consumer. Phase 2 methodology: three-tier fixture strategy per close-out plan iteration 2 (Tier 1 scaffolding regression + Tier 2 `1d72aac` V0.1 binary fixture snapshot + Tier 3 founder one-shot smoke on real V0.1 vault). `LanceVectorStore::open()` plaintext path remains alive — Phase 2 is its last caller; Phase 3 deletes it.
+**Active task:** **T0.2.0 Phase 2 — detector + scaffolding milestone HOLDS (2026-05-10 session close); next session: migration loop implementation.** Phase 1 SHIPPED at `9c3c24f`; CI matrix GREEN. This session's deliverables (full audit in "implementation milestone checkpoint" section below):
+
+1. Iteration 3 runtime-confirmation spike SHIPPED + RUN — `crates/vault-storage/examples/v0_1_lance_compat_spike.rs` PASS end-to-end against the Tier 2 fixture (lance 4.0 reads V0.1 lance 0.15 fragments).
+2. Detector layer COMPLETE — `crates/vault-storage/src/migration.rs` `detect_v0_1_state` + `MigrationDetectorOutcome` (6 variants per iteration 2.1 §1's 6-state rule). Production code ~190 LOC.
+3. Detector tests COMPLETE — 7 tests, all PASS: 4 actionable outcomes + 2 no-op outcomes (+2 amendment) + 1 Tier 2 fixture-replay realism gate.
+4. Migration loop scaffolding HOLDS — `migrate_v0_1_to_sealed_if_needed` stub + `MigrationOutcome` enum + 6 tests `#[ignore]`'d ("scaffolding stub: impl lands in Phase 2 step-(b)") covering all 6 named outcomes (+2 amendment over iteration 1 §5 forecast).
+5. All scoped DoD gates green per per-step discipline (test 7 pass / 0 fail / 6 ignored, fmt clean, clippy clean).
+
+**Next session opener: migration loop implementation per HANDOFF.md "T0.2.0 Phase 2 — plan iteration 1" §1.** Implementation deliverable MUST include — **contract-class commitment** — removing all 6 `#[ignore]` annotations on the migration_v0_1_to_sealed.rs scaffolding tests (the tests run live thereafter and MUST pass; ignore-removal IS the impl-trigger contract). Sequence per iteration 2 §5: migration loop module → cookie-recovery state machine + 3 tests → vault-tauri main.rs step 5b wiring + dialog test → StorageBackend at-rest-key wiring → workspace DoD gates → Phase 2 commit milestone.
+
+**Working tree at session close** (all bundle with Phase 2's first code commit per `feedback_admin_changes_ride_with_code.md`): `HANDOFF.md` M, `crates/vault-storage/src/lib.rs` M, 23 untracked fixture files at `crates/vault-storage/tests/fixtures/v0_1_alpha_data_dir/`, `crates/vault-storage/examples/v0_1_lance_compat_spike.rs` ??, `crates/vault-storage/src/migration.rs` ??, `crates/vault-storage/tests/migration_v0_1_to_sealed.rs` ??.
 
 **Why we got here:** V0.2 first task per BRD §6 is T0.2.0 (LanceDB Encryption at Rest, HARD GATE per ADR-010). Spike v1 (lance 0.15 era, designed against `WrappingObjectStore`) FORMALLY FAILED 2026-05-07 — discovered lance-io 0.15's `LocalObjectReader` bypasses the `object_store::ObjectStore` trait for `file://` URIs in BOTH directions, defeating both the `WrappingObjectStore` wrapper AND direct injection via `ObjectStoreParams.object_store`. Web research found lance-io 4.x exposes a first-class `ObjectStoreProvider` + `ObjectStoreRegistry` API designed for this exact integration — but requires a **major lancedb upgrade** (0.8 → 0.27.2, 19 minor versions). Phase 0a executed the upgrade; Phase 0a-fix resolved a `merge_insert` memory regression surfaced by the upgrade (see ADR-038); Phase 0b audit + ADR-039 production fix; Phase 0c re-spiked the at-rest extension on the upgraded stack with the spike-discipline runtime-confirmation (per `feedback_runtime_confirmation_after_web_spike.md`) — and caught a real privacy bug in the Phase 0b ADR-039 implementation, fixed before V0.2 beta cohort exposure.
 
@@ -757,6 +767,494 @@ DoD-gate session 2026-05-10 hit a parallel-cargo-on-16-GB-Windows OOM event — 
 
 ---
 
+## T0.2.0 Phase 2 — plan iteration 1 (drafted 2026-05-10, post-Phase-1-ship)
+
+Phase 2 implements one-time-on-first-launch detection of V0.1-shape plaintext vault → migrate every row through `LanceVectorStore::open_with_at_rest_key` → delete V0.1 plaintext data + `ALPHA_DO_NOT_STORE_REAL_DATA.txt` marker → distinguishing one-time INFO log. Phase 2 is the LAST CALLER of plaintext `LanceVectorStore::open()` in the codebase; Phase 3 deletes the plaintext path immediately after. Iteration 1 names concrete file paths + function signatures from Phase 2 surface source-read; iteration 2 resolves three open questions.
+
+### 1. Migration module location + signature (vault-storage)
+
+New module `crates/vault-storage/src/migration.rs` (~250-350 LOC estimated). Public surface:
+
+```rust
+pub enum MigrationOutcome {
+    NoMigrationNeeded,                // clean first-run V0.2 install OR already-migrated
+    Migrated { rows_migrated: u64 },  // successful one-shot migration
+}
+
+pub async fn migrate_v0_1_to_sealed_if_needed(
+    vector_dir: &Path,
+    dimension: usize,
+    at_rest_key: &[u8; 32],
+) -> VaultResult<MigrationOutcome>;
+```
+
+**Detection signal:** V0.1-shape data dir = BOTH conditions present:
+- `ALPHA_DO_NOT_STORE_REAL_DATA.txt` marker file exists (V0.1 ADR-010 compensating control written by `LanceVectorStore::open` plaintext path, `crates/vault-storage/src/vector_store.rs` step "ADR-010 compensating control #4")
+- At least one Parquet file under `vector_dir/<table>/data/` starts with `PAR1` magic bytes (plaintext Lance fragment)
+
+Neither condition → `NoMigrationNeeded`. Marker without Parquet (half-state corruption) → fail-closed `Err`. Parquet without marker (V0.2-shape sealed file already, OR third-party-write) → fail-closed `Err`.
+
+**Migration steps (atomic on success, rollback-on-failure):**
+1. Create temp dir `vector_dir.with_extension("v0_1_migration_in_progress")`.
+2. Open V0.1 source via `LanceVectorStore::open(vector_dir, dimension)` (still alive at Phase 2; deleted at Phase 3).
+3. Stream every row via lance scan API → collect `Vec<RecordBatch>`. **Streaming-vs-collect-into-RAM decision deferred to iteration 2 OQ #2 (lance 4.0 row-iteration API runtime confirmation).**
+4. Open temp dir as sealed via `LanceVectorStore::open_with_at_rest_key(temp_dir, dimension, at_rest_key)`.
+5. Bulk-insert all rows via the sealed store's writer.
+6. Drop both store handles (release LanceDB file locks before any rename).
+7. Atomic directory swap: `rename(vector_dir, vector_dir.with_extension("v0_1_backup"))` → `rename(temp_dir, vector_dir)`. **Windows-rename ordering deferred to iteration 2 OQ #1.**
+8. Delete `ALPHA_DO_NOT_STORE_REAL_DATA.txt` from the new sealed dir (V0.2 contract: marker absent).
+9. Delete the backup dir (post-swap; cleanup-best-effort — failure is WARN-not-Err).
+10. Emit one-time INFO log: `"V0.1 → V0.2 migration complete: {rows_migrated} rows migrated, V0.1 plaintext data deleted"`.
+
+**Failure modes + rollback:**
+- Read failure mid-iteration → drop both handles, delete temp dir, return Err. V0.1 source untouched.
+- Write failure → drop sealed handle, delete temp dir, return Err. V0.1 source untouched.
+- Atomic dir swap failure → restore V0.1 by reverse-rename if possible; return Err.
+- Backup-dir delete failure (post-swap) → log WARN, return `Migrated { rows_migrated }`. Migration logically succeeded; backup cleanup is best-effort.
+
+### 2. Migration call site (vault-tauri main.rs)
+
+Insert a new step **5b** between AppConfig construction (current step 5, line 226) and Application::new (current step 6, line 256):
+
+```rust
+// 5b. V0.1 → V0.2 migration (one-shot, idempotent — NoMigrationNeeded
+//     on every launch after the first sealed write). Per HANDOFF.md
+//     T0.2.0 close-out plan iteration 1 Phase 2.
+let migration_outcome = tauri::async_runtime::block_on(
+    vault_storage::migration::migrate_v0_1_to_sealed_if_needed(
+        &config.vector_dir,
+        EMBEDDING_DIM,
+        &config.at_rest_key,
+    ),
+);
+match migration_outcome {
+    Ok(MigrationOutcome::NoMigrationNeeded) => {}
+    Ok(MigrationOutcome::Migrated { rows_migrated }) => {
+        tracing::info!(rows_migrated, "V0.1 → V0.2 migration complete");
+    }
+    Err(e) => show_fatal_dialog_and_exit(
+        app.handle(),
+        "Memory Vault — V0.1 Data Migration Failed",
+        &format_migration_error_dialog(&e),
+        EXIT_STARTUP_FAILURE,
+    ),
+}
+```
+
+Plus new `vault_tauri::format_migration_error_dialog(&VaultError) -> String` in `vault-tauri/src/lib.rs` (parallel pattern to Phase 1's `format_keychain_error_dialog`; same fall-through-to-`format_startup_failure_dialog` discipline for non-migration variants) + spec-pin test.
+
+This step turns AppConfig's `at_rest_key` `#[allow(dead_code)]` field into live consumption — Phase 1 staging fulfilled.
+
+### 3. StorageBackend at-rest-key wiring (vault-storage + vault-app)
+
+`StorageBackend::open` gets a sealed companion (mirrors LanceVectorStore's two-constructor pattern):
+
+```rust
+pub async fn open_with_at_rest_key(
+    metadata_path: &Path,
+    vector_dir: &Path,
+    graph_path: &Path,
+    key: SqlCipherKey,
+    dimension: usize,
+    at_rest_key: &[u8; 32],
+) -> VaultResult<Self>;
+```
+
+`Application::new` (`crates/vault-app/src/application.rs:102`) flips from `StorageBackend::open(...)` → `StorageBackend::open_with_at_rest_key(..., &config.at_rest_key)`. Plaintext `StorageBackend::open` retained for Phase 2's migration source path; **Phase 3 deletes both** `LanceVectorStore::open` and `StorageBackend::open` plaintext constructors.
+
+### 4. Three-tier fixture strategy (per iteration 2 OQ #2 resolution — locked file paths)
+
+**Tier 1 — Scaffolding regression test** at `crates/vault-storage/tests/migration_v0_1_to_sealed.rs`:
+- Setup: cargo-test fixture writes synthetic V0.1-shape Parquet via `arrow_array::RecordBatch` + `parquet::arrow::ArrowWriter`, plus the `ALPHA_DO_NOT_STORE_REAL_DATA.txt` marker.
+- Assertions: `NoMigrationNeeded` on empty dir / `Migrated` on V0.1-shape / row-count preserved / framing-bytes `0x01 0x00` on every file post-migration / zero PAR1 magic post-migration / marker file deleted from new sealed dir.
+- Runs every commit on every CI matrix OS. Catches "migration logic mishandles a known V0.1 file shape."
+
+**Tier 2 — Real V0.1 binary fixture** at `crates/vault-storage/tests/fixtures/v0_1_alpha_data_dir/`:
+- Captured ONCE from V0.1 binary at commit `1d72aac` (= `v0.1.0` tag, V0.1 SHIPPED commit, MSI SHA-256 `03d127371f6a881366e2f048d81f2785de97f68236c5d52747bf0100284d0a06`, Phase 5e build).
+- Capture procedure: build V0.1 binary at `1d72aac` → launch with `$env:VAULT_KEY = "fixture-capture-key"` → save 5 throwaway anonymized memories ("fixture row 1" / "fixture row 2" / ... / "fixture row 5", boundary `"default"`) → verify `ALPHA_DO_NOT_STORE_REAL_DATA.txt` marker present → copy entire `%APPDATA%/com.memoryvault.dev/lance/` directory + the marker into the fixture dir.
+- `README.md` alongside fixture: capture date, V0.1 commit SHA `1d72aac`, V0.1 tag `v0.1.0`, MSI SHA-256, capture key (intentionally checked in — fixture-only, never used for real data), row count, content of each row.
+- Test runs migration on a deep-copy of the fixture (so re-runs are idempotent) and asserts Tier-1 expectations + content-equality on every row (5 known strings).
+- Catches "V0.1 actually wrote files we didn't anticipate in scaffolding."
+
+**Tier 3 — Founder one-shot smoke**, before Phase 2 commit:
+- Shahbaz creates a snapshot of his actual V0.1 vault dir for safety (`Copy-Item -Recurse %APPDATA%/com.memoryvault.dev/lance/ %APPDATA%/com.memoryvault.dev/lance.pre-v0.2-snapshot/`).
+- Runs the Phase 2 binary against the live V0.1 vault.
+- Validates row count preserved + spot-checks 2-3 memories via UI search + confirms `ALPHA_DO_NOT_STORE_REAL_DATA.txt` is gone post-migration.
+- Documented as a Phase 2 close-out checklist item; HANDOFF.md captures any findings.
+
+### 5. Test count floor (per `feedback_floor_forecast_is_pre_declaration_not_estimate.md`)
+
+Phase 2 floor: **+5 vault-storage tests** (was +3 at iteration 2):
+- Tier 1: `migration_returns_no_migration_needed_on_empty_dir`, `migration_succeeds_on_v0_1_shape_with_marker_and_parquet`, `migration_fails_closed_on_marker_without_parquet`, `migration_fails_closed_on_parquet_without_marker`
+- Tier 2: `migration_succeeds_on_real_v0_1_fixture_from_1d72aac`
+
+Plus **+1 vault-tauri test**: `format_migration_error_dialog_includes_recovery_options` (spec-pin parallel to Phase 1's `format_keychain_error_dialog_for_keychain_provenance_variant`).
+
+Aggregate: **+6 tests across Phase 2**, taking vault-storage from 231 → ≥236 (post-Phase-1 baseline 231 = 226 + Phase-1's +5 keychain unit tests in vault-app), vault-tauri 6 → ≥7. Floor breach surfaces + plan-amends per discipline.
+
+### 6. DoD acceptance criteria
+
+- All 4 BRD §0.1 gates green (build / test / clippy `-D warnings` / fmt --check).
+- Tier 1 scaffolding tests pass on `[ubuntu-latest, windows-latest, macos-latest]` matrix.
+- Tier 2 real-fixture test passes on the same matrix.
+- Tier 3 founder smoke passes on actual V0.1 vault (manual, before commit).
+- Zero regression in vault-storage's existing 226 tests.
+- vault-tauri new dialog-format test passes; ADR-020 + ADR-040 dialog tests still pass (no convention regression).
+
+### 7. Open questions for iteration 2
+
+1. **Atomic dir swap on Windows.** `std::fs::rename` is atomic on Windows when source + dest are on the same volume — BUT Windows rejects `rename` if the destination exists (POSIX allows overwrite). Migration step 7 ("rename vector_dir → backup, rename temp → vector_dir") must be sequenced as: (a) rename `vector_dir` → `backup_dir` (works because `backup_dir` doesn't exist yet), (b) rename `temp_dir` → `vector_dir` (works because `vector_dir` no longer exists). Verify this exact ordering survives a kill-mid-step-a / kill-mid-step-b crash + re-launch — does iteration 2 want a recovery path for those partial states (re-detect on next launch + resume)?
+
+2. **lance 4.0 row-iteration streaming API** (per `feedback_runtime_confirmation_after_web_spike.md` discipline). Phase 2 step 3 needs to "iterate every row" from a `LanceVectorStore`. Web research suggests `vector_store.scan().execute().await?` returns a `Stream<RecordBatch>` — but this is web-research-level evidence. Need either a quick spike OR a runtime-confirmation test in iteration 2 that streams the existing `LanceVectorStore` against the real lancedb 0.27.2 API before locking the migration loop's structure. If streaming is unavailable, fall back to bulk-collect-then-insert (RAM-bounded by V0.1 vault size — tens of MB worst-case for a founder-dogfood vault).
+
+3. **Tier 2 fixture capture timing.** Capturing requires building the V0.1 binary at commit `1d72aac` once. Two options: (a) capture during Phase 2 implementation (defers cost, but Tier 2 test is unrunnable until the fixture exists, blocking the test-first discipline), (b) capture at iteration 2 close, before Phase 2 implementation starts (front-loads cost, but Tier 2 test exists from the first commit). Iteration 2 picks.
+
+### 8. Cross-references
+
+- HANDOFF.md "T0.2.0 close-out plan iteration 1" Phase 2 paragraph (line 358) — original framing
+- HANDOFF.md "T0.2.0 close-out plan iteration 2" OQ #2 resolution (lines 384-394) — three-tier fixture strategy
+- HANDOFF.md "T0.2.0 close-out plan iteration 1.5" Discovery 2 — Phase 2 dependency on Phase 1 master_key flow
+- ADR-040 amendment "Updated production-wiring contract" — `at_rest_key` flows from keychain through AppConfig to migration consumer
+- ADR-008 amendment (V0.2 at-rest extension lock-in) — migration target shape (per-file granularity, K3 KDF, sealing format)
+- ADR-010 — V0.1 plaintext compensating controls (`ALPHA_DO_NOT_STORE_REAL_DATA.txt` marker is detection signal); Phase 3 removes the controls
+- BRD §6 T0.2.0 acceptance criteria — Phase 3 acceptance suite consumes Phase 2's migration outcome
+
+---
+
+## T0.2.0 Phase 2 — plan iteration 2 (drafted 2026-05-10, resolves iteration 1's three open questions)
+
+Iteration 1 stands. Iteration 2 resolves the three open questions named in iteration 1 §7, applies one calibration to the iteration 1 detection rule (6-state expansion replaces the 4-state rule), and locks the Tier 2 fixture capture path. After iteration 2 closes, the next concrete action is **Tier 2 fixture capture from the V0.1 binary at commit `1d72aac`** (UI procedure, see §3 below) — Phase 2 implementation work begins after the fixture is checked in.
+
+### 1. OQ #2 — RESOLVED, no spike needed (in-tree runtime confirmation)
+
+The lance 4.0 row-iteration streaming API question is answered by existing vault-storage production code, not a fresh spike. Two call sites already exercise the pattern across the 226 green vault-storage tests:
+
+- `crates/vault-storage/src/vector_store.rs:562-577` — `search()` impl: `query().nearest_to(...).only_if(...).limit(...).distance_type(...).execute().await` returns a stream; `stream.try_collect().await` collects into `Vec<RecordBatch>`.
+- `crates/vault-storage/src/vector_store.rs:675-685` — `validate_readable()` impl: `query().limit(row_count).execute().await` → `stream.try_collect()` → `Vec<RecordBatch>`. The doc comment at line 645 explicitly names this as the locked shape: *"The full shape: `query().limit(count).execute().try_collect()`."*
+
+**Lock for Phase 2 migration step 3:**
+
+```rust
+let row_count = source_store.table.count_rows(None).await?;
+let stream = source_store.table.query().limit(row_count).execute().await?;
+let batches: Vec<RecordBatch> = stream.try_collect().await?;
+```
+
+**Bulk-collect over streaming.** V0.1 vault scale is bounded by founder-dogfood reality: ADR-029 V0.1 dogfood was 11 memories. Even at hypothetical 10K rows × (16-byte UUID + 1536-byte Float32 embedding + ~50-byte boundary) ≈ 16 MB peak — trivial. Streaming would be premature optimisation; bulk-collect matches the existing `validate_readable()` shape exactly.
+
+**Discipline:** Per `feedback_runtime_confirmation_after_web_spike.md`, in-tree production code that already passes 226 tests is **stronger evidence** than a fresh spike could produce. Per `feedback_source_read_call_graph_upstream_of_empirical.md`, source-read first (before reaching for empirical investigation) — found the pattern, no further investigation needed.
+
+### 2. OQ #1 — RESOLVED with calibration (6-state detection rule + cookie file + locked rename ordering)
+
+Crash-scenario enumeration of the iteration 1 step-7 atomic dir-swap surfaced two real risks against iteration 1's 4-state detection rule: (a) post-step-(a)-pre-step-(b) crash leaves V0.1 data orphaned in `backup_dir` while next-launch detection sees no `vector_dir` and treats as fresh V0.2 install (data-orphaning risk), (b) post-step-(b)-pre-marker-delete crash leaves the new sealed `vector_dir` with the V0.1 marker still inside, tripping iteration 1's "marker without PAR1 Parquet → fail-closed" rule against successful migration (false-fail-closed risk).
+
+**Calibration A — 6-state detection rule (replaces iteration 1 §1 4-state rule).** Six combinations of marker × disk-content map to specific outcomes. Two new failure-mode names introduced for grep-discoverability per `feedback_quote_locked_artefacts_dont_paraphrase.md`: **`half-state corruption fail-closed`** (marker present + disk empty/mixed = aborted-write-mid-creation), **`third-party data fail-closed`** (marker absent + PAR1 Parquet present = V0.1 data without marker, indicates corrupt or third-party-tool-write).
+
+| Marker file | Disk content | Outcome (named) |
+|---|---|---|
+| Present | PAR1 Parquet | **`v0_1_shape_migrate`** — V0.1-shape detected, run migration |
+| Present | Sealed framing (`0x01 0x00`) | **`post_swap_marker_cleanup`** — Phase 2 step-(b)-succeeded crash recovery: delete marker, return `NoMigrationNeeded` |
+| Present | Empty / mixed | **`half_state_corruption_fail_closed`** — aborted-write-mid-creation; cannot safely recover; surface to caller |
+| Absent | PAR1 Parquet | **`third_party_data_fail_closed`** — V0.1 data without marker; corrupt or non-Memory-Vault-write; surface to caller |
+| Absent | Sealed framing | **`v0_2_clean_no_op`** — clean post-migration V0.2 state, return `NoMigrationNeeded` |
+| Absent | Empty | **`first_run_install_no_op`** — first-run V0.2 install, return `NoMigrationNeeded` |
+
+**Calibration B — cookie file for the rename-pair window.** A single sentinel file at `vector_dir.parent().join(".vault_migration_in_progress")` containing the resolved temp_dir + backup_dir paths (JSON, two `PathBuf` strings) is written **before** step (a) and **deleted after** step (b). On next launch the cookie-presence check runs **before** the 6-state detection. State machine on cookie-present:
+
+| Visible state | Recovery action |
+|---|---|
+| `temp_dir` exists with sealed framing + `vector_dir` does not exist | Resume from step (b) — `rename(temp_dir, vector_dir)`; delete cookie; return `Migrated { rows_migrated: <re-derived from new vector_dir> }` |
+| `backup_dir` exists + `vector_dir` does not exist + `temp_dir` gone (rare — temp deleted between crash and re-launch) | Restore from backup — `rename(backup_dir, vector_dir)`; delete cookie; restart migration normally |
+| `vector_dir` exists with V0.1-shape data | Step (a) didn't happen yet — delete cookie + any orphaned `temp_dir`/`backup_dir` from earlier aborted runs; restart migration normally |
+| Any other state | Surface as cookie-recovery-fail-closed; require manual intervention (Tier 3 founder snapshot is the safety net) |
+
+**Calibration C — locked rename ordering (Windows-correct).** `std::fs::rename` on NTFS rejects rename-to-existing-destination (POSIX allows overwrite; Windows does not). Ordering MUST be:
+
+1. `rename(vector_dir, backup_dir)` — succeeds because `backup_dir` doesn't exist yet
+2. `rename(temp_dir, vector_dir)` — succeeds because `vector_dir` no longer exists
+
+Reverse ordering fails on Windows; same-volume guarantee preserves NTFS atomicity per `MoveFileEx` semantics.
+
+**Belt-and-suspenders:** Tier 3 founder snapshot (per iteration 1 §4) remains the unhandled-edge-case safety net. The cookie file + 6-state rule handle named failure modes; cookie-recovery-fail-closed surfaces unhandled cases for human triage rather than silent corruption.
+
+### 3. OQ #3 — RESOLVED, UI capture path locked (CLI capability check finding negative)
+
+**Capability check completed 2026-05-10:** vault-cli at `1d72aac` has **no add-memory capability**. Verified by `git show 1d72aac:crates/vault-cli/Cargo.toml` (description: *"Operator CLI for the Memory Vault. Dead-letter recovery + divergence triage. See BRD §5.2 / ADR-009 / T0.1.6."*) + `git show 1d72aac:crates/vault-cli/src/main.rs` (Command enum has only `DeadLetter { action }` + `DivergenceCheck`; no `Add` / `Put` / `Store` / `Create` / `Memory` subcommand).
+
+**Locked capture path: UI capture via the V0.1 Tauri binary built at `1d72aac`.** Procedure for the Tier 2 fixture capture (front-loaded per iteration 1 §7 OQ #3 option (b) per BRD §0.3 test-first discipline):
+
+1. From the founder's Windows machine: `git worktree add ../memory-vault-v0_1 1d72aac` (preserves current working tree at HEAD; isolated capture environment).
+2. In the worktree: `cargo build --release -p vault-tauri` (V0.1 binary build).
+3. `$env:VAULT_KEY = "fixture-capture-key-do-not-use-in-prod"`; `cargo run --release -p vault-tauri` (or launch the built MSI; either works).
+4. Via the Add tab in the Tauri UI, save **5 throwaway memories** with content exactly: `"Tier 2 fixture row 1"`, `"Tier 2 fixture row 2"`, ..., `"Tier 2 fixture row 5"`. Boundary `"default"` (V0.1 hardcoded). No PII, no real data.
+5. Close the Tauri UI cleanly. Verify `%APPDATA%/com.memoryvault.dev/lance/memories/_versions/` contains Parquet files; verify `%APPDATA%/com.memoryvault.dev/lance/ALPHA_DO_NOT_STORE_REAL_DATA.txt` exists (per ADR-010 compensating control #4).
+6. Copy the entire `%APPDATA%/com.memoryvault.dev/lance/` directory + the marker file into `crates/vault-storage/tests/fixtures/v0_1_alpha_data_dir/`.
+7. Write `crates/vault-storage/tests/fixtures/v0_1_alpha_data_dir/README.md` with: capture date, V0.1 commit SHA `1d72aac`, V0.1 tag `v0.1.0`, MSI SHA-256 `03d127371f6a881366e2f048d81f2785de97f68236c5d52747bf0100284d0a06`, capture key (intentionally checked in — fixture-only, never used for real data), 5 row contents listed verbatim, **CLI capture fallback rationale** (vault-cli at `1d72aac` had no add-memory subcommand — Cargo.toml + Command enum verified at OQ #3 resolution; UI capture is the only available path; future Phase 2 fixture refreshes follow the same UI procedure unless vault-cli grows add-memory capability later).
+8. `git worktree remove ../memory-vault-v0_1` (cleanup; worktree state is captured into the fixture, original isn't needed).
+9. `git add crates/vault-storage/tests/fixtures/v0_1_alpha_data_dir/` (stage for the Phase 2 first commit alongside the migration code).
+
+**Why the README captures the CLI fallback rationale:** future-session reader looking at the fixture and asking "why was this captured manually instead of scripted?" gets the answer in-place — the capability-check finding is durable evidence, not a silent omission.
+
+### 4. Updated test-count floor (calibration delta)
+
+Iteration 1 §5 forecast +5 vault-storage + 1 vault-tauri = **+6 tests**. Iteration 2 calibrations don't change that floor at the test-count level: the 6-state detection rule still consumes the same 4 tests iteration 1 named (each maps to a named outcome — `v0_1_shape_migrate` / `post_swap_marker_cleanup` / `half_state_corruption_fail_closed` / `third_party_data_fail_closed`), plus the cookie-recovery state machine adds defensive pins.
+
+**Updated floor: +5 vault-storage + 1 vault-tauri + 2 cookie-recovery pins = +8 tests.** Plus 1 Tier-2 real-fixture pin from iteration 1 §5 = **+9 tests total** (was +6 at iteration 1; +3 from cookie-recovery-state-machine pins surfaced at iteration 2 calibration B). Floor breach surfaced + plan-amends per `feedback_floor_forecast_is_pre_declaration_not_estimate.md`.
+
+Cookie-recovery test names (proposed):
+- `cookie_recovery_resumes_step_b_when_temp_dir_exists_and_vector_dir_missing`
+- `cookie_recovery_restores_from_backup_when_temp_dir_gone`
+- `cookie_recovery_restarts_when_step_a_did_not_happen`
+
+### 5. Next concrete action (Phase 2 sequence opener)
+
+Tier 2 fixture capture per §3 above. **Requires founder time on Windows UI** (~15-20 min: V0.1 binary build + UI capture + fixture commit). After fixture is checked in:
+
+1. Tier 1 scaffolding test scaffolds against synthetic Parquet — implementable without the fixture (depends only on arrow_array + parquet crates).
+2. Tier 2 real-fixture test wires against the now-checked-in fixture — implementable after step (1).
+3. Migration module implementation against the failing tests per BRD §0.3 test-first discipline.
+4. Production wiring at vault-tauri main.rs setup() step 5b per iteration 1 §2.
+5. StorageBackend at-rest-key wiring per iteration 1 §3.
+6. DoD gates green per iteration 1 §6.
+
+### 6. Cross-references
+
+- HANDOFF.md "T0.2.0 Phase 2 — plan iteration 1" (lines above) — full Phase 2 surface
+- `crates/vault-storage/src/vector_store.rs:562-577` (search) + `:675-685` (validate_readable) — in-tree runtime evidence for OQ #2
+- `feedback_runtime_confirmation_after_web_spike.md` — discipline that says in-tree confirmation suffices, no fresh spike
+- `feedback_source_read_call_graph_upstream_of_empirical.md` — source-read first, before empirical investigation
+- `feedback_quote_locked_artefacts_dont_paraphrase.md` — explicit failure-mode names introduced for grep-discoverability
+- `feedback_floor_forecast_is_pre_declaration_not_estimate.md` — test-count floor delta surfaced + plan-amends, not silently absorbed
+- `git show 1d72aac:crates/vault-cli/src/main.rs` — vault-cli at V0.1 SHIPPED commit, capability check evidence
+
+---
+
+## T0.2.0 Phase 2 — plan iteration 2.1 (drafted 2026-05-10, post-Tier-2-fixture-capture)
+
+**Trigger.** Tier 2 fixture capture (per iteration 2 §3 procedure) ran 2026-05-10 against the V0.1 binary at commit `1d72aac` and produced 5 Lance data fragments + 6 manifest versions in `crates/vault-storage/tests/fixtures/v0_1_alpha_data_dir/`. Empirical inspection of the captured `.lance` files surfaced a **runtime drift from iteration 1+2's detection-signal text** that would have caused Phase 2 implementation to ship a detector that NEVER triggers on real V0.1 data. Iteration 2.1 captures the correction; iteration 1 §1 + iteration 2 §2's "PAR1 magic on root files" / "PAR1 Parquet" wording is **SUPERSEDED** by this iteration's LANC-magic-at-file-end detection signal. Iteration 1 + 2 text is preserved intact for history; future-session readers should treat this iteration 2.1 as the authoritative detection rule.
+
+### 1. Detection-signal correction (PAR1-at-start → LANC-at-end)
+
+**What V0.1 actually wrote** (verified by inspecting `crates/vault-storage/tests/fixtures/v0_1_alpha_data_dir/lance/memories.lance/data/*.lance`):
+
+- Each `.lance` data file ends with **`4C 41 4E 43`** = ASCII `"LANC"` (last 4 bytes; Lance's own format-magic, not Parquet)
+- `_latest.manifest` and `_versions/*.manifest` files **also end with `LANC`** magic
+- Files do **NOT** start with PAR1 magic (`50 41 52 31`); the first bytes of `.lance` data files are an embedded UUID string (e.g. `019dfced-19c3-7a...`)
+- The V0.1 ADR-010 marker file `lance/ALPHA_DO_NOT_STORE_REAL_DATA.txt` is plain text (337 bytes, with the V0.1 ADR-010 wording verbatim — the prior detection-signal anchor remains valid)
+
+**Updated 6-state detection rule (replaces iteration 2 §2's table — LANC where PAR1 was named):**
+
+| Marker file | Disk content | Outcome (named — UNCHANGED from iteration 2 §2) |
+|---|---|---|
+| Present | At least one `.lance` file in `<table>/data/` ends with `LANC` magic (`4C 41 4E 43`) | **`v0_1_shape_migrate`** — V0.1-shape detected, run migration |
+| Present | Files start with sealed framing (`0x01 0x00`) per ADR-008 amendment | **`post_swap_marker_cleanup`** — Phase 2 step-(b)-succeeded crash recovery: delete marker, return `NoMigrationNeeded` |
+| Present | Empty / mixed | **`half_state_corruption_fail_closed`** — aborted-write-mid-creation; cannot safely recover; surface to caller |
+| Absent | At least one `.lance` file in `<table>/data/` ends with `LANC` magic | **`third_party_data_fail_closed`** — V0.1 data without marker; corrupt or non-Memory-Vault-write; surface to caller |
+| Absent | Sealed framing | **`v0_2_clean_no_op`** — clean post-migration V0.2 state, return `NoMigrationNeeded` |
+| Absent | Empty | **`first_run_install_no_op`** — first-run V0.2 install, return `NoMigrationNeeded` |
+
+**Detection-implementation note:** check the LAST 4 bytes of `.lance` files in `<table>/data/`, NOT the first 4 bytes (V0.1 puts an embedded UUID at the start; only the trailing magic is reliable). Concrete: `std::fs::read` the file, take `bytes[bytes.len()-4..]`, compare to `b"LANC"`.
+
+### 2. Tier 1 scaffolding strategy implication
+
+Iteration 2 §3 Tier 1 scaffolding plan said: *"cargo-test fixture writes synthetic V0.1-shape Parquet via `arrow_array::RecordBatch` + `parquet::arrow::ArrowWriter`"*. **This was wrong** — Parquet writer would produce PAR1-magic files, not LANC-magic Lance fragments. Tier 1 cannot synthesize V0.1-shape data via raw Parquet writer.
+
+**Two viable Tier 1 strategies** post-correction:
+
+- **Tier 1a (recommended):** Use the workspace's lance 4.0 dep to write `.lance` files via `lance::Dataset::write` or equivalent. lance 4.0's `.lance` files also end with `LANC` magic (Lance's format-magic is consistent across V0.1 era → V0.2 era; what differs is internal fragment-layout schema). Tier 1 scaffolding writes a minimal valid Lance fragment + the ADR-010 marker file, then runs the detector. Tests detection-rule logic without coupling to the Tier 2 fixture's real-file presence.
+- **Tier 1b (fallback if 1a's lance 4.0 file isn't recognised by the migration's lance 4.0 reader as backward-compat):** Tier 1 collapses into "shallow regression on the detector logic only" — write raw bytes that match the LANC magic at the end of a fake `.lance` file, plus the marker. Detector tests pass; full migration round-trip happens only at Tier 2 (real fixture).
+
+Iteration 2 §3 Tier 1 file-path target stays at `crates/vault-storage/tests/migration_v0_1_to_sealed.rs`.
+
+### 3. New open question for iteration 3 — lance 4.0 backward-compat read of V0.1 (lance 0.15) fragments
+
+Phase 2 migration step 3 (per iteration 1 §1 + iteration 2 §1) reads V0.1 source via `LanceVectorStore::open(vector_dir, dimension)` then iterates rows via `query().limit(N).execute().try_collect()`. **Open question:** does lance 4.0 (the version in the workspace's Cargo.toml since Phase 0a) successfully read V0.1's lance 0.15 fragments?
+
+Lance has documented backward-compat across V2 file format versions, but lance 0.15 may have used V1 file format — if so, lance 4.0 may refuse to open it OR open it but mis-decode rows. **This is a hard blocker for the migration plan if it fails.**
+
+**Iteration 3 must runtime-confirm** by either:
+- Quick spike: write a small Rust program that opens `crates/vault-storage/tests/fixtures/v0_1_alpha_data_dir/lance/memories.lance/` via lance 4.0 and dumps row count + first row's content. Pass = lance 4.0 reads V0.1 fragments.
+- Or implement Tier 1 scaffolding first; if it can write a lance 4.0 `.lance` file that the migration reader picks up correctly, then Tier 2 (real V0.1 fixture) is the final test.
+
+If lance 4.0 cannot read V0.1 fragments, **alternative migration strategies** for iteration 3 to consider:
+- Bundle a lance 0.15 reader as a dev-dep just for migration (heavy)
+- Build a one-shot migration tool from the V0.1 binary that exports to a lance-version-neutral format (Parquet, JSON), then V0.2 reads that (extra step, but unblocks the migration architecturally)
+- Document migration-not-supported for V0.1 founder data; founder accepts data loss; new alpha-cohort installs are first-run-only (acceptable since alpha-cohort hasn't shipped yet)
+
+**Discipline:** This is exactly the spike-or-empirical-confirmation gate `feedback_runtime_confirmation_after_web_spike.md` exists to enforce. Should have been an iteration 1 OQ; surfaces here only because the Tier 2 fixture capture made the version-compat question concrete + reproducible. Iteration 3 carries it.
+
+### 4. Discipline cross-references
+
+- `feedback_quote_locked_artefacts_dont_paraphrase.md` — the iteration 1+2 "PAR1 magic" wording was paraphrased from web-research-level Lance docs without runtime verification. Iteration 2.1's correction (LANC at file END) is the verbatim-from-runtime-evidence form. The fixture README (`crates/vault-storage/tests/fixtures/v0_1_alpha_data_dir/README.md` "⚠️ CRITICAL V0.1 file-format finding" section) names the same finding for grep-discoverability.
+- `feedback_runtime_confirmation_after_web_spike.md` — Tier 2 fixture capture WAS the runtime confirmation. Without it, Phase 2 implementation would have shipped a detector that never triggers on real V0.1 data. This is the third triple-validation of this discipline (after T0.1.11 Phase 1 ort/ORT version coupling, Phase 5b rmcp stdin-hang, Phase 5c Tauri 2 `window.__TAURI__` default).
+- `feedback_source_read_call_graph_upstream_of_empirical.md` — vault-cli capability check (iteration 2 §3 OQ #3 resolution) used `git show 1d72aac:crates/vault-cli/...` instead of working-tree checkout per this discipline; iteration 2.1's detection-rule correction uses the same source-read pattern (inspect captured fixture bytes directly) before constructing the corrected rule.
+
+### 5. Cross-references
+
+- `crates/vault-storage/tests/fixtures/v0_1_alpha_data_dir/` — the captured V0.1 fixture
+- `crates/vault-storage/tests/fixtures/v0_1_alpha_data_dir/README.md` — fixture provenance + capture procedure + the LANC-vs-PAR1 finding
+- HANDOFF.md "T0.2.0 Phase 2 — plan iteration 2" §2 — the superseded 6-state rule (preserved intact for history)
+- HANDOFF.md "T0.2.0 Phase 2 — plan iteration 1" §1 — the superseded "PAR1 magic" wording (preserved intact for history)
+- ADR-008 amendment (V0.2 at-rest extension lock-in) — sealed-framing magic (`0x01 0x00`) referenced in the corrected 6-state rule
+- ADR-010 — V0.1 plaintext compensating controls; the `ALPHA_DO_NOT_STORE_REAL_DATA.txt` marker remains the marker-side detection signal (unchanged by this iteration)
+
+---
+
+## T0.2.0 Phase 2 — plan iteration 3 (drafted 2026-05-10, post-spike)
+
+**Trigger.** Iteration 2.1 §3 raised one new open question: does lance 4.0 (lancedb 0.27.2 in workspace since Phase 0a) successfully read V0.1's lance 0.15 fragments? The question is a hard-blocker for the Phase 2 migration plan — step 3 reads V0.1 source via `LanceVectorStore::open(vector_dir, dimension)` then iterates rows. If lance 4.0 cannot read V0.1's fragments, Phase 2 must pick from one of three fallback strategies (bundle a lance 0.15 reader as dev-dep / V0.1-binary export to a neutral format / document-data-loss for V0.1 founder data). Iteration 3 runtime-confirms by writing and running a small spike against the Tier 2 fixture per `feedback_runtime_confirmation_after_web_spike.md`.
+
+### 1. Spike PASS evidence (verbatim from spike run)
+
+**Spike file:** `crates/vault-storage/examples/v0_1_lance_compat_spike.rs` (~190 LOC, deep-copies the checked-in fixture's `lance/` subdir to a tempdir before opening so the fixture is never mutated).
+
+**Run command:** `cargo run --example v0_1_lance_compat_spike -p vault-storage --release`
+
+**Run date:** 2026-05-10, against the Tier 2 fixture captured this session.
+
+**Output (5 sequential checks, all PASS, exit 0):**
+
+```
+[1/5] LanceVectorStore::open(dim=384)         OK — store opened
+[2/5] validate_readable() (ADR-018)           OK — full decode succeeded
+[3/5] count(None)                              count = 5
+[4/5] count(Some("default"))                   count(default) = 5
+[5/5] search(top=1)                            hit: id=019e1212-564a-7ab1-a97d-52e1eba510ed
+                                               cosine_distance=0.9944
+PASS — lance 4.0 reads V0.1 (lance 0.15) fragments end-to-end.
+```
+
+**Why each check is load-bearing:**
+- `LanceVectorStore::open` is the exact production call Phase 2 step 3 will make to read the V0.1 source. The spike doesn't shortcut to a lower-level `lancedb::connect` — it tests the call site that will appear in production code.
+- `validate_readable()` is ADR-018's "minimum-cost end-to-end read that exercises data-decode" contract. NOT metadata-only. Per the 2026-04-30 LanceDB-corruption spike (`crates/vault-storage/examples/lance_corruption_spike.rs`), metadata + count can both succeed on a store whose fragment data is corrupted to unreadability. `validate_readable` exercises the full decode path against the row with smallest UUID — the strongest single signal that lance 4.0 actually decodes V0.1's fragment bytes.
+- `count(None) = 5` matches the fixture's row count from its README. Wrong count would mean lance 4.0 opened metadata but mis-decoded fragment row counts.
+- `count(Some(default)) = 5` confirms boundary-column decode. The fixture's `boundary` column is the V0.1 `Utf8` "default" string for all 5 rows; if lance 4.0 mis-decoded the column, the scoped count would be 0 or wrong.
+- `search(top=1)` returns a real UUIDv7 (`019e1212-...`) with a sane cosine_distance (`0.9944` against an L2-normalised all-1/sqrt(384) probe). Wrong UUIDs or NaN distance would mean either id-column decode failure or embedding-column decode failure.
+
+### 2. Implication for Phase 2 implementation
+
+**The 3 alternative migration strategies in iteration 2.1 §3 are moot.** Phase 2 step 3's plan stands as written:
+
+```rust
+let source_store = LanceVectorStore::open(&v0_1_vector_dir, EMBEDDING_DIM).await?;
+// → iterate rows via source_store's table.query().limit(N).execute().try_collect()
+// → batch-write through StorageBackend::open_with_at_rest_key sealed path
+// → atomic directory swap (Phase 2 step 7 per iteration 1 §1)
+```
+
+**The 6-state detection rule from iteration 2.1 §1 is the authoritative form** — its `LANC` magic at file END check (not PAR1 at file start) is what Phase 2 detector tests assert against.
+
+**Tier 1 scaffolding strategy 1a (recommended, iteration 2.1 §2) is unblocked.** lance 4.0 can write `.lance` files via `lance::Dataset::write` or equivalent for synthetic-fixture detector tests — and since lance 4.0 reads V0.1 (lance 0.15) fragments end-to-end (this iteration's evidence), it will also read its own lance 4.0 output by transitivity. The Tier 1b fallback (raw-bytes-with-LANC-magic) is reserved for the unlikely event that lance 4.0's writer produces something its own reader rejects in this specific build configuration.
+
+### 3. Spike file disposition (kept as executable documentation)
+
+Per `feedback_spike_playbook_for_unknowns.md`, the spike stays in-tree as runtime-evidence. Phase 2 implementation does not delete it. Future-session readers can re-run the same command above to re-confirm the read-compat property if any of these change:
+- lancedb / lance dep versions advance (e.g., lance 4.x → 5.x).
+- The Tier 2 fixture is re-captured against a different V0.1 commit.
+- A future Phase 2 refactor changes `LanceVectorStore::open`'s side-effects in a way that could affect the read path.
+
+The spike's 5-check structure is also a model for the Tier 2 fixture-replay test — same call sequence, but inside a `#[tokio::test]` with `assert_eq!` instead of `eprintln!` + `process::exit`.
+
+### 4. Schema invariant (load-bearing for Phase 2 row-iteration)
+
+**Verified by spike:** the V0.1 schema `(id: Utf8, embedding: FixedSizeList<Float32, 384>, boundary: Utf8)` is byte-stable across V0.1 (lance 0.15) → V0.2 (lance 4.0). lance 4.0's reader decoded all three columns from V0.1 fragments without schema-coercion errors. Phase 2's batch-iteration code can use the V0.2 schema constant (`make_schema(384)` in `vector_store.rs`) directly against V0.1 source data.
+
+This invariant is captured here because it is **not** explicitly named in the V0.1 schema's source-code site — it's implicit in the stable column types. If a future schema-evolution feature lands (e.g., a new optional `provenance` column), this invariant will need to be re-stated and the migration plan amended.
+
+### 5. Discipline cross-references
+
+- `feedback_runtime_confirmation_after_web_spike.md` — this iteration is the runtime confirmation. The web-research-level claim "Lance has documented backward-compat across V2 file format versions" (iteration 2.1 §3) is now empirically verified for the specific version pair (V0.1 lance 0.15 → V0.2 lance 4.0) on the Tier 2 fixture. Without this iteration, Phase 2 would have proceeded on a docs-claim alone and risked shipping a migration that fails on real V0.1 data.
+- `feedback_quote_locked_artefacts_dont_paraphrase.md` — the spike's PASS-criteria sentence above quotes the spike file's check sequence verbatim rather than paraphrasing. Future iterations can re-run the spike file as ground truth instead of relying on this paragraph's wording.
+- `feedback_spike_playbook_for_unknowns.md` — spike kept in-tree as executable documentation; not promoted to production code (`LanceVectorStore::open` already exists in production); not deleted after PASS.
+
+### 6. Cross-references
+
+- `crates/vault-storage/examples/v0_1_lance_compat_spike.rs` — the spike file (in working tree, bundles with Phase 2 first commit)
+- `crates/vault-storage/tests/fixtures/v0_1_alpha_data_dir/` — the Tier 2 fixture the spike runs against
+- HANDOFF.md "T0.2.0 Phase 2 — plan iteration 2.1" §3 — the open question this iteration resolves
+- HANDOFF.md "T0.2.0 Phase 2 — plan iteration 1" §4 — the three-tier fixture strategy now fully unblocked
+- ADR-018 — `validate_readable` data-decode contract that the spike's check [2/5] exercises
+
+---
+
+## T0.2.0 Phase 2 — implementation milestone checkpoint (2026-05-10 session close)
+
+This section captures session deliverables — what shipped, what holds at scaffolding, what next session inherits. Recorded here (rather than as a fresh "iteration 4" plan paragraph) because no new plan decisions were made; this session executed iteration 1 + 2 + 2.1 + 3 plans against locked contracts. Only floor-amendment surfacing was net-new.
+
+### 1. Session deliverables (in dependency order)
+
+1. **CI green confirmed on Phase 1 push (`9c3c24f`)** — run `25628476966` matrix-wide success across `[ubuntu-latest, windows-latest, macos-latest] × [build+test, clippy]` + fmt, completed 2026-05-10T13:22:47Z. Verified via `gh run view 25628476966` per CLAUDE.md per-commit CI standing rule before any new code lands.
+
+2. **Iteration 3 spike SHIPPED + RUN** — `crates/vault-storage/examples/v0_1_lance_compat_spike.rs` (~190 LOC). Five sequential checks against the captured Tier 2 fixture: `LanceVectorStore::open(dim=384)` → `validate_readable()` (ADR-018 full data-decode) → `count(None)=5` → `count(Some(default))=5` → `search(top=1)` returning UUIDv7 `019e1212-564a-7ab1-a97d-52e1eba510ed` (cosine_distance=0.9944). Exit 0. **Resolves iteration 2.1 §3 OQ:** lance 4.0 reads V0.1 (lance 0.15) fragments end-to-end; the 3 alternative migration strategies (bundle-old-reader / V0.1-binary-export / document-data-loss) are all moot.
+
+3. **Detector layer COMPLETE** — `crates/vault-storage/src/migration.rs` (~190 LOC):
+   - `MigrationDetectorOutcome` enum (6 variants matching iteration 2.1 §1 verbatim).
+   - `detect_v0_1_state(lance_data_dir: &Path) -> VaultResult<MigrationDetectorOutcome>` async impl. Metadata-only per ADR-018 spirit (file presence + magic-byte peeks via seek-based reads; never decodes Lance content). Helpers `file_ends_with` / `file_starts_with` keep the magic-byte checks size-bounded.
+   - Exported via `vault-storage/src/lib.rs`.
+
+4. **Detector tests COMPLETE — 7 tests, all PASS** (`crates/vault-storage/tests/migration_v0_1_to_sealed.rs`):
+   - `detect_v0_1_shape_migrate` — marker present + LANC magic → V0_1ShapeMigrate
+   - `detect_post_swap_marker_cleanup` — marker present + sealed framing → PostSwapMarkerCleanup
+   - `detect_half_state_corruption_fail_closed` — marker present + empty → HalfStateCorruptionFailClosed
+   - `detect_third_party_data_fail_closed` — marker absent + LANC magic → ThirdPartyDataFailClosed
+   - `detect_v0_2_clean_no_op` — marker absent + sealed framing → V0_2CleanNoOp **[+1 amendment]**
+   - `detect_first_run_install_no_op` — marker absent + empty → FirstRunInstallNoOp **[+1 amendment]**
+   - `tier_2_real_v0_1_fixture_returns_v0_1_shape_migrate` — Tier 2 realism gate (captured V0.1 fixture from MSI commit `1d72aac`)
+
+5. **Migration loop scaffolding HOLDS — 6 tests `#[ignore]`'d**:
+   - Public surface stubbed in `migration.rs`: `MigrationOutcome` enum (`NoMigrationNeeded`, `Migrated { rows_migrated: u64 }`) + `migrate_v0_1_to_sealed_if_needed(vector_dir, dimension, at_rest_key)` returning `Err(VaultError::Storage("migration loop not yet implemented..."))`.
+   - 6 tests in same test file, all `#[ignore = "scaffolding stub: impl lands in Phase 2 step-(b)"]`:
+     - `migration_succeeds_on_v0_1_shape` — V0_1ShapeMigrate path
+     - `migration_no_op_on_v0_2_clean` — V0_2CleanNoOp **[+1 amendment]**
+     - `migration_no_op_on_first_run_install` — FirstRunInstallNoOp
+     - `migration_no_op_on_post_swap_marker_cleanup` — PostSwapMarkerCleanup **[+1 amendment]**
+     - `migration_fails_closed_on_half_state_corruption` — substring assertion on error message (so stub error doesn't trivially satisfy `is_err()`)
+     - `migration_fails_closed_on_third_party_data` — same substring discipline
+   - Run via `cargo test ... -- --ignored` to exercise the stub-driven failure mode (uniform 6/6).
+
+6. **Scoped DoD verified after every milestone** — per per-step discipline:
+   - `cargo test -p vault-storage --test migration_v0_1_to_sealed`: 7 passed, 0 failed, 6 ignored (final).
+   - `cargo fmt -p vault-storage --check`: clean (after rustfmt auto-applies on each pass).
+   - `cargo clippy -p vault-storage --tests -- -D warnings`: clean.
+
+### 2. Floor amendments — surface for the Phase 2 first commit message
+
+Iteration 1 + 2 forecast: 4 detector tests + 1 Tier-2 fixture-replay + 4 migration-loop tests + 3 cookie-recovery + 1 vault-tauri = +13 vault-storage + +1 vault-tauri = 14 total. (Iteration 2 §4's "+8 vs +9" arithmetic discrepancy resolved as +9 per its own test-name list.)
+
+This session lands +13 (7 detector + 6 migration loop scaffolding ignored) toward the +13 vault-storage forecast, BUT:
+- **+2 detector layer amendment** (`detect_v0_2_clean_no_op`, `detect_first_run_install_no_op`) — defense-in-depth pinning of all 6 named outcomes from iteration 2.1 §1, surfaced and approved before commit.
+- **+2 migration loop layer amendment** (`migration_no_op_on_v0_2_clean`, `migration_no_op_on_post_swap_marker_cleanup`) — covers the 2 no-op outcomes iteration 2.1 §1 added to the 6-state rule that iteration 1 §5's pre-iteration-2.1 4-state framing didn't anticipate.
+
+Net session count: 7 PASS detector tests + 6 IGNORED migration loop scaffolding tests = 13 tests across both layers, +4 over the iteration 1+2 forecast for these two layers. Cookie-recovery (3 tests) + vault-tauri dialog (1 test) stay unattempted; they land with migration loop impl + production wiring next session.
+
+Both amendments surfaced + approved per `feedback_floor_forecast_is_pre_declaration_not_estimate.md`.
+
+### 3. Contract-class commitment (next-session opener)
+
+**The migration loop implementation milestone (next session) MUST remove all 6 `#[ignore]` annotations on migration_v0_1_to_sealed.rs scaffolding tests as part of the impl deliverable.** After removal the tests run live — they MUST pass against the real `migrate_v0_1_to_sealed_if_needed` implementation. Ignore-removal IS the impl-trigger contract.
+
+Concrete next-session sequence:
+
+1. Confirm CI green on this session's commit before any new code lands (per CLAUDE.md per-commit CI standing rule).
+2. Migration loop implementation: read-V0.1 → write-sealed → atomic-swap → cleanup loop per iteration 1 §1's 13-step list, with iteration 2 §2's cookie-file calibration baked in.
+3. Cookie-recovery state machine + 3 tests per iteration 2 §4's named cases.
+4. vault-tauri main.rs setup() step 5b wiring per iteration 1 §2 + dialog format helper + 1 vault-tauri test.
+5. StorageBackend `open_with_at_rest_key` wiring per iteration 1 §3.
+6. Workspace-level DoD gates (build / clippy / fmt / test --workspace).
+7. Phase 2 commit milestone — atomic dir swap + Windows-rename ordering safety + Tier 3 founder smoke test on actual V0.1 vault before commit.
+
+### 4. Cross-references
+
+- HANDOFF.md "T0.2.0 Phase 2 — plan iteration 1" §1 — migration loop spec
+- HANDOFF.md "T0.2.0 Phase 2 — plan iteration 2" §1-§4 — OQ resolutions + cookie-file calibration
+- HANDOFF.md "T0.2.0 Phase 2 — plan iteration 2.1" §1 — 6-state detection rule (verbatim)
+- HANDOFF.md "T0.2.0 Phase 2 — plan iteration 3" §1 — spike PASS evidence
+- `feedback_admin_changes_ride_with_code.md` — bundling discipline for HANDOFF + fixtures + spike with first Phase 2 code commit
+- `feedback_floor_forecast_is_pre_declaration_not_estimate.md` — both +2 amendments surfaced explicitly, neither silently absorbed
+- `feedback_quote_locked_artefacts_dont_paraphrase.md` — outcome names match iteration 2.1 §1 verbatim across enum variants, test names, and docstrings
+
+---
+
 ## Locked-into-code invariants (forward-carried verbatim from V0.1)
 
 These invariants are pinned by V0.1 code or tests — V0.2 work that touches the relevant subsystems MUST preserve them or explicitly amend with ADR + reasoning. **Verbatim per `feedback_quote_locked_artefacts_dont_paraphrase.md` discipline.**
@@ -868,6 +1366,7 @@ V0.2-deadline items forward-carried from V0.1. Full original entries with cross-
 - **`.gitattributes` for line-ending normalisation** — quick win when convenient
 - **Phase 0a-fix Cosine NaN-vector upstream issue** — file against `lance-format/lance` once we have a minimal-repro example. Regression: lancedb 0.8 returned NaN-distance rows in Cosine search; lancedb 0.27.2 / lance 4.0 filters them out. Affects zero-magnitude vectors only (cosine `0 / (0 * ||v||)` = NaN). Memory Vault production unaffected (BGE embeddings are L2-normalised non-zero) — purely an upstream-behaviour-change finding for the wider community. Defer to V0.2 alpha-distribution window when other compatibility checks happen. See ADR-038 Layer 4.
 - **Parallel cargo on 16 GB Windows = OOM corruption risk** (surfaced 2026-05-10, T0.2.0 Phase 1 DoD-gate session) — two concurrent `cargo build --workspace --all-targets` invocations on the founder's 16-CPU / 16 GB Windows dev box exhausted the paging file mid-link, corrupting shared workspace dep artifacts (`libtokio`, `libserde_json`, `libtracing`, `libtracing_subscriber`, `libvault_storage`, `libproptest`, `librpassword`) with `LNK1201` + cascading `E0786 ... os error 1455 paging file too small`. Recovery: surgical `cargo clean -p` of the corrupted set per `feedback_surgical_cargo_clean_first.md` (full clean is escalation, not first move). **Discipline:** before every cargo invocation, check `Get-Process | Where-Object { $_.ProcessName -in @('cargo','rustc','link') }` returns empty — not "is the previous output file growing." Silent-backgrounding-without-output is the failure mode that masked the still-running first build; bytes-arriving in the wrapper file is NOT evidence of completion when stdout is piped through `Out-Null`. Single-invocation discipline is the only safe path on this hardware.
+- **`vault-embedding test_7_spawn_blocking_does_not_starve_reactor` flakes under workspace-wide concurrent test load** (surfaced 2026-05-10, T0.2.0 Phase 2 commit DoD). Asserts `tokio::sleep` wakes within ~50ms; observed `250.3267ms` during `cargo test --workspace --no-fail-fast` under 300+ parallel tests on the founder's 16-CPU Windows dev box. Isolation re-run (`cargo test -p vault-embedding --test embedding_tests`) PASSED at exit code 0 — same test, same machine, no other changes. **Not a regression from migration work** — vault-embedding source-graph untouched by Phase 2; the failure is OS-scheduler delay under contention, not a real reactor-starvation defect. CI matrix has been green historically (more controlled environment); CI is the canonical test gate per the standing rule. Revisit at the vault-embedding stability pass — candidates: widen the threshold to bound for concurrent-load contention (e.g., 50ms → 500ms with documented headroom rationale) OR restructure to a non-timing-sensitive assertion via `tokio::time::pause` mocking + manual time advance. **Out of scope for T0.2.0.**
 - ~~**Phase 0b finding: lance 4.0 delete-tombstoning vs Memory Vault privacy property**~~ — **CLOSED 2026-05-07 (ADR-039 Prune-alone) → AMENDED 2026-05-08 (Phase 0c spike Stage E discovery: Prune-alone insufficient for partial-fragment deletes).** **Final resolution:** `LanceVectorStore::delete()` calls `Compact` then `Prune-with-zero-retention` after `table.delete()`, holding the ADR-038 upsert mutex throughout. Phase 0b's Prune-alone implementation was insufficient because Memory Vault's actual delete API is single-memory-id (partial-fragment) — Lance's `OptimizeAction::Prune` reports `data_files_removed: 0` for that case (verified empirically by spike Stage E 2×2 on both plain file:// and vault-sealed://). The Phase 0b regression test passed for the wrong reason (full-boundary delete = empty fragment = special case); Phase 0c added a partial-fragment companion (`delete_partial_fragment_physically_removes_content_per_adr_039`) using BLAKE3 content-hash-set-difference assertion. Trade-off (lose lance time-travel undo) preserved. See ADR-039 amendment block above for the full Phase 0c discovery + reasoning. **Beta cohort can now receive builds claiming "permanent deletion" — privacy contract preserved with the corrected Compact+Prune sequence.**
 
 **Closed in this commit (T0.2.0 Phase 0a-fix):**
