@@ -7,84 +7,54 @@
 //! converts to a binary at T0.1.11. Phase 3 interpretation: ADR-003's
 //! "converts to binary" reads as "add binary target," not "remove library
 //! target." Keeping the library alongside the binary lets us unit-test
-//! env-var parsing, OS dispatch, and integrity-failure formatting WITHOUT
-//! launching the Tauri runtime — standard Rust pattern for testable apps.
+//! OS dispatch + keychain-failure formatting WITHOUT launching the Tauri
+//! runtime — standard Rust pattern for testable apps.
 //!
 //! ## What lives here vs in main.rs
 //!
 //! - **lib.rs (this file):** pure functions that take inputs and return
-//!   outputs — testable in isolation. ADR-032 env-var parsing, ADR-019
-//!   OS-aware dylib filename dispatch, ADR-020 integrity-failure dialog
-//!   text formatting.
-//! - **main.rs:** Tauri Builder orchestration — builds the AppConfig from
-//!   resolved paths, launches `Application::start_with_mcp`, manages the
-//!   ApplicationHandle in Tauri state. Thin glue on top of these utilities.
+//!   outputs — testable in isolation. ADR-019 OS-aware dylib filename
+//!   dispatch, ADR-020 integrity-failure dialog text formatting,
+//!   ADR-040 keychain-error dialog text formatting (T0.2.0 Phase 1).
+//! - **main.rs:** Tauri Builder orchestration — sources master_key from
+//!   keychain via `vault_app::keychain`, derives SqlCipher / at-rest
+//!   subkeys, builds AppConfig, launches Application. Thin glue on top
+//!   of these utilities.
+//!
+//! ## T0.2.0 Phase 1 retirement (2026-05-09)
+//!
+//! Per ADR-040 + ADR-040 amendment, the V0.1 `parse_vault_key` /
+//! `ConfigError::VaultKey*` surface retired alongside the VAULT_KEY env
+//! var. The single remaining `ConfigError` variant (`UnsupportedPlatform`)
+//! is still used by `dylib_filename_for_os` for OS-dispatch error
+//! reporting. New `format_keychain_error_dialog` formats the
+//! `VaultError::KeychainProvenance` variant for fatal-dialog surfacing.
 
 #![forbid(unsafe_code)]
 
 pub mod commands;
 
-use std::env::VarError;
 use std::path::PathBuf;
 
 use thiserror::Error;
 use vault_core::VaultError;
-use vault_storage::SqlCipherKey;
 
 /// Configuration errors surfaced before the Tauri runtime starts.
 ///
-/// Each variant maps to a fatal-dialog message in main.rs and exits the
-/// process with a distinct non-zero code so wrapper scripts can
-/// distinguish "VAULT_KEY missing" from "model integrity failed."
+/// Pre-Phase-1 this enum carried `VaultKeyUnset` + `VaultKeyEmpty`
+/// variants for the V0.1 VAULT_KEY env-var path; both retired at T0.2.0
+/// Phase 1 alongside the env var (per ADR-040 + ADR-040 amendment —
+/// keychain provenance replaces env-var provenance). The remaining
+/// variant is still used by `dylib_filename_for_os` for OS-dispatch
+/// error reporting at the libonnxruntime resolution site.
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    /// VAULT_KEY environment variable is not set. Per ADR-032 (T0.1.11
-    /// Phase 3, branch (B) lock): vault-tauri sources its SQLCipher
-    /// passphrase from the VAULT_KEY env var for V0.1 founder-only
-    /// dogfood. Future-cohort secret-source migration deferred to V0.2
-    /// alpha-distribution task per ADR-032 forward-pointer.
-    #[error("VAULT_KEY environment variable must be set before launching vault-tauri")]
-    VaultKeyUnset,
-
-    /// VAULT_KEY environment variable is set but empty. Treating empty
-    /// as unset would let SqlCipherKey::new("") through, producing a
-    /// vault encrypted with the empty passphrase — silently wrong.
-    /// Failing closed here.
-    #[error("VAULT_KEY environment variable is set but empty")]
-    VaultKeyEmpty,
-
     /// Host OS is not one of the three supported V0.1 platforms (Linux /
     /// macOS / Windows per ADR-029 BRD amendment to "Mac or Windows" +
     /// `[ubuntu-latest, windows-latest, macos-latest]` CI matrix landed
     /// at T0.1.11 Phase 1).
     #[error("unsupported platform: {0}")]
     UnsupportedPlatform(String),
-}
-
-/// Read the SQLCipher passphrase from the `VAULT_KEY` environment
-/// variable per ADR-032 branch (B) lock.
-///
-/// Production callers use [`parse_vault_key`] which delegates to
-/// `std::env::var`. Tests pass a closure to [`parse_vault_key_from`] to
-/// avoid mutating the process env (env-var-mutation tests race when
-/// cargo runs multiple test binaries in parallel — closure-based tests
-/// don't).
-pub fn parse_vault_key() -> Result<SqlCipherKey, ConfigError> {
-    parse_vault_key_from(|name| std::env::var(name))
-}
-
-/// Inner [`parse_vault_key`] that takes an env-var getter closure for
-/// testability. Production [`parse_vault_key`] delegates here with
-/// `std::env::var`.
-pub fn parse_vault_key_from<F>(getter: F) -> Result<SqlCipherKey, ConfigError>
-where
-    F: Fn(&str) -> Result<String, VarError>,
-{
-    match getter("VAULT_KEY") {
-        Ok(value) if !value.is_empty() => Ok(SqlCipherKey::new(&value)),
-        Ok(_) => Err(ConfigError::VaultKeyEmpty),
-        Err(_) => Err(ConfigError::VaultKeyUnset),
-    }
 }
 
 /// Resolve the platform-specific filename for the bundled libonnxruntime
@@ -94,12 +64,6 @@ where
 /// installer-mode) or under the `VAULT_ORT_LIB_PATH` env var override
 /// (Phase 3 dev-mode boot — main.rs reads this env var if set,
 /// otherwise calls `app.path().resolve(BaseDirectory::Resource)`).
-///
-/// **ADR-019 amendment (T0.1.11 Phase 3):** the v3-vintage
-/// "PathResolver::resolve_resource" wording was the JS API name; the
-/// Rust API is `app.path().resolve(p, BaseDirectory::Resource)`. This
-/// function returns just the relative path; main.rs wires the resolve
-/// call. See HANDOFF.md ADR-019 cross-link for the corrected wording.
 pub fn dylib_filename_for_os(os: &str) -> Result<&'static str, ConfigError> {
     match os {
         "windows" => Ok("libs/onnxruntime.dll"),
@@ -116,10 +80,6 @@ pub fn dylib_filename_for_os(os: &str) -> Result<&'static str, ConfigError> {
 /// dylib / model / tokenizer without needing an installer. Production
 /// builds set no env var and fall through to `app.path().resolve(...,
 /// BaseDirectory::Resource)`.
-///
-/// Extracted from `main.rs` at T0.1.11 Phase 4b for testability per
-/// multi-agent code-review HIGH finding "extract pure functions to
-/// lib.rs for testing without launching Tauri."
 pub fn env_override_for(env_var_name: &str) -> Option<PathBuf> {
     match std::env::var(env_var_name) {
         Ok(v) if !v.is_empty() => Some(PathBuf::from(v)),
@@ -127,29 +87,40 @@ pub fn env_override_for(env_var_name: &str) -> Option<PathBuf> {
     }
 }
 
-/// Format a [`ConfigError`] as the fatal-dialog body shown by
-/// `main.rs::show_fatal_dialog_and_exit` when configuration parsing
-/// fails before Application::new is reached. Matches the `setup()`
-/// hook's `format_startup_failure_dialog` pattern (which handles
-/// post-Application-construction failures).
+/// Format a [`VaultError::KeychainProvenance`] as the fatal-dialog body
+/// shown by `main.rs::show_fatal_dialog_and_exit` when keychain access
+/// fails before Application::new is reached.
 ///
-/// Extracted from `main.rs` at T0.1.11 Phase 4b for testability per
-/// multi-agent code-review HIGH finding.
-pub fn format_config_error_dialog(err: &ConfigError) -> String {
+/// Per ADR-040 + ADR-040 amendment (T0.2.0 Phase 1, 2026-05-09):
+/// keychain provenance replaces the V0.1 VAULT_KEY env-var provenance.
+/// The dialog body explains the failure category + suggests the standard
+/// recovery path (Credential Manager inspection on Windows, reinstall on
+/// non-Windows where keychain is not yet supported in V0.2 Phase 1).
+///
+/// **Defensive fallback for non-`KeychainProvenance` variants:** the
+/// function accepts any `&VaultError` so the call site can pass through
+/// without prior pattern-matching, but only `KeychainProvenance` variants
+/// produce a tailored message; other variants render via the generic
+/// `format_startup_failure_dialog` path.
+pub fn format_keychain_error_dialog(err: &VaultError) -> String {
     match err {
-        ConfigError::VaultKeyUnset => "VAULT_KEY environment variable must be set before launching vault-tauri.\n\n\
-             Per ADR-032 (T0.1.11 Phase 3 SQLCipher key source), V0.1 alpha sources \
-             the SQLCipher passphrase from this env var.\n\n\
-             Set it via:\n  PowerShell: $env:VAULT_KEY = \"your-passphrase\"\n  Bash: export VAULT_KEY=your-passphrase".to_string(),
-        ConfigError::VaultKeyEmpty => "VAULT_KEY environment variable is set but empty.\n\n\
-             Empty passphrases would silently encrypt the vault with the empty key. \
-             Failing closed.\n\n\
-             Set VAULT_KEY to a non-empty passphrase and relaunch.".to_string(),
-        ConfigError::UnsupportedPlatform(os) => format!(
-            "Memory Vault does not support the current platform: {os}.\n\n\
-             V0.1 supports Linux, macOS, and Windows per BRD §5.11 (amended at T0.1.11 \
-             Phase 1 / ADR-029)."
+        VaultError::KeychainProvenance(msg) => format!(
+            "Memory Vault cannot start: keychain access failed.\n\n\
+             Details: {msg}\n\n\
+             Per ADR-040 (T0.2.0 Phase 1), Memory Vault sources its master \
+             encryption key from the OS keychain (Windows Credential Manager).\n\n\
+             Recovery options:\n\
+             1. On Windows, open Control Panel → User Accounts → Credential \
+                Manager → Windows Credentials and inspect entries under \
+                'com.memoryvault.v0.2'. If an entry exists with a corrupted \
+                or unexpected secret, delete it and relaunch Memory Vault \
+                (a new master_key will be generated on first run).\n\
+             2. If you are running on macOS or Linux, note that V0.2 Phase 1 \
+                wires keychain support for Windows only. Cross-platform \
+                keychain support lands in a follow-up sub-task.\n\
+             3. Reinstall Memory Vault if the failure persists."
         ),
+        other => format_startup_failure_dialog(other),
     }
 }
 
@@ -187,63 +158,6 @@ pub fn format_startup_failure_dialog(err: &VaultError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // -----------------------------------------------------------------
-    // ADR-032 tests (Phase 3 floor breach: +3 → +5; pre-declared in
-    // commit body. The +2 over the v4 floor are below — VAULT_KEY-unset
-    // and VAULT_KEY-empty paths.)
-    // -----------------------------------------------------------------
-
-    /// ADR-032 branch (B): VAULT_KEY unset → ConfigError::VaultKeyUnset.
-    /// main.rs catches this variant and shows the
-    /// "VAULT_KEY environment variable must be set" fatal dialog.
-    ///
-    /// Note: assertion can't `{result:?}`-format because SqlCipherKey
-    /// (the Ok type) deliberately doesn't impl Debug per its zeroize-on-
-    /// drop secrets discipline (vault-storage/src/key.rs:9-10). Format
-    /// only the err side via `.err()` which is `Option<ConfigError>`.
-    #[test]
-    fn parse_vault_key_returns_unset_err_when_env_var_missing() {
-        let result = parse_vault_key_from(|_| Err(VarError::NotPresent));
-        assert!(
-            matches!(result, Err(ConfigError::VaultKeyUnset)),
-            "ADR-032 branch (B): missing VAULT_KEY MUST surface as \
-             ConfigError::VaultKeyUnset; got err={:?}",
-            result.err()
-        );
-    }
-
-    /// ADR-032 branch (B): VAULT_KEY set but empty → ConfigError::
-    /// VaultKeyEmpty. Treating empty as unset would silently let
-    /// SqlCipherKey::new("") through, producing a vault encrypted with
-    /// the empty passphrase. Failing closed.
-    #[test]
-    fn parse_vault_key_returns_empty_err_when_env_var_empty() {
-        let result = parse_vault_key_from(|_| Ok(String::new()));
-        assert!(
-            matches!(result, Err(ConfigError::VaultKeyEmpty)),
-            "ADR-032 branch (B): empty VAULT_KEY MUST fail closed as \
-             ConfigError::VaultKeyEmpty (not silently accept and \
-             encrypt-with-empty-passphrase); got err={:?}",
-            result.err()
-        );
-    }
-
-    /// ADR-032 branch (B): VAULT_KEY set with non-empty value →
-    /// SqlCipherKey constructed successfully. SqlCipherKey doesn't
-    /// implement PartialEq / Debug per its zeroize-on-drop secrets
-    /// discipline (vault-storage/src/key.rs), so the assertion is
-    /// limited to "Ok variant returned."
-    #[test]
-    fn parse_vault_key_returns_ok_when_env_var_set() {
-        let result = parse_vault_key_from(|_| Ok("test-passphrase".to_string()));
-        assert!(
-            result.is_ok(),
-            "ADR-032 branch (B): non-empty VAULT_KEY MUST construct \
-             SqlCipherKey successfully; got {:?}",
-            result.err()
-        );
-    }
 
     // -----------------------------------------------------------------
     // ADR-019 dylib path resolution (v4 floor item — OS dispatch test)
@@ -325,8 +239,73 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Phase 4b — extracted-utilities tests (per multi-agent code-review
-    // HIGH finding: extract pure functions to lib.rs for testability)
+    // T0.2.0 Phase 1 — ADR-040 keychain-failure-dialog formatting
+    // -----------------------------------------------------------------
+
+    /// ADR-040: KeychainProvenance variant produces a dialog body that
+    /// names the failure cause + cites ADR-040 + lists recovery steps
+    /// (Credential Manager inspection on Windows; reinstall fallback).
+    /// Pinning the body here prevents drift between the dialog text and
+    /// what HANDOFF.md ADR-040 specified.
+    #[test]
+    fn format_keychain_error_dialog_for_keychain_provenance_variant() {
+        let err = VaultError::KeychainProvenance(
+            "Store::new failed: simulated keychain unavailable".to_string(),
+        );
+        let dialog = format_keychain_error_dialog(&err);
+
+        assert!(
+            dialog.contains("keychain access failed"),
+            "KeychainProvenance dialog must announce the failure category; got: {dialog}"
+        );
+        assert!(
+            dialog.contains("simulated keychain unavailable"),
+            "KeychainProvenance dialog must propagate the underlying error \
+             detail for diagnostics; got: {dialog}"
+        );
+        assert!(
+            dialog.contains("ADR-040"),
+            "KeychainProvenance dialog must reference ADR-040 for source-of-truth; \
+             got: {dialog}"
+        );
+        assert!(
+            dialog.contains("Credential Manager"),
+            "KeychainProvenance dialog must point Windows users at Credential \
+             Manager for recovery; got: {dialog}"
+        );
+        assert!(
+            dialog.contains("com.memoryvault.v0.2"),
+            "KeychainProvenance dialog must include the production namespace \
+             so users can find the entry in Credential Manager; got: {dialog}"
+        );
+        assert!(
+            dialog.contains("Reinstall"),
+            "KeychainProvenance dialog must include reinstall fallback for \
+             unrecoverable failures; got: {dialog}"
+        );
+    }
+
+    /// `format_keychain_error_dialog` falls through to
+    /// `format_startup_failure_dialog` for non-`KeychainProvenance`
+    /// variants. Pin the fall-through behaviour so future contributors
+    /// don't accidentally narrow the surface.
+    #[test]
+    fn format_keychain_error_dialog_falls_through_for_non_keychain_variants() {
+        let err = VaultError::ModelIntegrityFailed {
+            file: "tokenizer.json".to_string(),
+            expected: "expected123".to_string(),
+            actual: "actual456".to_string(),
+        };
+        let dialog = format_keychain_error_dialog(&err);
+        assert!(
+            dialog.contains("model integrity check failed"),
+            "Non-KeychainProvenance variants must fall through to \
+             format_startup_failure_dialog; got: {dialog}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // env_override_for tests (ADR-019 / Phase 4b extracted utility)
     // -----------------------------------------------------------------
 
     /// `env_override_for` returns Some(path) when env var is set + non-empty,
@@ -373,56 +352,6 @@ mod tests {
             "env_override_for MUST return Some(PathBuf) when env var is set + non-empty"
         );
         std::env::remove_var(unique_set);
-    }
-
-    /// `format_config_error_dialog` covers all three ConfigError variants
-    /// with appropriate user-facing messages. Pinning the body content
-    /// here prevents drift between the dialog text and what main.rs's
-    /// `show_fatal_dialog_and_exit` callers rely on.
-    #[test]
-    fn format_config_error_dialog_covers_all_three_variants() {
-        // VaultKeyUnset — references VAULT_KEY env var name + ADR-032 +
-        // both PowerShell and Bash setup commands.
-        let unset_dialog = format_config_error_dialog(&ConfigError::VaultKeyUnset);
-        assert!(
-            unset_dialog.contains("VAULT_KEY"),
-            "VaultKeyUnset dialog must reference the env var name; got: {unset_dialog}"
-        );
-        assert!(
-            unset_dialog.contains("ADR-032"),
-            "VaultKeyUnset dialog must reference ADR-032 for source-of-truth; got: {unset_dialog}"
-        );
-        assert!(
-            unset_dialog.contains("PowerShell") && unset_dialog.contains("Bash"),
-            "VaultKeyUnset dialog must include both PowerShell and Bash setup \
-             commands so cross-shell founders can recover; got: {unset_dialog}"
-        );
-
-        // VaultKeyEmpty — explains fail-closed posture.
-        let empty_dialog = format_config_error_dialog(&ConfigError::VaultKeyEmpty);
-        assert!(
-            empty_dialog.contains("empty"),
-            "VaultKeyEmpty dialog must announce empty-passphrase rejection; got: {empty_dialog}"
-        );
-        assert!(
-            empty_dialog.contains("Failing closed"),
-            "VaultKeyEmpty dialog must explain fail-closed posture so the \
-             founder doesn't think Memory Vault is broken; got: {empty_dialog}"
-        );
-
-        // UnsupportedPlatform — includes the unsupported OS name.
-        let unsupported_dialog =
-            format_config_error_dialog(&ConfigError::UnsupportedPlatform("freebsd".to_string()));
-        assert!(
-            unsupported_dialog.contains("freebsd"),
-            "UnsupportedPlatform dialog must include the unsupported OS \
-             name for diagnostics; got: {unsupported_dialog}"
-        );
-        assert!(
-            unsupported_dialog.contains("ADR-029"),
-            "UnsupportedPlatform dialog must reference ADR-029 (BRD amendment \
-             that locked V0.1 platform list); got: {unsupported_dialog}"
-        );
     }
 
     // -----------------------------------------------------------------

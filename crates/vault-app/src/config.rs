@@ -50,6 +50,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 use vault_storage::SqlCipherKey;
+use zeroize::Zeroizing;
 
 /// Composition-root configuration for [`crate::Application`].
 ///
@@ -106,6 +107,31 @@ pub struct AppConfig {
     /// **Migration anchor:** `Application::new`'s `ort_lib_path: &Path`
     /// parameter from T0.1.10 Phase 1.
     pub ort_lib_path: PathBuf,
+
+    /// 32-byte at-rest sealing key derived from the keychain-sourced
+    /// `master_key` per ADR-040 amendment option β
+    /// (`blake3::derive_key("vault memory at-rest sealing v1", &master_key)`).
+    /// `Zeroizing` wrapper wipes bytes on drop per BRD §11.5.3.
+    ///
+    /// **Phase 1 staging — `#[allow(dead_code)]`:** the field carries the
+    /// derived at-rest key forward from vault-tauri's main.rs through the
+    /// AppConfig surface, but Phase 1 has no in-tree consumer. The full
+    /// master_key derivation flow IS the contract — capturing it partial in
+    /// AppConfig contradicts the keychain helper's full derivation tree
+    /// and would force a Phase 2 plumbing change to add what should already
+    /// be there. Phase 2 (V0.1 plaintext data migration) reads this field
+    /// and passes the bytes into
+    /// [`vault_storage::LanceVectorStore::open_with_at_rest_key`] alongside
+    /// the existing plaintext-`open()` path needed for V0.1 data ingestion;
+    /// Phase 3 deletes the plaintext path and locks
+    /// `open_with_at_rest_key` as the only constructor.
+    ///
+    /// Cross-link: HANDOFF.md "T0.2.0 close-out plan iteration 1.5 — Phase 1
+    /// scope correction" Discovery 2 + 4 capture the staging rationale.
+    /// ADR-040 amendment "Updated production-wiring contract" pins the
+    /// staging discipline (`#[allow(dead_code)]` + forward-pointer comment).
+    #[allow(dead_code)] // Phase 2 migration consumer — see field-doc above
+    pub at_rest_key: Zeroizing<[u8; 32]>,
 }
 
 impl fmt::Debug for AppConfig {
@@ -122,6 +148,7 @@ impl fmt::Debug for AppConfig {
             .field("model_path", &self.model_path)
             .field("tokenizer_path", &self.tokenizer_path)
             .field("ort_lib_path", &self.ort_lib_path)
+            .field("at_rest_key", &"<redacted>")
             .finish()
     }
 }
@@ -155,6 +182,7 @@ mod tests {
             model_path: PathBuf::new(),
             tokenizer_path: PathBuf::new(),
             ort_lib_path: PathBuf::new(),
+            at_rest_key: Zeroizing::new([0u8; 32]),
         };
     }
 
@@ -164,6 +192,8 @@ mod tests {
     /// reintroduction or redaction-text drift.
     #[test]
     fn appconfig_debug_redacts_sqlcipher_key() {
+        let mut at_rest_bytes = Zeroizing::new([0u8; 32]);
+        at_rest_bytes[..12].copy_from_slice(b"AT-REST-KEY-");
         let config = AppConfig {
             metadata_path: PathBuf::from("/tmp/vault.db"),
             vector_dir: PathBuf::from("/tmp/lance"),
@@ -172,6 +202,7 @@ mod tests {
             model_path: PathBuf::from("/tmp/model.onnx"),
             tokenizer_path: PathBuf::from("/tmp/tokenizer.json"),
             ort_lib_path: PathBuf::from("/tmp/libonnxruntime.so"),
+            at_rest_key: at_rest_bytes,
         };
         let dbg_str = format!("{config:?}");
         assert!(
@@ -181,6 +212,10 @@ mod tests {
         assert!(
             !dbg_str.contains("super-secret-passphrase-xyz"),
             "AppConfig Debug output MUST NOT leak the SqlCipherKey contents; got: {dbg_str}"
+        );
+        assert!(
+            !dbg_str.contains("AT-REST-KEY-"),
+            "AppConfig Debug output MUST NOT leak the at_rest_key bytes; got: {dbg_str}"
         );
     }
 }

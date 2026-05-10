@@ -259,6 +259,15 @@ impl ToolInvokeError {
                 category: "McpBindFailed".to_string(),
                 message: message.clone(),
             },
+            // T0.2.0 Phase 1 (2026-05-09): KeychainProvenance is the same
+            // class as WorkerSpawnFailed / McpBindFailed — surfaces during
+            // vault-tauri setup() BEFORE Application::new is reached, never
+            // via MCP dispatch. Audit-coverage exhaustive via Internal with
+            // explicit category name. Per ADR-040 + ADR-040 amendment.
+            VaultError::KeychainProvenance(message) => Self::Internal {
+                category: "KeychainProvenance".to_string(),
+                message: message.clone(),
+            },
         }
     }
 }

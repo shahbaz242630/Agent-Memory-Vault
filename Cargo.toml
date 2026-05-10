@@ -159,6 +159,28 @@ tauri-plugin-dialog = "=2.5.0"
 # Security primitives (BRD §11.5.3)
 zeroize = { version = "=1.8.2", features = ["derive"] }
 
+# OS keychain (T0.2.0 Phase 1, ADR-040 + ADR-040 amendment).
+# `keyring-core` is the library crate (the previous `keyring` crate at v4
+# is sample-code-only; do-not-depend-on warning landed April 2026).
+# Per-platform stores are separate crates per the open-source-cooperative
+# org's coordinated April 2026 v1.0.0 release. Phase 1 lands Windows only;
+# macOS / Linux per-platform crates added at T0.2.0.x sub-task or T0.2.14
+# Stub-Installer-adjacent per HANDOFF.md OQ #1 partial resolution.
+# Promoted from vault-app spike-local dev-deps at Phase 1 close.
+keyring-core = "=1.0.0"
+# `windows-native-keyring-store` consumed only on Windows (cfg-gated in
+# vault-app); this workspace declaration is fine on all platforms because
+# Cargo's lazy [workspace.dependencies] semantics mean it's only resolved
+# when a member crate consumes it via { workspace = true }.
+windows-native-keyring-store = "=1.0.0"
+
+# Random + hex — used by the keychain helper (random master_key bytes on
+# first run; hex-encoding the BLAKE3-derived SqlCipher subkey to a String
+# passphrase per ADR-040 amendment derivation tree). Both are widely-used
+# small crates already in the resolved transitive tree pre-Phase-1.
+getrandom = "=0.2.17"
+hex = "=0.4.3"
+
 # Hashing (BRD §11.9.2 audit log tamper-evident chain — added in T0.1.3, ADR-006)
 blake3 = "=1.8.5"
 # sha2 (T0.1.7 vault-embedding model + tokenizer integrity per ADR-020).

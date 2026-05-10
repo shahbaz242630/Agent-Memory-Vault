@@ -1409,10 +1409,10 @@ V0.1 → V0.2 → V1.0. Build in order. Do not skip ahead.
 **Tasks:**
 
 **T0.2.0 — vault-storage: LanceDB Encryption at Rest** *(HARD GATE — see ADR-010)*
-- Resolve the ADR-008 dryoc/RustCrypto/sibling-crate spike before this task starts
-- Design the Windows path explicitly (the BRD §11.5.1 "memory-only handle on Windows" prescription is a TODO; this task is where it gets real). Likely path: per-file XChaCha20-Poly1305 sealing through a custom `lance::ObjectStore` adapter rather than tmpfs decryption — works uniformly across Mac, Linux, Windows.
-- Implement encrypted-at-rest storage for the LanceDB data directory using the chosen crypto crate
-- Migrate any existing V0.1 plaintext data on first launch (founder-only path; one-time conversion)
+- ~~Resolve the ADR-008 dryoc/RustCrypto/sibling-crate spike before this task starts~~ — CLOSED 2026-04-29 commit `5fdf0d8`. ADR-008 locked Path #1 (DryocStream-as-single-message) with AAD scheme + chunk-size policy. The actual pre-T0.2.0 spike question — the at-rest extension on top of LanceDB — was answered by the at-rest spike v1 (FAILED 2026-05-07 against lance-io 0.15) → lancedb 0.8 → 0.27.2 upgrade (ADR-037) → at-rest spike v2 (Phase 0c, ALL STAGES PASS) → production wiring at Phase 0d (commit `dcefd9b`) → contract lock at Phase 0e (ADR-008 amendment: K3 KDF, Finding 2(c) AAD, per-file granularity, ObjectStoreProvider integration via `vault-sealed://` URI scheme).
+- ~~Design the Windows path explicitly (the BRD §11.5.1 "memory-only handle on Windows" prescription is a TODO; this task is where it gets real). Likely path: per-file XChaCha20-Poly1305 sealing through a custom `lance::ObjectStore` adapter rather than tmpfs decryption — works uniformly across Mac, Linux, Windows.~~ — RESOLVED at Phase 0d. Final integration path: per-file XChaCha20-Poly1305 sealing via lance-io 4.x `ObjectStoreProvider` + `ObjectStoreRegistry` registered for the `vault-sealed://` URI scheme (NOT `WrappingObjectStore` — that mechanism was bypassed by `LocalObjectReader` fast-path at lance-io 0.15 per spike v1). Works uniformly across Mac, Linux, Windows because Lance's local-filesystem semantics are preserved by routing UNKNOWN-scheme URIs through our provider. See ADR-008 amendment (Phase 0e) for the locked contract surface; see ADR-037 (Phase 0e) for the lancedb upgrade rationale that enabled this path.
+- Implement encrypted-at-rest storage for the LanceDB data directory using the chosen crypto crate — DONE at Phase 0d (`crates/vault-storage/src/sealed_object_store.rs` + `LanceVectorStore::open_with_at_rest_key`).
+- Migrate any existing V0.1 plaintext data on first launch (founder-only path; one-time conversion) — Phase 2 of T0.2.0 close-out plan iteration 1.
 - **Remove all four V0.1 compensating controls per ADR-010:** modal first-run banner, persistent UI banner, plaintext-data-dir WARN log, `ALPHA_DO_NOT_STORE_REAL_DATA.txt` file
 - Acceptance:
   - Vector data dir contains no plaintext Parquet on disk after a write/close cycle (verified by reading raw bytes — entropy check + magic-bytes absence)
@@ -2269,7 +2269,11 @@ All data on disk is encrypted. No exceptions.
 | Cloud backups (R2) | Application-level | XChaCha20-Poly1305 | Vault Encryption Key |
 | Audit logs (local) | Application-level + MAC | XChaCha20-Poly1305 + BLAKE3 | Audit Log MAC Key |
 
-LanceDB and DuckDB don't natively support encryption, so we encrypt at the file system layer: store these databases in a dedicated directory, encrypt the directory contents using `dryoc`, decrypt on app start into a `tmpfs` (memory-backed file system) on Linux/Mac, or a memory-only handle on Windows. On app close, the tmpfs is destroyed.
+LanceDB and DuckDB don't natively support encryption, so we encrypt at the application layer.
+
+**Amendment 2026-05-09 (T0.2.0 Phase 0e, ADR-008 amendment + ADR-037):** the original tmpfs-on-Linux/Mac + memory-only-handle-on-Windows prescription is **superseded** for the LanceDB path. The integration is now per-file XChaCha20-Poly1305 sealing via lance-io 4.x's `ObjectStoreProvider` + `ObjectStoreRegistry` API, registered for a custom `vault-sealed://` URI scheme. Lance writes and reads files transparently through the sealing wrapper; nothing decrypts to a tmpfs at app start; nothing leaves the data dir in plaintext at any point. Sealing shape per ADR-008 amendment: 26-byte framing prefix (`version_byte || granularity_marker || dryoc_header`) + 17-byte AEAD = 43-byte per-file overhead. Spike v2 (Phase 0c) runtime-confirmed across Mac, Linux, Windows; production wiring at Phase 0d (commit `dcefd9b`); contract locks at Phase 0e (ADR-008 amendment in HANDOFF.md). The original tmpfs approach is retired because lance-io's `LocalObjectReader` fast-path at any earlier integration layer bypassed the encryption boundary (see spike v1 failure record at `crates/vault-storage/examples/at_rest_spike.rs.v1_fail_disabled`).
+
+**For the DuckDB path** (vault-graph at T0.2.x — not yet integrated): the same `vault-sealed://`-via-ObjectStoreProvider approach does NOT directly apply because DuckDB has its own I/O layer (no equivalent `ObjectStoreProvider` registry as of DuckDB 1.x). DuckDB at-rest sealing remains an open question to be answered at the vault-graph integration task; candidate approaches include (a) a sealed-tarball-on-close-with-dirty-flag scheme, (b) DuckDB's experimental encrypted database files when that lands stable, or (c) a sealed virtual filesystem bridge. Original tmpfs approach is one candidate but no longer the lead.
 
 #### 11.5.2 Data in Transit
 

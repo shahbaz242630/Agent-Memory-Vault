@@ -52,6 +52,46 @@ vault-storage = { path = "../vault-storage" }
 # update_memory (StorageBackend takes a pre-computed embedding).
 vault-embedding = { path = "../vault-embedding" }
 
+# Keychain helper — `vault_app::keychain` reads the master_key from the
+# OS keychain at vault-tauri startup (per ADR-040 + ADR-040 amendment).
+# `keyring-core` is the library API crate (April 2026 v1.0.0 release;
+# the older `keyring` crate at v4 is sample-code-only with explicit
+# do-not-depend warning). Cross-platform deps land per-platform; Phase 1
+# wires Windows only (per ADR-029 V0.1 dogfood pattern + HANDOFF.md
+# OQ #1 partial resolution). macOS / Linux per-platform stores added at
+# T0.2.0.x sub-task or T0.2.14 Stub-Installer-adjacent.
+keyring-core = { workspace = true }
+
+# Random bytes for master_key generation on first run (no keychain entry
+# exists). hex-encoding the BLAKE3-derived SqlCipher subkey to a 64-char
+# String passphrase per ADR-040 amendment option β derivation tree.
+getrandom = { workspace = true }
+hex = { workspace = true }
+
+# zeroize: master_key + at_rest_key are wrapped in `Zeroizing<[u8; 32]>`
+# per BRD §11.5.3 / ADR-008 amendment K3-KDF wrapper pattern. Used in the
+# keychain helper module's public surface.
+zeroize = { workspace = true }
+
+# blake3 — domain-separated subkey derivation per ADR-040 amendment option β
+# (sqlcipher_passphrase via "vault sqlcipher passphrase v1" prefix;
+# at_rest_key via "vault memory at-rest sealing v1" prefix per ADR-008
+# amendment K3 KDF).
+blake3 = { workspace = true }
+
+# vault-storage: SqlCipherKey is the type returned by
+# `derive_sqlcipher_passphrase`; needed in the keychain helper's signature.
+# Already a transitive dep via the existing vault-storage entry above; this
+# direct workspace path is implicit through the module-internal use.
+
+# Windows-only Credential Manager backend. Gated so Linux/macOS builds
+# don't pull it. The `vault_app::keychain` module is itself cfg-gated
+# Windows-only; cross-platform support adds per-platform store crates
+# (apple-native-keyring-store, linux-keyutils-keyring-store,
+# dbus-secret-service-keyring-store) at T0.2.0.x sub-task per ADR-040.
+[target.'cfg(windows)'.dependencies]
+windows-native-keyring-store = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 tempfile.workspace = true

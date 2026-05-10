@@ -27,6 +27,7 @@
 mod adapter;
 mod application;
 mod config;
+pub mod keychain;
 pub mod process_exit;
 pub mod signal_source;
 

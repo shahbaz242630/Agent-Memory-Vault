@@ -740,8 +740,16 @@ fn vault_error_to_mcp(err: VaultError) -> McpError {
         // practice — startup failure aborts the process before MCP
         // accepts requests. Mapped to internal_error defensively to
         // preserve privacy posture if they ever do leak.
+        //
+        // T0.2.0 Phase 1 (2026-05-09): KeychainProvenance follows the same
+        // discipline — keychain failures surface in vault-tauri's setup()
+        // hook BEFORE Application::new is reached, never via MCP dispatch.
+        // Defensive mapping preserves the same privacy posture (don't leak
+        // namespace / vault_id / per-OS keychain state to an MCP client).
+        // Per ADR-040 + ADR-040 amendment.
         | VaultError::WorkerSpawnFailed(_)
-        | VaultError::McpBindFailed(_) => McpError::internal_error("internal error", None),
+        | VaultError::McpBindFailed(_)
+        | VaultError::KeychainProvenance(_) => McpError::internal_error("internal error", None),
     }
 }
 

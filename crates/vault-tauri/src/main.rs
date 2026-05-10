@@ -24,9 +24,12 @@
 //!   pointer. Phase 4b adds source-grep regression test in
 //!   `lib.rs::tests::main_rs_does_not_register_external_mcp_spawn_command_per_adr_030`.
 //! - **ADR-032:** SQLCipher passphrase sourced from `VAULT_KEY` env var
-//!   for V0.1 founder-only dogfood. Branch (B) per Spike 1
-//!   (keyring-core ecosystem mid-migration; multi-user cohort secret
-//!   source revisits at V0.2 alpha-distribution task).
+//!   for V0.1 founder-only dogfood. **Retired at T0.2.0 Phase 1
+//!   (2026-05-09)** per ADR-040 + ADR-040 amendment: master_key now
+//!   sourced from Windows Credential Manager via `vault_app::keychain::
+//!   read_or_init_master_key`; SqlCipherKey + at-rest key derived as
+//!   domain-separated BLAKE3 subkeys. Pre-Phase-1 callers reading
+//!   VAULT_KEY env var are removed.
 //! - **ADR-034 (Phase 5b fix-forward, 2026-05-05):** V0.1 vault-tauri is
 //!   UI-only — no MCP server bound inside the Tauri process. Phase 5
 //!   founder smoke surfaced that `Application::start_with_mcp` calls
@@ -75,13 +78,24 @@ use std::path::PathBuf;
 
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
+use vault_app::keychain::{
+    derive_at_rest_key, derive_sqlcipher_passphrase, read_or_init_master_key, PRODUCTION_NAMESPACE,
+};
 use vault_app::{AppConfig, Application};
 use vault_tauri::{
-    dylib_filename_for_os, env_override_for, format_config_error_dialog,
-    format_startup_failure_dialog, parse_vault_key,
+    dylib_filename_for_os, env_override_for, format_keychain_error_dialog,
+    format_startup_failure_dialog,
 };
 
-/// Exit code for ConfigError::VaultKeyUnset / VaultKeyEmpty (ADR-032).
+/// V0.2 single-vault account string. V1.0 multi-vault per BRD §6.2 will
+/// pass real per-vault ids — same keychain namespace slot, multiple
+/// entries differentiated by account string per ADR-040 forward-compat.
+const VAULT_ID: &str = "default";
+
+/// Exit code for keychain provenance failures (ADR-040 + ADR-040 amendment;
+/// retains the same numeric code that V0.1 used for VAULT_KEY config errors,
+/// since wrapper scripts and CI keyed on `2 = config-class error` regardless
+/// of the underlying provenance mechanism).
 const EXIT_CONFIG_ERROR: i32 = 2;
 /// Exit code for Application startup failures including ADR-020
 /// ModelIntegrityFailed.
@@ -100,18 +114,38 @@ fn main() {
             vault_tauri::commands::acknowledge_alpha_banner,
         ])
         .setup(|app| {
-            // 1. Source SqlCipherKey from VAULT_KEY env var per ADR-032.
-            let key = match parse_vault_key() {
+            // 1. Source master_key from OS keychain per ADR-040 + ADR-040
+            //    amendment (T0.2.0 Phase 1). On first run (no entry exists)
+            //    the helper internally generates a new 32-byte master_key
+            //    via getrandom + persists via set_secret + returns the new
+            //    key. Any non-NotFound keychain error fails closed: ERROR
+            //    log + fatal dialog + exit non-zero.
+            //
+            //    The master_key is then split into two domain-separated
+            //    BLAKE3 subkeys per ADR-040 amendment option β:
+            //    - `sqlcipher_passphrase` (hex-encoded → SqlCipherKey)
+            //    - `at_rest_key` (32 bytes → AppConfig.at_rest_key, staged
+            //      for Phase 2/3 LanceVectorStore::open_with_at_rest_key
+            //      consumer per iteration-1.5 amendment Discovery 4).
+            //
+            //    Replaces the V0.1 VAULT_KEY env var path (ADR-032 retired).
+            let master_key = match read_or_init_master_key(PRODUCTION_NAMESPACE, VAULT_ID) {
                 Ok(k) => k,
                 Err(err) => {
                     show_fatal_dialog_and_exit(
                         app.handle(),
-                        "Memory Vault — Configuration Required",
-                        &format_config_error_dialog(&err),
+                        "Memory Vault — Keychain Access Failed",
+                        &format_keychain_error_dialog(&err),
                         EXIT_CONFIG_ERROR,
                     );
                 }
             };
+            let key = derive_sqlcipher_passphrase(&master_key);
+            let at_rest_key = derive_at_rest_key(&master_key);
+            // master_key drops here — the two derived subkeys carry the
+            // keying material forward; Zeroizing wipes the master_key
+            // bytes on Drop per BRD §11.5.3.
+            drop(master_key);
 
             // 2. Resolve libonnxruntime dylib path per ADR-019.
             let ort_lib_path = match resolve_ort_lib_path(app.handle()) {
@@ -186,7 +220,9 @@ fn main() {
             let vector_dir = data_dir.join("lance");
             let graph_path = data_dir.join("graph.duckdb");
 
-            // 5. Build AppConfig from resolved paths.
+            // 5. Build AppConfig from resolved paths + the derived subkeys.
+            //    `at_rest_key` is staged for Phase 2/3 consumption per
+            //    iteration-1.5 amendment Discovery 4 (option (a)).
             let config = AppConfig {
                 metadata_path,
                 vector_dir,
@@ -195,6 +231,7 @@ fn main() {
                 model_path,
                 tokenizer_path,
                 ort_lib_path,
+                at_rest_key,
             };
 
             // 6. Construct Application and spawn the cascading retry

@@ -1,7 +1,7 @@
 # Memory Vault — Build Handoff
 
 **Current version:** V0.2 Closed Beta (BRD §6.2 — sleep consolidator, boundaries hardening, cross-device sync, 30 beta users)
-**Last updated:** 2026-05-08 (T0.2.0 Phase 0d COMPLETED — production-wired `SealedFileStoreProvider` into `LanceVectorStore::open_with_at_rest_key`; spike-local dev-deps promoted to workspace; +5 sealed-path regression tests pass = 226/226 vault-storage; commit pending Phase 0c CI green)
+**Last updated:** 2026-05-10 (T0.2.0 Phase 1 COMPLETED in working tree — keychain helper module + ADR-040 + ADR-040 amendment + production wiring at vault-tauri main.rs + master_key derivation tree (option β) + VAULT_KEY env var retirement + workspace dep promotion. Two test-driven fixes landed in same working tree: NotFound classifier widened for Windows variant `"No matching credential found"` per saved-memory `feedback_runtime_confirmation_after_web_spike.md` discipline; KeychainProvenance dialog text capitalisation matched to spec-pin test. Full DoD green: build (59m 26s from clean state) / 384+ workspace tests / clippy `-D warnings` / fmt --check. Plus session-discipline learnings captured: HANDOFF.md tech-debt note for parallel-cargo-on-16-GB-Windows OOM + saved-memory `feedback_surgical_cargo_clean_first.md` escalation-trigger amendment. Next code commit bundles all Phase 1 + Phase 0e doc-only edits + 6 deleted T0.1.x plan files per `feedback_admin_changes_ride_with_code.md`. Phase 0d landed CI-green at run `25565477569`.)
 **Updated by:** Claude (Opus 4.7)
 
 > **📁 V0.1 historical record:** `HANDOFF_V0.1_ARCHIVE.md` — frozen as of 2026-05-06. Full T0.1.1 → T0.1.12 phase narratives, ADRs 001-036 full text, tech-debt closures, plan-iteration histories. Cross-link out to that file when V0.2 work needs V0.1 detail; do NOT paraphrase.
@@ -10,7 +10,7 @@
 
 ## Current Status
 
-**Active task:** **T0.2.0 Phase 0e — ADR-037 + ADR-008 amendment + T0.2.0 plan paragraph iteration 1.** Phase 0d production wiring landed: `LanceVectorStore::open_with_at_rest_key(path, dim, &master_key)` constructor, `crates/vault-storage/src/sealed_object_store.rs` (production module ported from spike, ~395 LOC), spike-local dev-deps promoted to workspace `[workspace.dependencies]` (lance-io / lance-core / object_store / bytes / url / dryoc — walkdir stays spike-local). 226/226 vault-storage tests pass (221 + 5 new sealed-path regression pins: round-trip / wrong-key-fails-closed / on-disk-framing-bytes / sealed-partial-fragment-Compact+Prune / sealed-INFO-log). All DoD gates green. Phase 0c CI was confirmed green before staging this commit (per CLAUDE.md per-step CI rule). Commit pending Shahbaz approval.
+**Active task:** **T0.2.0 Phase 2 — V0.1 plaintext data migration (per T0.2.0 close-out plan iteration 1 + iteration 2 three-tier fixture strategy).** Phase 1 completed 2026-05-10 with full DoD green; bundle commit pending (this commit lands all Phase 1 production code + Phase 0e doc edits + 6 deleted T0.1.x plan files + 2 test-driven fixes + tech-debt + saved-memory discipline updates). Phase 2 inherits a locked master_key flow (vault-tauri main.rs reads keychain → derives both subkeys → AppConfig forwards) and a staged `at_rest_key` field on AppConfig with `#[allow(dead_code)]` waiting for Phase 2's V0.1-plaintext-migration consumer. Phase 2 methodology: three-tier fixture strategy per close-out plan iteration 2 (Tier 1 scaffolding regression + Tier 2 `1d72aac` V0.1 binary fixture snapshot + Tier 3 founder one-shot smoke on real V0.1 vault). `LanceVectorStore::open()` plaintext path remains alive — Phase 2 is its last caller; Phase 3 deletes it.
 
 **Why we got here:** V0.2 first task per BRD §6 is T0.2.0 (LanceDB Encryption at Rest, HARD GATE per ADR-010). Spike v1 (lance 0.15 era, designed against `WrappingObjectStore`) FORMALLY FAILED 2026-05-07 — discovered lance-io 0.15's `LocalObjectReader` bypasses the `object_store::ObjectStore` trait for `file://` URIs in BOTH directions, defeating both the `WrappingObjectStore` wrapper AND direct injection via `ObjectStoreParams.object_store`. Web research found lance-io 4.x exposes a first-class `ObjectStoreProvider` + `ObjectStoreRegistry` API designed for this exact integration — but requires a **major lancedb upgrade** (0.8 → 0.27.2, 19 minor versions). Phase 0a executed the upgrade; Phase 0a-fix resolved a `merge_insert` memory regression surfaced by the upgrade (see ADR-038); Phase 0b audit + ADR-039 production fix; Phase 0c re-spiked the at-rest extension on the upgraded stack with the spike-discipline runtime-confirmation (per `feedback_runtime_confirmation_after_web_spike.md`) — and caught a real privacy bug in the Phase 0b ADR-039 implementation, fixed before V0.2 beta cohort exposure.
 
@@ -25,13 +25,18 @@
 | **0b** | ✅ DONE (audit + ADR-039 production fix + 4 regression tests + classifier widen) | Brief vault-storage API drift audit, run during Phase 0a-fix CI wait. Initial inventory: 17 lancedb API surfaces compile + test clean against 0.27.2; connection lifecycle invariant preserved. Shahbaz pushed back THREE times on "low-risk" / "defer-to-V0.2" framing — first round added 3 memory-system verifications + classifier widen, second round added 2 deeper verifications (compaction effectiveness + sidecar surface), THIRD round escalated tombstoning from "ADR-territory deferred to Phase 0e" to "fix in this commit or product development ends here." Results: (1) `is_permanent` widened to recognise `schema`/`CastError`/`dimension`/`No vector column found` lance 4.0 wording variants. (2) `merge_insert_last_write_wins_for_embedding_column` PASSES — lance 4.0 preserves last-write-wins semantics; no data-corruption regression. (3) `read_during_write_returns_monotonic_consistent_snapshots` PASSES — V2 MVCC preserves snapshot reads. (4) **ADR-039 implemented in production**: `LanceVectorStore::delete()` now calls `OptimizeAction::Prune { older_than: TimeDelta::zero(), delete_unverified: true, error_if_tagged_old_versions: false }` immediately after `table.delete()`, holding the ADR-038 upsert mutex throughout. Verified empirically (Phase 0b session): `OptimizeAction::All` was INSUFFICIENT (5 files still contained probe-string post-cleanup, default 7-day retention); only zero-retention `Prune` achieves full physical removal (0 files post-prune, `prune.bytes_removed: 12162`). Trade-off: lose lance time-travel undo capability — correct for a privacy-property memory vault. (5) `delete_physically_removes_content_per_adr_039` regression pin: post-delete, scans every file under data dir; assertion fails loudly if the probe string is ever found post-delete (catches accidental Prune-call removal or lance retention-semantic regression). Code changes: `is_permanent` widened (`retry_queue.rs`) + production `delete()` modified to prune (`vector_store.rs`) + 1 new classifier test + 3 new regression tests. **Test count: 220** (was 216 pre-audit; +4 net from Phase 0b: classifier-variants + 3 regression probes; floor breach surfaced + approved before commit per `feedback_floor_forecast_is_pre_declaration_not_estimate.md`). All 220 vault-storage tests pass. Bundles with next code commit per `feedback_admin_changes_ride_with_code.md`. |
 | **0c** | ✅ DONE (spike v2 ALL STAGES PASS + ADR-039 production fix in same commit) | Rewrote `at_rest_spike.rs` using lance-io 4.x `ObjectStoreProvider` + `ObjectStoreRegistry`. Stages A/B/C runtime-confirmed `vault-sealed://` scheme intercepts both write+read flows (refutes v1 LocalObjectReader bypass). Stage D adversarial sweep + ADR-039-through-sealing PASS via Compact+Prune. Stage E 2×2 diagnostic ({sealed, plain file://} × {Prune-alone, Compact+Prune}) attributed ADR-039 issue to Lance Prune semantics, NOT sealing-wrapper interference (sealed and plain identical OptimizeStats). Discovered Phase 0b ADR-039 production code was insufficient for partial-fragment deletes (Memory Vault's actual single-id delete pattern); amended `vector_store.rs` `delete()` to `Compact + Prune`; added `delete_partial_fragment_physically_removes_content_per_adr_039` regression pin (test count 220→221, floor amendment surfaced + approved before commit per `feedback_floor_forecast_is_pre_declaration_not_estimate.md`). All DoD gates green: build / 221 tests / clippy `-D warnings` / fmt --check. Sealing wrapper proven NON-interfering — Phase 0d wiring is straight production-mirror. |
 | **0d** | ✅ DONE (production wiring + 5 sealed-path tests + workspace dep promotion) | New `crates/vault-storage/src/sealed_object_store.rs` (~395 LOC): `SealedObjectStore` (object_store::ObjectStore impl, AEAD seal/unseal on put_opts/get_opts, head/list size adjustments), `SealedFileStoreProvider` (lance-io ObjectStoreProvider impl for `vault-sealed://` scheme, overrides `extract_path` + `calculate_object_store_prefix` per Finding 2 to handle the unknown scheme), `derive_at_rest_key` (K3 BLAKE3-derived key wrapped in `Zeroizing` for Drop-zeroization), URL helpers `make_vault_sealed_uri` + `vault_sealed_to_local_path`. ADR-007 manual Debug redaction on both Sealed types — never leaks key bytes. New `LanceVectorStore::open_with_at_rest_key(path, dim, &master_key)` constructor in `vector_store.rs` (existing plaintext `open()` retained for V0.1 alpha backwards-compat — removed at formal at-rest gate close in T0.2.0 proper). New `_session: Option<Arc<Session>>` field on `LanceVectorStore` to keep the registered provider alive for the store's lifetime. Workspace deps promoted: `lance-io`, `lance-core`, `object_store`, `bytes`, `url`, `dryoc` → `[workspace.dependencies]` (production code now consumes them). `walkdir` stays spike-local. **5 new tests:** `sealed_open_round_trip_returns_inserted_rows` (orthogonal unit vectors → exact-match top-hit), `sealed_open_with_wrong_key_fails_closed` (AEAD authentication mismatch surfaces), `sealed_open_writes_framing_bytes_to_disk` (every on-disk file starts `0x01 0x00`, no PAR1 magic anywhere — the strongest single signal that v1 LocalObjectReader-bypass class is gone in production), `sealed_delete_partial_fragment_physically_removes_content` (ADR-039 partial-fragment invariant survives sealed wrapper, BLAKE3 content-hash-set-difference), `sealed_open_emits_distinguishing_info_log` (positive INFO assertion, bleed-resistant under tracing-test parallel-test sharing). **Test count: 221 → 226** (matches floor forecast exactly). All DoD gates green: build (workspace+all-targets) / 226 tests / clippy `-D warnings` / fmt --check. Phase 0c CI green confirmed before staging per CLAUDE.md per-step CI standing rule. |
-| **0e** | PENDING | ADR-037 (lancedb upgrade rationale) + ADR-008 amendment (at-rest extension locking K3 KDF + Finding 2(c) AAD + ObjectStoreProvider integration + path-shape) + T0.2.0 plan paragraph iteration 1 (which subtasks remain to close T0.2.0 — likely: ADR-010 banner removal in vault-tauri, plaintext-`open()` deprecation/removal, at-rest-key provenance from keychain per ADR-032 amendment, founder-dogfood-on-sealed validation). ADR-038 already drafted at 0a-fix; ADR-039 amendment text already in this file (cross-link from ADR-037). |
+| **0e** | ✅ DONE (doc-only, working tree only — rides with next code commit per `feedback_admin_changes_ride_with_code.md`) | ADR-037 drafted (lancedb 0.8 → 0.27.2 upgrade rationale, in force from Phase 0a). ADR-008 amendment drafted (V0.2 at-rest extension lock-in: K3 KDF, Finding 2(c) AAD, per-file granularity, ObjectStoreProvider integration, ADR-007 redaction, in force from Phase 0d). T0.2.0 close-out plan iteration 1 drafted (5 phases — Phase 1 keychain → Phase 2 V0.1 migration → Phase 3 controls-removal + acceptance suite → Phase 4 founder-dogfood-on-sealed Windows-only → Phase 5 hard-gate clearance; 2 open questions for iteration 2). Queued sweep edits applied: BRD §6.2 line 1411-1413 (stale ADR-008 spike reference + tmpfs prescription replaced by ObjectStoreProvider integration), BRD §11.5.1 (tmpfs/memory-handle prescription superseded by sealed-ObjectStore-adapter approach), ADR-013 supersession note (chrono pin advanced 0.4.39 → 0.4.44 by ADR-037 trigger 1), V0.2-task-decomposition framing fix (alpha-distribution-as-first-task superseded by BRD §6 numerical ordering). ADR-038 already drafted at 0a-fix; ADR-039 amendment text already in this file. |
 
 ---
 
-## Session-end working-tree state (2026-05-08, Phase 0d single commit pending Shahbaz approval)
+## Session-end working-tree state (2026-05-09, Phase 0e doc-drafting block)
 
-**Phase 0d (production-wire SealedFileStoreProvider) — files modified:**
+**Phase 0d (production-wire SealedFileStoreProvider) was committed at `dcefd9b` and CI-green at run `25565477569`.** The files listed below are the historical Phase 0d record; they are no longer in the working tree as uncommitted changes. Phase 0e doc-drafting added the following uncommitted edits (all doc-only, ride with next code commit per `feedback_admin_changes_ride_with_code.md`):
+
+- **`HANDOFF.md`** — header `Last updated` flipped to 2026-05-09; Active Task block flipped to Phase 1 keychain spike; Phase 0e row in Phase 0 plan table flipped to DONE; V0.2 task decomposition framing fix; Doc-only-edits-queued items struck-through with "APPLIED Phase 0e sweep"; ADR-013 entry annotated with chrono 0.4.39 → 0.4.44 advance per ADR-037 trigger 1; new sections inserted: ADR-037 (lancedb upgrade rationale), ADR-008 amendment (V0.2 at-rest extension lock-in), T0.2.0 close-out plan iteration 1.
+- **`Agent_Build_Specification.txt`** — §6.2 T0.2.0 lines 1411-1415 amended to mark the ADR-008 spike + Windows-path TODO + implementation as resolved/done with cross-references to ADR-037 + ADR-008 amendment + Phase 0d commit; §11.5.1 LanceDB tmpfs prescription marked superseded for the LanceDB path with explicit pointer to the `vault-sealed://`-via-ObjectStoreProvider integration; DuckDB path noted as still-open-question.
+
+**Phase 0d (production-wire SealedFileStoreProvider) — historical record of files modified at commit `dcefd9b`:**
 - `Cargo.toml` (workspace, NEW dep entries): added `lance-io = "=4.0.0"`, `lance-core = "=4.0.0"`, `object_store = "=0.12.5"`, `bytes = "=1.11.1"`, `url = "=2.5.8"` to `[workspace.dependencies]`. Versions match Cargo.lock pre-flight snapshot from Phase 0c. `dryoc` was already workspace.
 - `crates/vault-storage/src/sealed_object_store.rs` (NEW, ~395 LOC): production module ported from `examples/at_rest_spike.rs`. Strips spike instrumentation (fire-counters, eprintln traces, stage scaffolding, identity provider, test-only helpers). Keeps: `SealedObjectStore` (object_store::ObjectStore impl), `SealedFileStoreProvider` (lance_io::object_store::providers::ObjectStoreProvider impl), sealing primitives (`derive_at_rest_key` / `compute_aad` / `seal_file_bytes` / `unseal_file_bytes`), URL helpers, locked sealing-shape constants (`VERSION_BYTE` / `GRANULARITY_PER_FILE` / `TOTAL_FRAMING_LEN` / `SEAL_OVERHEAD`), `VAULT_SEALED_SCHEME` const. ADR-007 manual `Debug` redaction on both Sealed types — never leaks key bytes. Key wrapped in `Arc<Zeroizing<[u8; 32]>>` for cheap-clone + Drop-zeroize. Multipart writes return `NotSupported` (per-file granularity locked, V1.0 revisit if column-projection latency surfaces).
 - `crates/vault-storage/src/lib.rs`: added `pub mod sealed_object_store;` + `pub use sealed_object_store::{derive_at_rest_key, make_vault_sealed_uri, SealedFileStoreProvider, VAULT_SEALED_SCHEME};` re-export.
@@ -99,10 +104,12 @@ These hold regardless of integration path. Phase 0c spike rewrite consumes them 
 
 ## Doc-only edits queued (ride with next code commit per `feedback_admin_changes_ride_with_code.md`)
 
-- **HANDOFF.md plan amendment** (lines 15 + 40 of pre-2026-05-07 state): "alpha-distribution as natural first task" framing is wrong — BRD §6 numbers T0.2.0 (LanceDB Encryption at Rest) first. Already partially superseded by this update; full sweep needed before T0.2.0 commit.
-- **BRD §6.2 line 1412 amendment**: stale reference to "ADR-008 dryoc/RustCrypto/sibling-crate spike" — that spike retired 2026-04-29 commit `5fdf0d8`. Update to reflect closure + name at-rest-extension as actual pre-T0.2.0 question.
-- **BRD §11.5.1 amendment**: tmpfs/memory-handle prescription is overridden by ObjectStoreProvider integration path (assuming Phase 0d PASS). Conditional on spike re-run outcome.
-- **ADR-013 supersession note**: chrono 0.4.39 pin lifted by ADR-037 (Phase 0e); document in archive cross-link.
+**All four queued items applied to working tree at Phase 0e sweep, 2026-05-09. Listed here for traceability; the next code commit (Phase 1 keychain spike) bundles the diff.**
+
+- ~~**HANDOFF.md plan amendment** (lines 15 + 40 of pre-2026-05-07 state)~~ — APPLIED Phase 0e sweep: "V0.2 task decomposition" section rewritten to reflect BRD §6.2 numerical ordering (T0.2.0 first per ADR-010 hard-gate, not alpha-distribution).
+- ~~**BRD §6.2 line 1412 amendment**~~ — APPLIED Phase 0e sweep: stale "ADR-008 dryoc/RustCrypto/sibling-crate spike" reference replaced with ADR-008 closure + ADR-037 (lancedb upgrade) + ADR-008 amendment (V0.2 at-rest extension lock-in) cross-references.
+- ~~**BRD §11.5.1 amendment**~~ — APPLIED Phase 0e sweep: tmpfs/memory-handle prescription replaced with ObjectStoreProvider-integration via `vault-sealed://` URI scheme per ADR-008 amendment locks; spike v2 runtime evidence + Phase 0d production wiring satisfies the integration condition.
+- ~~**ADR-013 supersession note**~~ — APPLIED Phase 0e sweep: chrono pin advance 0.4.39 → 0.4.44 (ADR-037 trigger 1: arrow upgrade past the conflict via arrow-arith 57.2.0) noted in HANDOFF.md "Active ADRs with V0.2+ implications" entry; archive entry remains unchanged for historical record per archive-frozen convention.
 
 ---
 
@@ -127,7 +134,49 @@ Per Agent_Build_Specification.txt §6.2:
 
 ## V0.2 task decomposition
 
-**TBD at next session's plan-paragraph drafting.** Forward-pointers from V0.1 ADRs suggest the natural first task is **alpha-distribution** consolidating multiple V0.2 hard-gates (see "V0.2 hard-gate ADR forward-pointers" section below). T0.2.x task numbering will land at first V0.2 plan iteration.
+**Per BRD §6.2 numerical ordering**, T0.2.0 (LanceDB Encryption at Rest, HARD GATE per ADR-010) is the first V0.2 task — NOT alpha-distribution. The alpha-cohort-distribution work (T0.2.14 Stub Installer + T0.2.16 Beta Onboarding) is hard-blocked on T0.2.0 acceptance per ADR-010 contract; it cannot land first. T0.2.0 close-out subtasks are enumerated in the "T0.2.0 close-out plan iteration 1" section below; remaining T0.2.x tasks (T0.2.1 vault-llm Phi-4-mini, T0.2.2-T0.2.6 vault-consolidator phases, T0.2.7 retrieval multi-strategy + vector index, T0.2.8 boundary enforcement, T0.2.9-T0.2.13 vault-sync, T0.2.14-T0.2.16 distribution + onboarding) follow per BRD §6.2 ordering. (Earlier framing here as "alpha-distribution as natural first task" was wrong — superseded 2026-05-09 at Phase 0e sweep edits.)
+
+---
+
+## ADR-037 — lancedb 0.8.0 → 0.27.2 upgrade (drafted 2026-05-09, T0.2.0 Phase 0e)
+
+**Status:** ACCEPTED, in force from T0.2.0 Phase 0a (commit `1e58d30` Phase 0a-fix; the upgrade itself landed in the Phase 0a working tree consumed by 0a-fix).
+
+**Context.** V0.1 was on `lancedb = "=0.8.0"` (lance 0.15, lance-io 0.15, arrow 51/52 split, datafusion 40, object_store 0.10) per ADR-012 ("AWS SDK + dual-arrow accepted as V0.1 cost"). T0.2.0 (LanceDB Encryption at Rest, HARD GATE per ADR-010) requires intercepting Lance's I/O so a sealing layer can wrap every read and write. The V1 spike (run 2026-05-07, archived as `at_rest_spike.rs.v1_fail_disabled`) FORMALLY FAILED at lance-io 0.15: both `WrappingObjectStore` and direct `ObjectStoreParams.object_store` injection were bypassed by lance-io's `LocalObjectReader` fast-path for `file://` URIs in BOTH directions. Web research (Phase 0a, verification report 2026-05-08) found lance-io 4.x exposes a first-class `ObjectStoreProvider` + `ObjectStoreRegistry` API. Registering a custom provider for an UNKNOWN scheme (`vault-sealed://`) bypasses any built-in fast-paths because there's no fast-path implementation for unknown schemes. Reaching that API requires moving from lancedb 0.8 to **0.27.2** — 19 minor versions, transitively `lance 4.0-rc.3`, `lance-io 4.0`, `arrow 57`, `datafusion 52`, `object_store 0.12`.
+
+**Decision.** Adopt `lancedb = "=0.27.2"` workspace-wide. The bump is the only known integration path for the at-rest extension; staying on 0.8 forces either `WrappingObjectStore` (proven non-functional at v1 spike Stage A — fire-counters read 0 on the read flow) or a much heavier sealed-tarball-on-close architecture (rejected at ADR-010 option B as half-baked-crypto). The chosen path keeps Lance's local-filesystem semantics intact and routes every byte through our provider.
+
+**Consequences (downstream ADRs forced by this upgrade).**
+
+- **ADR-038 (Concurrent-upsert serialisation + LANCE_MEM_POOL_SIZE shell ceiling).** lance 4.0 routes `merge_insert` through datafusion's full JOIN planner with no implicit per-table serialisation and no RAM ceiling by default. The pre-existing `concurrent_upserts_all_succeed` test surfaced the regression as an 8 GB allocation aborting the process. Three-layer + sibling defense landed at Phase 0a-fix. **This ADR would not have been written without the upgrade.**
+
+- **ADR-039 amendment (Compact+Prune for partial-fragment deletes).** lance 4.0's `OptimizeAction::Prune` does not compact partial fragments — `data_files_removed: 0` empirically on the single-id-delete pattern that is Memory Vault's actual production API. The Phase 0c spike Stage E 2×2 diagnostic discovered this and the production fix landed in the same commit. **This finding would not have surfaced without the upgrade — V0.1's lancedb 0.8 path didn't have the same tombstone semantics.**
+
+- **ADR-013 supersession (chrono pin advanced 0.4.39 → 0.4.44).** ADR-013's trigger 1 ("arrow upgrade past the conflict") fired: `arrow-arith 57.2.0` resolved the `ChronoDateExt::quarter()` collision that forced the original 0.4.38 pin. The pin form (`=0.4.44`) is retained per ADR-013 monthly-CVE-check discipline; the version inside the pin advanced. The pre-existing dual-bound band `[0.4.39, 0.4.44)` is now `[0.4.44, 0.4.45)` — single-version pin. ADR-013 amendment text in `HANDOFF_V0.1_ARCHIVE.md` will cross-link this ADR.
+
+- **lance 4.0 Cosine NaN-vector behaviour change (test-only finding, ADR-038 Layer 4).** lance 4.0 filters NaN-distance rows from Cosine search where lance 0.15 included them. Production unaffected — BGE-small-en-v1.5 produces L2-normalised non-zero embeddings. Test-only adjustment landed at Phase 0a-fix. Upstream issue filing tracked as tech-debt.
+
+- **ADR-012 dormant-cloud-backend footprint unchanged.** lance-io 4.0 still pulls `aws-config`, `aws-sdk-*`, etc. through the same `object_store` cloud-backend default-features path. ADR-012's monitoring + revisit triggers continue to apply.
+
+- **Build-time + test-runtime memory regression (ADR-038 Layer 3 + sibling).** lance 4.0's heavier dep tree roughly tripled per-rustc link-time peak memory; surfaced as `LNK1102: out of memory` on Shahbaz's 16-CPU / 16 GB Windows dev box. Resolution: `[build] jobs = 4` + `RUST_TEST_THREADS = 4` in `.cargo/config.toml`.
+
+**Verification.**
+
+- `cargo build --workspace --all-targets`: clean, zero warnings.
+- `cargo test -p vault-storage`: 226/226 passing post-Phase-0d (was 39/39 pre-upgrade).
+- `cargo test --workspace`: workspace-wide passing on `[ubuntu-latest, windows-latest, macos-latest]` per Phase 0d push CI run `25565477569` (success in 47m53s).
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo fmt --all --check`: clean.
+- Spike v2 runtime confirmation (Phase 0c Stages A-E PASS) proved the at-rest integration path the upgrade enabled is functional.
+- Phase 0d 5 sealed-path regression tests confirm the production-wired path matches the spike's runtime evidence.
+
+**When to revisit.**
+
+- **Lance V2 merge path lands with bounded memory by construction** ([lance#6151](https://github.com/lance-format/lance/issues/6151)) → drop ADR-038 Layer 2 (env var) first, then Layer 1 (mutex) only after concurrent-upsert runtime confirmation.
+- **lancedb gains feature flags for cloud backends** → ADR-012 binary-size revisit fires.
+- **lance/lancedb major-version bump** → re-audit dep graph; re-run at-rest spike to confirm `ObjectStoreProvider` + `ObjectStoreRegistry` API still works.
+
+**Cross-links.** ADR-008 (V0.2 at-rest extension amendment, Phase 0e). ADR-010 (V0.1 plaintext-LanceDB compensating-controls; this upgrade enables T0.2.0 acceptance). ADR-012 (dormant-cloud-backend acceptance, unchanged). ADR-013 (chrono pin advanced — see above). ADR-038 (concurrent-upsert + LANCE_MEM_POOL_SIZE, forced by this upgrade). ADR-039 (Compact+Prune amendment, forced by this upgrade). Spike v1 evidence: `crates/vault-storage/examples/at_rest_spike.rs.v1_fail_disabled`. Spike v2 evidence: `crates/vault-storage/examples/at_rest_spike.rs`.
 
 ---
 
@@ -242,6 +291,472 @@ Sealed and plain paths are byte-identical in Lance's reported stats — sealing 
 
 ---
 
+## ADR-008 amendment — V0.2 at-rest extension lock-in (drafted 2026-05-09, T0.2.0 Phase 0e)
+
+**Status:** ACCEPTED, in force from T0.2.0 Phase 0d (commit `dcefd9b`; production module landed at `crates/vault-storage/src/sealed_object_store.rs` + the `LanceVectorStore::open_with_at_rest_key` constructor).
+
+**Context.** ADR-008 (V0.1, 2026-04-29) locked Path #1 (DryocStream-as-single-message) for the T0.2.9 sync-envelope. The same primitive applies to the V0.2 at-rest extension on top of LanceDB, but the at-rest call site differs in three ways from sync envelopes:
+1. **Per-file invocation, not per-memory.** The at-rest layer wraps Lance's data files (Parquet shards, manifest fragments, index files), not application-level memory records. AAD must bind the file's identity, not a memory's.
+2. **Integration via lance-io's ObjectStoreProvider.** lancedb 0.27.2 (per ADR-037) exposes a registry-based mechanism that intercepts I/O for a custom URI scheme (`vault-sealed://`). The seal/unseal routines are called from inside an `object_store::ObjectStore` impl, not from application code.
+3. **No version_id in V0.2.** The sync-envelope path will (T0.2.9+) bind a sync-state version into AAD; the at-rest path cannot, because Lance writes files with manifest sequencing that is itself the version-coordinate. Adding version-id binding here would either circular-depend on Lance's manifest or duplicate it. V0.2 documents the replay-attack residual (sealed-file replaced with older sealed copy of itself at the same path) and revisits at V1.0.
+
+The Phase 0c spike v2 runtime-confirmed all locks below; the Phase 0d production module ports the spike verbatim minus instrumentation.
+
+**Decision (locks added on top of ADR-008's Path #1).**
+
+- **K3 KDF.** `at_rest_key = blake3::derive_key("vault memory at-rest sealing v1", &master_key)`. Single-source-crypto preserves ADR-008 line 693 principle ("crypto crates are not a place to multiply-source"). The domain-separator string `"vault memory at-rest sealing v1"` is distinct from any other BLAKE3 use in the workspace — the audit chain uses BLAKE3 directly (no `derive_key`), the sync-envelope AAD uses `blake3::hash` with prefix `"vault-aad-v1"`, and the at-rest AAD (below) uses `blake3::hash` with prefix `"vault-at-rest-v1"`. The `"v1"` suffix lets us rotate the KDF later without ambiguity.
+
+- **AAD scheme (Finding 2 candidate (c)).** `AAD = BLAKE3("vault-at-rest-v1" || file_path_bytes)` — the file path inside the `vault-sealed://` URI bound into AEAD authentication. Wrong-path-decryption fails closed (verified by spike Stage B + Phase 0d `sealed_open_with_wrong_key_fails_closed` regression pin). Distinct domain separator from ADR-008's sync-envelope AAD (`"vault-aad-v1"` per line 700). Inputs are unambiguous because `file_path_bytes` is the post-`extract_path` normalised path; no length-prefix needed. **No version_id binding in V0.2** — replay residual documented at top of this section; revisit V1.0.
+
+- **Sealing shape (locked, per-file granularity).** `sealed_bytes = version_byte (0x01) || granularity_marker (0x00 = per-file) || dryoc_header (24 bytes) || ciphertext`. 26-byte framing prefix + 17-byte AEAD overhead per ADR-008 line 686 = **43-byte total per-file overhead**. Materialised in `crates/vault-storage/src/sealed_object_store.rs` as `VERSION_BYTE` / `GRANULARITY_PER_FILE` / `TOTAL_FRAMING_LEN` / `SEAL_OVERHEAD` constants. Phase 0d regression pin `sealed_open_writes_framing_bytes_to_disk` asserts every on-disk file under the sealed data dir starts with `0x01 0x00` and contains zero PAR1 magic — the strongest single signal that the v1 LocalObjectReader-bypass class is gone in production.
+
+- **Per-file granularity (V0.2 unconditional).** Every file Lance writes through the provider seals as one envelope. No chunking. Per ADR-008 line 707 ("Path #1 ... is the right shape for V0.1, V0.2, and likely V1.x"); BRD §11.7.1 100KB per-memory cap means the largest sealed Parquet shard (the embedding column) is comfortably bounded. Multipart writes return `NotSupported` from `SealedObjectStore::put_multipart` — per-file granularity is locked at the trait boundary. **Revisit triggers (any):** column-projection latency benchmark shows per-file granularity insufficient (V1.0 retrieval-perf review); BRD §11.7.1 raises per-memory cap above 1MB; a Lance compaction operation produces files larger than the in-memory copy budget.
+
+- **ObjectStoreProvider integration (`vault-sealed://` URI scheme).** `SealedFileStoreProvider` registered in a per-store `lance::ObjectStoreRegistry` for the `vault-sealed://` scheme; `LanceVectorStore::open_with_at_rest_key` builds the registry, wraps it in a `Session`, and connects via `lancedb::connect(uri).session(session.clone()).execute()`. The provider overrides `extract_path` and `calculate_object_store_prefix` per spike Finding 2 to handle the unknown scheme — Lance's defaults assume scheme-known-paths and would mis-route `vault-sealed://` URIs. The session is held on `LanceVectorStore` via `_session: Option<Arc<Session>>` to keep the registered provider alive for the store's lifetime.
+
+- **AAD-parameter sized-input quirk (extending ADR-008 line 684).** `dryoc::DryocStream::push_to_vec` and `pull_to_vec` require `Option<&Vec<u8>>` for AAD — not `Option<&[u8]>` — for the same `Sized` trait bound that ADR-008 documented for plaintext. The at-rest seal/unseal routines materialise the BLAKE3 AAD digest as a `Vec<u8>` before passing. T0.2.9 sync envelopes have the same constraint per ADR-008 line 684; this amendment confirms it applies symmetrically to the at-rest call site.
+
+- **dryoc 0.7.2 unchanged.** Same dep version as ADR-008 lock. Workspace-promoted to `[workspace.dependencies]` at Phase 0d (was vault-sync `[dev-dependencies]` pre-V0.2).
+
+- **ADR-007 manual `Debug` redaction.** Both `SealedObjectStore` and `SealedFileStoreProvider` carry the at-rest key; both have manual `Debug` impls that redact the key field as `<redacted>`. The key itself is wrapped in `Arc<Zeroizing<[u8; 32]>>` for cheap-clone + Drop-zeroization per BRD §11.5.3. Verified at Phase 0d code-review reading.
+
+**Consequences.**
+
+- **43-byte per-file overhead** is bounded and small. For BRD §11.7.1's 100KB-per-memory ceiling, the worst-case sealed-file ratio is ≤0.05%; for small index files (<1KB) the ratio is higher but the absolute cost is sub-millisecond. No production benchmark warranted in V0.2.
+
+- **Replay-attack residual (no version_id binding).** A sealed file at path P can be replaced with an older sealed copy of itself at path P and validate. Memory Vault's threat model (BRD §11.1) flags this as low-likelihood: the attacker needs filesystem write access to the data dir, at which point they already have the SQLCipher metadata + audit log access path open — that is the honest context, not a mitigant; the threat model already treats this as an attacker-already-inside scenario. **V0.2 has no detection mechanism for the replay residual. The risk is documented, not mitigated.** V1.0 threat-model review designs real detection — likely candidates: version_id binding into AAD, or audit-chain row-count checkpoint at Lance manifest sequence boundaries.
+
+- **`vault-sealed://` URI scheme is reserved across the workspace.** No other crate may register a provider for this scheme. Documented at the `VAULT_SEALED_SCHEME` constant in `sealed_object_store.rs` and exposed via `pub use` from `vault-storage::lib.rs`.
+
+- **Multipart writes are unsupported.** Lance's V2 path mostly does not multipart-upload to local files, but if a future Lance feature (e.g. a column-projection compaction) calls `put_multipart`, the provider will return `NotSupported` and the operation will fail loudly. **Revisit trigger:** Lance changelog announces multipart-local-write usage.
+
+**Verification.**
+
+- Phase 0c spike v2 (`crates/vault-storage/examples/at_rest_spike.rs`) Stages A-E PASS. Stage A fire-counters confirm UNKNOWN-scheme bypass works; Stage B AAD round-trip + wrong-key adversarial; Stage C end-to-end sealed write+read; Stage D PAR1-magic absence + entropy ≥ 7.9; Stage E 2×2 plain×sealed × Prune-alone × Compact+Prune diagnostic (drove the ADR-039 amendment).
+- Phase 0d production-side regression pins: `sealed_open_round_trip_returns_inserted_rows`, `sealed_open_with_wrong_key_fails_closed`, `sealed_open_writes_framing_bytes_to_disk`, `sealed_delete_partial_fragment_physically_removes_content`, `sealed_open_emits_distinguishing_info_log`. 226/226 vault-storage tests pass post-Phase-0d.
+- CI matrix sustained green across `[ubuntu-latest, windows-latest, macos-latest]` per Phase 0d push CI run `25565477569`.
+
+**When to revisit.**
+
+- **Column-projection latency surfaces** at V1.0 retrieval review → switch to per-column or per-row-group granularity. Granularity-marker byte (`0x00 = per-file`) is reserved for forward-compat: `0x01` could mean per-column, `0x02` per-row-group, etc. — distinguishable on read.
+- **BRD §11.7.1 per-memory content cap raised above 1MB** → re-evaluate per-file granularity vs chunked streaming (same triggers as ADR-008 line 711).
+- **V1.0 threat-model review elevates replay-attack risk** → add version_id binding to AAD; bump domain-separator string to `"vault-at-rest-v2"`.
+- **dryoc minor-version bump** → re-run spike v2 to confirm DryocStream API still matches.
+- **lance-io API change** affecting `ObjectStoreProvider` / `ObjectStoreRegistry` / `Session` shape → re-run spike v2; potentially bump domain-separator if any sealed-on-disk format changes.
+- **Lance announces multipart-local-write usage** → spike `put_multipart` integration; lift the `NotSupported` return.
+
+**Cross-links.** ADR-008 V0.1 lock (`HANDOFF_V0.1_ARCHIVE.md`, 2026-04-29). ADR-007 (manual `Debug` redaction). ADR-010 (V0.1 plaintext-LanceDB compensating controls; this amendment is the integration that closes them at T0.2.0 acceptance). ADR-037 (lancedb upgrade rationale; this amendment is the at-rest extension built on the upgraded stack). ADR-039 amendment (Compact+Prune; the seal/unseal layer is non-interfering per spike Stage E 2×2 diagnostic, AND the privacy property survives composition through the sealed wrapper per Phase 0d regression pin `sealed_delete_partial_fragment_physically_removes_content`). Spike v2 evidence: `crates/vault-storage/examples/at_rest_spike.rs`. Production module: `crates/vault-storage/src/sealed_object_store.rs`.
+
+---
+
+## T0.2.0 close-out plan iteration 1 (drafted 2026-05-09, Phase 0e)
+
+Phase 0 (a / a-fix / b / c / d / e) was the spike-then-foundation block: lancedb upgrade, ADR-038/-039 fixes, sealing primitive runtime-confirmed in spike v2, production-wired in Phase 0d, contract-locked in Phase 0e ADRs (037 + 008 amendment). T0.2.0 proper now consumes those contracts to reach **BRD §6 T0.2.0 acceptance** (5 criteria) and **ADR-010 hard-gate clearance**. Five close-out phases below; two open questions punted to iteration 2.
+
+**Phase 1 — At-rest-key provenance: OS keychain (per ADR-032 amendment trigger).** ADR-032 line 289 ("V0.2 alpha-distribution must migrate to OS keychain — keyring-core ecosystem mid-migration at V0.1; revisit at V0.2 plan time + spike picks branch (D) keychain") is the trigger. **Methodology: spike-before-lock** per standing rule — 1-2 hour compile-and-run spike to pick the keychain crate (`keyring` 3.x vs `keyring-core`-derived; cross-platform-coverage check), runtime-confirm `set → get → wrong-account-fails-closed → process-restart-survives → Credential Manager UI shows entry` on Windows. Spike artifact kept under `crates/vault-app/examples/keychain_spike.rs` as executable documentation. **ADR-040 drafted at Phase 1 close** (post-spike, decision made from runtime evidence per spike-before-lock standing rule) with crate selection + key-storage policy (namespace, account, secret-shape). Production wiring at `Application::start_with_mcp`: read master_key from keychain on startup; on first run (no entry), generate new master_key + persist + use. **VAULT_KEY env var compensating control retired** — removed from `.env.example`, `setup-dev-env.{sh,ps1}`, CI workflow. Test: keychain round-trip Windows (≥1 regression pin); wrong-account-fails-closed pin.
+
+**Phase 2 — V0.1 plaintext data migration (founder-only one-shot, per BRD §6 T0.2.0 line 1415).** One-time-on-first-launch detection: at `Application::start` startup, check if data dir has BOTH plaintext-shaped Parquet (PAR1 magic on root files) AND `ALPHA_DO_NOT_STORE_REAL_DATA.txt` present → V0.1 alpha shape detected. Migration path: open V0.1 dir via the still-present plaintext `LanceVectorStore::open` (not yet deleted — Phase 3 deletes it immediately after this lands), read all rows, re-write through `open_with_at_rest_key` with master_key from keychain (Phase 1 must land first), delete V0.1 plaintext data-dir contents post-migration, write distinguishing one-time INFO log. Test: synthetic V0.1-shape data dir → migration → assert post-state has framing-bytes `0x01 0x00` on every file + zero PAR1 magic + same row count + content-equality on every row. **Phase 2 is the LAST CALLER of plaintext `open()` in the codebase** — Phase 3 deletes the plaintext path immediately after.
+
+**Phase 3 — ADR-010 compensating-controls removal + plaintext-`open()` deletion + BRD §6 acceptance-test suite.** Removes all four ADR-010 V0.1 compensating controls per ADR-010 removal-trigger clause: (1) modal first-run banner from vault-tauri, (2) persistent UI banner from vault-tauri, (3) WARN log at plaintext LanceDB open (the WARN site itself is removed alongside the plaintext path), (4) `ALPHA_DO_NOT_STORE_REAL_DATA.txt` file deleted on T0.2.0 first-run with one-time INFO log noting the upgrade. Plaintext `LanceVectorStore::open(path, dim)` deleted from `vector_store.rs` (Phase 2 was last caller). **BRD §6 T0.2.0 5-criterion acceptance suite** lands as named integration test in vault-app: (a) no-plaintext-on-disk after write/close (entropy ≥ 7.9 + zero PAR1 magic — extends Phase 0d's `sealed_open_writes_framing_bytes_to_disk` to top-level integration), (b) round-trip identity (encrypt → decrypt == original), (c) decryption with wrong key fails closed (extends Phase 0d's `sealed_open_with_wrong_key_fails_closed`), (d) all four ADR-010 controls absent from codebase (grep-test asserts the V0.1 strings are gone), (e) tampered-ciphertext detection — bit-flip a sealed byte, assert open returns Err with AEAD-auth message. **CI matrix runs the full suite on `[ubuntu-latest, windows-latest, macos-latest]`** per BRD §6 T0.2.0 acceptance #2 ("round-trip identity across Mac, Windows, Linux").
+
+**Phase 4 — Founder-dogfood-on-sealed validation (Windows-only per ADR-029 V0.1 pattern).** **Pinned single-platform: Windows 11 dev box only.** ADR-029 V0.1 dogfood was Windows-only-with-amendment because that is the founder's actual hardware; T0.2.0 is the encryption-at-rest task, not the platform-expansion task. Mac CI coverage is already provided by Phase 3 acceptance suite running on `macos-latest` per BRD §6 T0.2.0 (b). Mac human-in-the-loop dogfood belongs at T0.2.16 (Beta Onboarding) or a dedicated Mac-procurement sub-task — not bundled into T0.2.0 close-out. **Test trajectory:** 6+ hours cumulative on Windows 11 dev box matching V0.1 dogfood pattern per HANDOFF.md retrospective line 111. ≥10 memories saved through the sealed path, ≥10 search queries return correct results, full-laptop-reboot persistence test, wrong-keychain-entry restart-fails-closed test (manual: temporarily corrupt the keychain entry, restart app, expect fail-closed startup; restore keychain entry afterward). Capture findings per **ADR-036 amended bar** (≥2 issues filed OR honest closure note). MSI artifact build at Phase 4 close — SHA-256 captured into HANDOFF.md V0.2 alpha-distribution forward-record.
+
+**Phase 5 — T0.2.0 acceptance close + ADR-010 hard-gate clearance.** Final DoD pass (BRD §0.1 five conditions). HANDOFF.md updates: V0.2 hard-gate forward-pointer table flips ADR-010 from "HARD GATE before T0.2.0" → "HARD GATE CLEARED at T0.2.0 commit `<sha>`"; ADR-032 amendment trigger marked closed (keychain wired); active task flips to next T0.2.x per V0.2 task decomposition. **BRD §6.2 line 1411-1423 amendment** marks T0.2.0 DONE and lifts the T0.2.16 (Beta Onboarding) hard-block per ADR-010 contract.
+
+**Acceptance-criteria mapping.** BRD §6 T0.2.0 (a) entropy + magic-bytes absence → Phase 3 acceptance suite (a) extending Phase 0d. (b) round-trip Mac/Windows/Linux → Phase 3 acceptance suite (b) on CI matrix. (c) wrong-key fails closed → Phase 3 acceptance suite (c) extending Phase 0d. (d) four V0.1 controls removed → Phase 3 acceptance suite (d) grep-test. (e) tampered ciphertext detected → Phase 3 acceptance suite (e) bit-flip test. ADR-010 hard-gate clearance → Phase 5.
+
+**Open questions for iteration 2.**
+
+1. **Cross-platform keychain coverage in chosen crate.** Phase 1 spike answers Windows. Mac (Keychain Services) and Linux (libsecret / DBus Secret Service) parity is open until the spike runs. If the chosen crate covers all three, no extra phases needed; if Windows-only, Mac/Linux keychain wiring becomes T0.2.0.x sub-task or T0.2.14 Stub-Installer-adjacent. Iteration 2 picks crate post-spike + decides scope.
+
+2. **Migration-test fixture provenance.** Phase 2 test uses a "synthetic V0.1-shape data dir" — open question whether we manufacture it via test scaffolding (write Parquet + ALPHA file directly) or boot a full V0.1 binary one-shot to produce a real fixture. Scaffolding is cheaper but less realistic; binary-produced is the gold standard but adds a build step. Iteration 2 decides.
+
+**Test-count floor forecast (per `feedback_floor_forecast_is_pre_declaration_not_estimate.md`).** Phase 1: +3 (keychain round-trip, wrong-account, restart-survives). Phase 2: +2 (synthetic-V0.1-migration, alpha-marker-cleanup). Phase 3: +5 (BRD acceptance suite × 5 criteria). Phase 4: 0 (manual-test phase). Phase 5: 0 (admin close). **Aggregate floor: +10 tests across T0.2.0 close-out**, taking vault-storage from 226 → ≥236 (plus vault-app integration tests for Phases 1+2+3 acceptance suite at +5-7 in vault-app — total +15-17 across the workspace; vault-app figure firmer after iteration 2 spike informs Phase 1 shape).
+
+**ADRs to draft during T0.2.0 close-out.** ADR-040 (Phase 1 close — keychain crate selection + key-storage policy). Possible amendment to ADR-032 depending on iteration-2 decision on question 1.
+
+---
+
+## T0.2.0 close-out plan iteration 2 (drafted 2026-05-09, Phase 1 kickoff)
+
+**Iteration 1 stands.** Five-phase decomposition unchanged. Iteration 2 resolves one open question and explicitly defers the other to Phase 1 spike runtime evidence per spike-discipline standing rule.
+
+**OQ #2 resolution — Migration-test fixture provenance (Phase 2 of close-out plan).**
+
+Adopt **a three-tier fixture strategy**, not the single binary-vs-scaffolding choice iteration 1 framed:
+
+1. **Tier 1 (CI regression, fast):** scaffolding-based migration test. Cargo-test setup writes a synthetic V0.1-shape data dir directly — Parquet files via `arrow_array::RecordBatch` + `parquet::arrow::ArrowWriter` exposed-as-fixture, plus the `ALPHA_DO_NOT_STORE_REAL_DATA.txt` marker file. Cheap, deterministic, runs on every commit on every CI matrix OS. Catches the regression class "migration logic mishandles a known V0.1 file shape." Lives in `crates/vault-storage/tests/migration_v0_1_to_sealed.rs`.
+
+2. **Tier 2 (CI realism gate, checked-in):** snapshot a 5-memory synthetic V0.1 vault produced from a ONE-TIME run of the V0.1 binary at commit `1d72aac` (= `v0.1.0` tag, verified 2026-05-09; the V0.1 SHIPPED commit per HANDOFF.md V0.1 retrospective + the build whose Phase 5e MSI artifact SHA-256 was `03d12737...0a06`). Anonymized content (5 throwaway memories — no PII, no real data). Checked in under `crates/vault-storage/tests/fixtures/v0_1_alpha_data_dir/` with a README capturing provenance + capture date + V0.1 commit SHA + V0.1 tag. Test runs migration on a copy of the fixture and asserts post-state (framing bytes / row count / content equality on every row). Catches "V0.1 actually wrote files we didn't anticipate in scaffolding" — the realism gap iteration 1 flagged. **Not a CI build step** (no V0.1 binary build in the matrix); just static data files.
+
+3. **Tier 3 (one-shot manual smoke, before Phase 2 ships):** Shahbaz runs the migration on his actual V0.1 vault dir (the live dogfood vault from V0.1 alpha). Snapshot beforehand for safety. This is the gold-standard realism check on real-world data shape distribution. Not in CI; documented as a Phase 2 close-out checklist item; HANDOFF.md captures the smoke-test result + any findings.
+
+**Why three tiers, not one:** iteration 1's binary-vs-scaffolding framing was a false binary. Tier 1 catches regression; Tier 2 catches V0.1-binary-output reality; Tier 3 catches Shahbaz's-actual-vault-distribution reality. Each tier has a distinct purpose and the cost of all three combined is small (Tier 1 is trivial Rust; Tier 2 is a 5-memory data-dir capture once; Tier 3 is Shahbaz manually running migration on his own vault). The scaffolding-only path leaves the realism gap; the binary-only path leaves the regression-on-every-commit gap; the three-tier composition closes both with bounded incremental cost.
+
+**OQ #1 partially resolved by Phase 1 Leg 1 web research; final lock pending Leg 2 runtime evidence.**
+
+Phase 1 Leg 1 web research (executed 2026-05-09) found the ecosystem migrated mid-V0.1-to-V0.2: `keyring` v3 era is end-of-line; v4 is sample-code-only with explicit "do not depend"; the active library is **`keyring-core` 1.0.0** (April 2026, `open-source-cooperative` org, maintained by Dan Brotsky), with credential stores split into per-platform crates. Cross-platform coverage IS available, but in a per-platform-crate pattern (not a single cross-platform crate). User code uses `#[cfg(target_os = "...")]` or a thin wrapper to pick the right store. Coverage map at May 2026:
+
+| Platform | Crate | Version |
+|---|---|---|
+| Windows Credential Manager | `windows-native-keyring-store` | 1.0.0 (Apr 21 2026) |
+| macOS Keychain Services | `apple-native-keyring-store` | 1.x line — has TWO modules: `Keychain` (unsigned-app compat, V0.1-era equivalent) + `Protected` (code-signed-only, biometric + iCloud-sync) |
+| Linux Keyutils | `linux-keyutils-keyring-store` | 1.x line |
+| Linux libsecret/DBus | `dbus-secret-service-keyring-store` | 1.0.0 (Apr 21 2026) — needs `crypto-rust` or `crypto-openssl` feature |
+
+**Lock target for ADR-040 (pending Leg 2):** `keyring-core = "1"` + `windows-native-keyring-store = "1"` for V0.2 spike + Windows production wiring. macOS / Linux integration is per-platform-crate-add when those platforms enter founder-dogfood / CI matrix runtime confirmation. **Cross-platform path is unblocked**; OQ #1 closure is a per-platform-crate-add list, not an architecture redesign.
+
+**Test-count floor forecast adjustment.** Iteration 1 forecast Phase 2 +2 tests. Three-tier fixture strategy adjusts to **Phase 2 +3 tests**: (a) Tier-1 scaffolding-migration round-trip, (b) Tier-2 fixture-replay round-trip, (c) Tier-2 ALPHA-marker-cleanup-after-migration. **Aggregate floor: +11 tests across T0.2.0 close-out** (was +10 at iteration 1), taking vault-storage from 226 → ≥237. vault-app integration tests for Phases 1+2+3 unchanged at +5-7. Total workspace +16-18 (was +15-17 at iteration 1; +1 from Phase 2 fixture tier addition).
+
+---
+
+## T0.2.0 close-out plan iteration 1.5 — Phase 1 scope correction (drafted 2026-05-09, post-source-read)
+
+**Trigger.** Phase 1 production-wiring source-read of `crates/vault-app/src/application.rs` + `crates/vault-app/src/config.rs` + the V0.1 `vault-tauri` entry point surfaced three contract-class divergences from iteration 1's "Phase 1 — At-rest-key provenance: OS keychain" framing. Per `feedback_flag_review_as_plan_amendment.md`, these are plan amendments — flagged before any code landed rather than papered over with implementation choice. Iteration-1.5 captures the corrections; iteration 1's five-phase decomposition + iteration 2's three-tier fixture strategy remain intact above.
+
+**Discovery 1 — `Application::start_with_mcp` is the WRONG location for keychain reading.**
+
+`Application::new(config: &AppConfig)` consumes `config.key: SqlCipherKey` at construction time, cloning it into three `MetadataStore::open` / `StorageBackend::open` calls. By the time `start_with_mcp` runs as `&self`, the SqlCipherKey is already in flight. The keychain read MUST happen at **AppConfig construction site** (`vault-tauri/src/main.rs` for the V0.1 binary entry point), BEFORE `Application::new`. ADR-040's "Location: `Application::start_with_mcp`" line is imprecise — corrected here, ADR-040 amendment for the same correction lands in the same Phase 1 commit.
+
+**Discovery 2 — Phase 1 must wire BOTH `SqlCipherKey` provenance AND at-rest-key sourcing.**
+
+iteration 1 framed Phase 1 as at-rest-key only, with VAULT_KEY retirement as a side-deliverable. But VAULT_KEY currently feeds SqlCipherKey directly (V0.1 path); retiring VAULT_KEY in Phase 1 means SqlCipherKey provenance MUST flip to keychain-derived in Phase 1 — otherwise the build breaks. Plus: Phase 2 (V0.1 plaintext data migration) reads V0.1 plaintext data and re-writes through the sealed path; Phase 2 needs at-rest-key wired BEFORE it runs. So Phase 1 wires:
+1. **Single master_key source** (32 bytes) read from keychain at vault-tauri main.rs.
+2. **SqlCipherKey passphrase** derived from master_key (option β — see Discovery 3).
+3. **at-rest-key derivation in vault-storage** keyed off master_key flowing through AppConfig (per ADR-008 amendment K3 KDF).
+
+Phase 3 still owns plaintext-`open()` deletion + ADR-010 controls removal + acceptance suite. Phase 2 needs `LanceVectorStore::open()` (plaintext) alive to read V0.1 data; Phase 3's deletion timing remains contingent on Phase 2 being the LAST CALLER.
+
+**Discovery 3 — master_key → SqlCipherKey derivation tree was unlocked.**
+
+ADR-008 amendment locks master_key → at_rest_key via K3 KDF (`blake3::derive_key("vault memory at-rest sealing v1", &master_key)`). No equivalent lock existed for master_key → SqlCipherKey. Three options surfaced; **option β locked**:
+
+```
+sqlcipher_passphrase = hex(blake3::derive_key("vault sqlcipher passphrase v1", &master_key))
+at_rest_key          = blake3::derive_key("vault memory at-rest sealing v1", &master_key)
+```
+
+Reasoning: matches the K3 KDF pattern; preserves single-source-crypto principle (BLAKE3 already in workspace, single primitive across SqlCipher + at-rest + sync envelope + audit chain — all domain-separated by distinct prefix strings); clean key-per-consumer isolation. Option α (hex-encode master_key directly as SqlCipher passphrase) works but exposes master_key to SQLCipher's PBKDF2 directly — breaks the subkey-per-consumer pattern. Option γ (raw key via `PRAGMA key = "x'<hex>'"`) requires SqlCipherKey API change — out of scope for Phase 1. **Lock captured in ADR-040 amendment** (extending production-wiring section's master_key flow with the derivation tree); cross-links ADR-008 amendment for the at-rest K3 KDF parallel.
+
+**Discovery 4 — Phase 1 surface change is bounded by helper-module factoring.**
+
+Source-read showed Phase 1 would touch `vault-tauri/src/main.rs` + `vault-tauri/src/lib.rs` + `vault-tauri/dist/index.html` (VAULT_KEY references). Without factoring, Phase 1 splits across vault-tauri (binary) + vault-app (composition root) + vault-storage (KDF consumer) + vault-core (error variant). **Decision: factor keychain-touching code into a `vault_app::keychain` module** with the public function:
+
+```rust
+pub fn read_or_init_master_key(vault_id: &str) -> VaultResult<Zeroizing<[u8; 32]>>;
+```
+
+vault-tauri's main.rs change becomes one function call (`let master_key = vault_app::keychain::read_or_init_master_key(&vault_id)?;`). Keychain-touching code lives in vault-app where it's unit-testable; `keyring-core` + `windows-native-keyring-store` deps live in vault-app's `[dependencies]`, not vault-tauri's. Surface change in vault-tauri stays minimal.
+
+**Phase 1 close-out commit deliverables (corrected, supersedes iteration 1's Phase 1 paragraph for execution).**
+
+1. `vault_app::keychain::read_or_init_master_key(vault_id) -> VaultResult<Zeroizing<[u8; 32]>>` helper module.
+2. `vault_app::keychain::derive_sqlcipher_passphrase(&master_key) -> SqlCipherKey` derivation per option β. (Or co-located in vault-storage; decided at code-review time.)
+3. `vault-tauri/src/main.rs` AppConfig construction site: read keychain → derive SqlCipherKey → build AppConfig → call `Application::new(&config)`. master_key flows through to `LanceVectorStore::open_with_at_rest_key` via `AppConfig` (new `at_rest_key` field added — name TBD at code review) once Phase 3 deletes plaintext `open()`. **In Phase 1**, master_key is read + SqlCipherKey derived; at_rest_key is staged for Phase 2/3 consumption (see below).
+4. New `VaultError` variant (name TBD at code review) distinguishing keychain-provenance failure from generic `VaultError` variants.
+5. VAULT_KEY env var retirement: removed from `.env.example`, `setup-dev-env.{sh,ps1}`, `.cargo/config.toml` `[env]`, `.github/workflows/ci.yml` `env:` block.
+6. Workspace dep promotion: `keyring-core`, `windows-native-keyring-store`, `getrandom`, `hex` move from vault-app `[dev-dependencies]` to `[workspace.dependencies]` + vault-app `[dependencies]`.
+7. ADR-040 amendment: production-wiring location correction (vault-tauri main.rs, not `Application::start_with_mcp`) + SqlCipher derivation tree lock (option β).
+
+**Phase 2 dependency on Phase 1 (re-stated for clarity).** Phase 2 (V0.1 plaintext data migration) reads V0.1 plaintext via `LanceVectorStore::open()` and writes V0.2 sealed via `LanceVectorStore::open_with_at_rest_key(path, dim, &master_key)`. The master_key fed to the latter is the same master_key Phase 1 sourced from keychain. Phase 2 needs the AppConfig flow (or equivalent) to carry master_key from main.rs through to the migration call site. Concrete plumbing decision deferred to Phase 2 code review (could be a new AppConfig field `at_rest_key`, or could be a separate parameter to a Phase 2-specific migration function).
+
+**Test-count floor adjustment (iteration 1.5).** iteration 1 forecast Phase 1 +3 tests (keychain round-trip / wrong-account / restart-survives — all pin-tests of the spike artefact's behaviour). iteration-1.5 adds **+1-2 vault-app unit tests** for `read_or_init_master_key`: (a) round-trip (write a master_key via this function path → read back → byte-equal); (b) first-run-generates-and-persists (no entry exists → function generates new key + persists + returns; second call reads the persisted entry). **Aggregate floor: +12-13 tests across T0.2.0 close-out** (was +11 at iteration 2; +1-2 from iteration-1.5 helper-module pins). Total workspace +17-19 (was +16-18 at iteration 2).
+
+**Cross-references.** ADR-040 (Phase 1 close — keychain crate selection + key-storage policy). ADR-040 amendment (Phase 1 close — production-wiring location + SqlCipher derivation tree per option β). ADR-008 amendment (K3 KDF for at-rest sealing — parallel to the SqlCipher derivation locked here). ADR-032 (V0.1 VAULT_KEY env var; iteration-1.5 confirms its retirement timing as Phase 1, not deferred).
+
+---
+
+## Phase 1 keychain spike — methodology declaration (drafted 2026-05-09)
+
+**Context.** Trigger: ADR-032 amendment ("V0.2 alpha-distribution must migrate to OS keychain — keyring-core ecosystem mid-migration at V0.1; revisit at V0.2 plan time + spike picks branch (D) keychain"). The crate-selection decision must be runtime-confirmed before production wiring, per spike-before-lock standing rule.
+
+**Methodology: hybrid (web research + compile-and-run).** Per `feedback_runtime_confirmation_after_web_spike.md`, the compile-and-run leg is the **load-bearing** leg — web research informs but does not lock. Two legs run in this order, with a STOP-AND-REPORT checkpoint between them:
+
+**Leg 1 — Web research — EXECUTED 2026-05-09, findings below.**
+
+**Findings:** The `keyring` crate ecosystem migrated April 2026: v3.x is end-of-line, v4 is sample-code-only ("do not depend"), and the active library is `keyring-core` 1.0.0 with credential stores split into per-platform crates under the `open-source-cooperative` org (Dan Brotsky maintainer). Iteration 2's "keyring 3.x likely" prior was **invalidated** by Leg 1 — exactly the divergence the methodology gate was designed to catch per `feedback_runtime_confirmation_after_web_spike.md`. Crate-name / version map is captured in iteration 2's OQ #1 partial-resolution table above. No RustSec advisories surfaced for `keyring-core` or `windows-native-keyring-store` at web-research depth.
+
+**API shape confirmed:**
+```rust
+keyring_core::set_default_store(store);
+let entry = Entry::new("service", "user")?;
+entry.set_secret(&bytes)?;     // binary, not just string — matches our 32-byte master_key
+let bytes = entry.get_secret()?;
+```
+
+**Predicted lead candidate (Leg 1 web-research confirmed; runtime evidence pending Leg 2):** `keyring-core = "1"` + `windows-native-keyring-store = "1"`. Both are v1.0.0 stable, coordinated April 2026 release.
+
+**Side-finding for ADR-040 forward-compat (concrete-not-hypothetical per `feedback_forward_compat_concrete_vs_hypothetical.md`).** `apple-native-keyring-store` has TWO modules: `Keychain` (unsigned-app compat — works for Memory Vault V0.1 unsigned per ADR-031) and `Protected` (code-signed-only, biometric + iCloud-sync). When V0.2 alpha-cohort macOS signing pipeline lands per ADR-029 amendment hard-gate, Mac users on signed builds gain biometric + iCloud-sync vs Mac users on the founder-unsigned path. ADR-040 forward-compat note will name this upgrade path explicitly — V0.2 alpha cohort signing is hard-gated, so this is not speculation.
+
+**`cargo audit` against the actual resolved dep tree** is the load-bearing security check; runs in Leg 2 once Cargo.toml deps land.
+
+**Sources:** [keyring on crates.io](https://crates.io/crates/keyring) · [keyring-core on crates.io](https://crates.io/crates/keyring-core) · [keyring-rs main repo](https://github.com/open-source-cooperative/keyring-rs) · [windows-native-keyring-store releases](https://github.com/open-source-cooperative/windows-native-keyring-store/releases) · [apple-native-keyring-store](https://github.com/open-source-cooperative/apple-native-keyring-store) · [dbus-secret-service-keyring-store](https://github.com/open-source-cooperative/dbus-secret-service-keyring-store) · [Keyring ecosystem wiki](https://github.com/open-source-cooperative/keyring-rs/wiki/Keyring) · [RustSec Advisory Database](https://rustsec.org/advisories/).
+
+**Leg 2 — Compile-and-run on Windows (load-bearing, time budget ~60-90 min, GATED on Leg 1 go-ahead).**
+- Spike artifact: `crates/vault-app/examples/keychain_spike.rs` — kept long-term as executable documentation per ADR-008 line 695 pattern.
+- Spike-local dev-deps only (`[dev-dependencies]` of vault-app); no workspace-deps promotion until ADR-040 + production wiring at Phase 1 close.
+- Spike implements four assertions, in order:
+  1. **Round-trip byte-identity:** generate random 32-byte master_key, write to keychain (namespace = `com.memoryvault.spike.v0.2`, account = `spike-test-vault`), read back, assert byte-identical.
+  2. **Wrong-account-fails-closed:** attempt read from keychain with wrong account string (`spike-test-vault-WRONG`), assert returns `Err` (not panic, not empty bytes, not silent success).
+  3. **Process-restart-survives:** spike's main process writes the entry, spawns a child process (separate `std::process::Command` invocation of itself with a `--child-read` arg), child process reads + asserts identity, parent waits + checks child exit code.
+  4. **Manual Credential Manager UI verification:** spike prints the namespace + account string to stdout; Shahbaz opens Windows Credential Manager (Control Panel → User Accounts → Credential Manager → Windows Credentials) and confirms the entry is visible at the printed namespace. Manual step — runtime evidence requires human confirmation that the entry persisted to the OS layer, not just the keyring crate's in-memory cache.
+- **Cleanup:** spike deletes its own keychain entry on exit (success or failure path) so re-runs are deterministic. If cleanup fails, prints the namespace + account so Shahbaz can manually delete via Credential Manager.
+- Spike runs from PowerShell per `feedback_cargo_on_windows_use_powershell.md`. Single command: `cargo run -p vault-app --example keychain_spike --release`.
+- **Acceptance for Leg 2:** all four assertions PASS. Any failure → STOP and escalate to Shahbaz, do not improvise. Per `feedback_spike_methodology_explicit.md` discipline.
+
+**ADR-040 keychain-namespace + account + payload locks (confirmed pre-spike, drafted from spike runtime evidence at Phase 1 close).**
+- **Namespace.** Reverse-DNS convention matching macOS Keychain conventions.
+  - Production: `com.memoryvault.v0.2`
+  - Spike: `com.memoryvault.spike.v0.2`
+  - Distinguishable from any other Memory Vault keychain entry; spike namespace prevents accidentally clobbering a real production entry during repeated spike runs.
+- **Account string.** V0.2 ships single-vault per BRD §6.2; account string is the literal vault-id string (one keychain entry per vault). **Forward-compat for V1.0 multi-vault** (BRD §6 names multi-vault explicitly in V1.0 scope, so this is concrete-not-hypothetical per `feedback_forward_compat_concrete_vs_hypothetical.md`): the same account-string slot will hold the V1.0 vault-id; multiple entries under the same `com.memoryvault.v0.2` namespace gives multi-vault for free, no schema migration needed.
+- **Secret payload.** Raw 32-byte `master_key` bytes — no encoding overhead, no parse-error class, matches the existing `[u8; 32]` Rust shape. Wrapped in `Zeroizing<[u8; 32]>` on read per BRD §11.5.3 / ADR-008 amendment K3-KDF wrapper pattern.
+
+**Artifact retention.** Spike file kept long-term as executable documentation. ADR-040 cross-references the file path. If `keyring` minor-version bumps in the future, spike re-run is the verification mechanism — analogous to ADR-008 line 696 pattern for the dryoc spike.
+
+**Failure conditions (any → stop and escalate, do not silently work around).**
+- Web research finds no maintained crate with cross-platform claims that pass cargo-audit → escalate; ADR-032 may need re-architecting (e.g., DPAPI-direct on Windows, abandoning portable-keychain framing).
+- Spike compile fails → diagnose root cause; do not patch around (per saved-memory `feedback_dont_propose_relaxation_for_speed.md`).
+- Round-trip byte-identity fails → keyring crate is broken or misconfigured; escalate before any production wiring touches keychain.
+- Wrong-account-fails-closed returns silent success or empty bytes → security failure mode; escalate immediately, do not proceed.
+- Process-restart-survives fails → entry is in-memory-only; not actually persisted; ADR-032 amendment needs re-architecting.
+- Credential Manager UI does not show the entry → entry is in-process-cache-only or in a wrong store; escalate.
+
+**Out of scope for the spike (deferred to Phase 1 production wiring or later phases).**
+- macOS Keychain Services runtime confirmation — covered by Leg 1 cross-platform-claim audit + CI matrix at Phase 3 acceptance suite, not by the manual-test leg of this spike (per ADR-029 V0.1 dogfood pattern: spike runtime confirmation happens on the founder's actual hardware, which is Windows).
+- Linux libsecret runtime confirmation — same reason as macOS.
+- Production wiring to `Application::start_with_mcp` — Phase 1 close, post-ADR-040.
+- VAULT_KEY env var retirement — Phase 1 close, post-ADR-040.
+- Migration of any existing V0.1 keys (none exist; V0.1 used VAULT_KEY env var, not keychain).
+
+---
+
+## ADR-040 — Keychain crate selection + key-storage policy (drafted 2026-05-09, T0.2.0 Phase 1)
+
+**Status:** ACCEPTED, in force from T0.2.0 Phase 1 commit.
+
+**Context.** ADR-032 amendment trigger ("V0.2 alpha-distribution must migrate to OS keychain"). T0.2.0 close-out plan iteration 1 Phase 1: at-rest-key provenance must move from VAULT_KEY env var (V0.1 compensating control) to OS keychain before V0.2 alpha-cohort distribution. Spike-before-lock standing rule: crate selection is a runtime-evidence decision. Phase 1 Leg 1 (web research, 2026-05-09) + Leg 2 (compile-and-run on Windows, 2026-05-09) ran the hybrid spike methodology declared in HANDOFF.md "Phase 1 keychain spike — methodology declaration."
+
+**Decision (locks from combined Leg 1 + Leg 2 evidence).**
+
+- **Crate stack (Windows production):**
+  - `keyring-core = "=1.0.0"` — library API
+  - `windows-native-keyring-store = "=1.0.0"` — Windows Credential Manager backend
+  - Both v1.0.0 stable, coordinated April 2026 by `open-source-cooperative` org (Dan Brotsky maintainer)
+  - Pinned per BRD §0.2 + ADR-002
+
+- **Crate stack (cross-platform forward-compat, concrete-not-hypothetical per `feedback_forward_compat_concrete_vs_hypothetical.md`):** `apple-native-keyring-store` (macOS — `Keychain` module unsigned, `Protected` module signed-with-biometric+iCloud), `linux-keyutils-keyring-store`, `dbus-secret-service-keyring-store` (with `crypto-rust` feature). Per-platform crate-add at T0.2.0.x sub-task or T0.2.14 Stub-Installer-adjacent; not architecture-blocked.
+
+- **API pattern:**
+```rust
+use keyring_core::Entry;
+use windows_native_keyring_store::Store;
+
+keyring_core::set_default_store(Store::new()?);
+let entry = Entry::new(SERVICE, USER)?;
+entry.set_secret(&master_key)?;          // 32-byte binary
+let key = entry.get_secret()?;
+keyring_core::unset_default_store();
+```
+
+- **Key-storage policy:**
+  - **Namespace (service):** `com.memoryvault.v0.2` (production), `com.memoryvault.spike.v0.2` (spike-only). Reverse-DNS, distinguishable from any other Memory Vault keychain entry.
+  - **Account (user):** literal vault-id string. V0.2 single-vault per BRD §6.2 → one entry. **V1.0 multi-vault forward-compat (concrete-not-hypothetical):** same account-string slot holds future V1.0 vault-id; multiple entries under the same namespace gives multi-vault for free, no schema migration.
+  - **Secret payload:** raw 32-byte `master_key` bytes via `set_secret` / `get_secret`. No encoding overhead, no parse-error class, matches `[u8; 32]` Rust shape.
+  - **In-memory protection:** wrap on read in `Zeroizing<[u8; 32]>` per BRD §11.5.3 / ADR-008 amendment K3-KDF pattern; never materialise as plaintext `Vec<u8>` outside the `get_secret` call site.
+  - **Windows persistence:** `CRED_PERSIST_ENTERPRISE` (strongest of three Windows persistence types — survives reboots + logoffs; allows credential roaming on domain-joined machines with credential-roaming policy; functionally equivalent to Local Machine on personal-use). **Verified by Phase 1 Leg 2 UI screenshot.**
+  - **Windows on-OS target-format:** `windows-native-keyring-store` renders `(service, user)` as `<user>.<service>` joined with literal dot. Phase 1 spike entry rendered as `spike-test-vault.com.memoryvault.spike.v0.2` in Credential Manager. Documented for user-facing diagnostics; user code is unaffected (keyring-core API abstracts over the per-platform format).
+
+- **Production wiring (Phase 1 same-commit deliverable):**
+  - Location: `Application::start_with_mcp` (V0.1 path established at T0.1.10 Phase 2; ADR-034 V0.1 fix-forward).
+  - On startup: read master_key via `Entry::new(NAMESPACE, vault_id).get_secret()`. On `Err(NotFound)` → first-run: generate new 32-byte master_key via `getrandom`, persist via `set_secret`, proceed. On any other Err → fail-closed: ERROR log + new `VaultError` variant (name TBD at production-wiring code review) distinguishing keychain-provenance failure from generic `VaultError` variants → vault-app exits non-zero. **Never proceed with partially-recovered / empty / mismatched key.**
+  - **VAULT_KEY env var retired:** removed from `.env.example`, `setup-dev-env.{sh,ps1}`, `.cargo/config.toml` `[env]`, CI workflow `env:` block.
+
+**Spike runtime evidence (Phase 1 Leg 2, 2026-05-09).**
+
+Spike artifact: `crates/vault-app/examples/keychain_spike.rs`. Run modes: interactive (full 4 assertions), `--no-interactive` (1-3 + leave for offline UI verify), `--cleanup` (idempotent delete-and-exit).
+
+| # | Assertion | Result | Evidence |
+|---|---|---|---|
+| 1 | Round-trip byte-identity | **PASS** | 32 random bytes via `getrandom`; `set_secret` → `get_secret` byte-equal |
+| 2 | Wrong-account-fails-closed | **PASS** | `Entry::new(NS, "spike-test-vault-WRONG").get_secret()` returned `Err` |
+| 3 | Process-restart-survives | **PASS** | Parent spawned `current_exe()` with `--child-read <hex>`; child re-opened entry from fresh process; byte-identical; child exit 0 |
+| 4 | Manual Credential Manager UI | **PASS** | Founder screenshot confirmed `spike-test-vault.com.memoryvault.spike.v0.2`; `User name: spike-test-vault`; `Persistence: Enterprise` |
+
+Entry deleted via `--cleanup` post-verification. Re-runnable per ADR-008 line 696 pattern.
+
+**Consequences.**
+
+- **Cross-platform path unblocked, not landed.** OQ #1 partial resolution: per-platform-crate-add list = 3 crates; not architecture-redesign-blocked.
+- **Mac signing forward-compat: free upgrade.** When ADR-029 amendment hard-gate lands (V0.2 alpha-cohort macOS signing pipeline), Mac users gain biometric + iCloud-sync via `apple-native-keyring-store::Protected` module without keyring-API change in user code — module selection happens at store-construction time.
+- **Spike-local dev-deps promote to workspace at production wiring.** Phase 1 close commit moves `keyring-core`, `windows-native-keyring-store`, `getrandom`, `hex` from vault-app `[dev-dependencies]` to `[workspace.dependencies]` + vault-app `[dependencies]`. Pattern matches at-rest spike → ObjectStoreProvider production wiring.
+- **Replay-attack residual on Windows: credentials accessible to any process running as the same Windows user.** Windows Credential Manager scopes to `(user, target)`; any same-user process can read the master_key via the same API. **No V0.2 mitigation** — same-user-process-isolation is the OS contract, not application contract. Higher-trust (DPAPI prompt-on-access, hardware-backed keystore) would be needed for hostile-same-user-process scenarios — out of scope V0.2, revisit V1.0 threat-model review. Same discipline as ADR-008 amendment replay residual.
+- **VAULT_KEY migration is one-shot, founder-only.** V0.1 was Shahbaz-only; no external user has VAULT_KEY to migrate. First-run path generates new master_key under V0.2.
+
+**Verification.**
+
+- Phase 1 Leg 1 evidence: HANDOFF.md "Phase 1 keychain spike — methodology declaration" Leg 1 findings block.
+- Phase 1 Leg 2: 4/4 assertions PASS (table above).
+- Phase 1 close-out commit: production wiring + DoD gates green + CI matrix green (`[ubuntu-latest, windows-latest, macos-latest]`).
+- `cargo audit` against the Phase 1 close commit dep tree.
+
+**When to revisit.**
+
+- `keyring-core` 1.x minor-version bump → re-run spike per ADR-008 line 696 pattern.
+- macOS / Linux founder-dogfood platform expansion → add `apple-native-keyring-store` / `linux-keyutils-keyring-store` / `dbus-secret-service-keyring-store` per-platform crate; spike re-run on the new platform.
+- Hardware-backed keystore option appears in keyring-core ecosystem → V1.0 threat-model review window; replay-attack residual mitigation.
+- High/Critical RustSec advisory on `keyring-core` or any credential-store crate → standard monthly-tech-debt check picks up; immediate triage if blocking.
+- `open-source-cooperative` maintainer / org change → re-evaluate maintenance health.
+
+**Cross-links.** ADR-032 (V0.1 VAULT_KEY env var; this ADR closes the amendment trigger). ADR-008 amendment (K3 KDF + at-rest sealing — master_key sourced from keychain feeds at-rest sealing key derivation). ADR-029 amendment (V0.2 alpha-cohort macOS signing hard-gate; Mac path activates `Protected` module). ADR-031 (V0.1 unsigned MSI; no impact on Windows keychain — Credential Manager doesn't require code-signing). BRD §11.5.3 (in-memory key zeroize). Spike artifact: `crates/vault-app/examples/keychain_spike.rs`.
+
+---
+
+## ADR-040 amendment — Production-wiring location correction + master_key derivation tree (drafted 2026-05-09, T0.2.0 Phase 1 post-source-read)
+
+**Status:** ACCEPTED, in force from T0.2.0 Phase 1 commit. Supersedes ADR-040's original "Location: `Application::start_with_mcp`" line; locks the master_key → SqlCipherKey derivation that ADR-040 left implicit.
+
+**Trigger.** Phase 1 production-wiring source-read of `crates/vault-app/src/application.rs` + `crates/vault-app/src/config.rs` surfaced two contract divergences from the original ADR-040 text. Per `feedback_flag_review_as_plan_amendment.md`, the corrections land as an explicit ADR-040 amendment alongside the iteration-1.5 plan amendment in HANDOFF.md.
+
+**Correction 1 — Production-wiring location.**
+
+ADR-040 said: *"Location: `Application::start_with_mcp`."*
+
+**Corrected:** Production wiring lives at the **AppConfig construction site**, which for the V0.1 binary entry point is `vault-tauri/src/main.rs`. `Application::new(config: &AppConfig)` consumes `config.key: SqlCipherKey` at construction time, cloning into three `MetadataStore::open` / `StorageBackend::open` calls. By the time `start_with_mcp` runs as `&self`, the SqlCipherKey is already in flight. The keychain read MUST happen BEFORE `Application::new`.
+
+**Factoring:** Keychain-touching code lives in a new `vault_app::keychain` module (under `crates/vault-app/src/keychain.rs`) with the public surface:
+
+```rust
+pub fn read_or_init_master_key(vault_id: &str)
+    -> VaultResult<Zeroizing<[u8; 32]>>;
+
+pub fn derive_sqlcipher_passphrase(master_key: &[u8; 32])
+    -> SqlCipherKey;
+
+pub fn derive_at_rest_key(master_key: &[u8; 32])
+    -> Zeroizing<[u8; 32]>;
+```
+
+vault-tauri's main.rs change becomes one helper-module call sequence: read keychain → derive SqlCipherKey → derive at_rest_key → build AppConfig → call `Application::new`. `keyring-core` + `windows-native-keyring-store` deps live in vault-app's `[dependencies]`, NOT vault-tauri's. Surface change in vault-tauri stays minimal; keychain module is unit-testable in vault-app.
+
+**Correction 2 — master_key derivation tree.**
+
+ADR-040 left master_key → SqlCipherKey derivation implicit. **Locked here as option β (domain-separated BLAKE3 subkeys):**
+
+```
+master_key             ← 32 bytes from keychain (Phase 1 Leg 2 spike-confirmed flow)
+
+at_rest_key            = blake3::derive_key("vault memory at-rest sealing v1", &master_key)
+                         ^ ADR-008 amendment K3 KDF — UNCHANGED, locked there
+
+sqlcipher_passphrase   = hex(blake3::derive_key("vault sqlcipher passphrase v1", &master_key))
+                         ^ NEW — locked here
+```
+
+**Reasoning for option β over alternatives.**
+- **Option α (hex-encode master_key directly as SqlCipher passphrase):** smallest change, but exposes master_key bytes directly to SQLCipher's PBKDF2 — breaks the subkey-per-consumer pattern + couples the master_key value to two distinct cryptographic consumers.
+- **Option β (chosen — domain-separated BLAKE3 subkeys):** matches ADR-008 amendment K3 KDF pattern; preserves single-source-crypto principle (BLAKE3 already in workspace, single primitive across SqlCipher + at-rest + sync envelope + audit chain — all domain-separated by distinct prefix strings); clean key-per-consumer isolation. Domain-separator string `"vault sqlcipher passphrase v1"` is distinct from the at-rest sealing prefix per the same domain-separator-distinct-prefix discipline ADR-008 amendment locked.
+- **Option γ (raw key via `PRAGMA key = "x'<hex>'"`):** best perf (skips PBKDF2), but requires SqlCipherKey API change — out of scope for Phase 1.
+
+**Hex encoding for the SqlCipher passphrase:** SqlCipherKey accepts a String passphrase per `vault-storage::SqlCipherKey::new(String)`. The 32-byte BLAKE3 derive_key output is hex-encoded to a 64-character ASCII string (`hex::encode`) before being passed in. SQLCipher then runs PBKDF2 over this string per its standard key-derivation flow. The hex-encoding is a serialization choice (32 raw bytes don't fit cleanly into a String passphrase), not a security choice — the derived 32 bytes are full-strength keying material; PBKDF2 over them is defense-in-depth.
+
+**`vault_id` provenance for V0.2 single-vault.** Until BRD §6.2 multi-vault lands at V1.0, `vault_id` is a fixed string `"default"` for the keychain account field — matches the V0.1 hardcoded boundary `"default"` per BRD §5.1. V1.0 multi-vault forward-compat preserved per ADR-040: same account-string slot will hold real vault-ids; multiple entries under the same `com.memoryvault.v0.2` namespace gives multi-vault for free.
+
+**Updated production-wiring contract (supersedes ADR-040's bullet of the same name).**
+
+- Location: `vault-tauri/src/main.rs` AppConfig construction site (not `Application::start_with_mcp`).
+- Helper: `vault_app::keychain::read_or_init_master_key(vault_id)`.
+- On startup: `read_or_init_master_key("default")` returns `Zeroizing<[u8; 32]>`. On `Err(NotFound)` the helper internally generates new 32-byte master_key via `getrandom`, persists via `set_secret`, returns the newly-persisted key. On any other Err → fail-closed: ERROR log + new `VaultError` variant (name TBD at code review) → caller exits non-zero.
+- Caller (vault-tauri main.rs) then calls `derive_sqlcipher_passphrase(&master_key)` + `derive_at_rest_key(&master_key)` to produce both consumers' keys.
+- AppConfig grows a new `at_rest_key` field (name TBD at code review) carrying the derived at-rest key forward to the LanceDB layer; `AppConfig::key` continues to carry the derived SqlCipherKey. **Phase 1 lands the field with `#[allow(dead_code)]` + forward-pointer comment "Phase 2 migration consumer";** Phase 2/3 wire actual consumption.
+- VAULT_KEY env var compensating control retired: removed from `.env.example`, `setup-dev-env.{sh,ps1}`, `.cargo/config.toml` `[env]`, CI workflow `env:` block.
+
+**Verification.**
+
+- `vault_app::keychain::read_or_init_master_key` regression pins (Phase 1 close, +2 vault-app tests per iteration-1.5 floor adjustment): (a) round-trip — write a master_key via this function path → read back → byte-equal; (b) first-run-generates-and-persists — no entry exists → function generates new key + persists + returns; second call reads the persisted entry.
+- DoD gates green: build / test / clippy `-D warnings` / fmt --check.
+- CI matrix green per `[ubuntu-latest, windows-latest, macos-latest]`. (macOS / Linux gate the keychain code as Windows-only at Phase 1; cross-platform keychain wiring is per-platform crate-add at T0.2.0.x sub-task per HANDOFF.md OQ #1 partial resolution.)
+
+**Cross-links.** ADR-040 (original — superseded by this amendment for production-wiring location only; crate selection + key-storage policy + spike runtime evidence remain locked there). ADR-008 amendment (K3 KDF for at-rest sealing — parallel derivation pattern, this amendment matches its domain-separator-string discipline). ADR-032 (V0.1 VAULT_KEY env var; this amendment confirms retirement at Phase 1 close).
+
+---
+
+## T0.2.0 Phase 1 — close-out narrative (drafted 2026-05-10, post-DoD-gate close)
+
+Phase 1 lands T0.2.0 close-out plan iteration-1.5's full deliverable list (lines 451-459) under green DoD gates, plus two test-driven fixes the gate cycle surfaced. Three things worth capturing for Phase 2 + future-session memory.
+
+### 1. Implementation refinement vs plan — `read_or_init_master_key` signature
+
+iteration-1.5 line 446 documented the helper signature as:
+
+```rust
+pub fn read_or_init_master_key(vault_id: &str) -> VaultResult<Zeroizing<[u8; 32]>>;
+```
+
+Production code landed with **two parameters**:
+
+```rust
+pub fn read_or_init_master_key(namespace: &str, vault_id: &str) -> VaultResult<Zeroizing<[u8; 32]>>;
+```
+
+**Why the deviation:** unit tests need to pass unique-per-test namespaces (`com.memoryvault.test.v0.2.<test_name>.<random_nonce>`) to prevent stale-entry collisions across test runs and parallel-test execution against the real Windows Credential Manager. Hardcoding the production namespace inside the helper would force tests to either share an entry (race-prone) or duplicate the helper logic.
+
+**Production callers** in `vault-tauri/src/main.rs` pass `keychain::PRODUCTION_NAMESPACE` (= `"com.memoryvault.v0.2"`) — the production behaviour is identical to the iteration-1.5 contract.
+
+**ADR-040 amendment lines 630-631 also paraphrase the single-param signature** — that's a documentation drift that the per-`feedback_quote_locked_artefacts_dont_paraphrase.md` discipline would catch on a careful re-read. Captured here as a Phase 1 refinement; ADR-040 amendment text is not re-edited (the amendment itself was a snapshot; the refinement amends the refinement). Future-session reading order: this section overrides the API-signature paraphrase in ADR-040 amendment.
+
+Surfaced per `feedback_flag_review_as_plan_amendment.md` rather than left silent.
+
+### 2. Two test-driven bugs surfaced and fixed by the gate cycle
+
+**Bug 1 — `vault_app::keychain` NotFound classifier missed the Windows error variant.** `keychain.rs:174-181` matched on substrings `"no entry"` / `"not found"` / `"no such"` for the empty-entry case (the trigger for first-run-init). Windows Credential Manager (via `windows-native-keyring-store`) actually surfaces empty-entry as `"No matching credential found"` — none of the three substrings match. Result: production startup on a clean Windows box would error out with `KeychainProvenance("get_secret failed (non-NotFound): No matching credential found")` instead of generating + persisting a new master_key. Fix: add `"no matching credential"` to the OR chain with an inline comment naming Windows Credential Manager (`crates/vault-app/src/keychain.rs:173-181`). Preserves fail-closed posture for genuinely-unclassified errors. Test pin: `keychain::tests::read_or_init_master_key_round_trips_byte_identical` + `read_or_init_master_key_first_run_generates_and_persists` both PASS post-fix.
+
+**Bug 2 — `format_keychain_error_dialog` text used lowercase `"reinstall"` mid-sentence.** `vault-tauri/src/lib.rs:121` rendered option 3 as `"3. If the failure persists, reinstall Memory Vault to recover."` Spec-pin test at `vault-tauri/src/lib.rs:281` asserts `dialog.contains("Reinstall")` — capitalised — matching the convention established by the parallel ADR-020 integrity-dialog test (`format_startup_failure_dialog_includes_integrity_details` line 234, `dialog.contains("Reinstall")`). Fix: rewrote option 3 as `"3. Reinstall Memory Vault if the failure persists."` Same meaning, capitalised opening verb, satisfies the locked spec without weakening it. Test pin: `format_keychain_error_dialog_for_keychain_provenance_variant` PASS post-fix.
+
+**Why bug 1 matters as a discipline reinforcement.** This is exactly the spike→production gap `feedback_runtime_confirmation_after_web_spike.md` warns about. Phase 1 Leg 2 spike's first assertion was `set_secret` then `get_secret` — write-then-read, never empty-keychain-read with the production classifier in place. Spike PASSED 4/4 assertions on Windows, ADR-040 was drafted from runtime evidence — but the production-wiring path's first call on a clean keychain hit a code path the spike never exercised. **The runtime-confirmation gate IS load-bearing, not the spike acceptance.** Test author anticipated the bug class (assertion messages literally say "NotFound classifier regression" / "NotFound classifier is misfiring") — the test discipline caught it.
+
+### 3. OOM-recovery process-discipline lesson
+
+DoD-gate session 2026-05-10 hit a parallel-cargo-on-16-GB-Windows OOM event — two concurrent `cargo build --workspace --all-targets` invocations (the second launched after silent-backgrounding obscured the first's still-running state) exhausted the paging file mid-link, corrupting shared workspace dep artifacts across **two distinct file classes**: round 1 corrupted `.rlib` metadata (`libtokio`, `libserde_json`, `libtracing`, `libtracing_subscriber`, `libvault_storage`, `libproptest`, `librpassword`) with `LNK1201` + cascading `E0786 ... os error 1455 paging file too small`; round 2 (after surgical clean of the named `.rlib` set) hit `LNK1285 corrupt PDB file 'initialize_smoke-...pdb'` on a vault-mcp test binary. Round-3 risk (third file class) escalated the response from surgical to full `cargo clean` (114,549 files / 206 GiB removed) → 59m 26s rebuild from clean → green DoD gates → real Phase 1 bugs surfaced.
+
+**Captured lessons:**
+- **HANDOFF.md "Open tech-debt"** entry: `Parallel cargo on 16 GB Windows = OOM corruption risk` (added this session, lines ~794) — single-invocation discipline is the only safe path; check `Get-Process cargo|rustc|link` before every cargo invocation, not "is the previous output file growing."
+- **`feedback_surgical_cargo_clean_first.md`** escalation-trigger amendment (added this session): surgical-first remains default, BUT if OOM corruption surfaces across two distinct file classes in one session, escalate to full `cargo clean` rather than continue surgical — blast radius likely exceeds what surgical can catch.
+
+### 4. Phase 1 deliverable checklist — verification against iteration-1.5 lines 451-459
+
+| # | Deliverable | Status |
+|---|---|---|
+| 1 | `vault_app::keychain::read_or_init_master_key` helper module | ✓ — `crates/vault-app/src/keychain.rs` |
+| 2 | `vault_app::keychain::derive_sqlcipher_passphrase` (option β) | ✓ — same file (`derive_at_rest_key` co-located per option β symmetry) |
+| 3 | `vault-tauri/src/main.rs` AppConfig construction reads keychain → derives both subkeys → builds AppConfig → calls `Application::new` | ✓ |
+| 4 | New `VaultError::KeychainProvenance(String)` variant | ✓ — `crates/vault-core/src/error.rs` |
+| 5 | VAULT_KEY env var retirement | ✓ — runtime consumption removed from `vault-tauri/src/main.rs` (the only V0.1 consumption site, replaced with keychain helper). Plan-listed files `.env.example` / `setup-dev-env.{sh,ps1}` never existed in this repo (template-borrowed paragraph); `.cargo/config.toml [env]` and `.github/workflows/ci.yml env:` never contained `VAULT_KEY`. `grep -r 'VAULT_KEY' crates/` confirms zero runtime references; doc-comment references at `vault-tauri/src/{lib.rs,main.rs}` correctly frame as retired history. |
+| 6 | Workspace dep promotion: `keyring-core`, `windows-native-keyring-store`, `getrandom`, `hex` → `[workspace.dependencies]` + vault-app `[dependencies]` | ✓ |
+| 7 | ADR-040 amendment text (production-wiring location + SqlCipher derivation tree per option β) | ✓ — already in HANDOFF.md, lines 615-680 |
+| 8 (refinement) | `vault_app::keychain::PRODUCTION_NAMESPACE` const + 2-param helper signature | ✓ — see section 1 above |
+| 9 (gate-surfaced) | NotFound classifier widened for Windows variant | ✓ — see section 2, bug 1 |
+| 10 (gate-surfaced) | KeychainProvenance dialog text capitalisation fix | ✓ — see section 2, bug 2 |
+
+### 5. DoD gate state at Phase 1 close
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all --check` | ✓ exit 0 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | ✓ exit 0 |
+| `cargo build --workspace --all-targets` | ✓ exit 0 (59m 26s from clean state) |
+| `cargo test --workspace --no-fail-fast` | ✓ all crates pass — vault-app 19/0/1, vault-storage **226/0/0**, vault-tauri 6/0/6, vault-mcp 33/0/0, vault-retrieval 30/0/1, vault-core 49/0/0, vault-cli 18/0/0, vault-embedding 13/0/1, all doc-tests pass |
+| Test count delta | +5 vault-app (3 keychain regression pins + 2 KDF determinism pins) — within iteration 1.5 floor of +3-5 |
+
+### 6. What Phase 2 inherits
+
+- master_key flow is locked end-to-end at vault-tauri main.rs: keychain read → derive both subkeys → AppConfig carries both forward.
+- AppConfig has the staged `at_rest_key` field with `#[allow(dead_code)]` waiting for Phase 2's V0.1-plaintext-migration consumer (per iteration-1.5 deliverable 6 forward-pointer).
+- `LanceVectorStore::open()` (V0.1 plaintext) remains alive — Phase 2 is its last caller per close-out plan iteration 1; Phase 3 deletes it.
+- ADR-010 hard-gate is **three close-out phases away** (Phase 2 → 3 → 4 → 5).
+
+---
+
 ## Locked-into-code invariants (forward-carried verbatim from V0.1)
 
 These invariants are pinned by V0.1 code or tests — V0.2 work that touches the relevant subsystems MUST preserve them or explicitly amend with ADR + reasoning. **Verbatim per `feedback_quote_locked_artefacts_dont_paraphrase.md` discipline.**
@@ -311,7 +826,7 @@ Beyond hard-gates above, the following V0.1-era ADRs remain active and shape V0.
 - **ADR-009** — Retry queue policy gates T0.1.6 (amended C1b)
 - **ADR-011** — `protoc` per-machine build-time dep + monthly CVE check
 - **ADR-012** — LanceDB feature minimization investigated; AWS SDK + dual-arrow accepted as V0.1 cost
-- **ADR-013** — `chrono` `=0.4.39` pin (advanced from 0.4.38 at T0.1.9 Phase 1)
+- **ADR-013** — `chrono` pin advanced 0.4.38 → 0.4.39 (T0.1.9 Phase 1, 2026-05-01) → 0.4.44 (T0.2.0 Phase 0a, 2026-05-07 — ADR-037 trigger 1 fired: `arrow-arith 57.2.0` resolved the `ChronoDateExt::quarter()` collision). Pin form (`=0.4.44`) retained per ADR-013 monthly-CVE-check discipline; archive entry unchanged per archive-frozen convention
 - **ADR-014** — ALPHA file write failure: WARN + proceed (file is secondary, log is primary)
 - **ADR-015** — `Entity` and `Relationship` boundary-scoped at schema layer (BRD §5.1 deviation)
 - **ADR-016** — Connection-ownership: orchestrator routes through `MetadataStore::with_transaction`
@@ -352,6 +867,7 @@ V0.2-deadline items forward-carried from V0.1. Full original entries with cross-
 - **Future-swap evaluation criteria locked** — license / first-party ONNX / prefix-injection compat / MTEB-R parity / ≤512 MB
 - **`.gitattributes` for line-ending normalisation** — quick win when convenient
 - **Phase 0a-fix Cosine NaN-vector upstream issue** — file against `lance-format/lance` once we have a minimal-repro example. Regression: lancedb 0.8 returned NaN-distance rows in Cosine search; lancedb 0.27.2 / lance 4.0 filters them out. Affects zero-magnitude vectors only (cosine `0 / (0 * ||v||)` = NaN). Memory Vault production unaffected (BGE embeddings are L2-normalised non-zero) — purely an upstream-behaviour-change finding for the wider community. Defer to V0.2 alpha-distribution window when other compatibility checks happen. See ADR-038 Layer 4.
+- **Parallel cargo on 16 GB Windows = OOM corruption risk** (surfaced 2026-05-10, T0.2.0 Phase 1 DoD-gate session) — two concurrent `cargo build --workspace --all-targets` invocations on the founder's 16-CPU / 16 GB Windows dev box exhausted the paging file mid-link, corrupting shared workspace dep artifacts (`libtokio`, `libserde_json`, `libtracing`, `libtracing_subscriber`, `libvault_storage`, `libproptest`, `librpassword`) with `LNK1201` + cascading `E0786 ... os error 1455 paging file too small`. Recovery: surgical `cargo clean -p` of the corrupted set per `feedback_surgical_cargo_clean_first.md` (full clean is escalation, not first move). **Discipline:** before every cargo invocation, check `Get-Process | Where-Object { $_.ProcessName -in @('cargo','rustc','link') }` returns empty — not "is the previous output file growing." Silent-backgrounding-without-output is the failure mode that masked the still-running first build; bytes-arriving in the wrapper file is NOT evidence of completion when stdout is piped through `Out-Null`. Single-invocation discipline is the only safe path on this hardware.
 - ~~**Phase 0b finding: lance 4.0 delete-tombstoning vs Memory Vault privacy property**~~ — **CLOSED 2026-05-07 (ADR-039 Prune-alone) → AMENDED 2026-05-08 (Phase 0c spike Stage E discovery: Prune-alone insufficient for partial-fragment deletes).** **Final resolution:** `LanceVectorStore::delete()` calls `Compact` then `Prune-with-zero-retention` after `table.delete()`, holding the ADR-038 upsert mutex throughout. Phase 0b's Prune-alone implementation was insufficient because Memory Vault's actual delete API is single-memory-id (partial-fragment) — Lance's `OptimizeAction::Prune` reports `data_files_removed: 0` for that case (verified empirically by spike Stage E 2×2 on both plain file:// and vault-sealed://). The Phase 0b regression test passed for the wrong reason (full-boundary delete = empty fragment = special case); Phase 0c added a partial-fragment companion (`delete_partial_fragment_physically_removes_content_per_adr_039`) using BLAKE3 content-hash-set-difference assertion. Trade-off (lose lance time-travel undo) preserved. See ADR-039 amendment block above for the full Phase 0c discovery + reasoning. **Beta cohort can now receive builds claiming "permanent deletion" — privacy contract preserved with the corrected Compact+Prune sequence.**
 
 **Closed in this commit (T0.2.0 Phase 0a-fix):**

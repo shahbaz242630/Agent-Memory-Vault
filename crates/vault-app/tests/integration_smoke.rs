@@ -140,6 +140,13 @@ async fn setup_application() -> TestApp {
         model_path: require_fixture("model.onnx"),
         tokenizer_path: require_fixture("tokenizer.json"),
         ort_lib_path: ort_lib_path(),
+        // T0.2.0 Phase 1: at_rest_key staged on AppConfig per ADR-040
+        // amendment + iteration-1.5 amendment Discovery 4 (option (a)).
+        // Phase 2/3 wire actual consumption into LanceVectorStore::
+        // open_with_at_rest_key. Tests here pre-date that path; a fixed
+        // 32-byte sentinel preserves the smoke-test surface without
+        // exercising the at-rest sealing path.
+        at_rest_key: zeroize::Zeroizing::new([0u8; 32]),
     };
 
     let application = Application::new(&config).await.expect(

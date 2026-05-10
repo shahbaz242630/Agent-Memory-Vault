@@ -146,6 +146,26 @@ pub enum VaultError {
     /// pattern-matching pre-flag.
     #[error("mcp server bind failed: {0}")]
     McpBindFailed(String),
+
+    /// At-rest-key provenance failed: the OS keychain could not be read,
+    /// the entry could not be created on first run, or the platform is
+    /// not supported by the V0.2 Phase 1 keychain wiring.
+    ///
+    /// Carried as a structured variant (rather than nested into
+    /// [`Self::Crypto`] or [`Self::Config`]) so vault-tauri / vault-cli
+    /// can pattern-match exhaustively to surface a fatal-dialog flow
+    /// distinct from generic crypto / config errors. Per ADR-040 +
+    /// ADR-040 amendment, any non-`NotFound` keychain error fails closed
+    /// — vault-app exits non-zero rather than proceeding with a
+    /// partially-recovered or empty key.
+    ///
+    /// `NotFound` is NOT carried via this variant. The keychain helper
+    /// `vault_app::keychain::read_or_init_master_key` handles `NotFound`
+    /// internally as the first-run signal: it generates a new master_key
+    /// via `getrandom`, persists via `set_secret`, and returns the
+    /// newly-persisted key.
+    #[error("keychain provenance error: {0}")]
+    KeychainProvenance(String),
 }
 
 /// Standard result alias used throughout the workspace.
