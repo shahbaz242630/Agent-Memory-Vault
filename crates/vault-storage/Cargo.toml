@@ -44,6 +44,10 @@ url = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+# T0.2.0 Phase 2 (2026-05-11): cookie-recovery integration tests serialise
+# a synthetic cookie via `serde_json::json!` to drive the migration loop's
+# state machine without depending on the private `MigrationCookie` struct.
+serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio-test = { workspace = true }
 # tracing-test — T0.1.10 Phase 3b: thread-local subscriber that captures

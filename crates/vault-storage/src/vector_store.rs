@@ -63,7 +63,7 @@ use zeroize::Zeroizing;
 use vault_core::{Boundary, MemoryId, VaultError, VaultResult};
 
 use crate::sealed_object_store::{
-    derive_at_rest_key, make_vault_sealed_uri, SealedFileStoreProvider, VAULT_SEALED_SCHEME,
+    make_vault_sealed_uri, SealedFileStoreProvider, VAULT_SEALED_SCHEME,
 };
 
 /// Filename of the V0.1 alpha-warning file written into the data directory
@@ -301,9 +301,17 @@ impl LanceVectorStore {
     }
 
     /// Open or create a LanceDB store at `data_dir` with at-rest AEAD
-    /// sealing keyed off `master_key` (32 bytes — typically the user's
-    /// vault root key, T0.2.0 alpha-distribution will hand this in from
-    /// the keychain per ADR-032 amendment).
+    /// sealing keyed off the already-derived 32-byte `at_rest_key`.
+    ///
+    /// **Caller MUST pass the already-derived at-rest key**
+    /// (`K3(master_key)` per the ADR-008 amendment K3 KDF —
+    /// `blake3::derive_key("vault memory at-rest sealing v1", &master_key)`).
+    /// The canonical production derivation site is
+    /// [`vault_app::keychain::derive_at_rest_key`] per ADR-040 amendment
+    /// ("at_rest_key flows from keychain through AppConfig to migration
+    /// consumer"). Re-passing `master_key` here would silently produce
+    /// `K3(K3(master_key))` and break seal compatibility with anything
+    /// else in the system. The K3-once invariant is locked.
     ///
     /// Routes ALL of Lance's I/O through [`SealedFileStoreProvider`] via
     /// the custom `vault-sealed://` URI scheme registered with a
@@ -323,20 +331,19 @@ impl LanceVectorStore {
     ///   `vault-sealed://` to a [`SealedFileStoreProvider`].
     ///
     /// Key handling:
-    /// - The caller's `master_key` is consumed by reference; this
-    ///   function does not retain or zeroize it (the caller is
-    ///   responsible for the master key's lifecycle).
-    /// - The K3-derived `at_rest_key` is wrapped in [`Zeroizing`] and
-    ///   held inside the [`SealedFileStoreProvider`] for the store's
-    ///   lifetime; on drop it zeroes.
+    /// - The caller's `at_rest_key` is consumed by reference; this
+    ///   function copies the 32 bytes into a [`Zeroizing`] wrapper held
+    ///   inside the [`SealedFileStoreProvider`] for the store's
+    ///   lifetime. The copy zeros on drop alongside the provider.
+    /// - The caller is responsible for zeroizing the original buffer.
     #[instrument(
-        skip(data_dir, master_key),
+        skip(data_dir, at_rest_key),
         fields(data_dir = %data_dir.display(), dimension)
     )]
     pub async fn open_with_at_rest_key(
         data_dir: &Path,
         dimension: usize,
-        master_key: &[u8; 32],
+        at_rest_key: &[u8; 32],
     ) -> VaultResult<Self> {
         if dimension == 0 {
             return Err(VaultError::InvalidInput(
@@ -346,9 +353,10 @@ impl LanceVectorStore {
 
         fs::create_dir_all(data_dir)?;
 
-        // Derive the K3 at-rest key. Wrapped in Zeroizing inside the
-        // provider; the master_key reference is the caller's to manage.
-        let at_rest_key: Zeroizing<[u8; 32]> = derive_at_rest_key(master_key);
+        // Wrap the caller's already-derived at-rest key in Zeroizing so
+        // the provider-held copy zeros on drop. K3 derivation happens
+        // OUTSIDE this function (canonical site: vault-app::keychain).
+        let provider_key: Zeroizing<[u8; 32]> = Zeroizing::new(*at_rest_key);
 
         // Build a registry with our SealedFileStoreProvider registered
         // for the vault-sealed:// scheme. `default()` registers the
@@ -357,7 +365,7 @@ impl LanceVectorStore {
         let registry = ObjectStoreRegistry::default();
         registry.insert(
             VAULT_SEALED_SCHEME,
-            Arc::new(SealedFileStoreProvider::new(at_rest_key)),
+            Arc::new(SealedFileStoreProvider::new(provider_key)),
         );
         let session = Arc::new(Session::new(0, 0, Arc::new(registry)));
 
@@ -702,6 +710,106 @@ impl VectorStore for LanceVectorStore {
             }
         }
         Ok(())
+    }
+}
+
+impl LanceVectorStore {
+    /// Read every (id, embedding, boundary) tuple from the table for the
+    /// V0.1 → V0.2 migration loop. Crate-private — sole consumer is
+    /// [`crate::migration::migrate_v0_1_to_sealed_if_needed`]. Speaks
+    /// domain types only (per BRD §2.2 — the trait surface never exposes
+    /// arrow_array internals); the migration consumer treats the result
+    /// as a re-insertable iterator.
+    ///
+    /// **Iteration shape (locked by Phase 2 plan iteration 2 §1):** uses
+    /// the same `query().limit(count).execute().try_collect()` pattern as
+    /// `validate_readable()` (line 645 doc comment) — in-tree runtime
+    /// evidence that the shape works against lancedb 0.27.2 supersedes
+    /// the open question raised in iteration 1 §7.
+    ///
+    /// **Bulk-collect over streaming.** V0.1 vault scale is bounded by
+    /// founder-dogfood reality (ADR-029: 11 memories at V0.1 SHIPPED).
+    /// Even at 10K rows × ~1.6 KB/row ≈ 16 MB peak — trivial. Streaming
+    /// would be premature optimisation; bulk-collect matches the existing
+    /// `validate_readable()` shape exactly.
+    pub(crate) async fn scan_all_rows_for_migration(
+        &self,
+    ) -> VaultResult<Vec<(MemoryId, Vec<f32>, Boundary)>> {
+        let row_count = self
+            .table
+            .count_rows(None)
+            .await
+            .map_err(|e| VaultError::Storage(format!("scan_all_rows count: {e}")))?;
+        if row_count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let stream = self
+            .table
+            .query()
+            .limit(row_count)
+            .execute()
+            .await
+            .map_err(|e| VaultError::Storage(format!("scan_all_rows execute: {e}")))?;
+
+        let batches: Vec<RecordBatch> = stream
+            .try_collect()
+            .await
+            .map_err(|e| VaultError::Storage(format!("scan_all_rows collect: {e}")))?;
+
+        let mut out = Vec::with_capacity(row_count);
+        for batch in &batches {
+            let ids = batch
+                .column_by_name("id")
+                .ok_or_else(|| VaultError::Storage("scan_all_rows: missing id column".into()))?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| VaultError::Storage("scan_all_rows: id column not Utf8".into()))?;
+            let boundaries = batch
+                .column_by_name("boundary")
+                .ok_or_else(|| {
+                    VaultError::Storage("scan_all_rows: missing boundary column".into())
+                })?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    VaultError::Storage("scan_all_rows: boundary column not Utf8".into())
+                })?;
+            let embeddings = batch
+                .column_by_name("embedding")
+                .ok_or_else(|| {
+                    VaultError::Storage("scan_all_rows: missing embedding column".into())
+                })?
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .ok_or_else(|| {
+                    VaultError::Storage("scan_all_rows: embedding column not FixedSizeList".into())
+                })?;
+
+            for i in 0..batch.num_rows() {
+                let id_str = ids.value(i);
+                let uuid = Uuid::parse_str(id_str).map_err(|e| {
+                    VaultError::Storage(format!("scan_all_rows: invalid uuid at row {i}: {e}"))
+                })?;
+                let boundary_str = boundaries.value(i);
+                let boundary = Boundary::new(boundary_str).map_err(|e| {
+                    VaultError::Storage(format!("scan_all_rows: invalid boundary at row {i}: {e}"))
+                })?;
+                let inner = embeddings.value(i);
+                let inner_f32 = inner
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .ok_or_else(|| {
+                        VaultError::Storage(
+                            "scan_all_rows: embedding inner array not Float32".into(),
+                        )
+                    })?;
+                let embedding: Vec<f32> = inner_f32.values().to_vec();
+                out.push((MemoryId(uuid), embedding, boundary));
+            }
+        }
+
+        Ok(out)
     }
 }
 
@@ -2034,8 +2142,13 @@ mod tests {
     #[tokio::test]
     async fn sealed_open_round_trip_returns_inserted_rows() {
         let tmp = TempDir::new().unwrap();
-        let key: [u8; 32] = *b"phase-0d-test-key-32-bytes-A1B2C";
-        let store = LanceVectorStore::open_with_at_rest_key(tmp.path(), 4, &key)
+        // Model production caller flow: pre-derive K3 at fixture setup
+        // (canonical production site: vault-app::keychain::derive_at_rest_key).
+        // Context-string pinning lives in vault-app/src/keychain.rs's
+        // `derive_at_rest_key_is_deterministic_and_uses_k3_kdf_context` test.
+        let master_key: [u8; 32] = *b"phase-0d-master-key-32-bytes-RT1";
+        let at_rest_key = blake3::derive_key("vault memory at-rest sealing v1", &master_key);
+        let store = LanceVectorStore::open_with_at_rest_key(tmp.path(), 4, &at_rest_key)
             .await
             .unwrap();
 
@@ -2085,8 +2198,12 @@ mod tests {
     #[tokio::test]
     async fn sealed_open_with_wrong_key_fails_closed() {
         let tmp = TempDir::new().unwrap();
-        let key1: [u8; 32] = *b"phase-0d-correct-key-32-bytes-K1";
-        let key2: [u8; 32] = *b"phase-0d-WRONG-key-32-bytes----X";
+        // Pre-derive both at-rest keys at fixture setup — see test 1 for
+        // the production-caller-flow rationale.
+        let master_correct: [u8; 32] = *b"phase-0d-correct-master-32-bytes";
+        let master_wrong: [u8; 32] = *b"phase-0d-WRONG-master-32-bytes-X";
+        let key1 = blake3::derive_key("vault memory at-rest sealing v1", &master_correct);
+        let key2 = blake3::derive_key("vault memory at-rest sealing v1", &master_wrong);
 
         // Write phase: open with K1 + upsert + drop.
         {
@@ -2131,8 +2248,9 @@ mod tests {
     #[tokio::test]
     async fn sealed_open_writes_framing_bytes_to_disk() {
         let tmp = TempDir::new().unwrap();
-        let key: [u8; 32] = *b"phase-0d-framing-key-32-bytes-3F";
-        let store = LanceVectorStore::open_with_at_rest_key(tmp.path(), 4, &key)
+        let master_key: [u8; 32] = *b"phase-0d-framing-master-32-bytes";
+        let at_rest_key = blake3::derive_key("vault memory at-rest sealing v1", &master_key);
+        let store = LanceVectorStore::open_with_at_rest_key(tmp.path(), 4, &at_rest_key)
             .await
             .unwrap();
 
@@ -2196,8 +2314,9 @@ mod tests {
     #[tokio::test]
     async fn sealed_delete_partial_fragment_physically_removes_content() {
         let tmp = TempDir::new().unwrap();
-        let key: [u8; 32] = *b"phase-0d-delete-key-32-bytes-D44";
-        let store = LanceVectorStore::open_with_at_rest_key(tmp.path(), 4, &key)
+        let master_key: [u8; 32] = *b"phase-0d-delete-master-32-bytes-";
+        let at_rest_key = blake3::derive_key("vault memory at-rest sealing v1", &master_key);
+        let store = LanceVectorStore::open_with_at_rest_key(tmp.path(), 4, &at_rest_key)
             .await
             .unwrap();
         let b = Boundary::new("sealed_partial_delete").unwrap();
@@ -2283,8 +2402,9 @@ mod tests {
     #[tracing_test::traced_test]
     async fn sealed_open_emits_distinguishing_info_log() {
         let tmp = TempDir::new().unwrap();
-        let key: [u8; 32] = *b"phase-0d-no-warn-key-32-bytes-NW";
-        let _store = LanceVectorStore::open_with_at_rest_key(tmp.path(), 384, &key)
+        let master_key: [u8; 32] = *b"phase-0d-no-warn-master-32-bytes";
+        let at_rest_key = blake3::derive_key("vault memory at-rest sealing v1", &master_key);
+        let _store = LanceVectorStore::open_with_at_rest_key(tmp.path(), 384, &at_rest_key)
             .await
             .unwrap();
 
@@ -2296,6 +2416,61 @@ mod tests {
              either (a) the INFO log was removed/refactored, or (b) the \
              sealed-path constructor was never reached (open_with_at_rest_key \
              returned Err before logging)."
+        );
+    }
+
+    /// Phase 2 (T0.2.0) test: rename-invariance. Open a sealed store at
+    /// `path_a`, write rows, drop, atomically rename `path_a → path_b`,
+    /// reopen with the SAME at-rest key, read the rows back. Pins
+    /// ADR-008 amendment v2 (T0.2.0 Phase 2) — AAD must be relative to
+    /// the vault root so renaming the vault root doesn't break sealing.
+    /// This is the property the migration loop's `temp_dir →
+    /// vector_dir` atomic swap requires; without the amendment AAD
+    /// computed pre-rename (over the temp_dir absolute path) wouldn't
+    /// match AAD computed post-rename (over the vector_dir absolute
+    /// path) and unsealing would fail closed with "Message
+    /// authentication mismatch."
+    #[tokio::test]
+    async fn sealed_open_at_path_a_rename_to_b_open_at_b_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        let path_a = tmp.path().join("dir_a");
+        let path_b = tmp.path().join("dir_b");
+
+        let master_key: [u8; 32] = *b"phase-2-rename-master-32-bytes--";
+        let at_rest_key = blake3::derive_key("vault memory at-rest sealing v1", &master_key);
+
+        // Seal at path A.
+        {
+            let store = LanceVectorStore::open_with_at_rest_key(&path_a, 4, &at_rest_key)
+                .await
+                .unwrap();
+            let b = Boundary::new("rename_invariance").unwrap();
+            for i in 0..3 {
+                store
+                    .upsert(&new_id(), &embedding(4, (i + 1) as f32), &b)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(store.count(None).await.unwrap(), 3);
+        } // store dropped, locks released
+
+        // Atomic rename A → B (the canonical migration-loop step 8b shape).
+        std::fs::rename(&path_a, &path_b).unwrap();
+
+        // Reopen at B with the SAME key. Under absolute-path AAD this
+        // would fail closed with "Message authentication mismatch";
+        // under ADR-008 amendment v2 (relative-to-vault-root AAD) it
+        // succeeds.
+        let store = LanceVectorStore::open_with_at_rest_key(&path_b, 4, &at_rest_key)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.count(None).await.unwrap(),
+            3,
+            "post-rename count must equal pre-rename count — AAD must be invariant to \
+             renaming the vault root per ADR-008 amendment v2 (T0.2.0 Phase 2). If this \
+             fails, AAD is still binding to the absolute path and the migration loop's \
+             atomic-swap pattern would silently brick all sealed data."
         );
     }
 }

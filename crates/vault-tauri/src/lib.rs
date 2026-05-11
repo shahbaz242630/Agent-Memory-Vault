@@ -125,6 +125,71 @@ pub fn format_keychain_error_dialog(err: &VaultError) -> String {
 }
 
 /// Format a `VaultError` as a user-facing fatal-dialog message body for
+/// V0.1 → V0.2 migration failure surfacing (T0.2.0 Phase 2).
+///
+/// Migration runs at startup step 5b BEFORE `Application::new` opens
+/// the sealed StorageBackend. Two failure classes get tailored
+/// messages: half-state corruption (ALPHA marker present + Lance data
+/// dir empty/mixed) and third-party data (Lance data without ALPHA
+/// marker). Both are fail-closed conditions per HANDOFF.md "T0.2.0
+/// Phase 2 — plan iteration 2.1" §1; the dialog explains the cause +
+/// the manual recovery step + the founder-snapshot safety net.
+///
+/// **Defensive fallback for non-migration variants:** the function
+/// accepts any `&VaultError` so the call site can pass through without
+/// prior pattern-matching, but only `Storage` variants whose message
+/// names "half-state" or "third-party" produce tailored bodies; other
+/// variants render via the generic `format_startup_failure_dialog`
+/// path.
+pub fn format_migration_error_dialog(err: &VaultError) -> String {
+    let msg = err.to_string();
+    let lower = msg.to_lowercase();
+    if lower.contains("half-state") || lower.contains("half state") {
+        format!(
+            "Memory Vault cannot start: V0.1 → V0.2 data migration aborted (half-state corruption).\n\n\
+             Details: {msg}\n\n\
+             Per HANDOFF.md T0.2.0 Phase 2 plan iteration 2.1 §1, this means an \
+             earlier write was aborted mid-creation: the V0.1 ALPHA warning marker \
+             file (ALPHA_DO_NOT_STORE_REAL_DATA.txt) is present in the vault data \
+             directory but the LanceDB data files are empty or in an unrecognised \
+             shape. The migration cannot safely auto-recover from this state.\n\n\
+             Recovery options:\n\
+             1. If the data directory is known-empty (e.g., a fresh install that \
+                crashed during first-run setup), delete ALPHA_DO_NOT_STORE_REAL_DATA.txt \
+                from the vault data directory and relaunch Memory Vault — startup \
+                will proceed as a fresh V0.2 install.\n\
+             2. If you previously made a backup snapshot of the V0.1 vault data \
+                directory (recommended pre-migration step per the founder-distribution \
+                playbook), restore it over the current data directory and relaunch.\n\
+             3. If neither applies, contact support — Memory Vault refuses to \
+                migrate unrecognised data rather than risk corrupting it further."
+        )
+    } else if lower.contains("third-party") || lower.contains("third party") {
+        format!(
+            "Memory Vault cannot start: V0.1 → V0.2 data migration aborted (third-party data detected).\n\n\
+             Details: {msg}\n\n\
+             Per HANDOFF.md T0.2.0 Phase 2 plan iteration 2.1 §1, this means LanceDB \
+             data files are present in the vault data directory but the V0.1 ALPHA \
+             warning marker file (ALPHA_DO_NOT_STORE_REAL_DATA.txt) is missing. Either \
+             the marker was removed by an external tool, or the data directory \
+             contains LanceDB data not written by Memory Vault. The migration refuses \
+             to proceed rather than migrate unknown data into the new sealed format.\n\n\
+             Recovery options:\n\
+             1. If you intentionally removed the ALPHA marker file (it was just \
+                a warning), restore it (any non-empty content suffices — the \
+                migration only checks for its presence) and relaunch Memory Vault.\n\
+             2. If the data directory was repurposed from another LanceDB \
+                application, move that data elsewhere and relaunch — Memory Vault \
+                will start fresh as a V0.2 install.\n\
+             3. If you previously made a backup snapshot of the V0.1 vault data \
+                directory, restore it over the current data directory and relaunch."
+        )
+    } else {
+        format_startup_failure_dialog(err)
+    }
+}
+
+/// Format a `VaultError` as a user-facing fatal-dialog message body for
 /// ADR-020 integrity-failure surfacing.
 ///
 /// Special-cases [`VaultError::ModelIntegrityFailed`] with reinstall
@@ -282,6 +347,84 @@ mod tests {
             dialog.contains("Reinstall"),
             "KeychainProvenance dialog must include reinstall fallback for \
              unrecoverable failures; got: {dialog}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // T0.2.0 Phase 2 — V0.1 → V0.2 migration-failure-dialog formatting
+    // -----------------------------------------------------------------
+
+    /// Phase 2: each fail-closed migration variant produces a tailored
+    /// dialog body that names the failure mode + cites HANDOFF.md +
+    /// lists the recovery steps that mirror migration's named outcomes
+    /// per "T0.2.0 Phase 2 — plan iteration 2.1" §1. Generic
+    /// `VaultError::Storage` variants fall through to the startup-
+    /// failure path. Pinning here prevents drift between the dialog
+    /// text and what the migration loop actually surfaces.
+    #[test]
+    fn format_migration_error_dialog_includes_recovery_options() {
+        // Half-state corruption variant.
+        let err_half = VaultError::Storage(
+            "V0.1 → V0.2 migration aborted: half-state corruption detected at /vault/path \
+             (ALPHA marker present + Lance data dir empty/mixed). Aborted-write \
+             mid-creation; cannot safely auto-recover. Manual intervention required."
+                .to_string(),
+        );
+        let dialog_half = format_migration_error_dialog(&err_half);
+        assert!(
+            dialog_half.contains("half-state corruption"),
+            "half-state migration dialog must name the failure category; got: {dialog_half}"
+        );
+        assert!(
+            dialog_half.contains("ALPHA_DO_NOT_STORE_REAL_DATA.txt"),
+            "half-state dialog must name the marker file by name so users can find it; \
+             got: {dialog_half}"
+        );
+        assert!(
+            dialog_half.contains("Recovery options"),
+            "half-state dialog must enumerate recovery steps; got: {dialog_half}"
+        );
+        assert!(
+            dialog_half.contains("HANDOFF.md") && dialog_half.contains("T0.2.0 Phase 2"),
+            "half-state dialog must cross-link to HANDOFF.md + T0.2.0 Phase 2 for \
+             source-of-truth; got: {dialog_half}"
+        );
+
+        // Third-party data variant.
+        let err_third = VaultError::Storage(
+            "V0.1 → V0.2 migration aborted: third-party data detected at /vault/path \
+             (Lance data present without ADR-010 ALPHA marker). Either the marker \
+             was removed by an external tool, or the data dir contains non-Memory- \
+             Vault writes."
+                .to_string(),
+        );
+        let dialog_third = format_migration_error_dialog(&err_third);
+        assert!(
+            dialog_third.contains("third-party data"),
+            "third-party migration dialog must name the failure category; got: {dialog_third}"
+        );
+        assert!(
+            dialog_third.contains("ALPHA_DO_NOT_STORE_REAL_DATA.txt"),
+            "third-party dialog must name the marker file; got: {dialog_third}"
+        );
+        assert!(
+            dialog_third.contains("Recovery options"),
+            "third-party dialog must enumerate recovery steps; got: {dialog_third}"
+        );
+
+        // Fall-through: generic VaultError variant routes to the
+        // startup-failure dialog (parallel to keychain dialog's
+        // fall-through behaviour).
+        let err_other = VaultError::ModelIntegrityFailed {
+            file: "model.onnx".to_string(),
+            expected: "abc".to_string(),
+            actual: "def".to_string(),
+        };
+        let dialog_other = format_migration_error_dialog(&err_other);
+        assert!(
+            dialog_other.contains("model integrity check failed"),
+            "non-migration variants must fall through to format_startup_failure_dialog; \
+             got: {dialog_other}"
         );
     }
 

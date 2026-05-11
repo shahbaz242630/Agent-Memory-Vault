@@ -56,6 +56,6 @@ pub use retry_queue::{
 };
 pub use retry_worker::{RetryWorker, StepResult, DEFAULT_POLL_INTERVAL};
 pub use sealed_object_store::{
-    derive_at_rest_key, make_vault_sealed_uri, SealedFileStoreProvider, VAULT_SEALED_SCHEME,
+    make_vault_sealed_uri, SealedFileStoreProvider, VAULT_SEALED_SCHEME,
 };
 pub use vector_store::{LanceVectorStore, VectorStore, ALPHA_WARNING_FILENAME};

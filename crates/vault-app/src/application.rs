@@ -99,12 +99,23 @@ impl Application {
         //    SqlCipherKey clone is cheap (clones inner String); cloning
         //    inside the body is the canonical pattern for by-reference
         //    config (per AppConfig module docs).
-        let storage = StorageBackend::open(
+        //
+        //    T0.2.0 Phase 2 (2026-05-11): flipped from plaintext
+        //    `StorageBackend::open` to sealed `open_with_at_rest_key`
+        //    per ADR-040 amendment ("at_rest_key flows from keychain
+        //    through AppConfig to migration consumer"). LanceDB is now
+        //    AEAD-sealed at-rest via SealedFileStoreProvider; SQLCipher
+        //    metadata + DuckDB graph remain unchanged at Phase 2.
+        //    Plaintext `StorageBackend::open` is retained for the V0.1
+        //    → V0.2 migration source path (see vault_storage::migration);
+        //    Phase 3 deletes both plaintext constructors.
+        let storage = StorageBackend::open_with_at_rest_key(
             &config.metadata_path,
             &config.vector_dir,
             &config.graph_path,
             config.key.clone(),
             EMBEDDING_DIM,
+            &config.at_rest_key,
         )
         .await?;
 

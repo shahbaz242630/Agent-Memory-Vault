@@ -29,8 +29,16 @@
 //! - **Cipher (path #1, ADR-008 archive line 681):** dryoc 0.7.2's
 //!   DryocStream-as-single-message + `Tag::FINAL`. Same envelope as
 //!   T0.2.9 sync. No new crypto crate.
-//! - **KDF (K3):** `at_rest_key = blake3::derive_key("vault memory at-rest sealing v1", &master_key)`.
-//!   Single-source-crypto; same primitive as the AAD computation.
+//! - **KDF (K3) — derived by the CALLER, not this module.** The K3
+//!   contract is `at_rest_key = blake3::derive_key("vault memory at-rest sealing v1", &master_key)`,
+//!   but the canonical production derivation site lives in
+//!   [`vault_app::keychain::derive_at_rest_key`] per ADR-040 amendment
+//!   ("at_rest_key flows from keychain through AppConfig to migration
+//!   consumer"). [`SealedFileStoreProvider`] consumes the
+//!   already-derived 32-byte at-rest key directly. Re-deriving here
+//!   would silently produce `K3(K3(master_key))` — different keying
+//!   material than any other consumer expects, sealed data unreadable
+//!   by any clean code path. The K3-once invariant is locked.
 //! - **AAD (Finding 2(c)):** `AAD = BLAKE3("vault-at-rest-v1" || file_path_bytes)`.
 //!   Per-file binding; replay-attack residual documented (ADR-008
 //!   amendment, Phase 0e).
@@ -109,39 +117,35 @@ const SEAL_OVERHEAD: usize = TOTAL_FRAMING_LEN + AEAD_OVERHEAD;
 pub const VAULT_SEALED_SCHEME: &str = "vault-sealed";
 
 // ============================================================
-//   Key derivation + AAD
+//   AAD (K3 derivation lives at vault-app::keychain — see module docs)
 // ============================================================
 
-/// Derive the at-rest key from the user's master key per K3 lock:
-/// `blake3::derive_key("vault memory at-rest sealing v1", &master_key)`.
+/// Compute per-file AAD per Finding 2(c) lock + ADR-008 amendment v2
+/// (T0.2.0 Phase 2 — relative-path semantics):
+/// `AAD = BLAKE3("vault-at-rest-v1" || relative_path_within_store)`.
 ///
-/// BLAKE3's `derive_key` is the purpose-built domain-separated KDF
-/// primitive; same security properties as HKDF-SHA256 (PRF + domain
-/// separation) without adding a new crypto crate. The context string is
-/// distinct from any other KDF use in the workspace — domain-separation
-/// against future cross-context confusion.
-///
-/// Returned bytes are wrapped in [`zeroize::Zeroizing`] so they zero out
-/// on drop. Callers SHOULD pass the master key by `&[u8; 32]` and keep
-/// the master key's own zeroization separate.
-pub fn derive_at_rest_key(master_key: &[u8; 32]) -> Zeroizing<[u8; 32]> {
-    Zeroizing::new(blake3::derive_key(
-        "vault memory at-rest sealing v1",
-        master_key,
-    ))
-}
-
-/// Compute per-file AAD per Finding 2(c) lock:
-/// `AAD = BLAKE3("vault-at-rest-v1" || file_path_bytes)`.
+/// **Path is RELATIVE to the vault data dir root**, not absolute. The
+/// caller ([`SealedObjectStore::aad_for_path`]) strips the store's
+/// `base_path` prefix from the absolute `location` before passing it
+/// here. Rationale (ADR-008 amendment v2):
+/// - Original spec used the absolute path, which broke the migration
+///   loop's atomic-rename pattern (`temp_dir → vector_dir` changes
+///   every file's absolute path → AAD mismatch on reopen).
+/// - Relative-to-store-root preserves the "this file at this position
+///   in this vault" binding (within-store position binding) while
+///   making AAD invariant to renaming the vault root itself.
+/// - Cross-vault file substitution is prevented by per-vault key
+///   separation (different keychain entries → different at-rest keys
+///   → AEAD authentication fails on substitution regardless of AAD).
 ///
 /// The domain-separator `"vault-at-rest-v1"` is distinct from sync's
 /// `"vault-aad-v1"` (ADR-008 archive line 700) — prevents cross-context
 /// envelope confusion. No `version_id` binding in V0.2; replay-attack
 /// residual documented in the ADR-008 amendment (Phase 0e).
-fn compute_aad(file_path: &str) -> [u8; 32] {
+fn compute_aad(relative_path: &str) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"vault-at-rest-v1");
-    hasher.update(file_path.as_bytes());
+    hasher.update(relative_path.as_bytes());
     *hasher.finalize().as_bytes()
 }
 
@@ -271,6 +275,15 @@ fn vault_sealed_to_local_path(url: &Url) -> Result<std::path::PathBuf, String> {
 struct SealedObjectStore {
     inner: Arc<dyn ObjectStore>,
     key: Arc<Zeroizing<[u8; 32]>>,
+    /// Path of the vault data dir as an [`ObjectPath`] — strip prefix
+    /// applied to every `location` before AAD computation so AAD is
+    /// invariant to renaming the vault root (per ADR-008 amendment v2,
+    /// T0.2.0 Phase 2). Computed once at provider `new_store` from the
+    /// `vault-sealed://` URL Lance hands in. Empty if the URL didn't
+    /// resolve to an absolute path (defensive — falls back to absolute
+    /// AAD with rename-non-invariant semantics, surfaced loudly via the
+    /// `aad_*` unit tests).
+    base_path: ObjectPath,
 }
 
 impl std::fmt::Debug for SealedObjectStore {
@@ -281,6 +294,7 @@ impl std::fmt::Debug for SealedObjectStore {
         f.debug_struct("SealedObjectStore")
             .field("inner", &self.inner)
             .field("key", &"<redacted>")
+            .field("base_path", &self.base_path)
             .finish()
     }
 }
@@ -292,8 +306,48 @@ impl std::fmt::Display for SealedObjectStore {
 }
 
 impl SealedObjectStore {
+    /// Compute AAD for `location` after stripping the vault root prefix.
+    ///
+    /// Per ADR-008 amendment v2 (T0.2.0 Phase 2): AAD is computed over
+    /// the relative path within the vault data dir, not the absolute
+    /// filesystem path. This makes sealing rename-invariant for the
+    /// data dir itself (required by the migration loop's atomic
+    /// `temp_dir → vector_dir` swap) while preserving "this file at
+    /// this relative position in this vault" binding (defense against
+    /// within-vault file substitution).
+    ///
+    /// Edge cases:
+    /// - `base_path` is empty → AAD over full `location` (defensive
+    ///   fallback; surfaced by the `aad_*` unit tests).
+    /// - `location == base_path` (root file, rare) → AAD over empty
+    ///   string.
+    /// - `location` not under `base_path` (shouldn't happen — Lance
+    ///   wouldn't request a path outside the vault root) → AAD over
+    ///   full `location`, NOT rename-invariant; logged via the
+    ///   defensive-fallback test.
     fn aad_for_path(&self, location: &ObjectPath) -> [u8; 32] {
-        compute_aad(location.as_ref())
+        let relative = self.relative_path_str(location);
+        compute_aad(relative)
+    }
+
+    /// Return the path within the vault root, as a string slice
+    /// borrowed from `location`'s underlying string. Pure function —
+    /// no allocation. See `aad_for_path` for the path semantics.
+    fn relative_path_str<'a>(&self, location: &'a ObjectPath) -> &'a str {
+        let location_str = location.as_ref();
+        let base_str = self.base_path.as_ref();
+        if base_str.is_empty() {
+            return location_str;
+        }
+        if location_str == base_str {
+            return "";
+        }
+        // Strip the base + the path separator that follows it.
+        // `ObjectPath` always uses `/` as the separator regardless of OS.
+        location_str
+            .strip_prefix(base_str)
+            .and_then(|s| s.strip_prefix('/'))
+            .unwrap_or(location_str)
     }
 }
 
@@ -494,9 +548,21 @@ impl ObjectStoreProvider for SealedFileStoreProvider {
         _params: &ObjectStoreParams,
     ) -> LanceResult<LanceObjectStore> {
         let local: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+
+        // Compute the vault root as an ObjectPath so AAD can be made
+        // relative to it (ADR-008 amendment v2, T0.2.0 Phase 2 — see
+        // `compute_aad` doc + `SealedObjectStore::aad_for_path`).
+        // Empty fallback is defensive; the `aad_*` unit tests pin both
+        // the strip path and the empty-base fallback.
+        let base_object_path = vault_sealed_to_local_path(&base_path)
+            .ok()
+            .and_then(|p| ObjectPath::from_absolute_path(&p).ok())
+            .unwrap_or_else(|| ObjectPath::from(""));
+
         let sealed: Arc<dyn ObjectStore> = Arc::new(SealedObjectStore {
             inner: local,
             key: self.key.clone(),
+            base_path: base_object_path,
         });
 
         // 9-param `new` constructor — defaults mirror lance-io 4.0
@@ -534,5 +600,118 @@ impl ObjectStoreProvider for SealedFileStoreProvider {
     ) -> LanceResult<String> {
         // Mirror FileStoreProvider — return the scheme name as the prefix.
         Ok(VAULT_SEALED_SCHEME.to_string())
+    }
+}
+
+// ============================================================
+//   AAD relative-path tests (ADR-008 amendment v2, T0.2.0 Phase 2)
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_store(base: ObjectPath) -> SealedObjectStore {
+        SealedObjectStore {
+            inner: Arc::new(LocalFileSystem::new()),
+            key: Arc::new(Zeroizing::new([0xab_u8; 32])),
+            base_path: base,
+        }
+    }
+
+    /// Same physical file at the SAME relative position under two
+    /// different absolute base paths MUST yield equal AAD. This is the
+    /// rename-invariance property that ADR-008 amendment v2 introduces
+    /// to unblock the migration loop's atomic `temp_dir → vector_dir`
+    /// swap pattern.
+    #[test]
+    fn aad_is_equal_for_same_relative_path_under_different_bases() {
+        let store_a = make_store(ObjectPath::from("dir_a/vault"));
+        let store_b = make_store(ObjectPath::from("dir_b/vault"));
+
+        let loc_a = ObjectPath::from("dir_a/vault/memories.lance/data/abc.lance");
+        let loc_b = ObjectPath::from("dir_b/vault/memories.lance/data/abc.lance");
+
+        let aad_a = store_a.aad_for_path(&loc_a);
+        let aad_b = store_b.aad_for_path(&loc_b);
+
+        assert_eq!(
+            aad_a, aad_b,
+            "AAD must be equal for same relative position under different absolute bases — \
+             rename-invariance per ADR-008 amendment v2 (T0.2.0 Phase 2). If this fails, \
+             base_path stripping is broken and the migration loop's atomic-rename pattern \
+             would break sealing."
+        );
+    }
+
+    /// Two files at distinct relative paths under the same vault root
+    /// MUST yield distinct AADs — preserves within-vault position
+    /// binding. ADR-008 amendment v2 changes the path semantics from
+    /// absolute to relative-to-root, but does NOT remove the per-
+    /// position binding (defense against within-vault file
+    /// substitution attacks).
+    #[test]
+    fn aad_differs_for_distinct_relative_paths_within_same_store() {
+        let store = make_store(ObjectPath::from("vault"));
+
+        let foo = ObjectPath::from("vault/memories.lance/data/foo.lance");
+        let bar = ObjectPath::from("vault/memories.lance/data/bar.lance");
+
+        let aad_foo = store.aad_for_path(&foo);
+        let aad_bar = store.aad_for_path(&bar);
+
+        assert_ne!(
+            aad_foo, aad_bar,
+            "AAD must differ for distinct relative paths within the same store — \
+             within-vault position binding per ADR-008 amendment v2 must be preserved. \
+             If this fails, an attacker with disk write access could swap sealed files \
+             within a vault without AEAD detection."
+        );
+    }
+
+    /// `relative_path_str` returns "" for the root file, the bare
+    /// component for direct children, and the full sub-path for nested
+    /// children. Pin the exact strings so a future refactor cannot
+    /// silently change AAD inputs.
+    #[test]
+    fn relative_path_str_strips_base_prefix_correctly() {
+        let store = make_store(ObjectPath::from("dir_a/vault"));
+        assert_eq!(
+            store.relative_path_str(&ObjectPath::from("dir_a/vault")),
+            ""
+        );
+        assert_eq!(
+            store.relative_path_str(&ObjectPath::from("dir_a/vault/foo.lance")),
+            "foo.lance"
+        );
+        assert_eq!(
+            store.relative_path_str(&ObjectPath::from(
+                "dir_a/vault/memories.lance/data/abc.lance"
+            )),
+            "memories.lance/data/abc.lance"
+        );
+    }
+
+    /// Defensive fallback: `location` not under `base_path` (shouldn't
+    /// happen in normal Lance flows — Lance only requests paths inside
+    /// the vault root) → return the full location string. AAD won't be
+    /// rename-invariant for that file, but the file isn't part of the
+    /// vault anyway. Pin the fallback shape so a future refactor can't
+    /// silently swap to a panic / empty-string / etc.
+    #[test]
+    fn relative_path_str_falls_back_to_full_when_location_outside_base() {
+        let store = make_store(ObjectPath::from("dir_a/vault"));
+        let loc = ObjectPath::from("dir_other/somefile.lance");
+        assert_eq!(store.relative_path_str(&loc), "dir_other/somefile.lance");
+    }
+
+    /// Empty `base_path` (defensive fallback if `vault_sealed_to_local_path`
+    /// fails at `new_store` time) → AAD over the full location. Pin
+    /// this so the fallback path can't silently change.
+    #[test]
+    fn relative_path_str_with_empty_base_returns_full_location() {
+        let store = make_store(ObjectPath::from(""));
+        let loc = ObjectPath::from("dir_a/vault/foo.lance");
+        assert_eq!(store.relative_path_str(&loc), "dir_a/vault/foo.lance");
     }
 }

@@ -193,7 +193,60 @@ impl StorageBackend {
         let metadata = MetadataStore::open(metadata_path, key).await?;
         let vector = LanceVectorStore::open(vector_data_dir, dimension).await?;
         let graph = DuckDbGraphStore::open(graph_path).await?;
+        Self::assemble(metadata, vector, graph).await
+    }
 
+    /// Sealed companion to [`Self::open`] — opens the LanceDB store via
+    /// [`LanceVectorStore::open_with_at_rest_key`] (T0.2.0 sealed at-rest
+    /// path) instead of the V0.1 plaintext [`LanceVectorStore::open`].
+    /// MetadataStore (SQLCipher) and DuckDbGraphStore are unchanged at
+    /// Phase 2 — sealed metadata + sealed graph land at later T0.2.x
+    /// hardening phases per BRD §11.5.1. Same `Ok(Self)`-on-validation-
+    /// failure semantics as [`Self::open`] (degraded mode preserved).
+    ///
+    /// **Caller MUST pass the already-derived at-rest key** (`K3(master_key)`
+    /// per ADR-008 amendment K3 KDF). Canonical production derivation
+    /// site: [`vault_app::keychain::derive_at_rest_key`] per ADR-040
+    /// amendment.
+    ///
+    /// Plaintext [`Self::open`] is retained for the V0.1 → V0.2
+    /// migration source path; Phase 3 deletes both plaintext
+    /// constructors after the formal at-rest gate close.
+    #[instrument(
+        skip(metadata_path, vector_data_dir, graph_path, key, at_rest_key),
+        fields(
+            metadata_path = %metadata_path.display(),
+            vector_data_dir = %vector_data_dir.display(),
+            graph_path = %graph_path.display(),
+            dimension,
+        )
+    )]
+    pub async fn open_with_at_rest_key(
+        metadata_path: &Path,
+        vector_data_dir: &Path,
+        graph_path: &Path,
+        key: SqlCipherKey,
+        dimension: usize,
+        at_rest_key: &[u8; 32],
+    ) -> VaultResult<Self> {
+        let metadata = MetadataStore::open(metadata_path, key).await?;
+        let vector =
+            LanceVectorStore::open_with_at_rest_key(vector_data_dir, dimension, at_rest_key)
+                .await?;
+        let graph = DuckDbGraphStore::open(graph_path).await?;
+        Self::assemble(metadata, vector, graph).await
+    }
+
+    /// Shared assembly path for both [`Self::open`] (plaintext) and
+    /// [`Self::open_with_at_rest_key`] (sealed). Runs `validate_readable`
+    /// on the downstream stores, computes [`DegradedMode`], emits the
+    /// per-store `store.corruption` audit events on failure, and builds
+    /// the [`StorageBackend`] struct with shared metadata-store clones.
+    async fn assemble(
+        metadata: MetadataStore,
+        vector: LanceVectorStore,
+        graph: DuckDbGraphStore,
+    ) -> VaultResult<Self> {
         let vector: Arc<dyn VectorStore> = Arc::new(vector);
         let graph: Arc<dyn GraphStore> = Arc::new(graph);
 
