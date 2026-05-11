@@ -62,6 +62,15 @@ use zeroize::Zeroizing;
 /// account-string slot.
 pub const PRODUCTION_NAMESPACE: &str = "com.memoryvault.v0.2";
 
+/// V0.2 single-vault account string. Moved from vault-tauri main.rs at
+/// T0.2.0 Phase 3 sub-task (a) (2026-05-11) so vault-tauri + vault-cli
+/// share a single source of truth (both consume `PRODUCTION_NAMESPACE` +
+/// `VAULT_ID` to access the same keychain entry). V1.0 multi-vault per
+/// BRD §6.2 will pass real per-vault ids — same keychain namespace slot,
+/// multiple entries differentiated by this account-string slot per
+/// ADR-040 forward-compat.
+pub const VAULT_ID: &str = "default";
+
 /// BLAKE3 derive_key context for the SqlCipher passphrase subkey
 /// (ADR-040 amendment option β).
 ///
@@ -581,17 +590,37 @@ pub fn derive_at_rest_key(master_key: &[u8; 32]) -> Zeroizing<[u8; 32]> {
     Zeroizing::new(subkey)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+// =============================================================================
+// Test helpers — feature-gated module for cross-crate test consumption
+// =============================================================================
 
+/// Test infrastructure exposed for cross-crate test consumption.
+///
+/// **Visibility:** module-private under `#[cfg(test)]` for vault-app's own
+/// tests; `pub` when the `test-helpers` Cargo feature is enabled. Consumers
+/// (e.g., vault-cli's tests) enable the feature via `[dev-dependencies]`:
+///
+/// ```toml
+/// vault-app = { path = "../vault-app", features = ["test-helpers"] }
+/// ```
+///
+/// **Why a feature flag, not `#[cfg(test)]`:** `cfg(test)` does NOT propagate
+/// across crate boundaries — downstream consumers' test compilation cannot
+/// see this crate's `cfg(test)` items. The Cargo feature is the load-bearing
+/// piece that exposes the helpers to downstream test builds.
+///
+/// Promoted from `mod tests`'s private scope at T0.2.0 Phase 3 sub-task (a)
+/// (2026-05-11) to eliminate the 50-LOC duplication that would otherwise
+/// have landed in vault-cli's tests.
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod test_helpers {
     /// Generate a unique-per-test namespace so concurrent + sequential test
     /// runs never collide on the same keychain entry. Prefixed with
     /// `com.memoryvault.test.v0.2.` so a stale entry from a panicked test
     /// is still distinguishable from production / spike entries during
     /// manual Credential Manager cleanup.
     #[cfg(windows)]
-    fn unique_test_namespace(test_name: &str) -> String {
+    pub fn unique_test_namespace(test_name: &str) -> String {
         let mut nonce = [0u8; 8];
         getrandom::getrandom(&mut nonce).expect("getrandom for test namespace");
         format!(
@@ -604,7 +633,7 @@ mod tests {
     /// Best-effort cleanup helper. Used in test teardown so re-runs are
     /// deterministic; failures are logged but do not fail the test.
     #[cfg(windows)]
-    fn cleanup_keychain_entry(namespace: &str, vault_id: &str) {
+    pub fn cleanup_keychain_entry(namespace: &str, vault_id: &str) {
         use keyring_core::Entry;
         use windows_native_keyring_store::Store;
 
@@ -621,6 +650,65 @@ mod tests {
         }
         keyring_core::unset_default_store();
     }
+
+    /// Plant a malformed (non-32-byte) keychain entry so subsequent
+    /// [`super::read_or_init_master_key`] calls return
+    /// [`vault_core::VaultError::KeychainProvenance`] per the wrong-length-
+    /// secret fail-closed branch (`keychain.rs:154-163`). Used by negative-
+    /// path tests asserting generic "authentication failed" surfaces without
+    /// info leak per BRD §11.7.2.
+    #[cfg(windows)]
+    pub fn plant_malformed_keychain_entry(namespace: &str, vault_id: &str) {
+        use keyring_core::Entry;
+        use windows_native_keyring_store::Store;
+
+        let store = Store::new().expect("Store::new for malformed-entry planting");
+        keyring_core::set_default_store(store);
+        let entry =
+            Entry::new(namespace, vault_id).expect("Entry::new for malformed-entry planting");
+        // 31 bytes (NOT 32) triggers the "secret is N bytes (expected 32)"
+        // fail-closed branch in read_or_init_master_key.
+        let malformed: [u8; 31] = [0u8; 31];
+        entry
+            .set_secret(&malformed)
+            .expect("set_secret for malformed-entry planting");
+        keyring_core::unset_default_store();
+    }
+
+    /// Process-global mutex serializing keychain tests. `keyring_core`'s
+    /// `set_default_store` / `unset_default_store` are process-global state;
+    /// parallel tests under `RUST_TEST_THREADS=4` (ADR-038 layer 3 sibling)
+    /// race on the slot — test A unsetting the store while test B is mid-
+    /// keychain-write produces "No default store has been set" errors.
+    /// Production has no contention (vault-tauri + vault-cli each call the
+    /// keychain helpers once at startup). Tests serialize via this mutex;
+    /// each test acquires it before any keychain-related work and releases
+    /// via Drop at test end.
+    #[cfg(windows)]
+    pub static KEYCHAIN_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Acquire the keychain serialization guard. Released on Drop.
+    /// `unwrap_or_else(|p| p.into_inner())` recovers from a poisoned mutex
+    /// (prior-test panic) so one bad test doesn't lock out the rest of the
+    /// suite.
+    #[cfg(windows)]
+    pub fn keychain_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        KEYCHAIN_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // Test helpers (unique_test_namespace, cleanup_keychain_entry,
+    // keychain_test_guard, plant_malformed_keychain_entry, KEYCHAIN_TEST_MUTEX)
+    // are now in `super::test_helpers` per T0.2.0 Phase 3 sub-task (a)
+    // promotion (2026-05-11) — feature-gated for cross-crate consumption
+    // by vault-cli's tests (eliminates 50-LOC duplication).
+    #[cfg(windows)]
+    use super::test_helpers::*;
 
     /// Round-trip: write a master_key via the helper path → read back → byte-
     /// equal. Per iteration-1.5 amendment test floor adjustment (a).
@@ -772,32 +860,10 @@ mod tests {
     // ADR-029 + ADR-040 OQ #1 partial resolution). macOS/Linux per-platform
     // crate-add at T0.2.0.x sub-task or T0.2.14 Stub-Installer-adjacent.
     //
-    // **Serialization mutex (`KEYCHAIN_TEST_MUTEX`):** `keyring_core`'s
-    // `set_default_store` / `unset_default_store` are process-global state.
-    // Multiple bridge tests running in parallel (RUST_TEST_THREADS=4 per
-    // ADR-038 layer 3 sibling) race on the global slot — test A unsetting
-    // the store while test B is mid-keychain-write produces "No default
-    // store has been set" errors. Production has no contention (vault-
-    // tauri calls the bridge once at startup). Tests serialize via this
-    // mutex; each bridge test acquires it before any bridge-related work
-    // and releases via Drop at test end. `unwrap_or_else(|p| p.into_inner())`
-    // recovers from a poisoned mutex (prior test panic) so one bad test
-    // doesn't poison the entire suite.
+    // Tests serialize keychain access via `KEYCHAIN_TEST_MUTEX` (defined in
+    // `super::test_helpers` per T0.2.0 Phase 3 sub-task (a) promotion);
+    // see the module doc-comment there for the full rationale.
     // ────────────────────────────────────────────────────────────────────
-
-    #[cfg(windows)]
-    static KEYCHAIN_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Acquire the keychain serialization guard for the lifetime of a
-    /// bridge test. Returns a `MutexGuard` that releases on Drop. The
-    /// poison-recovery dance lets prior-test panics not lock out the rest
-    /// of the suite.
-    #[cfg(windows)]
-    fn keychain_test_guard() -> std::sync::MutexGuard<'static, ()> {
-        KEYCHAIN_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
 
     /// Test fixture helper: create a fresh SQLCipher file at `path`,
     /// keyed with `passphrase`, with `n_rows` rows of substantive content

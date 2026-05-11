@@ -15,8 +15,8 @@ path = "src/main.rs"
 [dependencies]
 vault-core = { path = "../vault-core" }
 vault-storage = { path = "../vault-storage" }
+vault-app = { path = "../vault-app" }
 clap = { workspace = true }
-rpassword = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
@@ -27,3 +27,11 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Sub-task (a) tests consume keychain test helpers (unique_test_namespace,
+# cleanup_keychain_entry, keychain_test_guard, plant_malformed_keychain_entry,
+# KEYCHAIN_TEST_MUTEX) promoted to `vault_app::keychain::test_helpers` at
+# T0.2.0 Phase 3 sub-task (a). The `test-helpers` feature flips the module
+# from `#[cfg(test)]`-private (in vault-app) to publicly visible for this
+# downstream consumer's tests. Production dep above does NOT enable the
+# feature — production binary builds with no test_helpers code compiled in.
+vault-app = { path = "../vault-app", features = ["test-helpers"] }

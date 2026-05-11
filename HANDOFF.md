@@ -1,7 +1,11 @@
 # Memory Vault — Build Handoff
 
 **Current version:** V0.2 Closed Beta (BRD §6.2 — sleep consolidator, boundaries hardening, cross-device sync, 30 beta users)
-**Last updated:** 2026-05-11 session-end checkpoint (Phase 2 + ADR-041 both SHIPPED. **Latest commit:** ADR-041 V0.1 → V0.2 SQLCipher passphrase bridge at `6f2af9d` (push 12:21Z, run `25669781494` IN_PROGRESS at session pause — verify via `gh run view 25669781494` on next-session open per CLAUDE.md per-commit CI standing rule). **Previous commit:** Phase 2 fmt-fix `02799b5` (run `25660977905` GREEN matrix-wide 1h4m55s, verified before staging ADR-041). **All workspace DoD gates green pre-push:** fmt clean, clippy `-D warnings` clean, build zero warns 41m38s, test 0 failures (vault-app: 27 passed +8 bridge tests; vault-storage lib: 232 stable; migration_v0_1_to_sealed: 16 stable; 17 pre-existing ignored markers preserved). **Working tree at session pause:** HANDOFF.md modified (this `Last updated` header + the next-session checkpoint section below) — admin-only doc edit, bundles with next code commit per `feedback_admin_changes_ride_with_code.md`. **Next-session opener:** see "## T0.2.0 next-session opener" section directly below the Current Status block.)
+**Last updated:** 2026-05-11 session-end-2 checkpoint (CI fix-forward for `ac577f4`'s windows-latest fail + Tier 3 founder-smoke SKIPPED on dev machine).
+
+**Session-end-1 (prior, still accurate as a milestone record):** Phase 2 + ADR-041 both SHIPPED. ADR-041 cfg-fix `ac577f4` (push 12:41Z, run `25670758274`). ADR-041 implementation landed at `6f2af9d` (push 12:21Z, run `25669781494`) BUT failed non-Windows clippy/build on unused-imports + dead-code; cfg-fix immediately followed in same session per `feedback_broken_ci_is_regression_not_techdebt.md`. Phase 2 fmt-fix `02799b5` (run `25660977905` GREEN matrix-wide 1h4m55s) preceded. All workspace DoD gates green pre-push: fmt clean, clippy `-D warnings` clean, build zero warns 41m38s, test 0 failures (vault-app: 27 passed +8 bridge tests; vault-storage lib: 232 stable; migration_v0_1_to_sealed: 16 stable; 17 pre-existing ignored markers preserved).
+
+**Session-end-2 events (this checkpoint):** `ac577f4` CI run `25670758274` completed with **windows-latest build+test FAILED** — `tier_2_real_v0_1_vault_db_bridges_and_preserves_5_rows` (added in `6f2af9d` per ADR-041 §5) panicked because the captured V0.1 fixture binary `crates/vault-storage/tests/fixtures/v0_1_alpha_data_dir/vault.db` was silently gitignored by `.gitignore`'s `*.db` rule (line 90) and never committed. Ubuntu + macOS all green (cfg-fix DID resolve the original `6f2af9d` non-Windows regression — that part worked). Locally the test passed because the fixture was on disk; CI runner doesn't get gitignored files — same class of "local-DoD-green ≠ CI-green" failure that originally drove the per-step-CI standing rule. **Fix-forward commit this session** (the commit this HANDOFF rides with): `.gitignore` negation rule for the fixture path + `git add -f` of `vault.db` (98 KB) + `vault.db-wal` (650 KB) so CI gets the real V0.1-binary-emitted byte shape for the realism-gate test. Per `feedback_broken_ci_is_regression_not_techdebt.md` resolved same session, not deferred to tech debt. **Tier 3 founder smoke SKIPPED on dev machine:** full user-profile scan found NO V0.1 production vault on this Windows box. Actual Tauri bundle identifier is `com.shahbaz242630.memory-vault` (HANDOFF Tier 3 procedure at lines 78-110 has stale `com.memoryvault.dev` path — corrects with Phase 3 ride-along); even at the correct identifier path `%APPDATA%\com.shahbaz242630.memory-vault\` doesn't exist and `%LOCALAPPDATA%\com.shahbaz242630.memory-vault\` only contains WebView2 runtime cache (no `lance/`, no `vault.db`). Either ADR-029 V0.1 dogfood happened on a different machine, was cleaned up, or never persisted in Tauri-app form on this dev box. Tier 2 fixture-replay (the test we're fixing in this commit) IS the realism gate per ADR-041 §5 — exercises the real V0.1-binary-emitted byte shape with 5 rows + the captured `fixture-capture-key-do-not-use-in-prod` passphrase. Tier 3 was an additional realism layer against a specific founder vault; deferred to first-alpha-cohort-member with real V0.1 data. **Next coding work:** T0.2.0 Phase 3 (controls removal + acceptance suite) per T0.2.0 close-out plan iteration 1.
 **Updated by:** Claude (Opus 4.7)
 
 > **📁 V0.1 historical record:** `HANDOFF_V0.1_ARCHIVE.md` — frozen as of 2026-05-06. Full T0.1.1 → T0.1.12 phase narratives, ADRs 001-036 full text, tech-debt closures, plan-iteration histories. Cross-link out to that file when V0.2 work needs V0.1 detail; do NOT paraphrase.
@@ -35,82 +39,53 @@
 
 ---
 
-## T0.2.0 next-session opener (2026-05-11 session-end checkpoint)
+## T0.2.0 next-session opener (2026-05-11 session-end-2 checkpoint)
 
-**On session open, do these three in order:**
+**On session open, do these two in order:**
 
-### 1. Verify CI green on the ADR-041 push `6f2af9d`
+### 1. Verify CI green on the latest fix-forward commit
+
+The fix-forward commit this HANDOFF rides with addresses `ac577f4`'s windows-latest test failure by un-gitignoring the Tier 2 V0.1 fixture binary (`.gitignore` negation rule + `git add -f` on `vault.db` + `vault.db-wal` under `crates/vault-storage/tests/fixtures/v0_1_alpha_data_dir/`). Look up the actual commit + run ID with:
 
 ```powershell
-gh run view 25669781494 --json status,conclusion,jobs -q '"status=" + .status + " conclusion=" + (.conclusion // "(empty)") + "\n" + (.jobs | map("  " + .name + ": " + .status + (if .conclusion != "" then " (" + .conclusion + ")" else "" end)) | join("\n"))'
+gh run list --workflow=ci.yml -L 3 --json databaseId,headSha,status,conclusion,displayTitle
 ```
 
-Per saved-memory `feedback_gh_run_watch_exit_not_equal_run_status.md`: trust `gh run view` actual status, NOT `gh run watch` exit code (watch-tool failures are network/rate-limit/session-drop transients).
+Then verify the topmost run (most recent push):
+
+```powershell
+gh run view <RUN_ID> --json status,conclusion,jobs -q '"status=" + .status + " conclusion=" + (.conclusion // "(empty)") + "\n" + (.jobs | map("  " + .name + ": " + .status + (if .conclusion != "" then " (" + .conclusion + ")" else "" end)) | join("\n"))'
+```
+
+Trust `gh run view` actual status, NOT `gh run watch` exit code (per `feedback_gh_run_watch_exit_not_equal_run_status.md`).
 
 - **If `conclusion=success`:** CI green, proceed to step 2.
-- **If `conclusion=failure`:** broken CI is a regression — fix in this session per `feedback_broken_ci_is_regression_not_techdebt.md`. Diagnose via per-job failures in the JSON output; common past failures were cargo fmt drift (saved-memory `feedback_fmt_runs_last_before_commit.md`).
-- **If still `in_progress`:** historically the matrix takes 40-67 min; just rerun the command after a few minutes.
+- **If `conclusion=failure`:** broken CI is a regression — fix in this session per `feedback_broken_ci_is_regression_not_techdebt.md`. Diagnose via `gh run view <RUN_ID> --log-failed` and per-job failures in the JSON output.
+- **If still `in_progress`:** historically the matrix takes 40-67 min; rerun the command after a few minutes.
 
-### 2. Working-tree state
+### 2. Phase 3 — controls removal + acceptance suite (NEXT CODING WORK)
 
-`git status --short` should show ONE modified file:
+Per T0.2.0 close-out plan iteration 1 Phase 3:
 
-```
- M HANDOFF.md
-```
+- Remove ADR-010 banners (modal + persistent strip) from `crates/vault-tauri/`.
+- Delete plaintext `LanceVectorStore::open` (retained through Phase 2 for migration source path) — sealed `open_with_at_rest_key` becomes the only constructor.
+- Delete plaintext `StorageBackend::open` (parallels the LanceVectorStore deletion).
+- Write T0.2.0 acceptance suite (DoD tests proving sealing is the only path — no plaintext escape hatches survive Phase 3).
 
-This is the doc-only edit (this very "next-session opener" section + `Last updated` header refresh) made at 2026-05-11 session pause AFTER the `6f2af9d` commit. Bundles with the next code commit per `feedback_admin_changes_ride_with_code.md`. **Do NOT commit this as a standalone admin commit** — wait for the next code change to ride alongside.
+Mechanical work; no major design questions expected. Tier 3 is NOT a prerequisite (deferred to first-alpha-cohort-member with real V0.1 data per session-end-2 reasoning above).
 
-### 3. Next work unit — Tier 3 founder smoke (now UNBLOCKED)
+**Ride-along admin edits to bundle with Phase 3 commit** (per `feedback_admin_changes_ride_with_code.md`):
+- Close the ADR-041 SQLCipher bridge tech-debt entry at line ~1779 — shipped this T0.2.0 closeout window across `6f2af9d` + `ac577f4` + the session-end-2 fix-forward.
+- Correct or strike-through the stale Tier 3 procedure at this section's predecessor's lines 78-110 in the prior checkpoint (had `com.memoryvault.dev` instead of actual `com.shahbaz242630.memory-vault`; now superseded entirely by the Tier 3 skip decision in session-end-2 — easiest move is to delete the stale procedure rather than fix the path).
 
-ADR-041 SHIPPED + CI green = Phase 2 Tier 3 founder smoke against the real V0.1 vault becomes feasible. Per Phase 2 plan iteration 1 §4 (Tier 3 was BLOCKED on ADR-041 — see HANDOFF "Tier 3 founder smoke status: BLOCKED on discovered Phase 1 follow-on" in the Phase 2 implementation milestone block).
-
-**Tier 3 procedure (founder action, ~15-30 min on Windows):**
-
-```powershell
-# Step 1 — Snapshot V0.1 vault for safety
-Copy-Item -Recurse `
-  $env:APPDATA\com.memoryvault.dev\lance\ `
-  $env:APPDATA\com.memoryvault.dev\lance.pre-v0.2-snapshot\
-
-Copy-Item `
-  $env:APPDATA\com.memoryvault.dev\vault.db `
-  $env:APPDATA\com.memoryvault.dev\vault.db.pre-v0.2-snapshot
-
-# Step 2 — Set VAULT_KEY env (V0.1 value, session-scope)
-$env:VAULT_KEY = "<your V0.1 passphrase>"
-
-# Step 3 — Launch Phase 2 binary built from this working tree
-cargo run --release -p vault-tauri
-# (or launch the built MSI / target/release/vault-tauri.exe)
-
-# Step 4 — Verify in UI
-# - First launch: bridge runs SQLCipher rekey + LanceDB migration
-#   - INFO log: "V0.1 → V0.2 SQLCipher passphrase bridge complete"
-#   - INFO log: "V0.1 → V0.2 migration complete: {rows} rows migrated"
-# - Search for known memories → results returned
-# - No error dialog at startup
-
-# Step 5 — Verify post-migration state
-Test-Path $env:APPDATA\com.memoryvault.dev\lance\ALPHA_DO_NOT_STORE_REAL_DATA.txt
-# Expected: False
-
-Test-Path $env:APPDATA\com.memoryvault.dev\vault.db.pre_v0_2_bridge
-# Expected: False (snapshot consumed post-success per ADR-041 §3 step 8)
-```
-
-**If Tier 3 surfaces any issue:** STOP, snapshot the current state, surface to Claude with diagnostic details. Tier 3 is the realism gate that Tier 1 (synthetic fixtures) + Tier 2 (captured V0.1 binary fixture from commit `1d72aac`, 5 rows) cannot cover.
-
-**If Tier 3 passes:** Phase 4 founder dogfood is unblocked; the T0.2.0 close-out plan iteration 1's Phase 3 (controls-removal + acceptance suite) becomes the next coding focus.
-
-### 4. Reference — open work units (per T0.2.0 close-out plan iteration 1)
+### 3. Reference — open work units (per T0.2.0 close-out plan iteration 1)
 
 | Phase | Status | What |
 |---|---|---|
-| ADR-041 SQLCipher bridge | ✅ SHIPPED 6f2af9d (CI pending) | Closes the Phase 2 follow-on gap; unblocks Tier 3 + Phase 4 + alpha cohort |
-| Phase 2 Tier 3 founder smoke | UNBLOCKED, founder action | Manual run against real V0.1 vault (this section above) |
+| ADR-041 SQLCipher bridge | ✅ SHIPPED (`6f2af9d` + `ac577f4` + session-end-2 fix-forward) | Closes the Phase 2 follow-on gap; Tier 2 fixture-replay is the realism gate |
+| Phase 2 Tier 3 founder smoke | SKIPPED on dev machine (deferred to first alpha-cohort member with real V0.1 data) | Tier 2 fixture-replay covers the realism layer; Tier 3 was an additional layer against a specific founder vault that doesn't exist on this dev box |
 | Phase 3 — controls removal + acceptance suite | NEXT CODING WORK | Remove ADR-010 banners (modal + persistent strip), delete plaintext `LanceVectorStore::open` + plaintext `StorageBackend::open`, T0.2.0 acceptance suite (DoD tests proving sealing is the only path). Mechanical work; no major design questions expected. |
-| Phase 4 — founder dogfood on sealed (Windows) | Blocked on Phase 3 + Tier 3 | Re-run V0.1's 6-hour ADR-029 dogfood pattern against the sealed build |
+| Phase 4 — founder dogfood on sealed (Windows) | Blocked on Phase 3 | Re-run V0.1's 6-hour ADR-029 dogfood pattern against the sealed build |
 | Phase 5 — T0.2.0 hard-gate clearance | Blocked on Phase 4 | Banners removed, sealing-only invariant locked, founder dogfood passed, all BRD §6.2 acceptance criteria green |
 
 ---
@@ -1671,6 +1646,167 @@ Concrete next-session sequence:
 - `feedback_admin_changes_ride_with_code.md` — bundling discipline for HANDOFF + fixtures + spike with first Phase 2 code commit
 - `feedback_floor_forecast_is_pre_declaration_not_estimate.md` — both +2 amendments surfaced explicitly, neither silently absorbed
 - `feedback_quote_locked_artefacts_dont_paraphrase.md` — outcome names match iteration 2.1 §1 verbatim across enum variants, test names, and docstrings
+
+---
+
+## T0.2.0 close-out plan iteration 4 — Phase 3 scope correction (drafted 2026-05-11, post-recon)
+
+**Trigger.** Phase 3 pre-implementation recon (2026-05-11 session) source-read the plaintext-`open()` call graph and found iteration 1 §Phase 3's "Phase 2 was last caller" assumption was false — 10+ live plaintext callers remain across vector_store unit tests, migration test scaffolding, cascading.rs production + tests, vault-cli, vault-app adapter test, divergence test, and 2 spike examples. Per `feedback_flag_review_as_plan_amendment.md`, this is plan amendment, not silent correction. Iteration 4 retracts iteration 1 §Phase 3's scope assumption explicitly + locks the corrected scope. Same shape as iteration 2.1's PAR1→LANC detection-signal correction.
+
+### 1. Retraction of iteration 1 §Phase 3 "Phase 2 was last caller" assumption
+
+Iteration 1 §Phase 3 paragraph (HANDOFF.md line 764) stated: *"Plaintext `LanceVectorStore::open(path, dim)` deleted from `vector_store.rs` (Phase 2 was last caller)."* This is **false** as of 2026-05-11 Phase 3 recon.
+
+**Falsified by:** call-graph source-read found 10+ live plaintext `LanceVectorStore::open` callers:
+- `crates/vault-storage/src/cascading.rs:194` — production `CascadingStorage::open` plaintext path (sealed companion at line 234)
+- `crates/vault-storage/src/migration.rs` — Phase 2 migration source-path reader
+- `crates/vault-storage/tests/migration_v0_1_to_sealed.rs:352` — Phase 2's Tier 1 test scaffolding
+- `crates/vault-storage/src/vector_store.rs:1039, 1047, 1060, 1099, 1141, 1160, 1162, 1171, 1181, 1191, 1193` — 11 unit tests
+- `crates/vault-storage/examples/v0_1_lance_compat_spike.rs` — Phase 2 iteration-3 spike
+- `crates/vault-storage/examples/lance_corruption_spike.rs` — ADR-018 historical-evidence spike
+
+Plus plaintext `StorageBackend::open` callers:
+- `crates/vault-cli/src/main.rs:227, 474` — live operator CLI (dead-letter triage + divergence check)
+- `crates/vault-storage/src/cascading.rs:730, 761, 812, 1244, 1251` — 5 cascading tests
+- `crates/vault-app/src/adapter.rs:389` — adapter test
+- `crates/vault-storage/src/divergence.rs:360` — divergence test
+
+**Why the assumption was wrong:** iteration 1 was drafted at Phase 0e (2026-05-09) when Phase 1 + 2 hadn't shipped yet. The "Phase 2 was last caller" framing assumed Phase 2 would migrate the unit-test surface alongside the production source-path. Phase 2 shortcut by leaving the test surface on plaintext + using plaintext `LanceVectorStore::open` for synthetic V0.1 fixture creation in `tests/migration_v0_1_to_sealed.rs` (Tier 1 scaffolding, vs iteration 2 §OQ #2 resolution's `RecordBatch+ArrowWriter` spec). vault-cli was never enumerated in iteration 1's Phase 3 scope.
+
+**Phase 3 scope superseded by this iteration (iteration 4).** Iteration 1 §Phase 3 paragraph (HANDOFF.md line 764) is retracted as the authoritative Phase 3 specification; iteration 4 §2-§9 below is the authoritative form.
+
+### 2. Deletion strategy locked — hard-delete plaintext from production surface; test surface migrates to sealed
+
+- **Production plaintext deletion.** `LanceVectorStore::open(path, dim)` (`vector_store.rs`), `StorageBackend::open(...)` (`lib.rs`), and `CascadingStorage::open` plaintext companion (`cascading.rs:194`) are deleted from their source files. Sealed `open_with_at_rest_key` becomes the sole constructor across all three.
+- **Test surface migrates to sealed.** 11 vector_store unit tests + 5 cascading tests + adapter.rs test + divergence.rs test flip from plaintext `open` → sealed `open_with_at_rest_key` with a `TEST_AT_REST_KEY` constant (mirrors `migration_v0_1_to_sealed.rs:486`'s existing test-key pattern).
+- **Tier 1 migration test scaffolding** (`migration_v0_1_to_sealed.rs:352`) is restructured to construct V0.1-shape data directly via `arrow_array::RecordBatch` + `parquet::arrow::ArrowWriter` per iteration 2 §OQ #2 resolution Tier 1 spec. Methodology pre-declared in §5 below.
+- **migration.rs source-path** restructure: either bypass Lance APIs via raw arrow/parquet read, OR keep a `#[cfg(feature = "v0_1_migration")]`-gated plaintext open callable ONLY by migration.rs. Methodology pre-declared in §4 below (compile-and-run spike required before lock).
+- **Spike examples are excluded from deletion scope** (see §6 below).
+- **Two distinct grep-tests assert absence (different scopes; not double-counted in §7 floor):**
+  - **BRD §6 T0.2.0 acceptance suite criterion (d) grep-test** (per ADR-010 line 763 + BRD §6.2 line 1421 verbatim) asserts the **four ADR-010 control STRINGS** are absent — banner text, persistent-strip text, WARN message text (*"LanceDB data dir is plaintext (V0.1 alpha — see ADR-010). Encryption layer ships in T0.2.0."* per ADR-010 line 761), `ALPHA_DO_NOT_STORE_REAL_DATA.txt` filename string. Counted as part of the +5 acceptance suite in §7 (sub-task §9 (f)).
+  - **Sub-task §9 (e) compensating-controls removal grep-test** asserts the **plaintext API SYMBOLS** are absent from production source — `LanceVectorStore::open` (without the `_with_at_rest_key` suffix) and `StorageBackend::open` (without the `_with_at_rest_key` suffix). This is a NEW assertion that iteration 4 §2 adds beyond BRD §6 T0.2.0 (a)-(e); it's the symbol-level companion to the strings-level test above. Counted as +1 in §7 (sub-task §9 (e)).
+  - Both tests scoped to `crates/*/src/` ONLY (excluding `crates/*/examples/` per §6 disposition; excluding the §4 cfg-gated migration.rs path if spike outcome (ii) lands and the gate name string `v0_1_migration` is co-located).
+
+### 3. vault-cli decision locked — option (a) migrate to sealed during Phase 3
+
+**Decision audit trail (honest framing per `feedback_flag_review_as_plan_amendment.md`):**
+
+ADR-010 wording does NOT name vault-cli. The four enumerated compensating controls (ADR-010 lines 759-762) are: (1) modal first-run banner (Tauri webview), (2) persistent UI banner (Tauri), (3) WARN log at plaintext LanceDB open (vault-storage), (4) `ALPHA_DO_NOT_STORE_REAL_DATA.txt` file (vault-storage). A defensible-but-aggressive reading of ADR-010's HARD GATE clause (*"No external user receives a build that contains the V0.1 plaintext-LanceDB code path"*, ADR-010 line 756) could have argued vault-cli is operator-only, not external-distributed, and therefore wording-compliant under a `#[cfg(test)] pub(crate)` gate.
+
+**This iteration locks (a) on functional grounds, NOT on a strict reading of the four enumerated controls.** After T0.2.0 lands, on-disk vault data is sealed (`vault-sealed://` URLs, AEAD framing per ADR-008 amendment + Phase 0d production wiring). vault-cli's plaintext `StorageBackend::open` → cascading plaintext `LanceVectorStore::open` chain attempting to read AEAD-sealed bytes as plain Parquet means AEAD authentication failure / parse error / fail-closed on every invocation. Paths (b) `#[cfg(test)]` gate + (c) defer-to-V0.2.x are functionally "vault-cli is dead post-T0.2.0", not "vault-cli is deferred". The migrate-now decision is the only path that keeps vault-cli's operator surface alive across the V0.2 task arc (T0.2.2 consolidator through T0.2.13 sync).
+
+**Second anchor — ADR-010's time-boundary clause (line 742):** *"The exception expires at the moment T0.2.0 lands; no further authorisation extends it."* This is the higher-order property that the four-controls enumeration instantiates. (a) honors this clause cleanly; (b)/(c) would silently violate it for the vault-cli production binary.
+
+**Convergence as lock signal (per `feedback_functional_observation_trumps_wording_interpretation.md`):** Both anchors — functional (AEAD-auth-fail post-T0.2.0) AND time-boundary clause (ADR-010 line 742) — point to option (a) independently. Two interpretive frames converging on the same lock is itself the load-bearing evidence that makes this lock confident, not over-confident. If only one anchor had been named, a future reader could read the decision as fragile (resting on a single interpretive frame); the convergence makes it sturdy. Named explicitly here so the audit trail surfaces the convergence, not just the two anchors.
+
+**Implementation shape (sub-task §9 (a)):** vault-cli adds `vault-app` workspace dep. Auth flow: call `vault_app::keychain::read_or_init_master_key(PRODUCTION_NAMESPACE, VAULT_ID)` — both consts co-located in `vault_app::keychain` (sub-task (a) decision lock 2026-05-11 moves `VAULT_ID = "default"` from vault-tauri main.rs:94 into `vault_app::keychain` alongside existing `PRODUCTION_NAMESPACE`; single source of truth across vault-tauri + vault-cli). Derive subkeys via `derive_sqlcipher_passphrase` + `derive_at_rest_key` (ADR-040 amendment v2 option β derivation tree). Open via `StorageBackend::open_with_at_rest_key`. **`rpassword` removed from vault-cli's `Cargo.toml`** — auth becomes implicit via OS-user keychain access; `windows-native-keyring-store` reads Windows Credential Manager transparently for the running OS user, with no separate keychain-unlock event to prompt for. The V0.1 prompt-for-passphrase UX is vestigial on the keychain model. Sub-task (a) decision lock option α (2026-05-11); matches vault-tauri's keychain-only auth pattern.
+
+### 4. Sub-plan: migration.rs source-path restructure — methodology declared (spike required)
+
+**Methodology: compile-and-run spike** per `feedback_runtime_confirmation_after_web_spike.md`. Web research alone is insufficient — iteration 3's spike confirmed lance 4.0 reads V0.1 fragments **via the Lance API**; the open question is whether the same fragments are readable via **raw arrow/parquet crates without going through Lance APIs**.
+
+**Spike question:** Can `parquet::file::reader::SerializedFileReader` + `parquet::arrow::ArrowReader` (or equivalent) read the V0.1 fixture's `.lance` data files directly, treating them as Parquet? Lance's `.lance` files were Parquet-with-extensions in lance 0.x; lance 2.0+ introduced a "V2" format. Iteration 3 evidence shows lance 4.0 reads V0.1 via Lance, but says nothing about whether raw Parquet readers can decode V0.1 fragment bytes outside of Lance.
+
+**Spike file:** `crates/vault-storage/examples/v0_1_raw_parquet_read_spike.rs` (new). Deep-copies the Tier 2 fixture's `lance/memories.lance/data/` subdir to a tempdir, opens the first `.lance` file via raw `parquet::arrow::ArrowReader`.
+
+**Spike stages (acceptance criteria pre-declared per ADR-041 spike Stages A+B pattern — empirical pass/fail per stage, not heuristic):**
+
+| Stage | Check | PASS criterion | FAIL implication |
+|---|---|---|---|
+| **A** | Compile `parquet::file::reader::SerializedFileReader::new(File::open(fixture_lance_data_file))` against workspace's pinned `parquet` crate version | Compiles cleanly; no API mismatch errors | API/crate-version incompatibility — outcome (ii) lands trivially (raw-Parquet path unbuildable in our workspace) |
+| **B** | Runtime open succeeds; file metadata + row-group count readable | Open returns Ok; `metadata.num_row_groups() >= 1` | Open returns Err / unparseable file — lance fragment file is not a vanilla Parquet container; outcome (ii) |
+| **C** | Schema decode + byte-equality against expected V0.1 schema | `parquet_to_arrow_schema(metadata, None)` returns a `Schema` with fields `[("id", Utf8, false), ("embedding", FixedSizeList<Float32, 384>, false), ("boundary", Utf8, false)]` in that order, with V0.1's actual nullability values | Any column type / order / nullability divergence — lance encodes schema differently than vanilla Parquet at the metadata layer; outcome (ii) |
+| **D** | Row decode succeeds via `ArrowReader::next() -> Some(Ok(batch))` | Iterator yields 5 rows total across all batches; at least one row's `id` column decode returns a UUIDv7 from fixture's known set (e.g., `019e1212-564a-7ab1-a97d-52e1eba510ed` per iteration 3 §1) | Decode error / wrong row count / wrong `id` value — lance encodes fragment-level data differently than vanilla Parquet at the data-page layer; outcome (ii) |
+
+**Outcome (i) lands ONLY if Stages A+B+C+D ALL PASS.** Any single stage FAIL lands outcome (ii). Spike exit code = 0 on full PASS, non-zero on first FAIL with which-stage-failed diagnostic to stderr.
+
+**Two possible outcomes (informed by the staged results above):**
+- **(i) Raw Parquet works (A+B+C+D all PASS):** Refactor `migration.rs` source-path read to bypass `LanceVectorStore::open` entirely, using the same `parquet::arrow::ArrowReader` API path the spike exercised. Plaintext `LanceVectorStore::open` deletion is unblocked across the production codebase (no cfg-gate retention needed).
+- **(ii) Raw Parquet does NOT work (any stage FAIL):** Keep plaintext `LanceVectorStore::open` callable from migration.rs ONLY, via `#[cfg(feature = "v0_1_migration")] pub(crate)` gate. The gate is removed when V0.2.x migration-source-path code itself is removed (V0.2.x lifecycle question, not T0.2.0 scope). ADR-010's time-boundary clause is honored at the user-distribution surface — production binaries built without the `v0_1_migration` feature have NO plaintext callable; migration.rs is internal one-shot upgrade code with a documented sunset trigger.
+
+**Spike disposition:** kept in-tree as executable documentation per `feedback_spike_playbook_for_unknowns.md`, regardless of outcome (i)/(ii). Same disposition pattern as iteration 3's `v0_1_lance_compat_spike.rs`.
+
+### 5. Sub-plan: Tier 1 RecordBatch+ArrowWriter restructure — methodology declared (schema-verbatim-mirror)
+
+**Methodology: canonical-source schema mirroring.** The Tier 1 synthetic V0.1-shape data construction must mirror the V0.1 binary's byte-shape exactly — column order, type widths, nullability, field metadata. Iteration 2 §OQ #2 resolution Tier 1 spec was right to call for `arrow_array::RecordBatch` + `parquet::arrow::ArrowWriter`; Phase 2's shortcut (using plaintext `LanceVectorStore::open` to write Tier 1 data) worked because Lance defined the byte-shape — but Lance is the same artifact we're trying to delete from the test surface.
+
+**Schema source-of-truth:** Tier 2 fixture's existing `.lance` files (captured from V0.1 binary at commit `1d72aac`, 5 rows). Inspect schema at test setup time via `parquet::file::reader::SerializedFileReader` + `parquet::arrow::parquet_to_arrow_schema(...)`. Mirror the column types + order + nullability exactly into a `RecordBatch` constructed in Rust.
+
+**Schema-equality assertion:** At Tier 1 test setup, after writing the synthetic RecordBatch to the temp data dir via `ArrowWriter`, the test re-reads the schema from disk and asserts `arrow_schema::Schema::PartialEq` against the schema read from the Tier 2 fixture. If schemas diverge silently, Tier 1 has drifted; the assertion fails loudly at test-setup before any migration logic exercises the synthetic data.
+
+**Coupling to §4 spike:** if §4 outcome (i) lands (raw Parquet works for read), then the migration.rs source-path read uses the SAME `parquet::arrow::parquet_to_arrow_schema` decode path that Tier 1 §5 uses for schema-equality assertion — Tier 1 and migration.rs become a closed loop where each defends the other. If §4 outcome (ii) lands, Tier 1's schema-mirror still stands independently (it's Lance-API-agnostic).
+
+### 6. Spike examples — explicit exclusion from Phase 3 deletion scope
+
+Per iteration 3 §3 disposition (HANDOFF.md line 1543-1550): spike files are **executable documentation** + **audit-trail artifacts** that prove the runtime-confirmation that locked iteration 2.1 → iteration 3 → Phase 2 implementation. Deleting them or migrating them off plaintext would lose their evidential value.
+
+**Phase 3 disposition for the 3 in-tree spike examples:**
+
+| Spike file | Phase 3 action |
+|---|---|
+| `examples/v0_1_lance_compat_spike.rs` | Kept verbatim. Calls plaintext `LanceVectorStore::open` against the Tier 2 V0.1 fixture — that's the entire point of the iteration 3 runtime-confirmation. |
+| `examples/lance_corruption_spike.rs` | Kept verbatim. Historical evidence for ADR-018 `validate_readable` design (metadata succeeds + count succeeds on a corrupted store; full decode fails). |
+| `examples/v0_1_raw_parquet_read_spike.rs` (new, §4) | Kept verbatim post-spike, same disposition pattern. |
+
+**Compilation gating:** If §4 lands outcome (ii) (`#[cfg(feature = "v0_1_migration")]` on plaintext `LanceVectorStore::open`), the spike examples either inherit the same gate at the example-binary `[features]` declaration in `crates/vault-storage/Cargo.toml`, OR plaintext `LanceVectorStore::open` is exposed via `#[cfg(any(test, feature = "v0_1_migration"))]` to keep examples buildable under the default workspace feature set. Gate granularity decided at Phase 3 implementation milestone, not pre-locked here.
+
+**Cross-link this disposition into BOTH grep-tests defined in §2:** the BRD criterion (d) four-control-strings test AND the §9 (e) plaintext-API-symbols test must both scope their scans to `crates/*/src/` ONLY (excluding `crates/*/examples/`) so neither absence-check fails on the spike examples (which intentionally call plaintext `LanceVectorStore::open` and may reference ADR-010 control strings in their explanatory doc-comments).
+
+### 7. Floor pre-declaration (Phase 3 test count)
+
+Per `feedback_floor_forecast_is_pre_declaration_not_estimate.md`, the floor is a pre-declaration, not an estimate. Net positive surfaces as floor amendment in commit message **before** the commit lands.
+
+| Sub-task | Net test delta |
+|---|---|
+| §9 (a) vault-cli migration to sealed | +2 firm (variable narrowed by sub-task (a) recon + decision lock 2026-05-11: sealed-open success + keychain-missing fail-closed with generic auth-failed message per BRD §11.7.2). Optional wrong-at-rest-key test subsumed by §9 (f) criterion (c). |
+| §9 (b) migration.rs source-path refactor (outcome (i) raw Parquet OR outcome (ii) cfg-gate retention) | 0 |
+| §9 (c) Tier 1 RecordBatch+ArrowWriter restructure | 0 (one restructured test, same name `tier_1_synthetic_v0_1_migration_round_trip`) |
+| §9 (d) 11 vector_store + 5 cascading + adapter + divergence unit-test migrations to sealed | 0 (migrations, not additions) |
+| §9 (e) Compensating-controls removal sweep — **plaintext API SYMBOLS absent** grep-test (scope: `LanceVectorStore::open` + `StorageBackend::open` symbols absent from `crates/*/src/`; distinct from criterion (d)'s four-control-STRINGS test below) | +1 |
+| §9 (f) Phase 3 BRD §6 T0.2.0 acceptance suite (a)-(e) — INCLUDES criterion (d)'s four-control-STRINGS grep-test (banner text + persistent-strip text + WARN message text + ALPHA filename) | +5 |
+| §4 raw-Parquet spike | +0 (spike is an example binary, not a test) |
+| **Pre-declared total** | **+8 net new tests** (variable narrowed to firm by sub-task (a) recon + decision lock 2026-05-11): +6 deterministic [+1 sub-task (e) plaintext-symbols grep-test + +5 sub-task (f) acceptance suite including criterion (d) four-controls-strings grep-test] + 2 firm for vault-cli sub-task (a). Original pre-declaration was +8 to +9 (variable range); narrowing down (NOT breaching) per `feedback_floor_forecast_is_pre_declaration_not_estimate.md` is in-discipline. |
+
+Any breach beyond +9 surfaces in commit message per discipline before the breaching commit lands.
+
+### 8. Iteration depth pre-declaration
+
+Per `feedback_plan_iteration_depth_scales_with_design_surface.md`, contract-establishing tasks warrant 2-3 iterations. Phase 3 is now contract-establishing (the contract being "what plaintext API surface exists after T0.2.0 closes"), not the "mechanical work" iteration 1 framed.
+
+- **Iteration 4 (this)** — Phase 3 plan amendment, contract-establishing. Locks §2 deletion strategy, §3 vault-cli decision, §4-§5 sub-plan methodologies, §6 spike-disposition, §7 floor pre-declaration, §9 sub-task enumeration.
+- **Iteration 5 RESERVED** — fires only if scope items surface from §4 spike findings or §5 schema-mirroring inspection that iteration 4's locks cannot accommodate. Example triggers: §4 spike outcome reveals raw Parquet works for V0.1 but lance 4.0 writes a non-Parquet `.lance` extension that breaks the migration source-path differently than §4's two anticipated outcomes; §5 schema-mirror inspection reveals a V0.1-binary field that the workspace's current arrow/parquet crate versions cannot represent without lossy coercion.
+- **Iteration 6 RESERVED** — fires only on §4 spike empirical findings if neither (i) nor (ii) is realizable. Triple-iteration reservation matches the contract-establishing-task pattern.
+
+### 9. Phase 3 sub-task enumeration (multi-session arc, not single-session)
+
+Phase 3 is no longer "mechanical work" as iteration 1 framed it. Six named sub-tasks with deliverables-per-sub-task + dependencies + test floor:
+
+| Sub-task | Deliverable | Test floor | Depends on |
+|---|---|---|---|
+| **(a) vault-cli migration to sealed** | `vault-cli/src/main.rs`: (1) replaces `read_passphrase` + `open_backend(cli, key)` with keychain-aware `open_backend(cli)` that calls `vault_app::keychain::read_or_init_master_key(PRODUCTION_NAMESPACE, VAULT_ID)` → `derive_sqlcipher_passphrase` + `derive_at_rest_key` → `StorageBackend::open_with_at_rest_key`; (2) `make_backend` test helper migrates to `open_with_at_rest_key` with `TEST_AT_REST_KEY` const (single-helper migration covers all 10 vault-cli integration tests for free per sub-task (a) decision lock — folded into (a), not (d)). `Cargo.toml`: adds `vault-app` workspace dep; removes `rpassword` (vestigial on Windows keychain model). `VAULT_ID = "default"` const co-located in `vault_app::keychain` (moved from vault-tauri main.rs:94). | +2 firm (sealed-open success + keychain-missing fail-closed with generic auth-failed message per BRD §11.7.2; sub-task (a) decision lock 2026-05-11 narrowed the +2-3 variable). Optional wrong-at-rest-key test subsumed by sub-task (f) criterion (c). | Phase 1 (shipped); independent of (b)-(f) |
+| **(b) migration.rs source-path refactor + spike** | `examples/v0_1_raw_parquet_read_spike.rs` runs against Tier 2 fixture. Outcome (i) → refactor `migration.rs` to raw Parquet. Outcome (ii) → `#[cfg(feature = "v0_1_migration")]` gate on plaintext `LanceVectorStore::open` callable only from migration.rs. | 0 (spike is example; refactor is shape-change, not behaviour-change) | Tier 2 fixture (un-staged from CI fix-forward, bundles with (a)'s commit per `feedback_admin_changes_ride_with_code.md`) |
+| **(c) Tier 1 RecordBatch+ArrowWriter restructure** | `tests/migration_v0_1_to_sealed.rs:352` restructured to construct V0.1-shape via `arrow_array::RecordBatch` + `parquet::arrow::ArrowWriter`. Schema-equality assertion against Tier 2 fixture at test setup. | 0 (one restructured test) | Tier 2 fixture (bundles with (a)); (b) spike outcome informs whether raw-Parquet read is the inverse the test should use for verification |
+| **(d) Unit-test surface migration to sealed** | 11 vector_store unit tests (`vector_store.rs:1039, 1047, 1060, 1099, 1141, 1160, 1162, 1171, 1181, 1191, 1193`) + 5 cascading tests (`cascading.rs:730, 761, 812, 1244, 1251`) + `adapter.rs:389` + `divergence.rs:360` flip from plaintext open → sealed `open_with_at_rest_key` with `TEST_AT_REST_KEY` constant. | 0 (migrations) | (b) outcome determines whether plaintext open is reachable from test code at all |
+| **(e) Compensating-controls removal sweep** | (1) Modal banner removed from `vault-tauri` Tauri command + dist/index.html. (2) Persistent strip removed from `vault-tauri` dist/index.html. (3) WARN log at plaintext LanceDB open removed alongside the plaintext path itself (the WARN site lives inside the to-be-deleted plaintext `open()`). (4) ALPHA file deletion-on-first-T0.2.0-run lands with one-time INFO log per ADR-010 line 763 removal-trigger spec. **Plus new plaintext-API-SYMBOLS grep-test** per §2 + §7: asserts `LanceVectorStore::open` + `StorageBackend::open` symbols absent from `crates/*/src/`. | +1 (plaintext-API-symbols grep-test, distinct from sub-task (f)'s criterion (d) four-control-STRINGS test) | (a)+(b)+(c)+(d) — production plaintext open must be deleted-able before WARN-emitting site can be removed |
+| **(f) Phase 3 acceptance suite (BRD §6 T0.2.0 a-e)** | (a) no plaintext on disk after write/close (entropy ≥ 7.9 + zero PAR1 magic — extends Phase 0d's `sealed_open_writes_framing_bytes_to_disk` to top-level integration). (b) round-trip identity encrypt → decrypt == original on CI matrix `[ubuntu-latest, windows-latest, macos-latest]`. (c) wrong key fails closed (extends Phase 0d's `sealed_open_with_wrong_key_fails_closed`). (d) four ADR-010 control STRINGS absent grep-test (banner text + persistent-strip text + WARN message text + ALPHA filename; distinct from sub-task (e)'s plaintext-API-symbols grep-test). (e) tampered ciphertext returns Err with AEAD authentication message — bit-flip a sealed byte, assert AEAD-auth message in returned VaultError. | +5 (one test per criterion (a)-(e); no double-count with sub-task (e)'s plaintext-symbols grep-test since scopes are distinct) | All preceding sub-tasks complete |
+
+**Sequencing locked:** (a) → (b) spike → (b) refactor → (c) → (d) → (e) → (f). Multi-session arc; no commit until a sub-task is independently DoD-green. **Sub-task (a)'s commit also carries the session-end-2 un-staged admin bundle** (`.gitignore` negation + Tier 2 fixture binaries `vault.db` + `vault.db-wal` + HANDOFF.md session-end-2 checkpoint + this iteration 4 paragraph) per `feedback_admin_changes_ride_with_code.md` — it's the first code commit after they were generated. CI red on `ac577f4` (windows-latest fixture-missing) becomes green at sub-task (a)'s push, not deferred to sub-task (e).
+
+### 10. Cross-references
+
+- ADR-010 (HANDOFF_V0.1_ARCHIVE.md:737) — hard-gate text quoted verbatim in §3.
+- BRD §6.2 T0.2.0 (`Agent_Build_Specification.txt:1411-1423`) — acceptance criteria + HARD GATE clause quoted verbatim in §2 + §7.
+- ADR-040 + amendment v2 (HANDOFF.md:938 + :1019 + this file :471) — keychain wiring + master_key derivation tree consumed by §9 (a).
+- HANDOFF.md "T0.2.0 Phase 2 — plan iteration 3" §3 — spike-disposition discipline that §6 inherits.
+- HANDOFF.md "T0.2.0 close-out plan iteration 1" §Phase 3 paragraph (line 764) — **retracted by §1 above**.
+- HANDOFF.md "T0.2.0 close-out plan iteration 2" §OQ #2 resolution — three-tier fixture strategy that §5 honors.
+- `feedback_flag_review_as_plan_amendment.md` — discipline that produced this iteration's existence.
+- `feedback_runtime_confirmation_after_web_spike.md` — discipline that produced §4 spike methodology declaration.
+- `feedback_floor_forecast_is_pre_declaration_not_estimate.md` — discipline that produced §7 floor pre-declaration.
+- `feedback_plan_iteration_depth_scales_with_design_surface.md` — discipline that produced §8 iteration depth pre-declaration.
+- `feedback_admin_changes_ride_with_code.md` — bundling discipline that locks §9's session-end-2 admin ride-along.
+- `feedback_spike_playbook_for_unknowns.md` — discipline that produced §6's spike-disposition.
+- `feedback_quote_locked_artefacts_dont_paraphrase.md` — all ADR-010 / BRD §6.2 phrases in this iteration are quoted verbatim, not paraphrased.
 
 ---
 

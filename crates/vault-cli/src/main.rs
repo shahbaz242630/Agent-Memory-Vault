@@ -20,12 +20,20 @@
 //!
 //! ## Authentication
 //!
-//! Every invocation requires the master passphrase. Read **stdin only,
-//! no-echo** via `rpassword` — no env-var support, per Phase C plan
-//! smaller-item-(a). Auth is verified by attempting to open the
-//! SQLCipher metadata DB; failure is reported generically as
-//! "authentication failed" with no information leak about which check
-//! triggered the failure (BRD §11.7.2 / §11.4.4).
+//! Authentication is implicit via OS-user keychain access. vault-cli reads
+//! the master_key from Windows Credential Manager (the SAME entry vault-
+//! tauri manages) via [`vault_app::keychain::read_or_init_master_key`],
+//! derives the SqlCipher passphrase + at-rest key per ADR-040 amendment v2
+//! option β derivation tree, then opens the storage backend via the sealed
+//! companion [`vault_storage::StorageBackend::open_with_at_rest_key`]. The
+//! V0.1 passphrase prompt (`rpassword`) was removed at T0.2.0 Phase 3 sub-
+//! task (a) (2026-05-11) — `windows-native-keyring-store` reads Credential
+//! Manager entries transparently for the running OS user with no separate
+//! unlock event to prompt for. Any keychain failure or backend-open failure
+//! is reported generically as "authentication failed" with no information
+//! leak about which check triggered the failure (BRD §11.7.2 / §11.4.4);
+//! diagnostic-side detail goes to the local `tracing` subscriber for dev
+//! debugging only.
 
 #![forbid(unsafe_code)]
 
@@ -36,10 +44,14 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use uuid::Uuid;
 
+use vault_app::keychain::{
+    derive_at_rest_key, derive_sqlcipher_passphrase, read_or_init_master_key, PRODUCTION_NAMESPACE,
+    VAULT_ID,
+};
 use vault_core::{Boundary, MemoryId};
 use vault_storage::{
     CascadeOperation, DeadLetterEntry, DivergenceDetector, DivergenceReport, Resolution,
-    SqlCipherKey, StorageBackend,
+    StorageBackend,
 };
 
 #[derive(Parser, Debug)]
@@ -140,8 +152,7 @@ fn init_tracing() {
 
 async fn real_main() -> Result<()> {
     let cli = Cli::parse();
-    let key = read_passphrase()?;
-    let backend = open_backend(&cli, key).await?;
+    let backend = open_backend(&cli).await?;
 
     if backend.degraded().is_degraded() {
         eprintln!(
@@ -201,35 +212,39 @@ fn print_divergence_report(r: &DivergenceReport) {
     }
 }
 
-/// Read the master passphrase from stdin with no echo. Returns an
-/// `SqlCipherKey` ready to pass to `StorageBackend::open`.
-///
-/// Per Phase C plan smaller-item-(a): stdin-only, NO env-var support. The
-/// stdin path is pipeable for scripts (`cat key.txt | vault-cli ...`)
-/// while still giving interactive users a no-echo prompt.
-fn read_passphrase() -> Result<SqlCipherKey> {
-    // `rpassword::prompt_password` writes the prompt to stderr (so it
-    // doesn't pollute stdout if the operator is piping the output) and
-    // reads from stdin without echoing.
-    let pw = rpassword::prompt_password("vault passphrase: ")
-        .context("failed to read passphrase from stdin")?;
-    if pw.is_empty() {
-        anyhow::bail!("passphrase must not be empty");
-    }
-    Ok(SqlCipherKey::new(pw))
+/// Open the storage backend, reading master_key from the OS keychain and
+/// deriving the SqlCipher passphrase + at-rest key per ADR-040 amendment
+/// v2 option β derivation tree. Generic `authentication failed` on any
+/// error — no info leak per BRD §11.7.2 / §11.4.4. Detailed diagnostics
+/// go to the local `tracing` subscriber for dev debugging only.
+async fn open_backend(cli: &Cli) -> Result<StorageBackend> {
+    open_backend_inner(cli, PRODUCTION_NAMESPACE, VAULT_ID).await
 }
 
-/// Open the storage backend with the supplied paths + key. Generic
-/// `authentication failed` on any error — no info leak (BRD §11.7.2 /
-/// §11.4.4). Detailed diagnostics go to the local tracing subscriber for
-/// dev debugging only.
-async fn open_backend(cli: &Cli, key: SqlCipherKey) -> Result<StorageBackend> {
-    StorageBackend::open(
+/// Inner helper taking keychain `namespace` + `vault_id` as parameters so
+/// tests can inject unique-per-test ids via [`vault_app::keychain::test_helpers::unique_test_namespace`]
+/// and avoid colliding with the production keychain entry.
+///
+/// Production callers use [`open_backend`] which passes
+/// [`PRODUCTION_NAMESPACE`] + [`VAULT_ID`].
+pub(crate) async fn open_backend_inner(
+    cli: &Cli,
+    namespace: &str,
+    vault_id: &str,
+) -> Result<StorageBackend> {
+    let master_key = read_or_init_master_key(namespace, vault_id).map_err(|e| {
+        tracing::warn!(error = %e, "keychain read failed");
+        anyhow!("authentication failed")
+    })?;
+    let sqlcipher_passphrase = derive_sqlcipher_passphrase(&master_key);
+    let at_rest_key = derive_at_rest_key(&master_key);
+    StorageBackend::open_with_at_rest_key(
         &cli.vault_db,
         &cli.vector_dir,
         &cli.graph_db,
-        key,
+        sqlcipher_passphrase,
         cli.dimension,
+        &at_rest_key,
     )
     .await
     .map_err(|e| {
@@ -462,18 +477,40 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use vault_storage::{NewDeadLetter, PAYLOAD_FORMAT_VERSION};
+    use vault_storage::{NewDeadLetter, SqlCipherKey, PAYLOAD_FORMAT_VERSION};
+
+    // Keychain test helpers (unique_test_namespace, cleanup_keychain_entry,
+    // keychain_test_guard, plant_malformed_keychain_entry) are imported from
+    // vault_app::keychain::test_helpers via the `test-helpers` feature
+    // (vault-cli's [dev-dependencies] enables it). Module is itself
+    // `#[cfg(windows)]`-gated upstream; this `use` mirrors that gating.
+    #[cfg(windows)]
+    use vault_app::keychain::test_helpers::*;
 
     const DIM: usize = 4;
+
+    /// Test-fixture at-rest key consumed by `make_backend` + the 2 new
+    /// sub-task (a) tests. Distinct from any production-derived at_rest_key
+    /// (which is BLAKE3-derived from the master_key per ADR-040 amendment
+    /// v2). 32 bytes of `0x42` is intentionally non-random + non-zero so
+    /// debug output is recognisable as test-data.
+    const TEST_AT_REST_KEY: [u8; 32] = [0x42u8; 32];
 
     async fn make_backend(tmp: &Path) -> StorageBackend {
         let metadata_path = tmp.join("vault.db");
         let vector_dir = tmp.join("lance");
         let graph_path = tmp.join("graph.duckdb");
         let key = SqlCipherKey::new("vault-cli-test-key");
-        StorageBackend::open(&metadata_path, &vector_dir, &graph_path, key, DIM)
-            .await
-            .unwrap()
+        StorageBackend::open_with_at_rest_key(
+            &metadata_path,
+            &vector_dir,
+            &graph_path,
+            key,
+            DIM,
+            &TEST_AT_REST_KEY,
+        )
+        .await
+        .unwrap()
     }
 
     fn embedding(fill: f32) -> Vec<f32> {
@@ -821,5 +858,139 @@ mod tests {
             err.to_string().contains("divergence findings present"),
             "expected findings error, got: {err}"
         );
+    }
+
+    // --------------------------------------------------------------
+    // Sub-task (a) sealed-open coverage (keychain-aware open_backend)
+    //
+    // Per HANDOFF.md "T0.2.0 close-out plan iteration 4" §3 + §9 (a)
+    // floor pre-declaration: +2 firm (sealed-open success + keychain-
+    // missing fail-closed). Optional wrong-at-rest-key test subsumed
+    // by sub-task (f) BRD §6 T0.2.0 acceptance suite criterion (c).
+    //
+    // Both tests `#[cfg(windows)]` — mirrors vault_app::keychain's
+    // Windows-only V0.2 Phase 1 scope (cross-platform per-platform
+    // keychain crates land at T0.2.0.x sub-task per ADR-040 OQ #1).
+    // --------------------------------------------------------------
+
+    // `clippy::await_holding_lock` fires because `keychain_test_guard()`
+    // returns a `std::sync::MutexGuard` held across `.await` points
+    // (`open_with_at_rest_key`, `open_backend_inner`). The mutex serializes
+    // process-global `keyring_core::set_default_store` /
+    // `unset_default_store` state across tests — releasing before awaits
+    // would defeat the serialization invariant the mutex exists to enforce.
+    // Safe here because: (a) `std::sync::Mutex` is sync (no runtime yield);
+    // (b) no other tokio task contends for KEYCHAIN_TEST_MUTEX; (c) async
+    // calls inside don't try to reacquire it. Production has no contention
+    // (vault-tauri + vault-cli each call keychain helpers once at startup).
+    #[tokio::test]
+    #[cfg(windows)]
+    #[allow(clippy::await_holding_lock)]
+    async fn open_backend_succeeds_with_keychain_initialized_vault() {
+        let _guard = keychain_test_guard();
+        let namespace = unique_test_namespace("open_backend_success");
+        let vault_id = "test-open-backend-success";
+        cleanup_keychain_entry(&namespace, vault_id);
+
+        // Bootstrap a real keychain entry via first-run path; derive the same
+        // subkeys that open_backend_inner will derive when it re-reads the
+        // entry (deterministic per ADR-040 amendment v2 derivation tree).
+        let master_key = read_or_init_master_key(&namespace, vault_id)
+            .expect("first-run should generate + persist master_key");
+        let sqlcipher_passphrase = derive_sqlcipher_passphrase(&master_key);
+        let at_rest_key = derive_at_rest_key(&master_key);
+
+        let tmp = TempDir::new().unwrap();
+        let cli = Cli::try_parse_from([
+            "vault-cli",
+            "--vault-db",
+            tmp.path().join("vault.db").to_str().unwrap(),
+            "--vector-dir",
+            tmp.path().join("lance").to_str().unwrap(),
+            "--graph-db",
+            tmp.path().join("graph.duckdb").to_str().unwrap(),
+            "--dimension",
+            &DIM.to_string(),
+            "divergence-check",
+        ])
+        .expect("Cli::try_parse_from for success test");
+
+        // Create the sealed vault first so open_backend_inner has a vault to
+        // re-open. Drop it explicitly so file handles close before the
+        // open_backend_inner call re-opens via its own internal opens.
+        {
+            let _initial = StorageBackend::open_with_at_rest_key(
+                &cli.vault_db,
+                &cli.vector_dir,
+                &cli.graph_db,
+                sqlcipher_passphrase.clone(),
+                DIM,
+                &at_rest_key,
+            )
+            .await
+            .expect("initial open_with_at_rest_key should succeed");
+        }
+
+        let result = open_backend_inner(&cli, &namespace, vault_id).await;
+        assert!(
+            result.is_ok(),
+            "open_backend_inner should succeed with valid keychain entry + sealed vault; got: {:?}",
+            result.err()
+        );
+
+        cleanup_keychain_entry(&namespace, vault_id);
+    }
+
+    // Same `clippy::await_holding_lock` allow as the success test above —
+    // see that test's preceding comment block for the full justification.
+    #[tokio::test]
+    #[cfg(windows)]
+    #[allow(clippy::await_holding_lock)]
+    async fn open_backend_fails_closed_with_generic_message_on_keychain_error() {
+        let _guard = keychain_test_guard();
+        let namespace = unique_test_namespace("open_backend_fail_closed");
+        let vault_id = "test-open-backend-fail";
+        cleanup_keychain_entry(&namespace, vault_id);
+
+        // Plant a 31-byte (malformed) keychain entry. read_or_init_master_key
+        // detects the wrong-length secret and returns
+        // VaultError::KeychainProvenance("...exists but secret is 31 bytes...").
+        // open_backend_inner's map_err converts this to a generic
+        // "authentication failed" with no info leak per BRD §11.7.2.
+        plant_malformed_keychain_entry(&namespace, vault_id);
+
+        let tmp = TempDir::new().unwrap();
+        let cli = Cli::try_parse_from([
+            "vault-cli",
+            "--vault-db",
+            tmp.path().join("vault.db").to_str().unwrap(),
+            "--vector-dir",
+            tmp.path().join("lance").to_str().unwrap(),
+            "--graph-db",
+            tmp.path().join("graph.duckdb").to_str().unwrap(),
+            "--dimension",
+            &DIM.to_string(),
+            "divergence-check",
+        ])
+        .expect("Cli::try_parse_from for fail-closed test");
+
+        let result = open_backend_inner(&cli, &namespace, vault_id).await;
+        // Cannot use `Result::expect_err` here because `StorageBackend` does
+        // not implement `Debug` by design (BRD §11 secrets-in-logs / ADR-007
+        // redaction posture). Explicit match yields the `anyhow::Error` for
+        // message inspection without requiring Debug on the Ok variant.
+        let err = match result {
+            Ok(_) => panic!("expected fail-closed on malformed keychain entry; got Ok"),
+            Err(e) => e,
+        };
+        let msg = format!("{}", err);
+        assert_eq!(
+            msg, "authentication failed",
+            "BRD §11.7.2 demands a generic error message with no info leak; \
+             leaking the underlying KeychainProvenance details would tell an \
+             attacker which check failed. Got: {msg}"
+        );
+
+        cleanup_keychain_entry(&namespace, vault_id);
     }
 }

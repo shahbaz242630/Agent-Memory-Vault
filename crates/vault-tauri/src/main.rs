@@ -80,18 +80,13 @@ use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 use vault_app::keychain::{
     bridge_or_init_master_key, derive_at_rest_key, derive_sqlcipher_passphrase,
-    PRODUCTION_NAMESPACE,
+    PRODUCTION_NAMESPACE, VAULT_ID,
 };
 use vault_app::{AppConfig, Application, EMBEDDING_DIM};
 use vault_tauri::{
     dylib_filename_for_os, env_override_for, format_keychain_error_dialog,
     format_migration_error_dialog, format_startup_failure_dialog,
 };
-
-/// V0.2 single-vault account string. V1.0 multi-vault per BRD §6.2 will
-/// pass real per-vault ids — same keychain namespace slot, multiple
-/// entries differentiated by account string per ADR-040 forward-compat.
-const VAULT_ID: &str = "default";
 
 /// Exit code for keychain provenance failures (ADR-040 + ADR-040 amendment;
 /// retains the same numeric code that V0.1 used for VAULT_KEY config errors,

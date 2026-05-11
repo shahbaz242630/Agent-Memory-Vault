@@ -96,6 +96,12 @@ api-key*
 *.sqlite-shm
 *.sqlite-wal
 
+# Test fixture — captured V0.1 binary's SQLCipher DB for ADR-041 §5 Tier 2
+# bridge test. Safe-to-commit (capture key is `fixture-capture-key-do-not-
+# use-in-prod`; never used in production).
+!crates/vault-storage/tests/fixtures/v0_1_alpha_data_dir/vault.db
+!crates/vault-storage/tests/fixtures/v0_1_alpha_data_dir/vault.db-wal
+
 # Encrypted vault files
 *.vault
 .vault/

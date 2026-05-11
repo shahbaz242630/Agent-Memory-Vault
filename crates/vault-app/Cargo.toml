@@ -92,6 +92,15 @@ blake3 = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 windows-native-keyring-store = { workspace = true }
 
+# Feature flag exposing `vault_app::keychain::test_helpers` to other crates'
+# dev-dependencies (notably vault-cli's tests for sub-task (a) sealed-open
+# coverage). Without the flag the module is `#[cfg(test)]`-gated for this
+# crate only; the feature flips the gate on for downstream test consumers.
+# Promoted at T0.2.0 Phase 3 sub-task (a) (2026-05-11) to eliminate the
+# 50-LOC duplication that would otherwise land in vault-cli's tests.
+[features]
+test-helpers = []
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 tempfile.workspace = true
