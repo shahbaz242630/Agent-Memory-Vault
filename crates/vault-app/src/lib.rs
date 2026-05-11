@@ -34,10 +34,10 @@ pub mod signal_source;
 pub use adapter::VaultAdapter;
 pub use application::{Application, ApplicationHandle};
 pub use config::AppConfig;
+pub use process_exit::{LiveProcessExit, ProcessExit};
+pub use signal_source::{LiveSignalSource, SignalSource};
 /// Re-export `EMBEDDING_DIM` from `vault_embedding` so vault-tauri (which
 /// doesn't depend on vault-embedding directly) can use the same canonical
 /// constant when calling `vault_storage::migration::migrate_v0_1_to_sealed_if_needed`
 /// at startup step 5b. Single source of truth for the BGE dimension.
 pub use vault_embedding::EMBEDDING_DIM;
-pub use process_exit::{LiveProcessExit, ProcessExit};
-pub use signal_source::{LiveSignalSource, SignalSource};
