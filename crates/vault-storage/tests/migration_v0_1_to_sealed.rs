@@ -41,18 +41,24 @@
 //! - `cookie_recovery_restores_from_backup_when_temp_dir_gone`                      — state 2
 //! - `cookie_recovery_restarts_when_step_a_did_not_happen`                          — state 3
 //!
-//! ## Tier 1a strategy (per iteration 2.1 §2)
+//! ## Tier 1 → Tier 2 collapse strategy (per iteration 4 §5 amendment, 2026-05-11)
 //!
-//! Synthetic V0.1-shape data is produced via `LanceVectorStore::open` +
-//! one `upsert` — lance 4.0 writes a real `.lance` fragment with `LANC`
-//! magic at file END. This is byte-compatible with V0.1 (lance 0.15)
-//! fragments per the iteration 3 spike's PASS evidence (lance 4.0 reads
-//! V0.1 fragments end-to-end).
+//! V0.1-shape data is produced via deep-copy of the checked-in Tier 2
+//! fixture's `lance/` subdir into the test's target dir
+//! (see [`create_v0_1_shape_data`]). Prior iteration 2.1 §2 + iteration 4 §5
+//! framings ("synthetic via `LanceVectorStore::open` + upsert" / "synthetic
+//! via `arrow_array::RecordBatch` + `parquet::arrow::ArrowWriter`") were
+//! both retracted by the §4 spike PASS + fixture README empirical
+//! evidence — V0.1 wrote Lance binary format (LANC at file END), not
+//! Parquet. With the real V0.1 fixture committed (`e27e6dc`), Tier 1
+//! collapses into Tier 2; the fixture IS the synthetic-equivalent
+//! regression catch, runs on every commit on every CI matrix OS, AND
+//! provides realism gating in one artefact.
 //!
 //! Sealed-shape data is produced via raw byte writes
 //! (`[0x01, 0x00, ...]`) under `<table>.lance/data/`. The detector only
 //! checks the first two bytes for the sealed-framing prefix per ADR-008
-//! amendment, so a minimal raw fixture suffices for Tier 1.
+//! amendment, so a minimal raw fixture suffices for sealed-side scaffolding.
 //!
 //! ## Test isolation: subdirectory pattern for migration tests
 //!
@@ -239,8 +245,8 @@ async fn migration_succeeds_on_v0_1_shape() {
     match outcome {
         MigrationOutcome::Migrated { rows_migrated } => {
             assert_eq!(
-                rows_migrated, 1,
-                "create_v0_1_shape_data inserts exactly 1 row"
+                rows_migrated, 5,
+                "create_v0_1_shape_data deep-copies the Tier 2 fixture which has exactly 5 rows per fixture README"
             );
         }
         other => panic!("expected Migrated, got {other:?}"),
@@ -342,18 +348,62 @@ async fn migration_fails_closed_on_third_party_data() {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
-/// Tier 1a strategy (iteration 2.1 §2): produce a real V0.1-shape Lance
-/// fragment by opening `LanceVectorStore` and upserting one row. This:
-/// 1. Writes the ADR-010 ALPHA marker file (via `LanceVectorStore::open`'s
-///    side effect — control #4 in the V0.1 plaintext compensating set).
-/// 2. Creates `<dir>/memories.lance/data/<uuid>.lance` containing the
-///    upserted row, ending with `LANC` magic (verified by iteration 3 spike).
+/// Tier 1 → Tier 2 collapse strategy per HANDOFF.md iteration 4 §5
+/// amendment (sub-task (b)+(c) P4 bundle, 2026-05-11): produce V0.1-shape
+/// data on disk by deep-copying the checked-in Tier 2 fixture's `lance/`
+/// subdir into `dir`. Replaces the prior "open LanceVectorStore + upsert
+/// one row" approach which had two problems: (1) the plaintext
+/// `LanceVectorStore::open` is now cfg-gated and `pub(crate)`-restricted
+/// so integration tests cannot call it; (2) iteration 2.1 §2's "Tier 1
+/// synthetic via `arrow_array::RecordBatch` + `parquet::arrow::ArrowWriter`"
+/// methodology was falsified by the §4 spike (V0.1 fragments are Lance
+/// binary format, not Parquet — fixture README lines 61-73). The
+/// committed fixture IS real V0.1-binary-emitted data and matches V0.1
+/// byte-shape exactly; deep-copy gives every caller a fresh per-test
+/// V0.1 vault dir without relying on Lance APIs or arrow/parquet writers.
+///
+/// The fixture's ALPHA marker is read-only on disk (V0.1 wrote it with
+/// `Permissions::set_readonly(true)` per ADR-010 compensating control #4
+/// + ADR-014); `fs::copy` preserves the read-only attribute on Windows.
+///
+/// We clear the read-only flag on each copied file so subsequent test
+/// operations (notably `delete_alpha_marker`) can mutate them without
+/// hitting ACCESS_DENIED.
 async fn create_v0_1_shape_data(dir: &Path) {
-    let store = LanceVectorStore::open(dir, EMBEDDING_DIM).await.unwrap();
-    let id = MemoryId::new();
-    let embedding = vec![0.1_f32 / (EMBEDDING_DIM as f32).sqrt(); EMBEDDING_DIM];
-    let boundary = Boundary::default_name();
-    store.upsert(&id, &embedding, &boundary).await.unwrap();
+    let fixture_lance = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("v0_1_alpha_data_dir")
+        .join("lance");
+    copy_dir_recursive_clear_readonly(&fixture_lance, dir)
+        .expect("deep-copy Tier 2 V0.1 fixture into test target dir");
+}
+
+/// Recursive directory copy that clears the read-only attribute on every
+/// copied file. Used by [`create_v0_1_shape_data`] so tests can mutate /
+/// delete files post-copy (notably the ALPHA marker that V0.1 wrote as
+/// read-only).
+fn copy_dir_recursive_clear_readonly(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive_clear_readonly(&src_path, &dst_path)?;
+        } else {
+            fs::copy(&src_path, &dst_path)?;
+            let mut perms = fs::metadata(&dst_path)?.permissions();
+            // Mirror migration.rs's clear_readonly_if_needed pattern — Unix
+            // makes the file world-writable but in test/tempdir contexts
+            // this is benign. Production code at migration.rs:674 uses the
+            // same allow attribute.
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            fs::set_permissions(&dst_path, perms)?;
+        }
+    }
+    Ok(())
 }
 
 /// Write a minimal sealed-shape file: `<dir>/memories.lance/data/0001.lance`
@@ -388,7 +438,7 @@ fn delete_alpha_marker(dir: &Path) {
 fn assert_alpha_marker_present(dir: &Path) {
     assert!(
         dir.join(ALPHA_WARNING_FILENAME).exists(),
-        "ADR-010 marker file should have been written by LanceVectorStore::open"
+        "ADR-010 marker file should be present in the deep-copied Tier 2 fixture's lance/ subdir per iteration 4 §5 amendment (was previously written by LanceVectorStore::open before P4 collapse)"
     );
 }
 
@@ -570,8 +620,8 @@ async fn cookie_recovery_restores_from_backup_when_temp_dir_gone() {
     match outcome {
         MigrationOutcome::Migrated { rows_migrated } => {
             assert_eq!(
-                rows_migrated, 1,
-                "create_v0_1_shape_data inserts exactly 1 row"
+                rows_migrated, 5,
+                "create_v0_1_shape_data deep-copies the Tier 2 fixture which has exactly 5 rows per fixture README"
             );
         }
         other => panic!("expected Migrated (state 2 restore-then-migrate), got {other:?}"),
@@ -618,8 +668,8 @@ async fn cookie_recovery_restarts_when_step_a_did_not_happen() {
     match outcome {
         MigrationOutcome::Migrated { rows_migrated } => {
             assert_eq!(
-                rows_migrated, 1,
-                "create_v0_1_shape_data inserts exactly 1 row"
+                rows_migrated, 5,
+                "create_v0_1_shape_data deep-copies the Tier 2 fixture which has exactly 5 rows per fixture README"
             );
         }
         other => panic!("expected Migrated (state 3 restart), got {other:?}"),

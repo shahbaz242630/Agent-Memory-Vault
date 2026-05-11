@@ -8,6 +8,20 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+# Feature flag gating the V0.1 → V0.2 plaintext-migration code path per
+# HANDOFF.md "T0.2.0 close-out plan iteration 4" §4 amendment (sub-task (b)
+# 2026-05-11). Plaintext `LanceVectorStore::open` + `StorageBackend::open`
+# + `pub mod migration` are all `#[cfg(any(test, feature = "v0_1_migration"))]`
+# / `#[cfg(feature = "v0_1_migration")]`-gated; vault-tauri enables the
+# feature (it ships the V0.1→V0.2 migration startup path); vault-cli does
+# NOT enable it (operator CLI only opens already-sealed vaults via the
+# sealed companion path from sub-task (a)). The gate is removed when V0.2.x
+# stops needing V0.1 migration (V0.2.x lifecycle question, not T0.2.0
+# scope) — at that point plaintext open + migration module get deleted
+# entirely.
+[features]
+v0_1_migration = []
+
 [dependencies]
 vault-core = { path = "../vault-core" }
 rusqlite = { workspace = true }

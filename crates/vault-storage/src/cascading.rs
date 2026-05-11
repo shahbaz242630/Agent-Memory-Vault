@@ -174,6 +174,14 @@ impl StorageBackend {
     /// DuckDB at all) still return `Err` — those mean the vault-cli
     /// can't even read the SQLite metadata, so degraded mode wouldn't
     /// help.
+    ///
+    /// **Visibility (T0.2.0 Phase 3 sub-task (b)+(c), 2026-05-11):** gated to
+    /// `#[cfg(any(test, feature = "v0_1_migration"))]` per HANDOFF.md iteration 4
+    /// §4 amendment cascade scope expansion (option α). Calls the gated plaintext
+    /// [`LanceVectorStore::open`] at line 194; the cascade gate keeps cascading.rs
+    /// compiling when the feature is off (the gated symbol it references doesn't
+    /// exist in those builds, so this function must also not exist).
+    #[cfg(any(test, feature = "v0_1_migration"))]
     #[instrument(
         skip(metadata_path, vector_data_dir, graph_path, key),
         fields(

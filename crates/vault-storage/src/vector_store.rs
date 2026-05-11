@@ -50,14 +50,25 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
-use chrono::{TimeDelta, Utc};
+use chrono::TimeDelta;
+// `Utc` is only used by the gated `write_alpha_warning` (timestamp in the
+// ALPHA marker body) per sub-task (b)+(c) P4 bundle (2026-05-11). Without
+// the gate, non-feature-enabled builds trip unused-import under -D warnings.
+#[cfg(any(test, feature = "v0_1_migration"))]
+use chrono::Utc;
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::table::{CompactionOptions, OptimizeAction, Table};
 use lancedb::{DistanceType, ObjectStoreRegistry, Session};
 use tokio::sync::Mutex;
-use tracing::{info, instrument, warn};
+use tracing::{info, instrument};
+// `warn` is only used by the gated plaintext `LanceVectorStore::open`
+// (ADR-010 compensating control #3 WARN log) per sub-task (b)+(c) P4
+// bundle (2026-05-11). Without this gate, non-feature-enabled builds
+// trip the unused-import lint under -D warnings.
+#[cfg(any(test, feature = "v0_1_migration"))]
+use tracing::warn;
 use zeroize::Zeroizing;
 
 use vault_core::{Boundary, MemoryId, VaultError, VaultResult};
@@ -240,6 +251,33 @@ impl LanceVectorStore {
     ///
     /// Steps 2 and 3 are non-negotiable V0.1 compensating controls for the
     /// plaintext-on-disk deviation; both are removed by T0.2.0.
+    ///
+    /// **Visibility (T0.2.0 Phase 3 sub-task (b)+(c), 2026-05-11):** gated to
+    /// `#[cfg(any(test, feature = "v0_1_migration"))]` per HANDOFF.md iteration 4
+    /// §4 amendment. The `any(test, feature)` form keeps vault-storage's own unit
+    /// tests compiling without needing the feature flag (cfg(test) applies inside
+    /// the crate's own test build); the `feature` half exposes the plaintext path
+    /// to downstream crates (vault-tauri, vault-retrieval's tests) that opt in by
+    /// enabling `v0_1_migration` on their vault-storage dep. vault-cli does NOT
+    /// enable the feature; its per-package build excludes plaintext open from the
+    /// binary.
+    ///
+    /// **`pub` (not `pub(crate)`) — iteration 4 §4 amendment retraction (2026-05-11
+    /// sub-task (b)+(c) recon iteration 4):** the original §4 wording locked
+    /// `pub(crate)`, but the local DoD-gate run surfaced that vault-retrieval's
+    /// tests at `crates/vault-retrieval/tests/common/mod.rs:103` +
+    /// `crates/vault-retrieval/src/strategies/semantic.rs:354` call this function
+    /// from a separate crate's test code. `pub(crate)` blocks cross-crate access
+    /// even with the feature flag enabled. Iteration 4 §1's caller enumeration
+    /// missed these. The feature flag (cfg-gate) remains the architectural gate
+    /// controlling EXISTENCE — `pub` vs `pub(crate)` only controls VISIBILITY when
+    /// the function exists. The "callable from migration.rs only" intent is
+    /// preserved at the user-distribution surface (vault-cli's binary excludes
+    /// plaintext open via its per-package build without the feature); test
+    /// consumers (vault-retrieval) opt in via dev-deps. Sub-task (d) later
+    /// migrates vault-retrieval's tests to sealed open_with_at_rest_key, at
+    /// which point the test-side feature dep can be removed.
+    #[cfg(any(test, feature = "v0_1_migration"))]
     #[instrument(
         skip(data_dir),
         fields(data_dir = %data_dir.display(), dimension)
@@ -732,6 +770,13 @@ impl LanceVectorStore {
     /// Even at 10K rows × ~1.6 KB/row ≈ 16 MB peak — trivial. Streaming
     /// would be premature optimisation; bulk-collect matches the existing
     /// `validate_readable()` shape exactly.
+    ///
+    /// Gated to `#[cfg(any(test, feature = "v0_1_migration"))]` per sub-task
+    /// (b)+(c) P4 bundle (2026-05-11) — sole caller is migration.rs which
+    /// is itself gated on the same feature; without the gate this function
+    /// trips dead-code under -D warnings on per-package builds (vault-cli)
+    /// that don't enable the feature.
+    #[cfg(any(test, feature = "v0_1_migration"))]
     pub(crate) async fn scan_all_rows_for_migration(
         &self,
     ) -> VaultResult<Vec<(MemoryId, Vec<f32>, Boundary)>> {
@@ -820,6 +865,11 @@ impl LanceVectorStore {
 /// Unix it clears write bits, on Windows it sets `FILE_ATTRIBUTE_READONLY`.
 /// We deliberately re-write the body on every open so the timestamp is
 /// fresh and the message can't be overwritten by accident.
+///
+/// Gated to `#[cfg(any(test, feature = "v0_1_migration"))]` per sub-task
+/// (b)+(c) P4 bundle (2026-05-11) — sole caller is plaintext
+/// `LanceVectorStore::open` which is itself gated on the same feature.
+#[cfg(any(test, feature = "v0_1_migration"))]
 fn write_alpha_warning(data_dir: &Path) -> VaultResult<()> {
     let path = data_dir.join(ALPHA_WARNING_FILENAME);
     let now = Utc::now().to_rfc3339();

@@ -44,6 +44,19 @@ vault-embedding = { path = "../vault-embedding" }
 # pipeline no longer builds JSON at this layer).
 
 [dev-dependencies]
+# vault-storage with `v0_1_migration` feature enabled per HANDOFF.md
+# iteration 4 §4 amendment iteration 4 (sub-task (b)+(c) P4 bundle,
+# 2026-05-11). vault-retrieval's tests at
+# `crates/vault-retrieval/tests/common/mod.rs:103` +
+# `crates/vault-retrieval/src/strategies/semantic.rs:354` (in `mod tests`)
+# call the plaintext `LanceVectorStore::open` for fixture setup. The
+# feature flag exposes the plaintext path to feature-enabled consumers;
+# vault-retrieval opts in for its test builds only. Sub-task (d) later
+# migrates these tests to sealed `open_with_at_rest_key` + a
+# `TEST_AT_REST_KEY` const (same pattern as sub-task (a)'s vault-cli
+# `make_backend` migration), at which point this dev-dep entry can drop
+# the feature.
+vault-storage = { path = "../vault-storage", features = ["v0_1_migration"] }
 tokio = { workspace = true }
 tokio-test.workspace = true
 proptest.workspace = true
