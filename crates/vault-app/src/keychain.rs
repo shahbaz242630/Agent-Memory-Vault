@@ -44,8 +44,11 @@
 //! the two consumers; same primitive (BLAKE3) preserves single-source-crypto
 //! per ADR-008 amendment line 693.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(windows)]
+use std::path::PathBuf;
 
+#[cfg(windows)]
 use tracing::{info, instrument, warn};
 use vault_core::{VaultError, VaultResult};
 use zeroize::Zeroizing;
@@ -496,6 +499,7 @@ fn run_v0_1_bridge(
 
 /// Sibling-path-of-vault.db for the pre-bridge snapshot. For input
 /// `vault.db`, returns `vault.db.pre_v0_2_bridge`.
+#[cfg(windows)]
 fn snapshot_path_for(vault_db_path: &Path) -> PathBuf {
     let mut s = vault_db_path.as_os_str().to_owned();
     s.push(".pre_v0_2_bridge");

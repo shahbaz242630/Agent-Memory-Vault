@@ -1,7 +1,7 @@
 # Memory Vault — Build Handoff
 
 **Current version:** V0.2 Closed Beta (BRD §6.2 — sleep consolidator, boundaries hardening, cross-device sync, 30 beta users)
-**Last updated:** 2026-05-11 session (Phase 2 SHIPPED at `02799b5` CI green run `25660977905`. **This session — ADR-041 V0.1 → V0.2 SQLCipher passphrase bridge IMPLEMENTED, ready for commit:** discovered as Phase 2 follow-on gap, planned across 2 iterations + spike, implemented end-to-end. Working tree: HANDOFF.md modified (iteration 2 LOCKED + iteration 2.1 spike-findings + ADR-041 final text), spike artifact (`sqlcipher_rekey_spike.rs`, untracked), bridge implementation (`vault-app/src/keychain.rs`, `vault-app/Cargo.toml` dev-dep, `vault-storage/src/{metadata_store,lib}.rs`, `vault-tauri/src/main.rs` step renumber + bridge call). Test results: 27/27 vault-app lib tests pass (8 new bridge tests = 7 Tier 1 + 1 Tier 2 using captured V0.1 fixture from commit `1d72aac`). Spike clean: Stages A + B PASS, read-only probe revealed silent-in-memory-rekey behavior → produced the "Post-write verification invariant" pinning. Test 7 methodology: (a) corrupted-fixture (in-test byte mutation at offset 6000 of multi-page fixture) — candidate (ii) from pin 2; works reliably on rusqlite + bundled-sqlcipher chain. Floor: +8 vault-app tests exactly as pre-declared. Next: workspace DoD gates → commit + push + CI watch → Phase 2 Tier 3 founder smoke now unblocked.)
+**Last updated:** 2026-05-11 session-end checkpoint (Phase 2 + ADR-041 both SHIPPED. **Latest commit:** ADR-041 V0.1 → V0.2 SQLCipher passphrase bridge at `6f2af9d` (push 12:21Z, run `25669781494` IN_PROGRESS at session pause — verify via `gh run view 25669781494` on next-session open per CLAUDE.md per-commit CI standing rule). **Previous commit:** Phase 2 fmt-fix `02799b5` (run `25660977905` GREEN matrix-wide 1h4m55s, verified before staging ADR-041). **All workspace DoD gates green pre-push:** fmt clean, clippy `-D warnings` clean, build zero warns 41m38s, test 0 failures (vault-app: 27 passed +8 bridge tests; vault-storage lib: 232 stable; migration_v0_1_to_sealed: 16 stable; 17 pre-existing ignored markers preserved). **Working tree at session pause:** HANDOFF.md modified (this `Last updated` header + the next-session checkpoint section below) — admin-only doc edit, bundles with next code commit per `feedback_admin_changes_ride_with_code.md`. **Next-session opener:** see "## T0.2.0 next-session opener" section directly below the Current Status block.)
 **Updated by:** Claude (Opus 4.7)
 
 > **📁 V0.1 historical record:** `HANDOFF_V0.1_ARCHIVE.md` — frozen as of 2026-05-06. Full T0.1.1 → T0.1.12 phase narratives, ADRs 001-036 full text, tech-debt closures, plan-iteration histories. Cross-link out to that file when V0.2 work needs V0.1 detail; do NOT paraphrase.
@@ -32,6 +32,86 @@
 **Working tree at session pause** (all bundle with Phase 2 commit per `feedback_admin_changes_ride_with_code.md`): HANDOFF.md M, AppConfig and Cargo.toml workspace deps unchanged, `crates/vault-storage/{src/{cascading,migration,sealed_object_store,vector_store,lib}.rs, tests/migration_v0_1_to_sealed.rs, Cargo.toml}` M, `crates/vault-app/src/{application,lib}.rs` M, `crates/vault-tauri/src/{lib,main}.rs` M.
 
 **Why we got here:** V0.2 first task per BRD §6 is T0.2.0 (LanceDB Encryption at Rest, HARD GATE per ADR-010). Spike v1 (lance 0.15 era, designed against `WrappingObjectStore`) FORMALLY FAILED 2026-05-07 — discovered lance-io 0.15's `LocalObjectReader` bypasses the `object_store::ObjectStore` trait for `file://` URIs in BOTH directions, defeating both the `WrappingObjectStore` wrapper AND direct injection via `ObjectStoreParams.object_store`. Web research found lance-io 4.x exposes a first-class `ObjectStoreProvider` + `ObjectStoreRegistry` API designed for this exact integration — but requires a **major lancedb upgrade** (0.8 → 0.27.2, 19 minor versions). Phase 0a executed the upgrade; Phase 0a-fix resolved a `merge_insert` memory regression surfaced by the upgrade (see ADR-038); Phase 0b audit + ADR-039 production fix; Phase 0c re-spiked the at-rest extension on the upgraded stack with the spike-discipline runtime-confirmation (per `feedback_runtime_confirmation_after_web_spike.md`) — and caught a real privacy bug in the Phase 0b ADR-039 implementation, fixed before V0.2 beta cohort exposure.
+
+---
+
+## T0.2.0 next-session opener (2026-05-11 session-end checkpoint)
+
+**On session open, do these three in order:**
+
+### 1. Verify CI green on the ADR-041 push `6f2af9d`
+
+```powershell
+gh run view 25669781494 --json status,conclusion,jobs -q '"status=" + .status + " conclusion=" + (.conclusion // "(empty)") + "\n" + (.jobs | map("  " + .name + ": " + .status + (if .conclusion != "" then " (" + .conclusion + ")" else "" end)) | join("\n"))'
+```
+
+Per saved-memory `feedback_gh_run_watch_exit_not_equal_run_status.md`: trust `gh run view` actual status, NOT `gh run watch` exit code (watch-tool failures are network/rate-limit/session-drop transients).
+
+- **If `conclusion=success`:** CI green, proceed to step 2.
+- **If `conclusion=failure`:** broken CI is a regression — fix in this session per `feedback_broken_ci_is_regression_not_techdebt.md`. Diagnose via per-job failures in the JSON output; common past failures were cargo fmt drift (saved-memory `feedback_fmt_runs_last_before_commit.md`).
+- **If still `in_progress`:** historically the matrix takes 40-67 min; just rerun the command after a few minutes.
+
+### 2. Working-tree state
+
+`git status --short` should show ONE modified file:
+
+```
+ M HANDOFF.md
+```
+
+This is the doc-only edit (this very "next-session opener" section + `Last updated` header refresh) made at 2026-05-11 session pause AFTER the `6f2af9d` commit. Bundles with the next code commit per `feedback_admin_changes_ride_with_code.md`. **Do NOT commit this as a standalone admin commit** — wait for the next code change to ride alongside.
+
+### 3. Next work unit — Tier 3 founder smoke (now UNBLOCKED)
+
+ADR-041 SHIPPED + CI green = Phase 2 Tier 3 founder smoke against the real V0.1 vault becomes feasible. Per Phase 2 plan iteration 1 §4 (Tier 3 was BLOCKED on ADR-041 — see HANDOFF "Tier 3 founder smoke status: BLOCKED on discovered Phase 1 follow-on" in the Phase 2 implementation milestone block).
+
+**Tier 3 procedure (founder action, ~15-30 min on Windows):**
+
+```powershell
+# Step 1 — Snapshot V0.1 vault for safety
+Copy-Item -Recurse `
+  $env:APPDATA\com.memoryvault.dev\lance\ `
+  $env:APPDATA\com.memoryvault.dev\lance.pre-v0.2-snapshot\
+
+Copy-Item `
+  $env:APPDATA\com.memoryvault.dev\vault.db `
+  $env:APPDATA\com.memoryvault.dev\vault.db.pre-v0.2-snapshot
+
+# Step 2 — Set VAULT_KEY env (V0.1 value, session-scope)
+$env:VAULT_KEY = "<your V0.1 passphrase>"
+
+# Step 3 — Launch Phase 2 binary built from this working tree
+cargo run --release -p vault-tauri
+# (or launch the built MSI / target/release/vault-tauri.exe)
+
+# Step 4 — Verify in UI
+# - First launch: bridge runs SQLCipher rekey + LanceDB migration
+#   - INFO log: "V0.1 → V0.2 SQLCipher passphrase bridge complete"
+#   - INFO log: "V0.1 → V0.2 migration complete: {rows} rows migrated"
+# - Search for known memories → results returned
+# - No error dialog at startup
+
+# Step 5 — Verify post-migration state
+Test-Path $env:APPDATA\com.memoryvault.dev\lance\ALPHA_DO_NOT_STORE_REAL_DATA.txt
+# Expected: False
+
+Test-Path $env:APPDATA\com.memoryvault.dev\vault.db.pre_v0_2_bridge
+# Expected: False (snapshot consumed post-success per ADR-041 §3 step 8)
+```
+
+**If Tier 3 surfaces any issue:** STOP, snapshot the current state, surface to Claude with diagnostic details. Tier 3 is the realism gate that Tier 1 (synthetic fixtures) + Tier 2 (captured V0.1 binary fixture from commit `1d72aac`, 5 rows) cannot cover.
+
+**If Tier 3 passes:** Phase 4 founder dogfood is unblocked; the T0.2.0 close-out plan iteration 1's Phase 3 (controls-removal + acceptance suite) becomes the next coding focus.
+
+### 4. Reference — open work units (per T0.2.0 close-out plan iteration 1)
+
+| Phase | Status | What |
+|---|---|---|
+| ADR-041 SQLCipher bridge | ✅ SHIPPED 6f2af9d (CI pending) | Closes the Phase 2 follow-on gap; unblocks Tier 3 + Phase 4 + alpha cohort |
+| Phase 2 Tier 3 founder smoke | UNBLOCKED, founder action | Manual run against real V0.1 vault (this section above) |
+| Phase 3 — controls removal + acceptance suite | NEXT CODING WORK | Remove ADR-010 banners (modal + persistent strip), delete plaintext `LanceVectorStore::open` + plaintext `StorageBackend::open`, T0.2.0 acceptance suite (DoD tests proving sealing is the only path). Mechanical work; no major design questions expected. |
+| Phase 4 — founder dogfood on sealed (Windows) | Blocked on Phase 3 + Tier 3 | Re-run V0.1's 6-hour ADR-029 dogfood pattern against the sealed build |
+| Phase 5 — T0.2.0 hard-gate clearance | Blocked on Phase 4 | Banners removed, sealing-only invariant locked, founder dogfood passed, all BRD §6.2 acceptance criteria green |
 
 ---
 
