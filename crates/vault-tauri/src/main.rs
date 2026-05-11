@@ -79,7 +79,8 @@ use std::path::PathBuf;
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 use vault_app::keychain::{
-    derive_at_rest_key, derive_sqlcipher_passphrase, read_or_init_master_key, PRODUCTION_NAMESPACE,
+    bridge_or_init_master_key, derive_at_rest_key, derive_sqlcipher_passphrase,
+    PRODUCTION_NAMESPACE,
 };
 use vault_app::{AppConfig, Application, EMBEDDING_DIM};
 use vault_tauri::{
@@ -114,40 +115,7 @@ fn main() {
             vault_tauri::commands::acknowledge_alpha_banner,
         ])
         .setup(|app| {
-            // 1. Source master_key from OS keychain per ADR-040 + ADR-040
-            //    amendment (T0.2.0 Phase 1). On first run (no entry exists)
-            //    the helper internally generates a new 32-byte master_key
-            //    via getrandom + persists via set_secret + returns the new
-            //    key. Any non-NotFound keychain error fails closed: ERROR
-            //    log + fatal dialog + exit non-zero.
-            //
-            //    The master_key is then split into two domain-separated
-            //    BLAKE3 subkeys per ADR-040 amendment option β:
-            //    - `sqlcipher_passphrase` (hex-encoded → SqlCipherKey)
-            //    - `at_rest_key` (32 bytes → AppConfig.at_rest_key, staged
-            //      for Phase 2/3 LanceVectorStore::open_with_at_rest_key
-            //      consumer per iteration-1.5 amendment Discovery 4).
-            //
-            //    Replaces the V0.1 VAULT_KEY env var path (ADR-032 retired).
-            let master_key = match read_or_init_master_key(PRODUCTION_NAMESPACE, VAULT_ID) {
-                Ok(k) => k,
-                Err(err) => {
-                    show_fatal_dialog_and_exit(
-                        app.handle(),
-                        "Memory Vault — Keychain Access Failed",
-                        &format_keychain_error_dialog(&err),
-                        EXIT_CONFIG_ERROR,
-                    );
-                }
-            };
-            let key = derive_sqlcipher_passphrase(&master_key);
-            let at_rest_key = derive_at_rest_key(&master_key);
-            // master_key drops here — the two derived subkeys carry the
-            // keying material forward; Zeroizing wipes the master_key
-            // bytes on Drop per BRD §11.5.3.
-            drop(master_key);
-
-            // 2. Resolve libonnxruntime dylib path per ADR-019.
+            // 1. Resolve libonnxruntime dylib path per ADR-019.
             let ort_lib_path = match resolve_ort_lib_path(app.handle()) {
                 Ok(p) => p,
                 Err(e) => {
@@ -167,7 +135,7 @@ fn main() {
                 }
             };
 
-            // 3. Resolve bundled model + tokenizer paths per ADR-019/020.
+            // 2. Resolve bundled model + tokenizer paths per ADR-019/020.
             //    Phase 4b HIGH fix: ?-propagation → fatal-dialog routing for
             //    UX consistency with the surrounding setup() failure paths.
             let model_path = match resolve_model_path(app.handle()) {
@@ -195,7 +163,7 @@ fn main() {
                 ),
             };
 
-            // 4. Per-user data directory.
+            // 3. Per-user data directory.
             let data_dir = match app.path().app_data_dir() {
                 Ok(p) => p,
                 Err(e) => show_fatal_dialog_and_exit(
@@ -219,6 +187,66 @@ fn main() {
             let metadata_path = data_dir.join("vault.db");
             let vector_dir = data_dir.join("lance");
             let graph_path = data_dir.join("graph.duckdb");
+
+            // 4. Source master_key per ADR-040 + ADR-041. The bridge
+            //    composes ADR-040's keychain logic with the V0.1 → V0.2
+            //    SQLCipher passphrase bridge (ADR-041 plan iteration 2):
+            //    - Keychain entry present → return existing master_key
+            //      (V0.2 second-launch path; identical to read_or_init).
+            //    - Keychain absent + no V0.1 vault.db → fresh-init via
+            //      read_or_init's first-run path.
+            //    - Keychain absent + V0.1 vault.db present → V0.1 bridge:
+            //      verify VAULT_KEY env var unlocks vault.db → generate
+            //      new master_key → keychain write FIRST → snapshot
+            //      vault.db → PRAGMA rekey to new keychain-derived
+            //      passphrase → close+reopen+verify (post-write
+            //      verification invariant per ADR-041 §10) → cleanup
+            //      snapshot. Fail-closed with rollback at any step.
+            //
+            //    This step needs `data_dir` (to detect V0.1 vault.db)
+            //    so it runs AFTER step 3 (data_dir resolution), unlike
+            //    pre-ADR-041 ordering where keychain was step 1. Step
+            //    renumbering 1-4 reflects the new ordering.
+            //
+            //    The master_key is then split into two domain-separated
+            //    BLAKE3 subkeys per ADR-040 amendment option β:
+            //    - `sqlcipher_passphrase` (hex-encoded → SqlCipherKey)
+            //    - `at_rest_key` (32 bytes → AppConfig.at_rest_key,
+            //      consumed by Application::new's
+            //      StorageBackend::open_with_at_rest_key per Phase 2).
+            //
+            //    Replaces the V0.1 VAULT_KEY env var path (ADR-032
+            //    retired in Phase 1; ADR-041 bridges existing V0.1
+            //    vaults forward).
+            //    VAULT_KEY env var is read here (once, at the call site)
+            //    rather than inside the bridge so the bridge stays a pure
+            //    fn of its inputs — avoids hidden env dependency + keeps
+            //    tests pure. Empty string treated as unset (matches the
+            //    bridge's Some-with-non-empty-content discipline).
+            let vault_key_env = std::env::var("VAULT_KEY").ok();
+            let v0_1_vault_key = vault_key_env.as_deref().filter(|s| !s.is_empty());
+            let master_key = match bridge_or_init_master_key(
+                &data_dir,
+                PRODUCTION_NAMESPACE,
+                VAULT_ID,
+                v0_1_vault_key,
+            ) {
+                Ok(k) => k,
+                Err(err) => {
+                    show_fatal_dialog_and_exit(
+                        app.handle(),
+                        "Memory Vault — Keychain Access Failed",
+                        &format_keychain_error_dialog(&err),
+                        EXIT_CONFIG_ERROR,
+                    );
+                }
+            };
+            let key = derive_sqlcipher_passphrase(&master_key);
+            let at_rest_key = derive_at_rest_key(&master_key);
+            // master_key drops here — the two derived subkeys carry the
+            // keying material forward; Zeroizing wipes the master_key
+            // bytes on Drop per BRD §11.5.3.
+            drop(master_key);
 
             // 5. Build AppConfig from resolved paths + the derived subkeys.
             let config = AppConfig {

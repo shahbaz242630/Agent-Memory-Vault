@@ -96,3 +96,8 @@ windows-native-keyring-store = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
 tempfile.workspace = true
 serde_json = { workspace = true }
+# T0.2.0 ADR-041 (2026-05-11): bridge tests construct synthetic V0.1
+# SQLCipher fixtures via direct rusqlite usage (PRAGMA key + INSERT).
+# Production vault-app code stays rusqlite-free — the bridge composes
+# `vault_storage::rekey_in_place` which wraps the SQLCipher dance.
+rusqlite = { workspace = true }

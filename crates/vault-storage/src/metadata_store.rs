@@ -491,6 +491,154 @@ impl MetadataStore {
 }
 
 // ---------------------------------------------------------------------------
+// SQLCipher passphrase primitives — for ADR-041 V0.1 → V0.2 bridge.
+// Free fns (not on MetadataStore) because they're one-shot transition
+// operations distinct from normal store ops. Sync — caller wraps in
+// spawn_blocking if needed.
+// ---------------------------------------------------------------------------
+
+/// Open a SQLCipher file and verify the given passphrase unlocks it.
+///
+/// Returns `Ok(())` if the passphrase decrypts the file (verified by a
+/// schema query — SQLCipher defers verification to first query, NOT to
+/// the `PRAGMA key` set itself). Returns `VaultError::Storage` with a
+/// descriptive message on any failure (open, set-key, query).
+///
+/// **Used by ADR-041 bridge step 1** (per HANDOFF.md ADR-041 plan
+/// iteration 2 §3) to fail-fast on a wrong V0.1 VAULT_KEY env value
+/// BEFORE writing a new keychain entry — avoids creating a keychain
+/// entry that points to a master_key for a vault the bridge can't
+/// actually rekey.
+///
+/// Connection drops at function return — file lock released. Same
+/// `OpenFlags::SQLITE_OPEN_NO_MUTEX` shape as `rekey_in_place` (single-
+/// threaded one-shot use; no concurrent access).
+#[instrument(skip(path, passphrase), fields(path = %path.display()))]
+pub fn verify_sqlcipher_passphrase(path: &Path, passphrase: &SqlCipherKey) -> VaultResult<()> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| VaultError::Storage(format!("verify: open {}: {e}", path.display())))?;
+    conn.pragma_update(None, "key", passphrase.as_str())
+        .map_err(|e| VaultError::Storage(format!("verify: set key: {e}")))?;
+    conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+        row.get::<_, i64>(0)
+    })
+    .map_err(|e| {
+        VaultError::Storage(format!(
+            "verify: passphrase verification failed (wrong passphrase or file not \
+             a SQLCipher database): {e}"
+        ))
+    })?;
+    Ok(())
+}
+
+/// Re-encrypt a SQLCipher file in place from `old_passphrase` to
+/// `new_passphrase`.
+///
+/// **Sequence (per ADR-041 plan iteration 2 §3 + §10 post-write
+/// verification invariant):**
+///
+/// 1. Open `path` with `old_passphrase`. Schema-query verify (catches
+///    "wrong old passphrase" before any rekey attempt).
+/// 2. `PRAGMA rekey '<new_passphrase>'` — re-encrypts every page in
+///    place with the new key.
+/// 3. Close the connection.
+/// 4. **Reopen with `new_passphrase` + schema-query verify** — load-bearing
+///    per ADR-041 §10 post-write verification invariant: SQLCipher's
+///    `PRAGMA rekey` may return Ok with the changes living only in the
+///    connection's memory (spike Read-only probe 2026-05-11 — Outcome 3).
+///    Without this verify step, multiple silent-failure modes (read-only
+///    file, disk-full, antivirus locks, ACL changes, network filesystem
+///    flush quirks) would leave `path` actually still keyed by
+///    `old_passphrase` while the caller proceeds as though it's now keyed
+///    by `new_passphrase`.
+///
+/// **Caller responsibility (per ADR-041 §2 cross-store snapshot-commit
+/// invariant Pattern B):** the caller MUST take a pre-rekey snapshot of
+/// `path` BEFORE invoking this primitive, AND MUST roll back via snapshot
+/// restore on Err return. This primitive does NOT take or manage the
+/// snapshot — that's the caller's composition responsibility.
+///
+/// # Errors
+///
+/// - `VaultError::Storage` wrapping any rusqlite open / pragma / query
+///   failure. Error messages include the failing step name for triage.
+/// - Wrong `old_passphrase` surfaces as schema-query Err at step 1
+///   (NOT as PRAGMA-key Err — SQLCipher defers verification to first
+///   query).
+///
+/// # Idempotency
+///
+/// Calling `rekey_in_place(path, K, K)` (same passphrase both sides) is
+/// safe but pointless — SQLCipher rewrites every page with the same key.
+/// Caller should compare passphrases before invoking if avoiding the
+/// rewrite is important.
+///
+/// # See also
+///
+/// - ADR-041 plan iteration 2 §3 step 6-7 (the bridge sequence calling
+///   this primitive).
+/// - HANDOFF.md ADR-041 §10 post-write verification invariant
+///   (rationale for the close+reopen+verify step).
+/// - `crates/vault-storage/examples/sqlcipher_rekey_spike.rs` (compile-
+///   and-run runtime evidence the primitive works on this dep chain).
+#[instrument(skip(path, old_passphrase, new_passphrase), fields(path = %path.display()))]
+pub fn rekey_in_place(
+    path: &Path,
+    old_passphrase: &SqlCipherKey,
+    new_passphrase: &SqlCipherKey,
+) -> VaultResult<()> {
+    // Step 1: open + verify with old passphrase.
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| VaultError::Storage(format!("rekey: open {}: {e}", path.display())))?;
+    conn.pragma_update(None, "key", old_passphrase.as_str())
+        .map_err(|e| VaultError::Storage(format!("rekey: set old key: {e}")))?;
+    conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+        row.get::<_, i64>(0)
+    })
+    .map_err(|e| {
+        VaultError::Storage(format!(
+            "rekey: old-passphrase verification failed (wrong old passphrase or \
+             file not a SQLCipher database): {e}"
+        ))
+    })?;
+
+    // Step 2: PRAGMA rekey to new passphrase.
+    conn.pragma_update(None, "rekey", new_passphrase.as_str())
+        .map_err(|e| VaultError::Storage(format!("rekey: PRAGMA rekey: {e}")))?;
+
+    // Step 3: close the connection so the next open sees committed state.
+    drop(conn);
+
+    // Step 4: reopen with NEW passphrase + verify (post-write verification
+    // invariant per ADR-041 §10 — load-bearing, not belt-and-suspenders).
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| VaultError::Storage(format!("rekey: post-rekey reopen: {e}")))?;
+    conn.pragma_update(None, "key", new_passphrase.as_str())
+        .map_err(|e| VaultError::Storage(format!("rekey: post-rekey set new key: {e}")))?;
+    conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+        row.get::<_, i64>(0)
+    })
+    .map_err(|e| {
+        VaultError::Storage(format!(
+            "rekey: post-rekey verification failed (PRAGMA rekey returned Ok but \
+             reopen with new passphrase fails — silent in-memory rekey or write \
+             not persisted): {e}"
+        ))
+    })?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Transaction-bound helpers (sync). Centralised so the test harness can
 // exercise them too if needed and so all SQL lives in one place.
 //

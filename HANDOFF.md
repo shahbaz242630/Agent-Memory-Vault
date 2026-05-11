@@ -1,7 +1,7 @@
 # Memory Vault — Build Handoff
 
 **Current version:** V0.2 Closed Beta (BRD §6.2 — sleep consolidator, boundaries hardening, cross-device sync, 30 beta users)
-**Last updated:** 2026-05-11 session (T0.2.0 Phase 2 detector + scaffolding milestone SHIPPED at `a4f293c`, CI run `25635424433` GREEN. **This session — Phase 2 implementation milestone HOLDS, ready for commit:** migration loop impl + cookie-recovery state machine + StorageBackend sealed-companion + vault-tauri step 5b + dialog helper + 2 design-question catches that produced same-commit ADR amendments. Both catches surfaced before wiring: (1) `LanceVectorStore::open_with_at_rest_key` master_key→at_rest_key signature fix (canonical K3 derivation site at vault-app::keychain; deletion of duplicate K3 site at vault-storage); (2) **ADR-008 amendment v2** — AAD path semantics absolute → relative-to-store-root, surfaced by the first migration test that exercised file mobility, unblocks atomic-rename migration pattern. All workspace DoD gates green: build (zero warnings, 23m20s), 232 vault-storage lib tests + 16 migration tests + 17 pre-existing ignored markers preserved, fmt, clippy `-D warnings`. Floor amendments to surface in commit message: +5 vault-storage tests pre-approved (3 cookie-recovery + 1 rename-positive + 1 right-key-wrong-relative-path-negative) + 4 surplus on AAD path-semantics defensive pins (`aad_is_equal_for_same_relative_path_under_different_bases` + 3 helper-strip pins) — both surplus and pre-approval blocks explicitly approved 2026-05-11 in-session per `feedback_floor_forecast_is_pre_declaration_not_estimate.md`. Plan amendment: cookie-path naming `vector_dir.with_extension("vault_migration_in_progress")` (per-vault sibling) instead of iteration 2 §2 literal `vector_dir.parent().join(".vault_migration_in_progress")` — needed for parallel-test isolation under `RUST_TEST_THREADS=4`; production semantics unchanged. Tier 3 founder smoke pending before commit per iteration 1 §4. See "## T0.2.0 Phase 2 — implementation milestone (2026-05-11)" section below for full deliverables + ADR-008 amendment v2 text.)
+**Last updated:** 2026-05-11 session (Phase 2 SHIPPED at `02799b5` CI green run `25660977905`. **This session — ADR-041 V0.1 → V0.2 SQLCipher passphrase bridge IMPLEMENTED, ready for commit:** discovered as Phase 2 follow-on gap, planned across 2 iterations + spike, implemented end-to-end. Working tree: HANDOFF.md modified (iteration 2 LOCKED + iteration 2.1 spike-findings + ADR-041 final text), spike artifact (`sqlcipher_rekey_spike.rs`, untracked), bridge implementation (`vault-app/src/keychain.rs`, `vault-app/Cargo.toml` dev-dep, `vault-storage/src/{metadata_store,lib}.rs`, `vault-tauri/src/main.rs` step renumber + bridge call). Test results: 27/27 vault-app lib tests pass (8 new bridge tests = 7 Tier 1 + 1 Tier 2 using captured V0.1 fixture from commit `1d72aac`). Spike clean: Stages A + B PASS, read-only probe revealed silent-in-memory-rekey behavior → produced the "Post-write verification invariant" pinning. Test 7 methodology: (a) corrupted-fixture (in-test byte mutation at offset 6000 of multi-page fixture) — candidate (ii) from pin 2; works reliably on rusqlite + bundled-sqlcipher chain. Floor: +8 vault-app tests exactly as pre-declared. Next: workspace DoD gates → commit + push + CI watch → Phase 2 Tier 3 founder smoke now unblocked.)
 **Updated by:** Claude (Opus 4.7)
 
 > **📁 V0.1 historical record:** `HANDOFF_V0.1_ARCHIVE.md` — frozen as of 2026-05-06. Full T0.1.1 → T0.1.12 phase narratives, ADRs 001-036 full text, tech-debt closures, plan-iteration histories. Cross-link out to that file when V0.2 work needs V0.1 detail; do NOT paraphrase.
@@ -436,6 +436,265 @@ The relative-path AAD does not by itself prevent substituting a sealed file from
 - All workspace DoD gates green (see ADR-008 amendment v2 verification).
 
 **Cross-links.** ADR-040 (V0.2 Phase 1 keychain layer; `at_rest_key` flows from keychain through AppConfig). ADR-008 amendment v1 (K3 KDF lock; this amendment doesn't change the K3 contract, only its caller responsibility). ADR-008 amendment v2 (above; AAD path semantics — same Phase 2 commit, same canonical-derivation-then-sealing flow). `feedback_source_read_call_graph_upstream_of_empirical.md` (catch was source-read-first, not empirical-only). Production sites: `crates/vault-storage/src/vector_store.rs::open_with_at_rest_key`, `crates/vault-storage/src/cascading.rs::open_with_at_rest_key`, `crates/vault-app/src/keychain.rs::derive_at_rest_key`.
+
+---
+
+## ADR-041 — V0.1 VAULT_KEY → V0.2 keychain SQLCipher passphrase bridge — plan iteration 2 LOCKED (2026-05-11)
+
+**Status:** PROPOSED, plan iteration 2 LOCKED post-Shahbaz-review (2026-05-11). Implementation gates on Phase 2 fmt-fix CI green (run `25660977905`) → spike Stages A + B (compile-and-run) → if pass, ADR-041 implementation milestone (+8 tests + ADR-041 final text + commit + push + CI watch). Iteration 3 RESERVED for spike findings only.
+
+### 1. Iteration 1 answers (LOCKED)
+
+- **Spike methodology:** compile-and-run, **Stages A + B only**. Stage C (kill-mid-rekey atomicity probe) DROPPED — not deterministic enough to be load-bearing; assume non-atomic and design around with snapshot (§3 below).
+- **Failure mode #4 → cross-store snapshot-commit invariant:** keychain write FIRST, then pre-rekey snapshot, then PRAGMA rekey, then verify, then snapshot cleanup. Detailed sequence in §3.
+- **Bridge location:** option (c) sibling fn `bridge_or_init_master_key(data_dir, namespace, vault_id)` in `vault-app/src/keychain.rs`. Composes existing `read_or_init_master_key`. vault-tauri main.rs changes one call site.
+
+### 2. Cross-store commit-or-rollback without native 2PC — LOCKED workspace invariant
+
+Future cross-store work cross-links this section rather than re-deriving.
+
+**Core property — system state at every step.** The system is in exactly one of:
+- **(a)** Original state intact + co-store writes rolled back (or never started).
+- **(b)** Snapshot or backup exists + state can be rolled forward (commit) or restored (abort).
+- **(c)** Commit complete + original state retired.
+
+The system is never simultaneously in `¬a ∧ ¬b ∧ ¬c` (no half-committed unrecoverable window).
+
+**Two implementation patterns derived from store capabilities:**
+
+**Pattern A — atomic-rename with implicit backup.** Used when the store supports atomic file/dir-level moves (POSIX/NTFS rename). The destructive op IS an atomic swap; old state becomes implicit backup as a side effect of the rename pair. **Canonical instance:** Phase 2's `vector_dir → backup_dir` followed by `temp_dir → vector_dir` (per "T0.2.0 Phase 2 — plan iteration 2" §2 calibration C). The cookie file (`vector_dir.with_extension("vault_migration_in_progress")`) is a SEPARATE role — an in-flight marker that tracks which crash-recovery state-machine branch applies on next launch — NOT a data snapshot. Don't conflate the marker file with the implicit backup; they serve different purposes.
+
+**Pattern B — explicit pre-copy snapshot.** Used when the destructive op modifies state in place (no atomic file-level swap available at the destructive layer). Pre-copy snapshot taken before destructive op; cleanup only on full success; rollback restores from snapshot. **Canonical instance:** ADR-041's `vault.db.pre_v0_2_bridge` snapshot before `PRAGMA rekey`. SQLCipher rekey rewrites in place — no atomic-swap primitive available at the SQLite layer, so explicit snapshot is required to satisfy the invariant.
+
+**Shared discipline (both patterns):**
+1. Cheapest-to-rollback co-store write goes FIRST. (Pattern A / Phase 2: cookie file write before rename pair. Pattern B / ADR-041: keychain entry write before snapshot+rekey.)
+2. Destructive op runs only after the co-store write succeeds.
+3. Verification of post-destructive state gates cleanup.
+4. Cleanup only on full success; failure rolls back via the pattern's backup mechanism.
+
+**Forward-reference discipline:** future cross-store work picks Pattern A when atomic-swap is available at the destructive layer, Pattern B otherwise. Confusing the two propagates wrong mental model across consumers (V0.2.x sync touching SQLCipher + LanceDB; V0.3 consolidator touching DuckDB + SQLCipher; T0.2.7+ retrieval-index work spanning stores).
+
+### 3. Bridge sequence v2 — LOCKED
+
+```text
+Inputs: data_dir (Path), namespace (str), vault_id (str)
+Triggers when ALL three: keychain entry absent, vault.db exists, VAULT_KEY env set
+
+1. Open V0.1 vault.db with VAULT_KEY as passphrase. Schema-query verify
+   (SELECT name FROM sqlite_master LIMIT 1).
+   FAIL: dialog "VAULT_KEY env var does not unlock the V0.1 vault."
+2. Generate new master_key via getrandom.
+3. Derive new SQLCipher passphrase = hex(BLAKE3("vault sqlcipher passphrase v1", new_master_key)).
+4. WRITE NEW MASTER_KEY TO KEYCHAIN (cheapest-to-rollback co-store write per §2 invariant).
+   FAIL: dialog "Keychain write failed: <err>. No vault state modified; retry."
+         Bridge exits cleanly; user retries after fixing keychain.
+5. SNAPSHOT vault.db (Pattern B explicit pre-copy per §2). Snapshot at
+   vault.db.pre_v0_2_bridge alongside vault.db.
+   FAIL: dialog "Snapshot write failed: <err>." Bridge MUST also delete
+         keychain entry before exiting (rollback step 4).
+6. PRAGMA rekey '<new_passphrase>' on vault.db (destructive op per §2).
+   FAIL: restore from snapshot, delete keychain entry, dialog with diagnostic.
+7. Close + reopen vault.db with new passphrase. Schema-query verify
+   (verification gate per §2).
+   FAIL: restore from snapshot, delete keychain entry, dialog with diagnostic.
+8. Delete snapshot file (success-only cleanup per §2).
+9. Emit one-time INFO: "V0.1 → V0.2 SQLCipher passphrase bridge complete;
+   VAULT_KEY env var no longer required."
+10. Return new master_key.
+```
+
+**Property pinned:** at every step the system satisfies §2's core property — never `¬a ∧ ¬b ∧ ¬c`. Steps 1-4: state (a). Step 5 onward: state (b) until step 8; state (c) after.
+
+### 4. Schema migration concern — PINNED no-op for V0.2.0
+
+`MIGRATIONS` slice in `crates/vault-storage/src/migrations/mod.rs:28-39` contains exactly 2 entries (`0001_initial` T0.1.3-era + `0002_cascade_infra` T0.1.6-era), both shared between V0.1 + V0.2. Phase 2 (V0.2.0) did NOT add new SQLCipher schema migrations. `MetadataStore::open` runs `migrations::run` on every open with idempotent `CREATE TABLE IF NOT EXISTS` discipline — any future V0.2.x migration (e.g., the tech-debt `pending_sync` 0003 extension) rides through transparently AFTER the bridge has rekeyed the file. No bridge-side schema work required in V0.2.0.
+
+**Forward-pointer pin:** when V0.2.x first adds a `0003_*.sql`, cross-link this section to confirm bridge + migrations composition still holds (it should — migrations run AFTER bridge completes, on the rekeyed file, no interaction).
+
+### 5. Tier 2 fixture VERIFIED + WAL-replay sub-question pinned
+
+Per `crates/vault-storage/tests/fixtures/v0_1_alpha_data_dir/README.md`:
+- `vault.db` (98 KB) — present
+- `vault.db-wal` (650 KB) — present (SQLite replays on open; bridge handles transparently via rusqlite + SQLCipher)
+- Capture key: `VAULT_KEY = fixture-capture-key-do-not-use-in-prod`
+- Capture commit: `1d72aac`, MSI SHA-256 `03d127371f6a881366e2f048d81f2785de97f68236c5d52747bf0100284d0a06`
+
+**WAL-replay sub-question pinned for Tier 2 test:** the WAL is from a live V0.1 binary that didn't checkpoint before snapshot capture. Bridge rides through WAL-replay-on-open transparently (rusqlite + SQLCipher handles this); Tier 2 test asserts on POST-bridge content equality, so any WAL-replay quirk surfaces as test failure rather than silent data loss. **Optional Tier 1 +1 floor amendment** (only if the implementation surfaces WAL-replay sensitivity): create a synthetic fixture with uncommitted WAL on purpose; assert bridge handles it. Surface as floor breach if it materializes.
+
+### 6. Test count floor pre-declaration — +8 vault-app tests
+
+Per `feedback_floor_forecast_is_pre_declaration_not_estimate.md`. Distribution + named tests:
+
+**Tier 1 (vault-app/src/keychain.rs `mod tests` — synthetic SQLCipher fixtures, 7 tests):**
+1. `bridge_rekeys_fresh_sqlcipher_file_and_preserves_rows` — happy path
+2. `bridge_fails_closed_when_vault_key_env_var_is_wrong` — wrong passphrase
+3. `bridge_fails_closed_when_vault_key_env_var_is_unset` — env var missing dialog
+4. `bridge_no_op_when_keychain_entry_already_exists` — V0.2 second-launch path
+5. `bridge_no_op_when_no_v0_1_sqlcipher_file_present` — fresh V0.2 install
+6. `bridge_writes_keychain_before_rekey_ordering_invariant` — confirms keychain-write-first per §3 step 4-before-5 ordering (pinned by step ordering observation; spy/log/timestamp instrumentation TBD at impl time)
+7. `bridge_restores_from_snapshot_on_rekey_failure` — fault-injection via methodology (c) below; restores snapshot + rolls back keychain on rekey failure
+
+**Tier 2 (vault-app/tests/integration_smoke.rs OR new dedicated test file — captured V0.1 fixture, 1 test):**
+8. `tier_2_real_v0_1_vault_db_bridges_and_preserves_5_rows` — uses fixture vault.db, asserts 5 known memories survive bridge
+
+**Tier 3: manual founder smoke** (zero CI test count). Snapshot-then-launch-then-verify, same procedure as Phase 2's Tier 3 (now unblocked).
+
+**Floor breach surface discipline:** any deviation from +8 surfaces in commit message per `feedback_floor_forecast_is_pre_declaration_not_estimate.md`.
+
+**Methodology declaration for test 7** (`bridge_restores_from_snapshot_on_rekey_failure`) — pre-declared per spike-discipline reflex applied to test infrastructure:
+
+**Methodology choice: (c) filesystem permission fault-injection** (preferred), with (a) corrupted-fixture as fallback.
+
+- **(c) chosen because:** no production seam grown for testing (option b's cost), no fixture-manufacturing-fragility (option a's risk), real rekey call exercised end-to-end. Implementation: open vault.db, run PRAGMA key + verify-readable, set file read-only via `Permissions::set_readonly(true)` (cross-platform: Unix clears write bits, Windows sets `FILE_ATTRIBUTE_READONLY`), call bridge → expect rekey failure → assert snapshot restored + keychain entry deleted.
+- **Spike acceptance gains a probe** to confirm (c) viability: Stage A or B's setup includes "PRAGMA rekey against a read-only file fails cleanly" check. If probe shows silent-success-in-memory (rekey returns Ok but doesn't write), fall back to (a).
+- **(a) corrupted-fixture fallback** (only if (c) probe fails): manufacture vault.db with truncated header or page-checksum corruption that PRAGMA rekey reliably rejects. Fixture path TBD if used.
+- **(b) mock seam REJECTED** because adding a production seam that exists only for testing violates "no over-engineering" + "test the real thing" disciplines.
+
+### 7. Iteration 3 RESERVED — fires only on spike findings
+
+Iteration 3 fires only if:
+- Stage A fails → bridge mechanism changes from PRAGMA rekey to manual `ATTACH DATABASE 'new.db' KEY 'K2'; INSERT INTO new SELECT * FROM main` (slower, more code, different fault modes).
+- Stage B fails → wrong-key-after-rekey leaks → ADR-041 stops; SQLCipher passphrase bridging is not viable on this dep chain.
+- Spike's read-only probe shows silent-in-memory rekey → §6 test 7 methodology flips from (c) to (a); minor scope shift, not iteration-3-worthy unless additional fault-injection design questions surface.
+
+### 8. Cross-references
+
+- HANDOFF.md "Open tech-debt" entry (V0.1 VAULT_KEY → V0.2 keychain bridge) — discovery context
+- HANDOFF.md "T0.2.0 Phase 2 — plan iteration 2" §2 calibration C (Phase 2's atomic dir-swap = canonical Pattern A instance per §2 above)
+- `crates/vault-storage/src/migrations/mod.rs:28-39` — schema migrations slice (no-op evidence for §4)
+- `crates/vault-storage/tests/fixtures/v0_1_alpha_data_dir/README.md` — Tier 2 fixture provenance + vault.db inventory + WAL note
+- ADR-008 + amendments v1 + v2 (sealing layer; orthogonal to this bridge but established the snapshot-commit pattern)
+- ADR-040 + amendments (keychain layer composition; this bridge extends `read_or_init_master_key`)
+- `feedback_spike_methodology_explicit.md` — spike methodology declared (compile-and-run, Stages A+B + read-only probe)
+- `feedback_floor_forecast_is_pre_declaration_not_estimate.md` — +8 test floor pre-declaration
+- `feedback_runtime_confirmation_after_web_spike.md` — N/A (no web-research methodology here; all empirical)
+
+### 9. Spike findings (2026-05-11) — iteration 2.1 amendment
+
+Spike `crates/vault-storage/examples/sqlcipher_rekey_spike.rs` ran 2026-05-11 post-iteration-2-lock. Results:
+
+| Stage | Outcome |
+|---|---|
+| Stage A — basic rekey + reopen with new key | ✅ PASS |
+| Stage B — reopen with WRONG key fails closed | ✅ PASS |
+| Read-only-file probe (§6 methodology check) | ❌ FAIL — Outcome 3 |
+
+**Stages A + B PASS:** PRAGMA rekey is viable on the rusqlite + bundled-sqlcipher-vendored-openssl chain (ADR-006). Bridge mechanism in §3 stands as drafted. ADR-041 implementation proceeds.
+
+**Read-only-file probe FAIL — Outcome 3 (silent-in-memory rekey):** SQLCipher's `PRAGMA rekey` on a read-only file returns Ok but the changes only live in the connection's memory; on close, the disk file remains unchanged (subsequent reopen with the new key fails because the file is still encrypted with the old key). This is documented SQLite/SQLCipher behavior — `PRAGMA rekey` doesn't perform an explicit write-permission check up front; it streams pages through the new cipher state and writes them lazily, so a write rejection happens silently mid-stream rather than at the PRAGMA call.
+
+**Methodology flip per iteration 2 §7 pre-declaration:** test 7 (`bridge_restores_from_snapshot_on_rekey_failure`) methodology changes from **(c) filesystem permission fault-injection** to **(a) corrupted-fixture**. This was pre-anticipated and pre-approved at iteration 2 lock; no iteration 3 needed. Test 7 implementation (when ADR-041 impl lands) will:
+
+1. Manufacture a `vault.db` fixture with a corruption shape that PRAGMA rekey reliably rejects (candidates: truncated header below the 16-byte SQLite header, page-checksum mismatch on a non-header page). Exact shape to be determined empirically at impl time — adopt whichever shape produces clean Err return from `PRAGMA rekey` on the rusqlite + bundled-sqlcipher chain.
+2. Fixture lives at `crates/vault-app/tests/fixtures/sqlcipher_corrupted_for_rekey_failure.db` (path locked here for grep-discoverability).
+3. Test asserts: bridge calls PRAGMA rekey → Err → snapshot restored + keychain entry deleted (rollback per §3 step 6 fail path).
+
+**Spike does NOT ride into production.** The example file remains as runtime-confirmation evidence per `feedback_spike_playbook_for_unknowns.md` ("keep spike as executable documentation"). No spike-specific dep promotions needed (rusqlite + tempfile already in vault-storage main + dev deps).
+
+**No iteration 3 needed** — spike findings match the iteration 2 §7 pre-declared "minor scope shift" branch exactly. Implementation kickoff proceeds.
+
+### 10. Pin 1 (post-spike) — Post-write verification invariant (LOCKED, lands in ADR-041 final text)
+
+The Read-only-file probe finding generalizes beyond test methodology to a **production-relevant property**. SQLCipher's `PRAGMA rekey` can return Ok with the changes living only in the connection's memory, not persisted to disk — and the same shape applies to any underlying-primitive write fault the OS surfaces as a no-op-success: read-only file (probed empirically), parent dir read-only / disk-full / antivirus-locked / ACL-denied / network-filesystem-flush quirks (class generalization). This validates that §3 step 7 (close + reopen + schema-query verify) is **load-bearing, not belt-and-suspenders**. Without it, a silent-failure-mode rekey would leave the keychain entry referencing a K2-encrypted file that's actually still K1 on disk, with no clean recovery on next launch.
+
+**To pin in ADR-041 final text under named invariant:**
+
+> **Post-write verification invariant.** Destructive cross-store operations MUST verify persistence via close + reopen + read-back rather than trusting the primitive's success return value. SQLCipher's `PRAGMA rekey` is the load-bearing example (spike Read-only probe 2026-05-11: rekey returns Ok on read-only files with changes in-memory only). The pattern generalizes — any underlying primitive may report success for an operation that didn't persist (disk-full, antivirus locks, ACL changes, network filesystem flush quirks). The verify step is what makes the snapshot-commit invariant in §2 actually safe; remove it and the whole invariant collapses to "we hope the primitive told us the truth."
+
+**Cross-link from §2 Pattern A** (Phase 2): `validate_readable()` post-rename is the analogous verification step for the LanceDB store. Same invariant, two stores. Phase 2 commit `739e8da` got this right (see `crates/vault-storage/src/cascading.rs::assemble`); the rationale was "ADR-018 corruption-detection" but post-spike the deeper rationale is now named: post-write verification against silent-primitive-success is the load-bearing safety property, NOT just corruption-detection-on-open. Pattern A's verification step is identical in role to Pattern B's; future cross-store work consumes both as one invariant.
+
+### 11. Pin 2 (post-spike) — Test 7 corruption-mode selection criteria + iteration-3 watch-trigger
+
+Methodology flip (c) → (a) corrupted-fixture is locked per §9. The Read-only finding sharpens the prior caveat ("rekey might silently succeed on partially-corrupted files") from theoretical to empirically-evidenced concern. Some corruption classes will fail at initial open (truncated file, wrong magic bytes) BEFORE rekey runs; others might silent-succeed at rekey just like the read-only case did. Test 7 needs to find a corruption mode satisfying ALL THREE criteria:
+
+1. **MUST allow vault.db to open successfully with K1** — bridge needs to get past §3 step 1 (`PRAGMA key` + schema-query verify) before reaching step 6 (rekey).
+2. **MUST cause rekey to fail observably (Err return)** — not silent-success of any flavor (in-memory-only, disk-write-rejected-but-Ok-returned, etc.).
+3. **MUST be cross-platform reproducible** — test runs on `[ubuntu-latest, windows-latest, macos-latest]` matrix.
+
+Likely candidates worth probing during test 7 implementation:
+
+- **Candidate (i) — parent directory read-only mid-bridge.** Make `<data_dir>/` read-only between bridge steps 1 and 6. SQLCipher rekey creates temp/journal files in the parent dir during page-by-page rewrite; read-only parent might surface as Err where vault-db-itself-read-only didn't. Cross-platform: `Permissions::set_readonly(true)` on the parent dir works on Unix (clears write bits) and Windows (sets `FILE_ATTRIBUTE_READONLY`).
+- **Candidate (ii) — malformed page injection.** Modify a non-header page byte (e.g., page 4 byte offset 100) to trigger HMAC failure during rekey's page-by-page rewrite. Schema query (page 1, sqlite_master root) succeeds; page-N rewrite fails. Requires manufacturing the fixture once and checking it in at `crates/vault-app/tests/fixtures/sqlcipher_corrupted_for_rekey_failure.db` (path locked per §9).
+
+**Watch-trigger for iteration 3:** if test 7 implementation cannot find a corruption mode satisfying all three criteria within ~1 hour of probing, **STOP and surface** — fault-injection design becomes a real ADR-041 scope question and iteration 3 fires for methodology re-evaluation. Don't grind on it for half a day silently. Probe candidate (i) first (cheaper — no fixture manufacturing); fall to (ii) if (i) doesn't satisfy criterion 2; surface if neither works.
+
+---
+
+## ADR-041 — V0.1 VAULT_KEY → V0.2 keychain SQLCipher passphrase bridge — final ADR (LOCKED, 2026-05-11)
+
+**Status:** ACCEPTED, in force from this commit. Implementation lands at `crates/vault-app/src/keychain.rs::bridge_or_init_master_key` (plus the rekey + verify primitives at `crates/vault-storage/src/metadata_store.rs::{rekey_in_place, verify_sqlcipher_passphrase}`). Replaces ADR-032 (V0.1 VAULT_KEY-as-SQLCipher-passphrase) for V0.1 → V0.2 upgrade paths; ADR-040 keychain-as-master_key-source unchanged.
+
+### Context
+
+V0.1 sourced the SQLCipher passphrase directly from the `VAULT_KEY` environment variable (ADR-032). V0.2 Phase 1 (ADR-040) replaced that with an OS-keychain-derived passphrase: `hex(BLAKE3("vault sqlcipher passphrase v1", &master_key))`, where `master_key` is read from the OS keychain on each launch. Phase 1's `read_or_init_master_key` generated a NEW random master_key on first launch when no keychain entry existed; it did NOT bridge from V0.1's VAULT_KEY-derived passphrase. Discovered during Phase 2 Tier 3 founder-smoke preparation (2026-05-11): real V0.1 vaults would succeed at the Phase 2 LanceDB migration (plaintext doesn't need a key) but fail at `Application::new`'s `MetadataStore::open` because the new keychain-derived SQLCipher passphrase doesn't match V0.1's VAULT_KEY-derived passphrase.
+
+### Decision
+
+Add a `bridge_or_init_master_key(data_dir, namespace, vault_id, v0_1_vault_key)` composition fn alongside `read_or_init_master_key`. Three branches based on detected state:
+
+1. **Keychain entry present** → return existing master_key (V0.2 second-launch path; identical to `read_or_init`).
+2. **Keychain absent + no V0.1 vault.db** → delegate to `read_or_init_master_key` first-run path (fresh V0.2 install).
+3. **Keychain absent + V0.1 vault.db present** → V0.1 bridge sequence (per "Bridge sequence" below).
+
+Branch 3 fail-closes if `v0_1_vault_key` is `None` or empty (VAULT_KEY env var unset) — vault-tauri main.rs sources VAULT_KEY env once and passes it through (avoids unsafe `std::env::set_var` test contamination per ADR-002 `#![forbid(unsafe_code)]`).
+
+### Bridge sequence — locked
+
+Sequence + numbering verbatim from iteration 2 §3, applied in `run_v0_1_bridge` private fn:
+
+1. Verify V0.1 passphrase unlocks vault.db (`vault_storage::verify_sqlcipher_passphrase`). Fail-fast at step 1 prevents writing an orphan keychain entry pointing to a master_key for a vault that can't be rekeyed.
+2. Generate new master_key (`getrandom`).
+3. Derive new SQLCipher passphrase = `hex(BLAKE3("vault sqlcipher passphrase v1", &new_master_key))`.
+4. Write new master_key to OS keychain — cheapest-to-rollback co-store write FIRST per the cross-store snapshot-commit invariant (Pattern B).
+5. Snapshot vault.db at `vault.db.pre_v0_2_bridge` (explicit pre-copy per Pattern B).
+6. PRAGMA rekey to new passphrase (`vault_storage::rekey_in_place`).
+7. Post-write verification — close + reopen + schema-query verify with new passphrase (embedded in `rekey_in_place`'s step 4 per the post-write verification invariant below).
+8. Cleanup snapshot file (success-only).
+9. Emit one-time INFO log: `"V0.1 → V0.2 SQLCipher passphrase bridge complete; VAULT_KEY env var no longer required."`
+10. Return new master_key.
+
+Failure at any step rolls back via the snapshot-commit invariant: step 5+ failures restore vault.db from snapshot AND delete the keychain entry; steps 1-4 failures don't need rollback because no destructive op has run yet.
+
+### Post-write verification invariant — LOCKED, named, load-bearing
+
+**Destructive cross-store operations MUST verify persistence via close + reopen + read-back rather than trusting the primitive's success return value.** SQLCipher's `PRAGMA rekey` is the load-bearing example (spike Read-only probe 2026-05-11: rekey returns Ok on read-only files with changes in-memory only). The pattern generalizes — any underlying primitive may report success for an operation that didn't persist (disk-full, antivirus locks, ACL changes, network filesystem flush quirks). The verify step is what makes the cross-store snapshot-commit invariant in iteration 2 §2 actually safe; remove it and the whole invariant collapses to "we hope the primitive told us the truth."
+
+Implementation: `vault_storage::rekey_in_place` embeds the verify step (close + reopen + schema-query) internally; callers (the bridge) don't need to remember to add it. Phase 2's `validate_readable()` post-rename in `crates/vault-storage/src/cascading.rs::assemble` is the analogous verification step at the LanceDB store layer — same invariant, two stores, different primitives.
+
+### Cross-store snapshot-commit invariant — Pattern B canonical instance
+
+Per iteration 2 §2 (LOCKED workspace invariant). ADR-041 is the canonical Pattern B implementation (explicit pre-copy snapshot before destructive op). Phase 2's atomic dir-swap is the canonical Pattern A (atomic-rename with implicit backup). Both share: cheapest-to-rollback co-store write FIRST → destructive op → verification → cleanup-or-rollback. Future cross-store work cross-links iteration 2 §2 + this section to consume the canonical patterns rather than re-deriving.
+
+### Per-vault UUID in AAD — deferred to V0.3 sync ADR
+
+Documented in ADR-008 amendment v2 (Phase 2). Today: per-vault key separation (each Memory Vault install has its own keychain entry → distinct master_key → distinct K3 derived at-rest key → AEAD authentication fails on cross-vault file substitution regardless of AAD content). Cross-vault UUID binding becomes load-bearing if V0.3 sync ever introduces a shared at-rest key across devices. The V0.3 sync ADR MUST re-evaluate; flagged in ADR-008 amendment v2 §"Open question deferred to V0.3 sync amendment."
+
+### Verification
+
+- 8 tests pass on Windows runner: 7 Tier 1 (`crates/vault-app/src/keychain.rs` mod tests) + 1 Tier 2 (real V0.1 fixture from commit `1d72aac`, also in `crates/vault-app/src/keychain.rs` mod tests).
+- Spike `crates/vault-storage/examples/sqlcipher_rekey_spike.rs` Stages A + B PASS (compile-and-run runtime evidence the primitive works on this dep chain).
+- Test 7 corruption-mode methodology: **(a) corrupted-fixture, candidate (ii) malformed-page injection at byte offset 6000** — locks per the pin 2 watch-trigger discipline. The implementation uses an in-test corruption (mutate one byte at offset 6000 of a freshly-created multi-page V0.1 SQLCipher fixture) which reliably triggers PRAGMA rekey Err on the rusqlite + bundled-sqlcipher chain. No checked-in static corrupted-fixture file required.
+- Test concurrency mutex: `KEYCHAIN_TEST_MUTEX` static in `mod tests` serializes the bridge tests' use of `keyring_core::set_default_store` / `unset_default_store` global state. Discovered during initial test run: parallel tests race on the global default-store slot, producing "No default store has been set" rollback failures. Production has no contention (single startup call); tests need the mutex.
+
+### When to revisit
+
+- **macOS / Linux keychain support lands at T0.2.0.x sub-task or T0.2.14** — bridge `#[cfg(windows)]` opens up; macOS-Keychain + Linux-Secret-Service backends consume the same bridge logic.
+- **V0.2.x first SQLCipher schema migration** (`0003_*.sql`) — confirm bridge + migrations composition still holds (it should — migrations run AFTER bridge on the rekeyed file; idempotent CREATE TABLE IF NOT EXISTS discipline applies). Cross-link iteration 2 §4 forward-pointer.
+- **VAULT_KEY env-var support removal** — once founder dogfood vault is bridged + alpha cohort has only-ever-used V0.2, can retire VAULT_KEY support entirely (delete branch 3 + the VAULT_KEY env-var read at vault-tauri main.rs). Defer to V1.0.
+
+### Cross-references
+
+- HANDOFF.md "ADR-041 plan iteration 2 LOCKED" (above) — full plan iteration history + design questions resolved
+- HANDOFF.md "ADR-008 amendment v2" (Phase 2) — AAD path semantics; cross-store key separation defense for cross-vault substitution
+- HANDOFF.md "ADR-040 amendment — Signature fix" (Phase 2) — single-canonical-K3-derivation site invariant; bridge consumes this discipline
+- ADR-032 (V0.1 VAULT_KEY env-var path) — bridge retires this for V0.1 → V0.2 upgrade paths
+- ADR-040 (Phase 1 keychain layer) — bridge composes `read_or_init_master_key`
+- `crates/vault-storage/examples/sqlcipher_rekey_spike.rs` — compile-and-run runtime evidence
+- `crates/vault-storage/src/metadata_store.rs::{verify_sqlcipher_passphrase, rekey_in_place}` — primitives
+- `crates/vault-app/src/keychain.rs::bridge_or_init_master_key` — composition fn
+- `crates/vault-tauri/src/main.rs` step 4 — production call site
+- `feedback_runtime_confirmation_after_web_spike.md` — spike methodology discipline (compile-and-run)
+- `feedback_floor_forecast_is_pre_declaration_not_estimate.md` — +8 test floor pre-declared, hit exactly (7 Tier 1 + 1 Tier 2)
 
 ---
 

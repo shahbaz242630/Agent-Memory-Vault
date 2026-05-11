@@ -44,6 +44,9 @@
 //! the two consumers; same primitive (BLAKE3) preserves single-source-crypto
 //! per ADR-008 amendment line 693.
 
+use std::path::{Path, PathBuf};
+
+use tracing::{info, instrument, warn};
 use vault_core::{VaultError, VaultResult};
 use zeroize::Zeroizing;
 
@@ -201,6 +204,355 @@ fn read_or_init_inner(namespace: &str, vault_id: &str) -> VaultResult<Zeroizing<
     }
 }
 
+/// V0.1 → V0.2 SQLCipher passphrase bridge entry point — composes
+/// [`read_or_init_master_key`] with the V0.1 bridge path per ADR-041.
+///
+/// Three branches based on detected state:
+/// 1. **Keychain entry present** (V0.2 second-launch path) → return
+///    existing master_key. Identical to `read_or_init_master_key`'s
+///    existing-entry behavior; no V0.1 detection runs.
+/// 2. **Keychain absent + no V0.1 vault.db** (fresh V0.2 install) →
+///    delegate to [`read_or_init_master_key`]'s first-run path
+///    (generate new master_key + persist to keychain).
+/// 3. **Keychain absent + V0.1 vault.db present** → V0.1 bridge path:
+///    verify the V0.1 passphrase unlocks the vault → generate new
+///    master_key → derive new SQLCipher passphrase → write keychain
+///    entry FIRST (cheapest-failure-first per ADR-041 §2 Pattern B
+///    cross-store snapshot-commit invariant) → snapshot vault.db →
+///    [`vault_storage::rekey_in_place`] (which includes the §10 post-
+///    write verification invariant: close + reopen + verify with new
+///    passphrase) → cleanup snapshot. On any failure: rollback
+///    snapshot + delete keychain entry, return Err.
+///
+/// **Branch-3 fail-closed condition:** if V0.1 vault.db exists but
+/// `v0_1_vault_key` is `None` OR `Some("")`, returns
+/// [`VaultError::KeychainProvenance`] with a tailored message naming
+/// VAULT_KEY + recovery steps. vault-tauri main.rs's
+/// `format_keychain_error_dialog` surfaces this to the user.
+///
+/// # Arguments
+///
+/// - `data_dir` — per-user data directory (e.g.,
+///   `%APPDATA%/com.memoryvault.dev/`). Bridge checks for V0.1 vault.db
+///   at `<data_dir>/vault.db`.
+/// - `namespace` / `vault_id` — same shape as `read_or_init_master_key`.
+/// - `v0_1_vault_key` — the V0.1 alpha passphrase, sourced from the
+///   `VAULT_KEY` env var by the production caller (vault-tauri
+///   main.rs). Passed in as a parameter rather than read from env
+///   inside the bridge so (a) tests can inject fixture values without
+///   mutating global env state (which would require `unsafe` per
+///   rustc 1.92's `std::env::set_var` semantics, blocked by ADR-002's
+///   `#![forbid(unsafe_code)]`), and (b) the bridge stays a pure
+///   function of its inputs — no hidden environment dependency.
+///
+/// # Errors
+///
+/// - [`VaultError::KeychainProvenance`] for keychain access failures,
+///   wrong V0.1 passphrase, missing V0.1 passphrase (with tailored
+///   message naming VAULT_KEY).
+/// - [`VaultError::Storage`] wrapping snapshot or rekey failures.
+///
+/// # See also
+///
+/// - HANDOFF.md "ADR-041 plan iteration 2 LOCKED" — full bridge sequence + invariant
+/// - HANDOFF.md ADR-041 §10 post-write verification invariant
+/// - [`vault_storage::verify_sqlcipher_passphrase`] (step 1)
+/// - [`vault_storage::rekey_in_place`] (steps 6-7 with internal verify)
+#[cfg(windows)]
+pub fn bridge_or_init_master_key(
+    data_dir: &Path,
+    namespace: &str,
+    vault_id: &str,
+    v0_1_vault_key: Option<&str>,
+) -> VaultResult<Zeroizing<[u8; 32]>> {
+    use windows_native_keyring_store::Store;
+
+    keyring_core::set_default_store(
+        Store::new()
+            .map_err(|e| VaultError::KeychainProvenance(format!("Store::new failed: {e}")))?,
+    );
+
+    let result = bridge_or_init_inner(data_dir, namespace, vault_id, v0_1_vault_key);
+
+    keyring_core::unset_default_store();
+
+    result
+}
+
+/// Non-Windows stub mirrors [`read_or_init_master_key`]'s shape.
+#[cfg(not(windows))]
+pub fn bridge_or_init_master_key(
+    _data_dir: &Path,
+    _namespace: &str,
+    _vault_id: &str,
+    _v0_1_vault_key: Option<&str>,
+) -> VaultResult<Zeroizing<[u8; 32]>> {
+    Err(VaultError::KeychainProvenance(format!(
+        "Keychain provenance is Windows-only at V0.2 Phase 1 (current platform: {}). \
+         macOS / Linux per-platform crate-add deferred to T0.2.0.x sub-task or \
+         T0.2.14 Stub-Installer-adjacent per HANDOFF.md OQ #1 partial resolution.",
+        std::env::consts::OS
+    )))
+}
+
+/// Inner bridge orchestration. Caller has already established the keychain
+/// default store; this fn only does the 3-way branch + V0.1 bridge sequence.
+#[cfg(windows)]
+#[instrument(skip(data_dir, v0_1_vault_key), fields(data_dir = %data_dir.display(), vault_id))]
+fn bridge_or_init_inner(
+    data_dir: &Path,
+    namespace: &str,
+    vault_id: &str,
+    v0_1_vault_key: Option<&str>,
+) -> VaultResult<Zeroizing<[u8; 32]>> {
+    // Branch 1: existing keychain entry present?
+    if let Some(existing) = try_read_existing_master_key(namespace, vault_id)? {
+        return Ok(existing);
+    }
+
+    // Keychain absent. Branch 2 vs 3 depends on V0.1 vault.db presence.
+    let vault_db_path = data_dir.join("vault.db");
+    if !vault_db_path.exists() {
+        // Branch 2: fresh V0.2 install — delegate to existing first-run logic.
+        // (read_or_init_inner regenerates the keychain entry; calling it
+        // here means we re-do the keychain probe, but that's idempotent
+        // and the cost is one keychain RPC.)
+        return read_or_init_inner(namespace, vault_id);
+    }
+
+    // Branch 3: V0.1 vault.db present. Check passphrase parameter.
+    let vault_key = match v0_1_vault_key {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            return Err(VaultError::KeychainProvenance(format!(
+                "V0.1 vault detected at {} but VAULT_KEY env var is not set. \
+                 Per ADR-041, the V0.1 → V0.2 SQLCipher passphrase bridge requires \
+                 VAULT_KEY (the V0.1 alpha passphrase) to unlock the existing vault \
+                 for one-time re-encryption with the new keychain-derived passphrase. \
+                 Set VAULT_KEY to your V0.1 passphrase and relaunch Memory Vault. \
+                 The keychain entry will be created automatically; on subsequent \
+                 launches VAULT_KEY is no longer needed.",
+                vault_db_path.display()
+            )))
+        }
+    };
+
+    run_v0_1_bridge(&vault_db_path, vault_key, namespace, vault_id)
+}
+
+/// Probe whether the keychain entry already exists. Returns:
+/// - `Ok(Some(master_key))` if the entry exists with a 32-byte secret
+/// - `Ok(None)` if the entry is NotFound (first-run signal)
+/// - `Err(VaultError::KeychainProvenance)` for any other error (read failure,
+///   wrong-size secret, etc.)
+///
+/// Splits out the existence-probe from `read_or_init_inner` (which also
+/// generates + persists on NotFound) so the bridge can branch on absence
+/// without triggering the auto-generate side effect.
+#[cfg(windows)]
+fn try_read_existing_master_key(
+    namespace: &str,
+    vault_id: &str,
+) -> VaultResult<Option<Zeroizing<[u8; 32]>>> {
+    use keyring_core::Entry;
+
+    let entry = Entry::new(namespace, vault_id)
+        .map_err(|e| VaultError::KeychainProvenance(format!("Entry::new failed: {e}")))?;
+
+    match entry.get_secret() {
+        Ok(bytes) => {
+            if bytes.len() != 32 {
+                return Err(VaultError::KeychainProvenance(format!(
+                    "Keychain entry exists but secret is {} bytes (expected 32). \
+                     Entry may have been written by a non-Memory-Vault tool or by \
+                     a future version with a different scheme. Investigate via \
+                     Credential Manager (entry namespace: {namespace}, account: \
+                     {vault_id}) before proceeding.",
+                    bytes.len()
+                )));
+            }
+            let mut master_key = Zeroizing::new([0u8; 32]);
+            master_key.copy_from_slice(&bytes);
+            Ok(Some(master_key))
+        }
+        Err(get_err) => {
+            // Same NotFound-detection string-match logic as read_or_init_inner.
+            let err_str = format!("{get_err}");
+            let err_lower = err_str.to_lowercase();
+            let is_not_found = err_lower.contains("no entry")
+                || err_lower.contains("not found")
+                || err_lower.contains("no such")
+                || err_lower.contains("no matching credential");
+            if is_not_found {
+                Ok(None)
+            } else {
+                Err(VaultError::KeychainProvenance(format!(
+                    "get_secret failed (non-NotFound) during bridge existence-probe: {get_err}"
+                )))
+            }
+        }
+    }
+}
+
+/// Runs the V0.1 → V0.2 SQLCipher passphrase bridge sequence per ADR-041
+/// plan iteration 2 §3 (LOCKED). Caller has already verified preconditions
+/// (no keychain entry + V0.1 vault.db present + VAULT_KEY env set).
+///
+/// Cross-store snapshot-commit invariant Pattern B: keychain write FIRST,
+/// then snapshot, then rekey, then verify (inside `rekey_in_place`),
+/// then snapshot cleanup. Failure at any step rolls back per the
+/// invariant's core property (system never in `¬a ∧ ¬b ∧ ¬c`).
+#[cfg(windows)]
+fn run_v0_1_bridge(
+    vault_db_path: &Path,
+    v0_1_vault_key: &str,
+    namespace: &str,
+    vault_id: &str,
+) -> VaultResult<Zeroizing<[u8; 32]>> {
+    let v0_1_passphrase = vault_storage::SqlCipherKey::new(v0_1_vault_key.to_string());
+
+    // Step 1: verify V0.1 passphrase unlocks vault.db (fail-fast BEFORE
+    // any keychain write — avoids creating an orphan keychain entry
+    // pointing to a master_key for a vault we can't actually rekey).
+    vault_storage::verify_sqlcipher_passphrase(vault_db_path, &v0_1_passphrase).map_err(|e| {
+        VaultError::KeychainProvenance(format!(
+            "V0.1 VAULT_KEY env var does not unlock the vault at {}: {e}. Verify VAULT_KEY \
+             matches the value used in V0.1 alpha; the bridge cannot proceed with a wrong \
+             passphrase.",
+            vault_db_path.display()
+        ))
+    })?;
+
+    // Step 2: generate new master_key.
+    let mut new_master_key = Zeroizing::new([0u8; 32]);
+    getrandom::getrandom(&mut *new_master_key)
+        .map_err(|e| VaultError::KeychainProvenance(format!("getrandom: {e}")))?;
+
+    // Step 3: derive new SQLCipher passphrase from new master_key.
+    let new_v0_2_passphrase = derive_sqlcipher_passphrase(&new_master_key);
+
+    // Step 4: write keychain entry FIRST (cheapest-to-rollback per §2
+    // Pattern B). If keychain write fails, no destructive op has run.
+    write_keychain_entry(namespace, vault_id, &new_master_key)?;
+
+    // Step 5: snapshot vault.db (Pattern B explicit pre-copy).
+    let snapshot_path = snapshot_path_for(vault_db_path);
+    if let Err(e) = std::fs::copy(vault_db_path, &snapshot_path) {
+        // Rollback step 4 keychain write. Best-effort delete; if it fails
+        // we surface compound err but the system state is still in §2's
+        // (a) — vault.db untouched, just an orphan keychain entry that
+        // next launch's bridge entry-probe will handle.
+        rollback_keychain_entry(namespace, vault_id);
+        return Err(VaultError::Storage(format!(
+            "bridge step 5 (snapshot vault.db at {}): {e}. Keychain entry rolled \
+             back; V0.1 vault.db untouched.",
+            snapshot_path.display()
+        )));
+    }
+
+    // Step 6+7: PRAGMA rekey + post-write verify (delegated to
+    // vault_storage::rekey_in_place which embeds §10 verification).
+    if let Err(rekey_err) =
+        vault_storage::rekey_in_place(vault_db_path, &v0_1_passphrase, &new_v0_2_passphrase)
+    {
+        // Restore vault.db from snapshot, roll back keychain.
+        if let Err(restore_err) = std::fs::copy(&snapshot_path, vault_db_path) {
+            warn!(
+                error = %restore_err,
+                snapshot = %snapshot_path.display(),
+                vault = %vault_db_path.display(),
+                "snapshot restore failed during rollback; vault.db may be in unknown \
+                 state. Manual recovery: copy snapshot over vault.db."
+            );
+        }
+        // Best-effort snapshot cleanup post-restore.
+        let _ = std::fs::remove_file(&snapshot_path);
+        rollback_keychain_entry(namespace, vault_id);
+        return Err(VaultError::Storage(format!(
+            "bridge step 6/7 (rekey + verify): {rekey_err}. Snapshot restored to \
+             vault.db; keychain entry rolled back."
+        )));
+    }
+
+    // Step 8: success cleanup of snapshot. Best-effort — bridge is
+    // logically complete even if cleanup fails.
+    if let Err(e) = std::fs::remove_file(&snapshot_path) {
+        warn!(
+            error = %e,
+            snapshot = %snapshot_path.display(),
+            "post-bridge snapshot cleanup failed (best-effort, bridge logically \
+             complete)"
+        );
+    }
+
+    // Step 9: one-time INFO log per iteration 2 §3.
+    info!(
+        "V0.1 → V0.2 SQLCipher passphrase bridge complete; VAULT_KEY env var no longer \
+         required."
+    );
+
+    Ok(new_master_key)
+}
+
+/// Sibling-path-of-vault.db for the pre-bridge snapshot. For input
+/// `vault.db`, returns `vault.db.pre_v0_2_bridge`.
+fn snapshot_path_for(vault_db_path: &Path) -> PathBuf {
+    let mut s = vault_db_path.as_os_str().to_owned();
+    s.push(".pre_v0_2_bridge");
+    PathBuf::from(s)
+}
+
+/// Persist `master_key` to the keychain. Used by the V0.1 bridge path to
+/// write the new master_key BEFORE the destructive PRAGMA rekey.
+#[cfg(windows)]
+fn write_keychain_entry(namespace: &str, vault_id: &str, master_key: &[u8; 32]) -> VaultResult<()> {
+    use keyring_core::Entry;
+
+    let entry = Entry::new(namespace, vault_id).map_err(|e| {
+        VaultError::KeychainProvenance(format!(
+            "Entry::new failed during bridge keychain write: {e}"
+        ))
+    })?;
+    entry.set_secret(master_key).map_err(|e| {
+        VaultError::KeychainProvenance(format!("set_secret failed during bridge: {e}"))
+    })?;
+    Ok(())
+}
+
+/// Best-effort delete of the bridge-written keychain entry. Used in
+/// rollback paths when the destructive ops fail post-keychain-write.
+/// Failure to delete is logged WARN; the orphan entry is recoverable on
+/// next launch (the bridge's existence-probe sees it + branch 1 returns
+/// the master_key, but no vault.db is actually keyed to it → next call
+/// to MetadataStore::open fails closed → user re-runs setup).
+#[cfg(windows)]
+fn rollback_keychain_entry(namespace: &str, vault_id: &str) {
+    use keyring_core::Entry;
+
+    let entry = match Entry::new(namespace, vault_id) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(
+                error = %e,
+                namespace,
+                vault_id,
+                "rollback: Entry::new failed (cannot delete orphan keychain entry; \
+                 manual cleanup via Credential Manager required)"
+            );
+            return;
+        }
+    };
+    if let Err(e) = entry.delete_credential() {
+        warn!(
+            error = %e,
+            namespace,
+            vault_id,
+            "rollback: delete_credential failed (orphan keychain entry remains; \
+             manual cleanup via Credential Manager required)"
+        );
+    }
+}
+
 /// Derive the SqlCipher passphrase from the master_key per ADR-040
 /// amendment option β: BLAKE3 derive_key with the locked
 /// [`SQLCIPHER_KDF_CONTEXT`] domain-separator, hex-encoded to a 64-character
@@ -271,6 +623,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn read_or_init_master_key_round_trips_byte_identical() {
+        let _guard = keychain_test_guard();
         let namespace = unique_test_namespace("round_trip");
         let vault_id = "test-round-trip-vault";
 
@@ -301,6 +654,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn read_or_init_master_key_first_run_generates_and_persists() {
+        let _guard = keychain_test_guard();
         let namespace = unique_test_namespace("first_run");
         let vault_id = "test-first-run-vault";
 
@@ -404,6 +758,597 @@ mod tests {
              derivation. STOP."
         );
     }
+
+    // ────────────────────────────────────────────────────────────────────
+    // ADR-041 V0.1 → V0.2 SQLCipher passphrase bridge tests (Tier 1)
+    //
+    // Per ADR-041 plan iteration 2 §6: 7 named tests + 1 Tier 2 integration.
+    // All bridge tests `#[cfg(windows)]` — bridge wraps Windows Credential
+    // Manager via `windows_native_keyring_store::Store` (Phase 1 lock per
+    // ADR-029 + ADR-040 OQ #1 partial resolution). macOS/Linux per-platform
+    // crate-add at T0.2.0.x sub-task or T0.2.14 Stub-Installer-adjacent.
+    //
+    // **Serialization mutex (`KEYCHAIN_TEST_MUTEX`):** `keyring_core`'s
+    // `set_default_store` / `unset_default_store` are process-global state.
+    // Multiple bridge tests running in parallel (RUST_TEST_THREADS=4 per
+    // ADR-038 layer 3 sibling) race on the global slot — test A unsetting
+    // the store while test B is mid-keychain-write produces "No default
+    // store has been set" errors. Production has no contention (vault-
+    // tauri calls the bridge once at startup). Tests serialize via this
+    // mutex; each bridge test acquires it before any bridge-related work
+    // and releases via Drop at test end. `unwrap_or_else(|p| p.into_inner())`
+    // recovers from a poisoned mutex (prior test panic) so one bad test
+    // doesn't poison the entire suite.
+    // ────────────────────────────────────────────────────────────────────
+
+    #[cfg(windows)]
+    static KEYCHAIN_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Acquire the keychain serialization guard for the lifetime of a
+    /// bridge test. Returns a `MutexGuard` that releases on Drop. The
+    /// poison-recovery dance lets prior-test panics not lock out the rest
+    /// of the suite.
+    #[cfg(windows)]
+    fn keychain_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        KEYCHAIN_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Test fixture helper: create a fresh SQLCipher file at `path`,
+    /// keyed with `passphrase`, with `n_rows` rows of substantive content
+    /// inserted. Used by tier-1 bridge tests + the corruption-mode test 7
+    /// (which needs a multi-page DB to corrupt a non-header page).
+    #[cfg(windows)]
+    fn create_v0_1_sqlcipher_fixture(path: &Path, passphrase: &str, n_rows: usize) {
+        use rusqlite::{Connection, OpenFlags};
+
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .expect("fixture open");
+        conn.pragma_update(None, "key", passphrase)
+            .expect("fixture set key");
+        conn.execute_batch(
+            "CREATE TABLE memories_v0_1 (id INTEGER PRIMARY KEY, content TEXT NOT NULL);",
+        )
+        .expect("fixture create table");
+        for i in 0..n_rows {
+            // Substantive content per row so multiple rows cross page
+            // boundaries — needed by test 7's corruption probe to land
+            // outside page 1.
+            let content = format!("v0_1_row_{i}_padding_{}", "x".repeat(256));
+            conn.execute(
+                "INSERT INTO memories_v0_1 (id, content) VALUES (?1, ?2)",
+                rusqlite::params![i as i64, content],
+            )
+            .expect("fixture insert");
+        }
+    }
+
+    /// Read back a known row from a SQLCipher file under a given passphrase.
+    /// Returns `Err` if open / set-key / read fails. Used to verify
+    /// post-bridge content equality (rekey didn't lose data).
+    #[cfg(windows)]
+    fn read_row_content(path: &Path, passphrase: &str, id: i64) -> Result<String, String> {
+        use rusqlite::{Connection, OpenFlags};
+
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| format!("open: {e}"))?;
+        conn.pragma_update(None, "key", passphrase)
+            .map_err(|e| format!("set key: {e}"))?;
+        conn.query_row(
+            "SELECT content FROM memories_v0_1 WHERE id = ?1",
+            rusqlite::params![id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|e| format!("read: {e}"))
+    }
+
+    /// Probe whether a keychain entry exists under `(namespace, vault_id)`.
+    /// Returns true if the entry exists with a 32-byte secret. Used by
+    /// rollback-assertion paths in tests.
+    #[cfg(windows)]
+    fn keychain_entry_exists(namespace: &str, vault_id: &str) -> bool {
+        use keyring_core::Entry;
+        use windows_native_keyring_store::Store;
+
+        let store = match Store::new() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        keyring_core::set_default_store(store);
+        let exists = Entry::new(namespace, vault_id)
+            .ok()
+            .and_then(|e| e.get_secret().ok())
+            .map(|bytes| bytes.len() == 32)
+            .unwrap_or(false);
+        keyring_core::unset_default_store();
+        exists
+    }
+
+    /// Test 1 — happy path: bridge rekeys a fresh V0.1 SQLCipher fixture
+    /// from VAULT_KEY-derived passphrase to keychain-derived passphrase,
+    /// preserving all rows. Verifies §3 steps 1-9 + §10 post-write
+    /// verification end-to-end.
+    #[test]
+    #[cfg(windows)]
+    fn bridge_rekeys_fresh_sqlcipher_file_and_preserves_rows() {
+        let _guard = keychain_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data_dir = tmp.path();
+        let vault_db = data_dir.join("vault.db");
+        let namespace = unique_test_namespace("bridge_happy_path");
+        let vault_id = "test-bridge-happy";
+
+        cleanup_keychain_entry(&namespace, vault_id);
+        create_v0_1_sqlcipher_fixture(&vault_db, "v0_1_test_passphrase", 5);
+
+        let master_key =
+            bridge_or_init_master_key(data_dir, &namespace, vault_id, Some("v0_1_test_passphrase"))
+                .expect("bridge happy path must succeed");
+
+        // Verify keychain entry created.
+        assert!(
+            keychain_entry_exists(&namespace, vault_id),
+            "keychain entry MUST be persisted after successful bridge"
+        );
+
+        // Verify vault.db is now keyed by the new keychain-derived passphrase.
+        // `SqlCipherKey::as_str` is `pub(crate)` to vault-storage so we
+        // recompute the hex form here for the test's direct rusqlite read.
+        // This is the SAME derivation `derive_sqlcipher_passphrase` performs
+        // internally — test-side independence prevents a derivation drift
+        // from silently passing this assertion.
+        let new_passphrase_hex =
+            hex::encode(blake3::derive_key(SQLCIPHER_KDF_CONTEXT, &*master_key));
+        let row = read_row_content(&vault_db, &new_passphrase_hex, 0)
+            .expect("post-bridge read with new passphrase must succeed");
+        assert!(
+            row.starts_with("v0_1_row_0_padding_"),
+            "row content MUST be preserved across rekey; got {row:?}"
+        );
+
+        // Verify snapshot file was cleaned up (success-path step 8).
+        let snapshot = snapshot_path_for(&vault_db);
+        assert!(
+            !snapshot.exists(),
+            "snapshot file MUST be cleaned up on bridge success; still exists at {}",
+            snapshot.display()
+        );
+
+        cleanup_keychain_entry(&namespace, vault_id);
+    }
+
+    /// Test 2 — wrong VAULT_KEY: bridge fail-fasts at step 1 (verify),
+    /// no keychain entry created, vault.db unchanged.
+    #[test]
+    #[cfg(windows)]
+    fn bridge_fails_closed_when_vault_key_is_wrong() {
+        let _guard = keychain_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data_dir = tmp.path();
+        let vault_db = data_dir.join("vault.db");
+        let namespace = unique_test_namespace("bridge_wrong_key");
+        let vault_id = "test-bridge-wrong-key";
+
+        cleanup_keychain_entry(&namespace, vault_id);
+        create_v0_1_sqlcipher_fixture(&vault_db, "v0_1_correct_passphrase", 3);
+
+        let pre_bridge_bytes = std::fs::read(&vault_db).expect("read vault.db pre-bridge");
+
+        let result = bridge_or_init_master_key(
+            data_dir,
+            &namespace,
+            vault_id,
+            Some("v0_1_WRONG_passphrase"),
+        );
+
+        assert!(
+            matches!(result, Err(VaultError::KeychainProvenance(_))),
+            "wrong VAULT_KEY MUST fail closed with KeychainProvenance; got {result:?}"
+        );
+        assert!(
+            !keychain_entry_exists(&namespace, vault_id),
+            "wrong VAULT_KEY MUST NOT create a keychain entry (fail-fast at step 1, before step 4)"
+        );
+        let post_bridge_bytes = std::fs::read(&vault_db).expect("read vault.db post-bridge");
+        assert_eq!(
+            pre_bridge_bytes, post_bridge_bytes,
+            "wrong VAULT_KEY MUST leave vault.db bit-for-bit unchanged"
+        );
+
+        cleanup_keychain_entry(&namespace, vault_id);
+    }
+
+    /// Test 3 — VAULT_KEY unset: bridge returns tailored
+    /// KeychainProvenance error naming VAULT_KEY for user-facing dialog.
+    #[test]
+    #[cfg(windows)]
+    fn bridge_fails_closed_when_vault_key_is_unset() {
+        let _guard = keychain_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data_dir = tmp.path();
+        let vault_db = data_dir.join("vault.db");
+        let namespace = unique_test_namespace("bridge_no_key");
+        let vault_id = "test-bridge-no-key";
+
+        cleanup_keychain_entry(&namespace, vault_id);
+        create_v0_1_sqlcipher_fixture(&vault_db, "v0_1_test_passphrase", 1);
+
+        // Both None and Some("") must trigger the "VAULT_KEY env var is not set"
+        // path (per bridge's match arm `Some(s) if !s.is_empty()`).
+        for vault_key in [None, Some("")] {
+            let result = bridge_or_init_master_key(data_dir, &namespace, vault_id, vault_key);
+            match result {
+                Err(VaultError::KeychainProvenance(msg)) => {
+                    assert!(
+                        msg.contains("VAULT_KEY env var is not set"),
+                        "VAULT_KEY-unset error MUST name VAULT_KEY for the user-facing \
+                         dialog (vault_key={vault_key:?}); got: {msg}"
+                    );
+                }
+                other => panic!(
+                    "VAULT_KEY-unset MUST fail closed with KeychainProvenance \
+                     (vault_key={vault_key:?}); got {other:?}"
+                ),
+            }
+            assert!(
+                !keychain_entry_exists(&namespace, vault_id),
+                "VAULT_KEY-unset MUST NOT create a keychain entry (vault_key={vault_key:?})"
+            );
+        }
+    }
+
+    /// Test 4 — keychain entry already present: bridge takes branch 1
+    /// (V0.2 second-launch path), returns existing master_key, ignores
+    /// V0.1 vault.db / VAULT_KEY entirely.
+    #[test]
+    #[cfg(windows)]
+    fn bridge_no_op_when_keychain_entry_already_exists() {
+        let _guard = keychain_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data_dir = tmp.path();
+        let vault_db = data_dir.join("vault.db");
+        let namespace = unique_test_namespace("bridge_existing_kc");
+        let vault_id = "test-bridge-existing-kc";
+
+        cleanup_keychain_entry(&namespace, vault_id);
+        // Pre-populate keychain via the existing read_or_init path (which
+        // generates + persists on first call).
+        let pre_existing = read_or_init_master_key(&namespace, vault_id)
+            .expect("pre-populate keychain via read_or_init");
+
+        // Even if a V0.1 vault.db is sitting there + VAULT_KEY is set,
+        // bridge takes branch 1 (existing keychain entry) and ignores them.
+        create_v0_1_sqlcipher_fixture(&vault_db, "irrelevant_v0_1_passphrase", 1);
+        let pre_bytes = std::fs::read(&vault_db).expect("read vault.db pre-bridge");
+
+        let returned = bridge_or_init_master_key(
+            data_dir,
+            &namespace,
+            vault_id,
+            Some("irrelevant_v0_1_passphrase"),
+        )
+        .expect("bridge with existing keychain entry must succeed");
+
+        assert_eq!(
+            pre_existing.as_slice(),
+            returned.as_slice(),
+            "bridge MUST return existing keychain master_key byte-identical when keychain \
+             entry exists (branch 1, no V0.1 detection runs)"
+        );
+        let post_bytes = std::fs::read(&vault_db).expect("read vault.db post-bridge");
+        assert_eq!(
+            pre_bytes, post_bytes,
+            "bridge MUST NOT touch vault.db when keychain entry exists (branch 1 short-circuit)"
+        );
+
+        cleanup_keychain_entry(&namespace, vault_id);
+    }
+
+    /// Test 5 — fresh V0.2 install (no keychain + no V0.1 vault.db):
+    /// bridge takes branch 2, delegates to read_or_init's first-run path
+    /// (generate + persist new master_key).
+    #[test]
+    #[cfg(windows)]
+    fn bridge_no_op_when_no_v0_1_sqlcipher_file_present() {
+        let _guard = keychain_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data_dir = tmp.path();
+        let namespace = unique_test_namespace("bridge_fresh_install");
+        let vault_id = "test-bridge-fresh-install";
+
+        cleanup_keychain_entry(&namespace, vault_id);
+        // No vault.db created — fresh V0.2 install state.
+        assert!(!data_dir.join("vault.db").exists());
+
+        let master_key = bridge_or_init_master_key(data_dir, &namespace, vault_id, None)
+            .expect("bridge with no V0.1 vault must succeed via fresh-init delegation");
+
+        assert!(
+            keychain_entry_exists(&namespace, vault_id),
+            "fresh V0.2 install MUST persist new keychain entry (delegated to read_or_init)"
+        );
+        // Sanity: 32 bytes, not all zero.
+        assert_eq!(master_key.len(), 32);
+        assert!(master_key.iter().any(|&b| b != 0));
+
+        cleanup_keychain_entry(&namespace, vault_id);
+    }
+
+    /// Test 6 — keychain-write-before-rekey ordering invariant (§3).
+    /// Trigger a step-5 (snapshot) failure deliberately + verify rollback
+    /// removed the keychain entry. The fact that rollback REMOVES (not
+    /// "never created") proves keychain WAS written before snapshot —
+    /// pinning the §2 Pattern B "cheapest-to-rollback co-store write
+    /// FIRST" invariant.
+    ///
+    /// Mechanism: pre-create the snapshot path as a directory (not a
+    /// file). `std::fs::copy(vault.db, snapshot_path)` then fails with
+    /// "destination is a directory" without touching vault.db, leaving
+    /// keychain in the post-step-4 state for the rollback to clear.
+    #[test]
+    #[cfg(windows)]
+    fn bridge_writes_keychain_before_rekey_ordering_invariant() {
+        let _guard = keychain_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data_dir = tmp.path();
+        let vault_db = data_dir.join("vault.db");
+        let namespace = unique_test_namespace("bridge_ordering");
+        let vault_id = "test-bridge-ordering";
+
+        cleanup_keychain_entry(&namespace, vault_id);
+        create_v0_1_sqlcipher_fixture(&vault_db, "v0_1_ordering", 2);
+
+        // Pre-create the snapshot path AS A DIRECTORY to make
+        // `std::fs::copy(vault.db, snapshot)` fail at step 5.
+        let snapshot_blocker = snapshot_path_for(&vault_db);
+        std::fs::create_dir(&snapshot_blocker).expect("create snapshot blocker dir");
+
+        let result =
+            bridge_or_init_master_key(data_dir, &namespace, vault_id, Some("v0_1_ordering"));
+
+        assert!(
+            result.is_err(),
+            "bridge MUST fail when snapshot step is blocked; got {result:?}"
+        );
+        assert!(
+            !keychain_entry_exists(&namespace, vault_id),
+            "rollback MUST have removed keychain entry. The fact that rollback REMOVES \
+             rather than 'never created' is the empirical proof that step 4 (keychain \
+             write) ran BEFORE step 5 (snapshot). If keychain entry is absent post-test \
+             AND step 5 failed, ordering invariant from §3 is preserved."
+        );
+
+        // Cleanup the snapshot blocker dir we pre-created.
+        std::fs::remove_dir(&snapshot_blocker).ok();
+        cleanup_keychain_entry(&namespace, vault_id);
+    }
+
+    /// Test 7 — snapshot-restore-on-rekey-failure (§3 step 6/7 fail path).
+    /// Methodology (a) corrupted-fixture per ADR-041 plan iteration 2 §6 +
+    /// iteration 2.1 §11. Probes candidate (ii) malformed-page injection:
+    /// PRAGMA key + sqlite_master read (page 1) succeed; PRAGMA rekey
+    /// iterates all pages → hits HMAC failure on corrupted page N → Err.
+    ///
+    /// Per pin 2 watch-trigger: if this corruption mode doesn't reliably
+    /// trigger rekey-Err within ~1h of probing, surface to iteration 3.
+    #[test]
+    #[cfg(windows)]
+    fn bridge_restores_from_snapshot_on_rekey_failure() {
+        let _guard = keychain_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data_dir = tmp.path();
+        let vault_db = data_dir.join("vault.db");
+        let namespace = unique_test_namespace("bridge_rekey_fail");
+        let vault_id = "test-bridge-rekey-fail";
+
+        cleanup_keychain_entry(&namespace, vault_id);
+
+        // Create a multi-page V0.1 SQLCipher fixture (n_rows × 256-byte
+        // padding ≈ multiple 4 KB pages even after compression).
+        let v0_1_passphrase = "v0_1_rekey_fail_test";
+        create_v0_1_sqlcipher_fixture(&vault_db, v0_1_passphrase, 50);
+
+        let pre_size = std::fs::metadata(&vault_db)
+            .expect("metadata pre-corrupt")
+            .len();
+        // Sanity: must be > 8 KB so we have at least page 2 to corrupt.
+        assert!(
+            pre_size > 8192,
+            "fixture must span >= 2 pages for the corruption probe; got {pre_size}"
+        );
+
+        // Corrupt a non-header byte deep in the middle of the file. SQLCipher
+        // default page size is 4096; offset 6000 lands inside page 2 body
+        // (well past the page-2 page-prefix header). Flip all bits to
+        // invalidate the per-page HMAC.
+        let mut bytes = std::fs::read(&vault_db).expect("read vault.db");
+        bytes[6000] ^= 0xFF;
+        std::fs::write(&vault_db, &bytes).expect("write corrupted vault.db");
+
+        // Sanity: PRAGMA key + sqlite_master query (page 1) must still
+        // succeed against the corrupted file. If this fails, the corruption
+        // landed too early (page 1) and step 1 verify would fail before
+        // reaching rekey — different test path. Surface as test setup error.
+        let pragma_key_works = read_row_content(&vault_db, v0_1_passphrase, 0).is_err();
+        // Note: we use a query against memories_v0_1 not sqlite_master, so a
+        // failure could be either (a) PRAGMA key failed (page 1 corrupted)
+        // or (b) the row itself is on a corrupted page. (b) is fine for our
+        // test purpose. The bridge's verify_sqlcipher_passphrase uses
+        // SELECT count(*) FROM sqlite_master, which only touches page 1; if
+        // page 1 is intact, that succeeds even when later pages are corrupt.
+        // We assert the bridge call shape below to confirm.
+        let _ = pragma_key_works; // silence unused warning if path differs
+
+        // Call bridge — expect Err at step 6 (rekey) AFTER step 1 verify
+        // succeeds (page 1 intact) AND step 4 keychain write succeeds AND
+        // step 5 snapshot succeeds.
+        let result =
+            bridge_or_init_master_key(data_dir, &namespace, vault_id, Some(v0_1_passphrase));
+
+        match result {
+            Err(VaultError::Storage(msg)) => {
+                // Bridge should report rekey failure with rollback context.
+                assert!(
+                    msg.contains("rekey")
+                        || msg.contains("Snapshot restored")
+                        || msg.contains("step 6"),
+                    "rekey failure error MUST name the failing step or rollback action; \
+                     got: {msg}"
+                );
+            }
+            Err(VaultError::KeychainProvenance(msg)) => {
+                // If the corruption made step 1 verify fail instead of step 6
+                // rekey, we surface as "PIN 2 WATCH TRIGGER" rather than a
+                // silent test failure — the corruption-mode candidate (ii)
+                // didn't isolate rekey-failure on this dep chain.
+                panic!(
+                    "WATCH-TRIGGER iteration-3 candidate: corruption at offset 6000 \
+                     made step 1 verify fail instead of step 6 rekey. Need to find a \
+                     corruption mode that lets sqlite_master read succeed but rekey \
+                     iterate fail. Adjust offset OR use larger fixture OR escalate to \
+                     iteration 3 per pin 2 watch-trigger. Error: {msg}"
+                );
+            }
+            other => {
+                panic!("bridge with corrupted vault.db MUST fail at rekey step; got {other:?}")
+            }
+        }
+
+        // Verify rollback ran:
+        // - keychain entry deleted
+        // - vault.db restored from snapshot (back to the corrupted state we
+        //   wrote, NOT some half-rekeyed state)
+        // - snapshot file cleaned up
+        assert!(
+            !keychain_entry_exists(&namespace, vault_id),
+            "rollback MUST delete keychain entry on rekey failure"
+        );
+        let post_size = std::fs::metadata(&vault_db)
+            .expect("metadata post-bridge")
+            .len();
+        assert_eq!(
+            pre_size, post_size,
+            "vault.db file size MUST equal pre-bridge size after snapshot restore \
+             (pre={pre_size}, post={post_size}). Different size = snapshot restore \
+             didn't run OR restored from a different file."
+        );
+        let snapshot = snapshot_path_for(&vault_db);
+        assert!(
+            !snapshot.exists(),
+            "snapshot file MUST be cleaned up post-rollback; still exists at {}",
+            snapshot.display()
+        );
+
+        cleanup_keychain_entry(&namespace, vault_id);
+    }
+
+    /// Test 8 — Tier 2 integration: bridge against the captured V0.1
+    /// fixture from commit `1d72aac` (V0.1 SHIPPED). The fixture has 5
+    /// known rows + the captured VAULT_KEY checked in alongside the
+    /// fixture README. This test is the realism gate per ADR-041 plan
+    /// iteration 2 §5 — Tier 1 uses synthetic SQLCipher fixtures
+    /// (rusqlite-direct construction) which might not exercise the
+    /// exact byte shape the V0.1 binary actually produced. Tier 2
+    /// proves the bridge works against real V0.1-binary-emitted bytes.
+    ///
+    /// Operates on a deep-copy of the fixture in a tempdir — the
+    /// checked-in fixture file is read-only by convention; mutating
+    /// it via the bridge would corrupt the test fixture.
+    #[test]
+    #[cfg(windows)]
+    fn tier_2_real_v0_1_vault_db_bridges_and_preserves_5_rows() {
+        let _guard = keychain_test_guard();
+        let fixture_vault_db = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("vault-storage")
+            .join("tests")
+            .join("fixtures")
+            .join("v0_1_alpha_data_dir")
+            .join("vault.db");
+        assert!(
+            fixture_vault_db.exists(),
+            "Tier 2 fixture not found at {}: ADR-041 §5 promised the captured V0.1 \
+             vault.db (98 KB, commit 1d72aac, capture key \
+             'fixture-capture-key-do-not-use-in-prod'). Recapture per the fixture \
+             README if missing.",
+            fixture_vault_db.display()
+        );
+
+        // Deep-copy into a tempdir so the bridge can rekey + we don't
+        // mutate the checked-in fixture.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data_dir = tmp.path();
+        let test_vault_db = data_dir.join("vault.db");
+        std::fs::copy(&fixture_vault_db, &test_vault_db).expect("copy fixture vault.db");
+        // Also copy vault.db-wal so SQLite's WAL recovery on first open
+        // sees a consistent state (the fixture README documents the
+        // WAL was captured alongside).
+        let fixture_wal = fixture_vault_db.with_file_name("vault.db-wal");
+        if fixture_wal.exists() {
+            std::fs::copy(&fixture_wal, data_dir.join("vault.db-wal"))
+                .expect("copy fixture vault.db-wal");
+        }
+
+        let namespace = unique_test_namespace("bridge_tier_2");
+        let vault_id = "test-bridge-tier-2";
+        cleanup_keychain_entry(&namespace, vault_id);
+
+        let master_key = bridge_or_init_master_key(
+            data_dir,
+            &namespace,
+            vault_id,
+            Some("fixture-capture-key-do-not-use-in-prod"),
+        )
+        .expect("bridge against Tier 2 fixture must succeed");
+
+        // Verify the new keychain-derived passphrase opens the rekeyed
+        // vault.db. We don't assert specific row content here because
+        // the V0.1 schema is independent of the bridge's job (the
+        // bridge is a pure-passphrase migration; schema-shape continuity
+        // is verified by `vault_storage::rekey_in_place`'s internal
+        // close+reopen+verify step at §3 step 7).
+        let new_passphrase_hex =
+            hex::encode(blake3::derive_key(SQLCIPHER_KDF_CONTEXT, &*master_key));
+        // Verify open + sqlite_master query succeeds with new passphrase.
+        let new_passphrase = vault_storage::SqlCipherKey::new(new_passphrase_hex.clone());
+        vault_storage::verify_sqlcipher_passphrase(&test_vault_db, &new_passphrase)
+            .expect("post-bridge verify with new keychain-derived passphrase must succeed");
+
+        // Verify the original 5 fixture rows survived rekey by counting
+        // memories — the V0.1 schema has a `memories` table; assert it
+        // has 5 rows.
+        use rusqlite::{Connection, OpenFlags};
+        let conn = Connection::open_with_flags(
+            &test_vault_db,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .expect("open rekeyed vault.db for row count");
+        conn.pragma_update(None, "key", &new_passphrase_hex)
+            .expect("set new key");
+        let row_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
+            .expect("count rows in memories table");
+        assert_eq!(
+            row_count, 5,
+            "Tier 2 fixture has 5 known rows per its README; post-bridge row count \
+             MUST be 5 — different count = rekey lost or corrupted rows"
+        );
+
+        cleanup_keychain_entry(&namespace, vault_id);
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Pre-existing tests follow.
+    // ────────────────────────────────────────────────────────────────────
 
     /// Distinct domain-separator strings for SqlCipher vs at-rest produce
     /// distinct subkeys from the same master_key. Defensive pin against

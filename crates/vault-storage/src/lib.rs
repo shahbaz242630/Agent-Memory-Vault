@@ -44,7 +44,9 @@ pub use graph_store::{
     DuckDbGraphStore, GraphStore, TraversalOptions, CROSS_BOUNDARY_RELATION_TYPES,
 };
 pub use key::SqlCipherKey;
-pub use metadata_store::{MemoryFilter, MetadataStore};
+pub use metadata_store::{
+    rekey_in_place, verify_sqlcipher_passphrase, MemoryFilter, MetadataStore,
+};
 pub use migration::{
     detect_v0_1_state, migrate_v0_1_to_sealed_if_needed, MigrationDetectorOutcome, MigrationOutcome,
 };
