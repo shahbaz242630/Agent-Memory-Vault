@@ -1,28 +1,15 @@
 //! [`VectorStore`] trait + [`LanceVectorStore`] — LanceDB-backed embedding
 //! store for the cascading backend (T0.1.4, BRD §5.2.2).
 //!
-//! ## V0.1 — vector data is stored unencrypted on disk (ADR-010)
+//! ## At-rest encryption (T0.2.0)
 //!
-//! LanceDB 0.8 has no native at-rest encryption. ADR-010 documents the
-//! V0.1-only deviation from BRD §11.5.1 ("All data on disk is encrypted.
-//! No exceptions") — encryption-at-FS-layer ships at T0.2.0 as a HARD
-//! GATE before T0.2.16 (Beta Onboarding). The deviation is bounded to
-//! the founder-only internal alpha; no external user receives a build
-//! containing the V0.1 plaintext code path.
-//!
-//! [`LanceVectorStore::open`] enforces the four ADR-010 compensating
-//! controls that live in this crate:
-//!
-//! 1. `ALPHA_DO_NOT_STORE_REAL_DATA.txt` is auto-written into the data
-//!    directory on every open and made read-only (cross-platform: Unix
-//!    clears the write bits, Windows sets the read-only attribute via
-//!    `std::fs::Permissions::set_readonly(true)`).
-//! 2. A WARN-level `tracing` event fires on every open while the data
-//!    dir is plaintext, naming ADR-010 and T0.2.0.
-//!
-//! The remaining two compensating controls (modal first-run banner and
-//! persistent UI banner) live in `vault-tauri` (T0.1.11). All four are
-//! removed by T0.2.0 when encryption ships.
+//! Vector data is sealed on disk via the [`SealedFileStoreProvider`]
+//! integration in [`crate::sealed_object_store`]. See ADR-008 amendment
+//! (V0.2 at-rest extension lock-in) and ADR-037 (lancedb 0.27.2 upgrade
+//! rationale) for the full design. The V0.1 plaintext code path + the
+//! four ADR-010 compensating controls (ALPHA marker file, plaintext
+//! WARN log, modal banner, persistent UI strip) were removed at T0.2.0
+//! Phase 3 sub-task (e), 2026-05-12.
 //!
 //! ## Boundary access control (BRD §11.4.3)
 //!
@@ -51,11 +38,6 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use chrono::TimeDelta;
-// `Utc` is only used by the gated `write_alpha_warning` (timestamp in the
-// ALPHA marker body) per sub-task (b)+(c) P4 bundle (2026-05-11). Without
-// the gate, non-feature-enabled builds trip unused-import under -D warnings.
-#[cfg(any(test, feature = "v0_1_migration"))]
-use chrono::Utc;
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
@@ -63,12 +45,6 @@ use lancedb::table::{CompactionOptions, OptimizeAction, Table};
 use lancedb::{DistanceType, ObjectStoreRegistry, Session};
 use tokio::sync::Mutex;
 use tracing::{info, instrument};
-// `warn` is only used by the gated plaintext `LanceVectorStore::open`
-// (ADR-010 compensating control #3 WARN log) per sub-task (b)+(c) P4
-// bundle (2026-05-11). Without this gate, non-feature-enabled builds
-// trip the unused-import lint under -D warnings.
-#[cfg(any(test, feature = "v0_1_migration"))]
-use tracing::warn;
 use zeroize::Zeroizing;
 
 use vault_core::{Boundary, MemoryId, VaultError, VaultResult};
@@ -76,11 +52,6 @@ use vault_core::{Boundary, MemoryId, VaultError, VaultResult};
 use crate::sealed_object_store::{
     make_vault_sealed_uri, SealedFileStoreProvider, VAULT_SEALED_SCHEME,
 };
-
-/// Filename of the V0.1 alpha-warning file written into the data directory
-/// on every [`LanceVectorStore::open`]. Removed by T0.2.0 when encryption
-/// ships.
-pub const ALPHA_WARNING_FILENAME: &str = "ALPHA_DO_NOT_STORE_REAL_DATA.txt";
 
 const TABLE_NAME: &str = "memories";
 
@@ -222,122 +193,19 @@ pub struct LanceVectorStore {
     /// (`.cargo/config.toml`, CI workflow, V0.2 alpha-distribution
     /// launchers).
     upsert_lock: Arc<Mutex<()>>,
-    /// Owned [`Session`] for the at-rest sealed-storage path. `None`
-    /// when [`Self::open`] (the V0.1 plaintext path) constructs the
-    /// store; `Some(_)` when [`Self::open_with_at_rest_key`] (the
-    /// T0.2.0 sealed path) constructs it. The [`SealedFileStoreProvider`]
-    /// registered in the session's [`ObjectStoreRegistry`] holds the
-    /// at-rest key and is invoked lazily by Lance on first I/O. Holding
-    /// this `Arc` here keeps the provider alive for the lifetime of the
-    /// store — without it, Lance might reach a registered provider that
-    /// has been dropped.
+    /// Owned [`Session`] for the at-rest sealed-storage path. The
+    /// [`SealedFileStoreProvider`] registered in the session's
+    /// [`ObjectStoreRegistry`] holds the at-rest key and is invoked
+    /// lazily by Lance on first I/O. Holding this `Arc` here keeps the
+    /// provider alive for the lifetime of the store — without it,
+    /// Lance might reach a registered provider that has been dropped.
     ///
     /// The leading underscore is intentional: the field is never read
     /// after construction. Its sole purpose is the lifetime guarantee.
-    _session: Option<Arc<Session>>,
+    _session: Arc<Session>,
 }
 
 impl LanceVectorStore {
-    /// Open or create a LanceDB store at `data_dir` with embedding dimension
-    /// `dimension`. On every call:
-    ///
-    /// 1. Creates `data_dir` if missing.
-    /// 2. Writes/refreshes [`ALPHA_WARNING_FILENAME`] in the data dir and
-    ///    sets it read-only (cross-platform).
-    /// 3. Emits a WARN-level `tracing` event naming ADR-010 + T0.2.0.
-    /// 4. Connects to LanceDB and opens (or creates) the `memories` table
-    ///    with the schema `(id: Utf8, embedding: FixedSizeList<Float32,
-    ///    dimension>, boundary: Utf8)`.
-    ///
-    /// Steps 2 and 3 are non-negotiable V0.1 compensating controls for the
-    /// plaintext-on-disk deviation; both are removed by T0.2.0.
-    ///
-    /// **Visibility (T0.2.0 Phase 3 sub-task (b)+(c), 2026-05-11):** gated to
-    /// `#[cfg(any(test, feature = "v0_1_migration"))]` per HANDOFF.md iteration 4
-    /// §4 amendment. The `any(test, feature)` form keeps vault-storage's own unit
-    /// tests compiling without needing the feature flag (cfg(test) applies inside
-    /// the crate's own test build); the `feature` half exposes the plaintext path
-    /// to downstream crates (vault-tauri, vault-retrieval's tests) that opt in by
-    /// enabling `v0_1_migration` on their vault-storage dep. vault-cli does NOT
-    /// enable the feature; its per-package build excludes plaintext open from the
-    /// binary.
-    ///
-    /// **`pub` (not `pub(crate)`) — iteration 4 §4 amendment retraction (2026-05-11
-    /// sub-task (b)+(c) recon iteration 4):** the original §4 wording locked
-    /// `pub(crate)`, but the local DoD-gate run surfaced that vault-retrieval's
-    /// tests at `crates/vault-retrieval/tests/common/mod.rs:103` +
-    /// `crates/vault-retrieval/src/strategies/semantic.rs:354` call this function
-    /// from a separate crate's test code. `pub(crate)` blocks cross-crate access
-    /// even with the feature flag enabled. Iteration 4 §1's caller enumeration
-    /// missed these. The feature flag (cfg-gate) remains the architectural gate
-    /// controlling EXISTENCE — `pub` vs `pub(crate)` only controls VISIBILITY when
-    /// the function exists. The "callable from migration.rs only" intent is
-    /// preserved at the user-distribution surface (vault-cli's binary excludes
-    /// plaintext open via its per-package build without the feature); test
-    /// consumers (vault-retrieval) opt in via dev-deps. Sub-task (d) later
-    /// migrates vault-retrieval's tests to sealed open_with_at_rest_key, at
-    /// which point the test-side feature dep can be removed.
-    #[cfg(any(test, feature = "v0_1_migration"))]
-    #[instrument(
-        skip(data_dir),
-        fields(data_dir = %data_dir.display(), dimension)
-    )]
-    pub async fn open(data_dir: &Path, dimension: usize) -> VaultResult<Self> {
-        if dimension == 0 {
-            return Err(VaultError::InvalidInput(
-                "vector dimension must be greater than zero".into(),
-            ));
-        }
-
-        fs::create_dir_all(data_dir)?;
-
-        // ADR-010 compensating control #4: write the loud warning file.
-        // Per ADR-014: the file is a SECONDARY safety control. If the data
-        // dir is read-only / quota-exceeded / otherwise un-writable, log a
-        // WARN with the underlying error and proceed — failing `open()`
-        // here would be a denial-of-service against legitimate use, and
-        // the primary safety control (the WARN log below) still fires.
-        if let Err(e) = write_alpha_warning(data_dir) {
-            warn!(
-                error = %e,
-                data_dir = %data_dir.display(),
-                "ALPHA warning file write failed (data dir may be read-only \
-                 or out of space). Continuing because the startup WARN log is \
-                 the primary safety control — see ADR-014."
-            );
-        }
-
-        // ADR-010 compensating control #3 (PRIMARY): WARN every open while
-        // plaintext. This fires regardless of whether the secondary ALPHA
-        // file write succeeded.
-        warn!(
-            data_dir = %data_dir.display(),
-            "LanceDB data dir is plaintext (V0.1 alpha — see ADR-010). \
-             Encryption layer ships in T0.2.0."
-        );
-
-        let uri = data_dir.to_string_lossy().to_string();
-        let connection = lancedb::connect(&uri)
-            .execute()
-            .await
-            .map_err(|e| VaultError::Storage(format!("lancedb connect: {e}")))?;
-
-        let table = open_or_create_table(&connection, dimension).await?;
-
-        info!(table = TABLE_NAME, dimension, "LanceVectorStore opened");
-
-        // The `Connection` is dropped here; `Table` holds its own internal
-        // reference to keep the connection alive for the store's lifetime.
-        let _ = connection;
-
-        Ok(Self {
-            table,
-            dimension,
-            upsert_lock: Arc::new(Mutex::new(())),
-            _session: None,
-        })
-    }
-
     /// Open or create a LanceDB store at `data_dir` with at-rest AEAD
     /// sealing keyed off the already-derived 32-byte `at_rest_key`.
     ///
@@ -355,15 +223,12 @@ impl LanceVectorStore {
     /// the custom `vault-sealed://` URI scheme registered with a
     /// [`Session`]'s [`ObjectStoreRegistry`]. Per ADR-008 amendment
     /// (Phase 0e) and the Phase 0c spike v2 runtime confirmation, this
-    /// is the production at-rest-encryption path; the existing
-    /// [`Self::open`] (plaintext) constructor remains for V0.1 alpha
-    /// backwards compatibility and is removed at the formal at-rest
-    /// gate close.
+    /// is the production at-rest-encryption path. The previous V0.1
+    /// plaintext `open()` constructor was removed at T0.2.0 Phase 3
+    /// sub-task (e) (2026-05-12) along with the rest of the V0.1
+    /// migration code.
     ///
-    /// Differences from [`Self::open`]:
-    /// - Does NOT write the V0.1 ALPHA warning file (ADR-010 banners
-    ///   are removed at the formal at-rest gate close).
-    /// - Does NOT emit the V0.1 plaintext-on-disk WARN log.
+    /// Behaviour:
     /// - URI scheme is `vault-sealed://` not the bare absolute path.
     /// - Connection is opened with a session whose registry routes
     ///   `vault-sealed://` to a [`SealedFileStoreProvider`].
@@ -440,7 +305,7 @@ impl LanceVectorStore {
             table,
             dimension,
             upsert_lock: Arc::new(Mutex::new(())),
-            _session: Some(session),
+            _session: session,
         })
     }
 }
@@ -751,164 +616,6 @@ impl VectorStore for LanceVectorStore {
     }
 }
 
-impl LanceVectorStore {
-    /// Read every (id, embedding, boundary) tuple from the table for the
-    /// V0.1 → V0.2 migration loop. Crate-private — sole consumer is
-    /// [`crate::migration::migrate_v0_1_to_sealed_if_needed`]. Speaks
-    /// domain types only (per BRD §2.2 — the trait surface never exposes
-    /// arrow_array internals); the migration consumer treats the result
-    /// as a re-insertable iterator.
-    ///
-    /// **Iteration shape (locked by Phase 2 plan iteration 2 §1):** uses
-    /// the same `query().limit(count).execute().try_collect()` pattern as
-    /// `validate_readable()` (line 645 doc comment) — in-tree runtime
-    /// evidence that the shape works against lancedb 0.27.2 supersedes
-    /// the open question raised in iteration 1 §7.
-    ///
-    /// **Bulk-collect over streaming.** V0.1 vault scale is bounded by
-    /// founder-dogfood reality (ADR-029: 11 memories at V0.1 SHIPPED).
-    /// Even at 10K rows × ~1.6 KB/row ≈ 16 MB peak — trivial. Streaming
-    /// would be premature optimisation; bulk-collect matches the existing
-    /// `validate_readable()` shape exactly.
-    ///
-    /// Gated to `#[cfg(feature = "v0_1_migration")]` per sub-task (d)
-    /// gate-narrowing (2026-05-12) — sole caller is `migration` mod
-    /// which is gated on the SAME feature (`lib.rs:30-31`). The earlier
-    /// `any(test, feature = ...)` gate was asymmetric: under
-    /// `cargo test --lib` without the feature, `test` was true so this
-    /// fn compiled, but the migration mod was off so no caller existed,
-    /// tripping `dead_code` under `-D warnings`. Matching the migration
-    /// mod's gate exactly closes the asymmetry.
-    #[cfg(feature = "v0_1_migration")]
-    pub(crate) async fn scan_all_rows_for_migration(
-        &self,
-    ) -> VaultResult<Vec<(MemoryId, Vec<f32>, Boundary)>> {
-        let row_count = self
-            .table
-            .count_rows(None)
-            .await
-            .map_err(|e| VaultError::Storage(format!("scan_all_rows count: {e}")))?;
-        if row_count == 0 {
-            return Ok(Vec::new());
-        }
-
-        let stream = self
-            .table
-            .query()
-            .limit(row_count)
-            .execute()
-            .await
-            .map_err(|e| VaultError::Storage(format!("scan_all_rows execute: {e}")))?;
-
-        let batches: Vec<RecordBatch> = stream
-            .try_collect()
-            .await
-            .map_err(|e| VaultError::Storage(format!("scan_all_rows collect: {e}")))?;
-
-        let mut out = Vec::with_capacity(row_count);
-        for batch in &batches {
-            let ids = batch
-                .column_by_name("id")
-                .ok_or_else(|| VaultError::Storage("scan_all_rows: missing id column".into()))?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| VaultError::Storage("scan_all_rows: id column not Utf8".into()))?;
-            let boundaries = batch
-                .column_by_name("boundary")
-                .ok_or_else(|| {
-                    VaultError::Storage("scan_all_rows: missing boundary column".into())
-                })?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| {
-                    VaultError::Storage("scan_all_rows: boundary column not Utf8".into())
-                })?;
-            let embeddings = batch
-                .column_by_name("embedding")
-                .ok_or_else(|| {
-                    VaultError::Storage("scan_all_rows: missing embedding column".into())
-                })?
-                .as_any()
-                .downcast_ref::<FixedSizeListArray>()
-                .ok_or_else(|| {
-                    VaultError::Storage("scan_all_rows: embedding column not FixedSizeList".into())
-                })?;
-
-            for i in 0..batch.num_rows() {
-                let id_str = ids.value(i);
-                let uuid = Uuid::parse_str(id_str).map_err(|e| {
-                    VaultError::Storage(format!("scan_all_rows: invalid uuid at row {i}: {e}"))
-                })?;
-                let boundary_str = boundaries.value(i);
-                let boundary = Boundary::new(boundary_str).map_err(|e| {
-                    VaultError::Storage(format!("scan_all_rows: invalid boundary at row {i}: {e}"))
-                })?;
-                let inner = embeddings.value(i);
-                let inner_f32 = inner
-                    .as_any()
-                    .downcast_ref::<Float32Array>()
-                    .ok_or_else(|| {
-                        VaultError::Storage(
-                            "scan_all_rows: embedding inner array not Float32".into(),
-                        )
-                    })?;
-                let embedding: Vec<f32> = inner_f32.values().to_vec();
-                out.push((MemoryId(uuid), embedding, boundary));
-            }
-        }
-
-        Ok(out)
-    }
-}
-
-/// Write (or refresh) the V0.1 alpha-warning file in `data_dir` and set it
-/// read-only.
-///
-/// `Permissions::set_readonly(true)` is the cross-platform primitive — on
-/// Unix it clears write bits, on Windows it sets `FILE_ATTRIBUTE_READONLY`.
-/// We deliberately re-write the body on every open so the timestamp is
-/// fresh and the message can't be overwritten by accident.
-///
-/// Gated to `#[cfg(any(test, feature = "v0_1_migration"))]` per sub-task
-/// (b)+(c) P4 bundle (2026-05-11) — sole caller is plaintext
-/// `LanceVectorStore::open` which is itself gated on the same feature.
-#[cfg(any(test, feature = "v0_1_migration"))]
-fn write_alpha_warning(data_dir: &Path) -> VaultResult<()> {
-    let path = data_dir.join(ALPHA_WARNING_FILENAME);
-    let now = Utc::now().to_rfc3339();
-    let body = format!(
-        "ALPHA BUILD — vector data is stored UNENCRYPTED on disk.\n\
-         \n\
-         Do NOT put real personal data, credentials, or sensitive\n\
-         information into this vault. Encryption ships in V0.2 (task\n\
-         T0.2.0) before any beta user receives the product.\n\
-         \n\
-         See ADR-010 in HANDOFF.md for full context.\n\
-         \n\
-         File last refreshed (UTC): {now}\n",
-    );
-
-    // If the file already exists and is read-only from a previous open,
-    // make it writable so we can refresh the body. Otherwise fs::write
-    // fails with "permission denied" on Windows.
-    if path.exists() {
-        let mut perms = fs::metadata(&path)?.permissions();
-        if perms.readonly() {
-            #[allow(clippy::permissions_set_readonly_false)]
-            perms.set_readonly(false);
-            fs::set_permissions(&path, perms)?;
-        }
-    }
-
-    fs::write(&path, body)?;
-
-    let mut perms = fs::metadata(&path)?.permissions();
-    perms.set_readonly(true);
-    fs::set_permissions(&path, perms)?;
-
-    Ok(())
-}
-
 async fn open_or_create_table(connection: &Connection, dimension: usize) -> VaultResult<Table> {
     let table_names = connection
         .table_names()
@@ -1031,19 +738,14 @@ pub(crate) fn quote_sql_string(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    //! Phase 2 tests cover `open()` semantics + the ADR-010 compensating
-    //! controls. The Phase 3 stubs at the bottom exercise the trait methods
-    //! and *will fail* until Phase 3 implements them — that's the TDD
-    //! red-bar for the rest of the task. They live here now so the trait's
-    //! intended behaviour is locked in code before the implementation
-    //! lands.
+    //! Unit tests for `LanceVectorStore` — open semantics, trait
+    //! method behaviour, ADR-018 corruption detection, ADR-038
+    //! concurrent-upsert mutex, ADR-039 hard-delete invariants.
     use super::*;
     use tempfile::TempDir;
     use vault_core::MemoryId;
 
-    /// Test-only at-rest key (32 bytes, fixed pattern). Per-mod local
-    /// const per HANDOFF sub-task (d) §"Const placement" decision lock;
-    /// matches the convention in `tests/migration_v0_1_to_sealed.rs:96`.
+    /// Test-only at-rest key (32 bytes, fixed pattern).
     const TEST_AT_REST_KEY: [u8; 32] = [0xab; 32];
 
     fn embedding(dim: usize, fill: f32) -> Vec<f32> {
@@ -1086,7 +788,7 @@ mod tests {
     }
 
     // ============================================================
-    //   Phase 2 — open() semantics + ADR-010 compensating controls
+    //   open() semantics
     // ============================================================
 
     #[tokio::test]
@@ -1099,130 +801,6 @@ mod tests {
             .unwrap();
         assert!(data_dir.exists());
         assert!(data_dir.is_dir());
-    }
-
-    #[tokio::test]
-    async fn open_writes_alpha_warning_file() {
-        let tmp = TempDir::new().unwrap();
-        let _store = LanceVectorStore::open(tmp.path(), 384).await.unwrap();
-        let alpha = tmp.path().join(ALPHA_WARNING_FILENAME);
-        assert!(alpha.exists(), "ALPHA warning file must exist after open");
-        let body = fs::read_to_string(&alpha).unwrap();
-        assert!(body.contains("ALPHA BUILD"));
-        assert!(body.contains("UNENCRYPTED"));
-        assert!(body.contains("ADR-010"));
-        assert!(body.contains("T0.2.0"));
-    }
-
-    #[tokio::test]
-    async fn alpha_warning_file_is_read_only_cross_platform() {
-        let tmp = TempDir::new().unwrap();
-        let _store = LanceVectorStore::open(tmp.path(), 384).await.unwrap();
-        let alpha = tmp.path().join(ALPHA_WARNING_FILENAME);
-        let perms = fs::metadata(&alpha).unwrap().permissions();
-        assert!(
-            perms.readonly(),
-            "ALPHA warning file must be read-only \
-             (Unix: write bits cleared; Windows: FILE_ATTRIBUTE_READONLY set)"
-        );
-    }
-
-    /// **T0.1.10 Phase 3b — ADR-010 compensating-control #3 PRIMARY pin.**
-    ///
-    /// Closes the T0.1.4 test gap that ADR-010 line 539 specified
-    /// (*"assert the WARN log fires on every open"*) but wasn't
-    /// implemented at T0.1.4. The WARN itself has been live in
-    /// `LanceVectorStore::open` since T0.1.4 (`vector_store.rs:240-244`);
-    /// this test pins it against regression at CI level so a future
-    /// "helpful" change that drops the WARN, demotes its level, or
-    /// removes the ADR-010 / T0.2.0 references trips CI immediately.
-    ///
-    /// Asserts three properties:
-    /// 1. A `tracing` event is emitted at any level under the
-    ///    `vault_storage` scope when `LanceVectorStore::open` runs.
-    /// 2. The event message contains the canonical "ADR-010" reference
-    ///    (regression check that the ADR citation isn't silently
-    ///    dropped from the message).
-    /// 3. The event message contains "T0.2.0" (regression check that
-    ///    the encryption-deferral milestone reference stays — that
-    ///    cross-link is what makes the WARN actionable for an alpha
-    ///    user reading their dev console).
-    ///
-    /// `tracing-test` captures events into a thread-local subscriber per
-    /// `#[traced_test]`; the `no-env-filter` workspace feature ensures
-    /// WARN events are captured regardless of `RUST_LOG`. Pattern matches
-    /// the existing usage at `vault-retrieval/src/strategies/semantic.rs:423-444`.
-    #[tokio::test]
-    #[tracing_test::traced_test]
-    async fn open_emits_adr_010_plaintext_warn_log() {
-        let tmp = TempDir::new().unwrap();
-        let _store = LanceVectorStore::open(tmp.path(), 384).await.unwrap();
-
-        assert!(
-            tracing_test::internal::logs_with_scope_contain(
-                "vault_storage",
-                "LanceDB data dir is plaintext",
-            ),
-            "ADR-010 compensating-control #3 (PRIMARY) WARN log MUST fire on every \
-             LanceVectorStore::open. If this fails, the WARN at vector_store.rs:240-244 \
-             has been removed, demoted, or its scope altered. Per ADR-010 line 525, \
-             this WARN is the primary safety control while V0.1 ships plaintext-on-disk."
-        );
-        assert!(
-            tracing_test::internal::logs_with_scope_contain("vault_storage", "ADR-010",),
-            "ADR-010 reference MUST appear in the WARN message — alpha users reading \
-             their dev console need the cross-link to the ADR's full context"
-        );
-        assert!(
-            tracing_test::internal::logs_with_scope_contain("vault_storage", "T0.2.0",),
-            "T0.2.0 reference MUST appear in the WARN message — alpha users need to \
-             know which release closes the deviation (encryption layer)"
-        );
-    }
-
-    /// ADR-014: if the ALPHA file write fails (read-only data dir, quota,
-    /// FS error), `open()` must STILL succeed. The startup WARN log is the
-    /// primary safety control; the file is secondary. We force the failure
-    /// by pre-creating the alpha *path* as a directory — `fs::write` then
-    /// fails because the path is a directory, but the rest of `open()`
-    /// proceeds.
-    #[tokio::test]
-    async fn open_succeeds_when_alpha_file_write_fails_per_adr_014() {
-        let tmp = TempDir::new().unwrap();
-        let data_dir = tmp.path();
-
-        // Pre-create the alpha *path* as a directory. Subsequent fs::write
-        // calls to this path will fail on every platform we support.
-        let alpha_path = data_dir.join(ALPHA_WARNING_FILENAME);
-        fs::create_dir(&alpha_path).unwrap();
-        assert!(alpha_path.is_dir());
-
-        // open() must succeed despite the alpha-file write failure.
-        let store = LanceVectorStore::open(data_dir, 4).await.unwrap();
-
-        // The alpha path is still a directory (the failed fs::write didn't
-        // overwrite it) and the LanceDB store is otherwise functional.
-        assert!(
-            alpha_path.is_dir(),
-            "alpha path was clobbered by failed write"
-        );
-        assert_eq!(store.dimension(), 4);
-        assert_eq!(store.count(None).await.unwrap(), 0);
-    }
-
-    #[tokio::test]
-    async fn open_refreshes_alpha_file_even_when_existing_is_read_only() {
-        // Reproduces the realistic case where the alpha file is left from a
-        // previous run. Without the explicit "make writable, rewrite,
-        // make read-only" sequence, fs::write would fail with permission
-        // denied on Windows.
-        let tmp = TempDir::new().unwrap();
-        let _s1 = LanceVectorStore::open(tmp.path(), 384).await.unwrap();
-        drop(_s1);
-        let _s2 = LanceVectorStore::open(tmp.path(), 384).await.unwrap();
-        let alpha = tmp.path().join(ALPHA_WARNING_FILENAME);
-        assert!(alpha.exists());
-        assert!(fs::metadata(&alpha).unwrap().permissions().readonly());
     }
 
     #[tokio::test]

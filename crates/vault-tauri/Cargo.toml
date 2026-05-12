@@ -31,12 +31,7 @@ tauri-plugin-dialog = { workspace = true }
 # Workspace types we wire through.
 vault-core = { path = "../vault-core" }
 vault-app = { path = "../vault-app" }
-# vault-storage with `v0_1_migration` feature enabled per HANDOFF.md
-# iteration 4 §4 amendment (sub-task (b)+(c) P4 bundle, 2026-05-11). The
-# feature gates plaintext `LanceVectorStore::open` + `StorageBackend::open`
-# + the `migration` module — all needed by vault-tauri's V0.1→V0.2
-# migration startup path. vault-cli does NOT enable this feature.
-vault-storage = { path = "../vault-storage", features = ["v0_1_migration"] }
+vault-storage = { path = "../vault-storage" }
 # Phase 4b: Tauri commands dispatch through Adapter (vault-mcp trait + ToolInvokeDetails / ToolInvokeError) and build RetrievalQuery (vault-retrieval).
 vault-mcp = { path = "../vault-mcp" }
 vault-retrieval = { path = "../vault-retrieval" }

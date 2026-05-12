@@ -22,13 +22,6 @@ pub(crate) mod fault_injection;
 pub mod graph_store;
 pub mod key;
 pub mod metadata_store;
-// V0.1 → V0.2 plaintext-migration module — gated to the `v0_1_migration`
-// feature flag per HANDOFF.md iteration 4 §4 amendment (sub-task (b)+(c)
-// P4 bundle, 2026-05-11). vault-tauri enables the feature; vault-cli does
-// NOT (its per-package build excludes this module from the binary).
-// Module is removed entirely when V0.2.x stops needing V0.1 migration.
-#[cfg(feature = "v0_1_migration")]
-pub mod migration;
 pub(crate) mod migrations;
 pub(crate) mod migrations_graph;
 pub mod pending_sync;
@@ -53,14 +46,6 @@ pub use key::SqlCipherKey;
 pub use metadata_store::{
     rekey_in_place, verify_sqlcipher_passphrase, MemoryFilter, MetadataStore,
 };
-// Re-exports from `migration` are gated on the same feature as the module
-// itself (sub-task (b)+(c) P4 bundle, 2026-05-11). Without the feature,
-// the `migration` module doesn't compile, so the re-export must also be
-// absent.
-#[cfg(feature = "v0_1_migration")]
-pub use migration::{
-    detect_v0_1_state, migrate_v0_1_to_sealed_if_needed, MigrationDetectorOutcome, MigrationOutcome,
-};
 pub use pending_sync::{PendingSync, PendingSyncEntry};
 pub use retry_queue::{
     base_backoff_secs, compute_next_attempt, is_permanent, CascadeOperation, DeadLetterReason,
@@ -71,4 +56,4 @@ pub use retry_worker::{RetryWorker, StepResult, DEFAULT_POLL_INTERVAL};
 pub use sealed_object_store::{
     make_vault_sealed_uri, SealedFileStoreProvider, VAULT_SEALED_SCHEME,
 };
-pub use vector_store::{LanceVectorStore, VectorStore, ALPHA_WARNING_FILENAME};
+pub use vector_store::{LanceVectorStore, VectorStore};

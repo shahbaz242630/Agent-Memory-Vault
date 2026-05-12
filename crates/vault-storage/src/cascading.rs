@@ -165,61 +165,25 @@ pub struct StorageBackend {
 }
 
 impl StorageBackend {
-    /// Open all three stores at the given paths and run `validate_readable`
-    /// on the downstream stores. Returns `Ok(Self)` even on validation
-    /// failure — the backend is reported via [`Self::degraded`] so
-    /// vault-cli triage can still run (per ADR-018 / Phase A Change 1).
+    /// Open all three stores at the given paths via the sealed at-rest
+    /// LanceDB path, then run `validate_readable` on the downstream
+    /// stores. Returns `Ok(Self)` even on validation failure — the
+    /// backend is reported via [`Self::degraded`] so vault-cli triage
+    /// can still run (per ADR-018 / Phase A Change 1).
     ///
     /// Hard failures (couldn't open SQLCipher, couldn't open LanceDB /
     /// DuckDB at all) still return `Err` — those mean the vault-cli
     /// can't even read the SQLite metadata, so degraded mode wouldn't
     /// help.
     ///
-    /// **Visibility (T0.2.0 Phase 3 sub-task (b)+(c), 2026-05-11):** gated to
-    /// `#[cfg(any(test, feature = "v0_1_migration"))]` per HANDOFF.md iteration 4
-    /// §4 amendment cascade scope expansion (option α). Calls the gated plaintext
-    /// [`LanceVectorStore::open`] at line 194; the cascade gate keeps cascading.rs
-    /// compiling when the feature is off (the gated symbol it references doesn't
-    /// exist in those builds, so this function must also not exist).
-    #[cfg(any(test, feature = "v0_1_migration"))]
-    #[instrument(
-        skip(metadata_path, vector_data_dir, graph_path, key),
-        fields(
-            metadata_path = %metadata_path.display(),
-            vector_data_dir = %vector_data_dir.display(),
-            graph_path = %graph_path.display(),
-            dimension,
-        )
-    )]
-    pub async fn open(
-        metadata_path: &Path,
-        vector_data_dir: &Path,
-        graph_path: &Path,
-        key: SqlCipherKey,
-        dimension: usize,
-    ) -> VaultResult<Self> {
-        let metadata = MetadataStore::open(metadata_path, key).await?;
-        let vector = LanceVectorStore::open(vector_data_dir, dimension).await?;
-        let graph = DuckDbGraphStore::open(graph_path).await?;
-        Self::assemble(metadata, vector, graph).await
-    }
-
-    /// Sealed companion to [`Self::open`] — opens the LanceDB store via
-    /// [`LanceVectorStore::open_with_at_rest_key`] (T0.2.0 sealed at-rest
-    /// path) instead of the V0.1 plaintext [`LanceVectorStore::open`].
-    /// MetadataStore (SQLCipher) and DuckDbGraphStore are unchanged at
-    /// Phase 2 — sealed metadata + sealed graph land at later T0.2.x
-    /// hardening phases per BRD §11.5.1. Same `Ok(Self)`-on-validation-
-    /// failure semantics as [`Self::open`] (degraded mode preserved).
-    ///
     /// **Caller MUST pass the already-derived at-rest key** (`K3(master_key)`
     /// per ADR-008 amendment K3 KDF). Canonical production derivation
     /// site: [`vault_app::keychain::derive_at_rest_key`] per ADR-040
     /// amendment.
     ///
-    /// Plaintext [`Self::open`] is retained for the V0.1 → V0.2
-    /// migration source path; Phase 3 deletes both plaintext
-    /// constructors after the formal at-rest gate close.
+    /// The V0.1 plaintext `open()` constructor was removed at T0.2.0
+    /// Phase 3 sub-task (e) (2026-05-12) alongside the rest of the V0.1
+    /// migration code.
     #[instrument(
         skip(metadata_path, vector_data_dir, graph_path, key, at_rest_key),
         fields(
@@ -245,11 +209,11 @@ impl StorageBackend {
         Self::assemble(metadata, vector, graph).await
     }
 
-    /// Shared assembly path for both [`Self::open`] (plaintext) and
-    /// [`Self::open_with_at_rest_key`] (sealed). Runs `validate_readable`
-    /// on the downstream stores, computes [`DegradedMode`], emits the
-    /// per-store `store.corruption` audit events on failure, and builds
-    /// the [`StorageBackend`] struct with shared metadata-store clones.
+    /// Shared assembly path used by [`Self::open_with_at_rest_key`].
+    /// Runs `validate_readable` on the downstream stores, computes
+    /// [`DegradedMode`], emits the per-store `store.corruption` audit
+    /// events on failure, and builds the [`StorageBackend`] struct with
+    /// shared metadata-store clones.
     async fn assemble(
         metadata: MetadataStore,
         vector: LanceVectorStore,

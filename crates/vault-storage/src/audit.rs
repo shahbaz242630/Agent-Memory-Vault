@@ -64,18 +64,6 @@ pub enum AuditEventType {
     /// so search calls retain full diagnostic detail at the MCP layer.
     McpToolInvoke,
 
-    /// **ADR-024 amendment 2026-05-05 (T0.1.11 Phase 4a).** Recorded
-    /// when the founder acknowledges the V0.1 alpha first-run banner
-    /// per ADR-010 control #1 (modal "ALPHA BUILD — vector data is
-    /// stored UNENCRYPTED" warning that blocks UI until acknowledged).
-    /// vault-tauri's `acknowledge_alpha_banner` Tauri command writes
-    /// this row at first-launch ack. Presence of the row enables
-    /// alpha-review verification that compensating control #1 fired.
-    /// `details_json` shape: `{"user_agent": "vault-tauri/<version>"}`
-    /// — timestamp lives in the audit row's `created_at` column,
-    /// not in `details_json`.
-    AlphaBannerAcknowledged,
-
     /// **ADR-024 amendment 2026-05-05 (T0.1.11 Phase 4b — Decision 5(γ)).**
     /// Recorded when vault-tauri dispatches a Tauri command (add_memory
     /// / search_memories / update_memory / delete_memory) through
@@ -95,8 +83,6 @@ pub enum AuditEventType {
     /// "search_memories", "update_memory", "delete_memory"). Reusing
     /// ToolInvokeDetails keeps the audit-row schema simple; only the
     /// event_type discriminates UI commands from MCP tools.
-    /// `acknowledge_alpha_banner` writes the SEPARATE
-    /// `AlphaBannerAcknowledged` variant above (UI state, not vault state).
     TauriCommandInvoke,
 }
 
@@ -115,7 +101,6 @@ impl AuditEventType {
             Self::StoreCorruption => "store.corruption",
             Self::CascadeQueueOverflow => "cascade.queue_overflow",
             Self::McpToolInvoke => "mcp.tool_invoke",
-            Self::AlphaBannerAcknowledged => "ui.alpha_banner_acknowledged",
             Self::TauriCommandInvoke => "ui.tauri_command_invoke",
         }
     }
@@ -139,7 +124,6 @@ impl AuditEventType {
             "store.corruption" => Some(Self::StoreCorruption),
             "cascade.queue_overflow" => Some(Self::CascadeQueueOverflow),
             "mcp.tool_invoke" => Some(Self::McpToolInvoke),
-            "ui.alpha_banner_acknowledged" => Some(Self::AlphaBannerAcknowledged),
             "ui.tauri_command_invoke" => Some(Self::TauriCommandInvoke),
             _ => None,
         }

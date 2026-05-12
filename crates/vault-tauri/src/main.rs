@@ -82,10 +82,10 @@ use vault_app::keychain::{
     bridge_or_init_master_key, derive_at_rest_key, derive_sqlcipher_passphrase,
     PRODUCTION_NAMESPACE, VAULT_ID,
 };
-use vault_app::{AppConfig, Application, EMBEDDING_DIM};
+use vault_app::{AppConfig, Application};
 use vault_tauri::{
     dylib_filename_for_os, env_override_for, format_keychain_error_dialog,
-    format_migration_error_dialog, format_startup_failure_dialog,
+    format_startup_failure_dialog,
 };
 
 /// Exit code for keychain provenance failures (ADR-040 + ADR-040 amendment;
@@ -107,7 +107,6 @@ fn main() {
             vault_tauri::commands::search_memories,
             vault_tauri::commands::update_memory,
             vault_tauri::commands::delete_memory,
-            vault_tauri::commands::acknowledge_alpha_banner,
         ])
         .setup(|app| {
             // 1. Resolve libonnxruntime dylib path per ADR-019.
@@ -254,43 +253,6 @@ fn main() {
                 ort_lib_path,
                 at_rest_key,
             };
-
-            // 5b. V0.1 → V0.2 migration (one-shot, idempotent —
-            //     NoMigrationNeeded on every launch after the first
-            //     sealed write). Per HANDOFF.md "T0.2.0 Phase 2 — plan
-            //     iteration 1" §1 + iteration 2 §2 cookie-file
-            //     calibration. Runs BEFORE Application::new so the
-            //     sealed `StorageBackend::open_with_at_rest_key` opens
-            //     a confirmed-V0.2-shape vault_dir.
-            //
-            //     `at_rest_key` is the K3-derived already-sealed key
-            //     per ADR-040 amendment + the Phase 2 signature-fix
-            //     amendment (LanceVectorStore::open_with_at_rest_key
-            //     takes the at-rest key directly, not master_key).
-            let app_handle_pre_app = app.handle().clone();
-            tauri::async_runtime::block_on(async {
-                match vault_storage::migration::migrate_v0_1_to_sealed_if_needed(
-                    &config.vector_dir,
-                    EMBEDDING_DIM,
-                    &config.at_rest_key,
-                )
-                .await
-                {
-                    Ok(vault_storage::MigrationOutcome::NoMigrationNeeded) => {}
-                    Ok(vault_storage::MigrationOutcome::Migrated { rows_migrated }) => {
-                        tracing::info!(
-                            rows_migrated,
-                            "V0.1 → V0.2 migration complete (vault-tauri startup step 5b)"
-                        );
-                    }
-                    Err(e) => show_fatal_dialog_and_exit(
-                        &app_handle_pre_app,
-                        "Memory Vault — V0.1 Data Migration Failed",
-                        &format_migration_error_dialog(&e),
-                        EXIT_STARTUP_FAILURE,
-                    ),
-                }
-            });
 
             // 6. Construct Application and spawn the cascading retry
             //    worker. Per ADR-034 (T0.1.11 Phase 5b): V0.1 vault-tauri

@@ -1,11 +1,8 @@
-//! Tauri command surface — V0.1 BRD §5.11 (5 commands).
+//! Tauri command surface — BRD §5.11.
 //!
-//! Five commands dispatch through `Application::adapter()` (the wired
+//! Commands dispatch through `Application::adapter()` (the wired
 //! `VaultAdapter` from Phase 4a) per ADR-030 outcome (a) single-process
-//! MCP architecture. Plus one banner-ack command writes directly to the
-//! metadata-store audit chain via
-//! `VaultAdapter::append_alpha_banner_acknowledged_audit` (UI state, not
-//! vault-state CRUD; per ADR-024 amendment 2026-05-05).
+//! MCP architecture.
 //!
 //! ## ADR-024 amendment 2026-05-05 (Decision 5(γ)) — TauriCommandInvoke audit
 //!
@@ -298,19 +295,6 @@ pub async fn delete_memory(state: State<'_, Application>, id: String) -> Result<
     delete_memory_inner(state.inner(), id).await
 }
 
-/// Inner acknowledge_alpha_banner implementation.
-pub async fn acknowledge_alpha_banner_inner(app: &Application) -> Result<(), String> {
-    app.adapter()
-        .append_alpha_banner_acknowledged_audit()
-        .await
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn acknowledge_alpha_banner(state: State<'_, Application>) -> Result<(), String> {
-    acknowledge_alpha_banner_inner(state.inner()).await
-}
-
 #[cfg(test)]
 mod tests {
     // Test fixture construction for vault-tauri commands requires a
@@ -355,12 +339,6 @@ mod tests {
     #[ignore = "Phase 4b deferred — same fixture-sharing constraint"]
     async fn delete_memory_command_dispatches_through_adapter_delete_with_auth_gate_inherited_from_phase_4a(
     ) {
-        unimplemented!("Phase 4b ignored placeholder");
-    }
-
-    #[tokio::test]
-    #[ignore = "Phase 4b deferred — same fixture-sharing constraint"]
-    async fn acknowledge_alpha_banner_writes_alphabanneracknowledged_audit_row() {
         unimplemented!("Phase 4b ignored placeholder");
     }
 

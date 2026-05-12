@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Memory Vault — Alpha</title>
+    <title>Memory Vault</title>
     <style>
       * { box-sizing: border-box; }
       body {
@@ -14,47 +14,6 @@
         padding: 0;
         font-size: 14px;
       }
-
-      /* ADR-010 control #2: persistent banner strip — always visible until V0.2 */
-      .alpha-banner {
-        background: #ff9800;
-        color: #000;
-        padding: 0.5rem 1rem;
-        font-weight: 600;
-        text-align: center;
-      }
-
-      /* ADR-010 control #1: modal first-run banner — blocks UI until acknowledged */
-      .modal-overlay {
-        display: none;
-        position: fixed;
-        inset: 0;
-        background: rgba(0, 0, 0, 0.85);
-        z-index: 1000;
-        align-items: center;
-        justify-content: center;
-      }
-      .modal-overlay.active { display: flex; }
-      .modal {
-        background: #2a2a2a;
-        padding: 2rem;
-        max-width: 600px;
-        border: 2px solid #ff9800;
-        border-radius: 8px;
-      }
-      .modal h2 { color: #ff9800; margin-top: 0; }
-      .modal-body { line-height: 1.6; margin-bottom: 1.5rem; }
-      .modal-button {
-        background: #ff9800;
-        color: #000;
-        border: none;
-        padding: 0.75rem 1.5rem;
-        font-weight: 600;
-        cursor: pointer;
-        border-radius: 4px;
-        font-size: 14px;
-      }
-      .modal-button:hover { background: #ffa726; }
 
       /* Tab navigation */
       .tabs {
@@ -170,22 +129,6 @@
     </style>
   </head>
   <body>
-    <!-- ADR-010 control #1: modal first-run banner. Blocks UI until ack. -->
-    <div id="alpha-modal" class="modal-overlay">
-      <div class="modal">
-        <h2>ALPHA BUILD — Read before continuing</h2>
-        <div class="modal-body">
-          <p><strong>Your vector data is stored UNENCRYPTED on disk.</strong></p>
-          <p>Do <strong>NOT</strong> put real personal data, credentials, or sensitive information into this vault. Encryption ships in V0.2 before any beta user receives the product.</p>
-          <p>Per ADR-010 (HANDOFF.md): this is a documented V0.1-only deviation from BRD §11.5.1.</p>
-        </div>
-        <button class="modal-button" id="modal-ack-btn">I understand — proceed</button>
-      </div>
-    </div>
-
-    <!-- ADR-010 control #2: persistent banner strip. -->
-    <div class="alpha-banner">ALPHA — vector store is unencrypted. V0.2 fixes this.</div>
-
     <div class="tabs">
       <div class="tab active" data-view="add">Add Memory</div>
       <div class="tab" data-view="search">Search</div>
@@ -235,16 +178,12 @@
     <div id="settings-view" class="view">
       <h1>Settings</h1>
       <div class="settings-row">
-        <div class="settings-label">Alpha Banner Acknowledged</div>
-        <div class="settings-value" id="setting-banner-ack">Loading...</div>
-      </div>
-      <div class="settings-row">
         <div class="settings-label">Master Key Provenance</div>
         <div class="settings-value set">Windows Credential Manager (com.memoryvault.v0.2)</div>
       </div>
       <div class="settings-row">
         <div class="settings-label">Memory Vault Version</div>
-        <div class="settings-value">vault-tauri 0.1.0 (V0.1 internal alpha)</div>
+        <div class="settings-value">vault-tauri 0.1.0 (V0.2)</div>
       </div>
       <div class="settings-row">
         <div class="settings-label">Boundary Management</div>
@@ -264,23 +203,6 @@
           tab.classList.add("active");
           document.getElementById(`${view}-view`).classList.add("active");
         });
-      });
-
-      // ADR-010 control #1 modal — show on first launch (founder hasn't ack'd yet).
-      // For V0.1 minimal, always show modal on every launch unless ack'd in this session.
-      // V0.2 will read the audit chain to remember the ack across sessions.
-      const ackedThisSession = sessionStorage.getItem("vault.alpha.ack") === "1";
-      if (!ackedThisSession) {
-        document.getElementById("alpha-modal").classList.add("active");
-      }
-      document.getElementById("modal-ack-btn").addEventListener("click", async () => {
-        try {
-          await invoke("acknowledge_alpha_banner");
-          sessionStorage.setItem("vault.alpha.ack", "1");
-          document.getElementById("alpha-modal").classList.remove("active");
-        } catch (err) {
-          alert(`Failed to record acknowledgment: ${err}`);
-        }
       });
 
       // Add memory
@@ -359,10 +281,6 @@
           btn.disabled = false;
         }
       });
-
-      // Settings: show banner-ack indicator
-      document.getElementById("setting-banner-ack").textContent =
-        ackedThisSession ? "Acknowledged this session" : "Not yet acknowledged";
 
       function escapeHtml(s) {
         return String(s).replace(/[&<>"']/g, (c) => ({
