@@ -1,7 +1,7 @@
 # Memory Vault — Build Handoff
 
 **Current version:** V0.2 Closed Beta (BRD §6.2 — sleep consolidator, boundaries hardening, cross-device sync, 30 beta users)
-**Last updated:** 2026-05-12 sub-task (e) ready-for-commit. Sub-task (d) SHIPPED at `2cc8c65` (CI run `25717821471` in progress at this session checkpoint). Sub-task (e) — V0.1 cleanup (full removal of V0.1→V0.2 LanceDB migration code + ADR-010 compensating controls per Shahbaz's "no baggage" call) — implemented + all workspace DoD gates green locally; pending Shahbaz commit approval and (d) CI green confirmation before push.
+**Last updated:** 2026-05-12 sub-task (f) ready-for-commit. Sub-task (e) CI run `25723881794` confirmed ALL-GREEN matrix-wide at session open (Windows build+test completed success; covers (d)+(e) per cumulative-commit property). Sub-task (f) — BRD §6 T0.2.0 acceptance suite (5 integration tests at `crates/vault-storage/tests/t0_2_0_acceptance.rs`) + γ unseal-site tightening at `crates/vault-storage/src/sealed_object_store.rs:210` (`"dryoc pull_to_vec: {e}"` → `"AEAD authentication failed: {e}"`, ADR-008 amendment-class +1-line edit per (f) iteration #1 Q2 lock) + stale doc-comment fix at `crates/vault-app/src/application.rs:145` (Block B caught a real (e)-sweep miss: `LanceVectorStore::open(...)` → `LanceVectorStore::open_with_at_rest_key(...)`) — implemented this session, all local DoD gates green, pending Shahbaz commit approval. **Next-session opener: verify (f)'s CI green matrix-wide, then start Phase 4 founder dogfood on sealed (Windows-only).**
 
 **Session-end-1 (prior, still accurate as a milestone record):** Phase 2 + ADR-041 both SHIPPED. ADR-041 cfg-fix `ac577f4` (push 12:41Z, run `25670758274`). ADR-041 implementation landed at `6f2af9d` (push 12:21Z, run `25669781494`) BUT failed non-Windows clippy/build on unused-imports + dead-code; cfg-fix immediately followed in same session per `feedback_broken_ci_is_regression_not_techdebt.md`. Phase 2 fmt-fix `02799b5` (run `25660977905` GREEN matrix-wide 1h4m55s) preceded. All workspace DoD gates green pre-push: fmt clean, clippy `-D warnings` clean, build zero warns 41m38s, test 0 failures (vault-app: 27 passed +8 bridge tests; vault-storage lib: 232 stable; migration_v0_1_to_sealed: 16 stable; 17 pre-existing ignored markers preserved).
 
@@ -19,16 +19,16 @@
 
 ## Current Status
 
-**Active task:** **T0.2.0 Phase 3 sub-task (f) — BRD §6 T0.2.0 acceptance suite (next coding work).** Sub-task (e) — V0.1 cleanup (full removal of V0.1→V0.2 LanceDB migration code) — implemented this session (2026-05-12); local DoD all green; pending commit approval. After (e)'s commit + CI green, (f) follows. Phase 3 progression status:
+**Active task:** **T0.2.0 Phase 4 — founder dogfood on sealed (Windows-only) — next coding work.** Sub-task (f) — BRD §6 T0.2.0 acceptance suite — implemented this session (2026-05-12); 5/5 integration tests pass, all local DoD gates green, pending Shahbaz commit approval. After (f)'s commit + CI green matrix-wide, T0.2.0 Phase 3 closes and Phase 4 unblocks. Phase 3 progression status:
 
 | Sub-task | Status | Commit |
 |---|---|---|
 | (a) vault-cli migration to sealed + ADR-041 keychain bridge | ✅ SHIPPED | `e27e6dc` (CI green `25678902497`) |
 | (b)+(c) plaintext cfg-gate + Tier 1→Tier 2 collapse | ✅ SHIPPED | `27c141c` (CI green `25687962807`) |
-| (d) unit-test surface migration to sealed | ✅ SHIPPED | `2cc8c65` (CI `25717821471` in progress at this checkpoint) |
-| (e) V0.1 cleanup — migration code + ADR-010 controls + plaintext open + 5 Class B tests + spike examples DELETED | ⏳ ready-for-commit (this session) | — (pending approval; gated on (d) CI green) |
-| (f) BRD §6 T0.2.0 acceptance suite | NEXT CODING WORK (post-(e) CI green) | — |
-| Phase 4 founder dogfood on sealed | Blocked on (f) | — |
+| (d) unit-test surface migration to sealed | ✅ SHIPPED | `2cc8c65` (CI `25717821471` CANCELLED — ubuntu clippy infra hang; covered by (e)'s CI per cumulative-commit property) |
+| (e) V0.1 cleanup — migration code + ADR-010 controls + plaintext open + 5 Class B tests + spike examples DELETED | ✅ SHIPPED | `d556b97` (CI `25723881794` ALL-GREEN matrix-wide at next-session open) |
+| (f) BRD §6 T0.2.0 acceptance suite (5 integration tests) + γ unseal-site tightening + stale-doc ride-along | ⏳ ready-for-commit (this session, 2026-05-12) | — (pending Shahbaz approval) |
+| Phase 4 founder dogfood on sealed (Windows-only) | Blocked on (f) CI green | — |
 | Phase 5 T0.2.0 hard-gate clearance | Blocked on Phase 4 | — |
 
 **Sub-task (d) historical record (shipped at `2cc8c65` earlier this session):**
@@ -128,7 +128,47 @@ Sub-task (d) details preserved for audit-trail purposes. **Many of the reference
 
 **Working tree at (e) session pause (2026-05-12):** 30 file changes (14 modified + 16 deleted), summary above. No Cargo.lock drift expected (feature flag removal doesn't change dep tree since the feature body was `[]`).
 
-**Next coding work after (e) lands + CI green confirms:** sub-task (f) — BRD §6 T0.2.0 acceptance suite (5 criteria: no plaintext on disk + round-trip identity + wrong-key fails closed + four V0.1 controls absent + tampered ciphertext detected). With (e)'s deletion, criterion (d) "four V0.1 controls absent" becomes a clean grep-test (the strings literally don't exist anywhere). After (f): Phase 4 founder dogfood on sealed → Phase 5 T0.2.0 hard-gate clearance.
+**Next coding work after (e) lands + CI green confirms:** sub-task (f) — BRD §6 T0.2.0 acceptance suite. **STATUS: ready-for-commit this session — see (f) deliverables block below.**
+
+---
+
+**Sub-task (f) deliverables (this session, 2026-05-12) — BRD §6 T0.2.0 acceptance suite + γ unseal-site tightening:**
+
+**Scope.** Iteration 4 §9 (f) locked the test surface; iteration #1 of this session locked Q1 (verbatim control strings recovered from `d556b97^`) + Q2 γ (semantic-intent error wording) + Q3 bundle (Block A four-strings + Block B five-symbols in one criterion-(d) test) before any code landed. Five integration tests + 1-line production edit + 1-line stale-doc fix.
+
+**Files added (1):**
+- `crates/vault-storage/tests/t0_2_0_acceptance.rs` — five `#[tokio::test]` (and one sync `#[test]` for criterion (d)) covering BRD §6 T0.2.0 lines 1418-1422 acceptance criteria (a) no plaintext on disk (entropy ≥ `ENTROPY_FLOOR_BITS_PER_BYTE` = 7.5 bits/byte on files ≥ `ENTROPY_MIN_FILE_SIZE` = 512 B + PAR1-magic absence); (b) round-trip identity encrypt → decrypt == original (CI matrix `[ubuntu-latest, windows-latest, macos-latest]`); (c) wrong-key open fails closed + no information leakage (asserts memory ids + boundary name absent from error msg); (d) four ADR-010 control strings absent (Block A) + five plaintext-API symbols absent (Block B, folded in per iteration 4 §9 (f) lock); (e) tampered ciphertext returns `VaultError::Storage(_)` with substring `"AEAD authentication failed"`.
+
+**Files modified (3):**
+- `crates/vault-storage/src/sealed_object_store.rs` — γ unseal-site tightening at line 210. Single-line edit: `format!("dryoc pull_to_vec: {e}")` → `format!("AEAD authentication failed: {e}")`. Replaces implementation-coupled error wording with semantic-intent wording — survives crypto-crate swaps without test rot. ADR-008 amendment-class +1-line edit per Q2 γ lock.
+- `crates/vault-app/src/application.rs` — line 145 doc-comment update: `LanceVectorStore::open(vector_dir, …)` → `LanceVectorStore::open_with_at_rest_key(vector_dir, …)`. **Ride-along stale-doc fix** caught by criterion (d) Block B's grep-over-symbol-literals on first run; was missed by sub-task (e)'s deletion sweep. Bundles with (f) per `feedback_admin_changes_ride_with_code.md` (no separate (e)-fix commit, no admin-only churn).
+- `HANDOFF.md` (this update + earlier session-open post-(e) admin update per `feedback_admin_changes_ride_with_code.md`).
+
+**Iteration #1 empirical calibration of criterion (a)'s entropy floor.** Initial 7.9 threshold + 256 B cutoff false-failed on first run against a 952-byte Lance fragment file scoring 7.7709. Root cause: plug-in Shannon-entropy estimator has finite-sample bias `E[H] ≈ 8.0 - 184/N` bits/byte for N truly-random samples. Calibrated to 7.5 bits/byte for files ≥ 512 B — sits cleanly between gzip-compressed worst-case (~7.3) and small-AEAD-with-finite-sample-bias (~7.6-7.8), preserves the no-plaintext-on-disk property across the full Lance-fragment-size distribution. Calibration source pinned in `ENTROPY_FLOOR_BITS_PER_BYTE` + `ENTROPY_MIN_FILE_SIZE` const doc-comments. Anchored to measured behaviour, not derived ceiling — same shape as ADR-038's `LANCE_MEM_POOL_SIZE=268435456` calibration.
+
+**Test floor:** iteration 4 §7 (f) pre-declared **+5 firm**. Actual: **+5** (exact match to floor; criterion (d) bundles Block A four-strings + Block B five-symbols into one test per Q3 bundle lock, preserving floor without splitting). No floor breach.
+
+**Cumulative T0.2.0 Phase 3 floor reconciliation (closing audit-trail entry):** pre-declared firm floor was +8 (iteration 4 §7: (a) +2, (b)+(c) 0, (d) 0, (e) +1, (f) +5). Actual cumulative: (a) +2 + (b)+(c) 0 + (d) -1 + (e) -23 + (f) +5 = **-17 net**. Variance driven entirely by (e)'s "no baggage" scope-expansion (16 migration integration tests + 5 Class B + 1 dialog + 1 placeholder deleted vs 0 added; planned (e) +1 grep-test moved to (f)'s criterion (d)). Surfaced in (e)'s commit message; this is the closing reconciliation on a sub-task arc that systematically reduced V0.1 baggage rather than added test count.
+
+**Local DoD gate state (this session, 2026-05-12 post-(f)):**
+
+| Gate | Result |
+|---|---|
+| `cargo check --workspace --all-targets` | ✅ 43.4s, zero warnings |
+| `cargo test -p vault-storage --test t0_2_0_acceptance` | ✅ 5/5 pass (acceptance_a/b/c/d/e all green) |
+| `cargo test -p vault-storage --lib` | ✅ 226/226 pass (γ edit didn't break Phase 0d) |
+| `cargo test --workspace` | ✅ all green (vault-app 27, vault-cli 20, vault-tauri 6 + 5 ignored, vault-retrieval 13+15+2, vault-mcp 49+4, vault-core 9, vault-storage 226 lib + 5 integration; zero FAILED) |
+| `cargo clippy --workspace --all-targets -- -D warnings` | ✅ 15.5s, clean |
+| `cargo fmt --all --check` | ✅ clean (one rustfmt-applied multi-line-collapse cycle + two stale-doc-comment threshold-reference fixes in test file) |
+| `git status --short` post-fmt | ✅ 4 expected files (3 M + 1 ??), no Cargo.lock drift |
+
+**Working tree at (f) session pause (2026-05-12):** 4 file changes:
+- `HANDOFF.md` (this update + post-(e) admin ride-along)
+- `crates/vault-app/src/application.rs` (1-line doc-comment fix)
+- `crates/vault-storage/src/sealed_object_store.rs` (1-line γ unseal-site tightening)
+- `crates/vault-storage/tests/t0_2_0_acceptance.rs` (new — five acceptance tests)
+
+**Next coding work after (f) lands + CI green confirms:** **T0.2.0 Phase 4 — founder dogfood on sealed (Windows-only).** Phase 3 closes with (f)'s CI green; Phase 4 is the user-acceptance layer of T0.2.0's hard gate, then Phase 5 is the formal hard-gate clearance review before T0.2.16 alpha-cohort opens.
 
 ---
 
@@ -136,34 +176,34 @@ Sub-task (d) details preserved for audit-trail purposes. **Many of the reference
 
 ---
 
-## T0.2.0 next-session opener (2026-05-12 sub-task (e) ready-for-commit)
+## T0.2.0 next-session opener (2026-05-12 sub-task (f) ready-for-commit)
 
 **On session open, do these two in order:**
 
-### 1. Verify CI green on sub-task (e)'s commit
+### 1. Verify CI green matrix-wide on sub-task (f)'s commit
 
-Sub-task (e) was ready-for-commit at this session's pause; commit hash + CI run ID pending Shahbaz approval. Sub-task (d) commit `2cc8c65` CI run `25717821471` was also still in_progress at this session's pause — verify both runs green before staging the next push:
+Sub-task (f) commit hash + CI run ID pending Shahbaz approval. Verify final conclusion of the (f) push's CI run:
 
 ```powershell
-gh run list --workflow=ci.yml -L 3
+gh run list --workflow=ci.yml -L 1
+gh run view <run-id> --json status,conclusion,jobs -q '"status=" + .status + " conclusion=" + (.conclusion // "(empty)") + "\n" + (.jobs | map("  " + .name + ": " + (.conclusion // .status)) | join("\n"))'
 ```
 
-Per CLAUDE.md per-step CI standing rule: don't stage sub-task (f)'s push until (e)'s CI is green.
+Per CLAUDE.md per-step CI standing rule: don't stage Phase 4 work until (f)'s CI is green.
 
-- **If (e) CI green:** proceed to step 2 (sub-task (f)).
-- **If (e) CI failure:** broken CI is a regression — fix in this session per `feedback_broken_ci_is_regression_not_techdebt.md`. Most likely failure given (e)'s scope: massive deletion sweep across 30 files; CI matrix runs Linux + macOS, our local DoD ran on Windows only. Possible surfaces: unused-import warnings on non-Windows platforms (e.g., `use std::fs` if the fs:: paths that referenced it inside Class B tests are gone but the import remains), or some downstream crate referencing now-deleted symbols. Diagnose via `gh run view <run-id> --log-failed`.
+- **If (f) CI green matrix-wide:** T0.2.0 Phase 3 CLOSES. Proceed to step 2 (Phase 4 kickoff).
+- **If (f) CI failure:** broken CI is a regression — fix in this session per `feedback_broken_ci_is_regression_not_techdebt.md`. Likely failure surfaces given (f)'s scope: criterion (d)'s grep-walk hits a stale-doc reference on Linux/macOS that this Windows-only local DoD didn't surface (low likelihood — Block B caught one already, no others expected); criterion (b)'s round-trip identity fails on a non-Windows OS due to a path-separator or Url encoding edge case (lance-io 4.x already abstracts this); criterion (e)'s byte-flip offset lands somewhere that doesn't trigger AEAD failure on a particular OS's lance fragment layout. Diagnose via `gh run view <run-id> --log-failed`.
+- **If ubuntu clippy hangs again on apt step:** recurring GitHub Actions ubuntu-latest runner infra problem from prior sessions. Use `gh run rerun <run-id> --failed-only` to land on a fresh runner.
 
-### 2. Sub-task (f) — BRD §6 T0.2.0 acceptance suite (NEXT CODING WORK)
+### 2. T0.2.0 Phase 4 — founder dogfood on sealed (NEXT CODING WORK)
 
-Per HANDOFF iteration 4 §9 (f). Five acceptance criteria from BRD §6 T0.2.0:
+Per T0.2.0 close-out plan iteration 1 §Phase 4. Windows-only first-pass user-acceptance layer on top of T0.2.0's now-shipped sealed-storage hard-gate. Procedure outline (full session-open plan iteration at Phase 4 start):
 
-(a) **No plaintext on disk after write/close** — entropy ≥ 7.9 + zero PAR1 magic — extends Phase 0d's `sealed_open_writes_framing_bytes_to_disk` to top-level integration.
-(b) **Round-trip identity** — encrypt → decrypt == original on CI matrix `[ubuntu-latest, windows-latest, macos-latest]`.
-(c) **Wrong key fails closed** — extends Phase 0d's `sealed_open_with_wrong_key_fails_closed`.
-(d) **Four ADR-010 controls absent** — grep-test for banner text + persistent-strip text + WARN message text + ALPHA filename, plus the plaintext-API-symbols-absent grep-test moved from (e). With (e)'s deletion these all trivially pass.
-(e) **Tampered ciphertext returns Err** — bit-flip a sealed byte, assert AEAD-auth message in returned VaultError.
-
-Floor +5 per iteration 4 §7.
+- Fresh install on Shahbaz's Windows dev box: `cargo run -p vault-tauri --release` (or build the MSI installer + install + launch fresh, depending on which surface Phase 4 elects).
+- Smoke flows: add memory → search → boundary check → delete → restart → verify persistence across the at-rest sealed wrapper end-to-end.
+- Keychain provenance: confirm first-run key generation persists, second-run key read works, wrong-key/missing-key fail-closed surfaces user-visible (not silent-empty vault).
+- Founder uses for ≥ a day with real data (consistent with BRD §6.1 V0.1 acceptance pattern — "founder uses it for a day" — applied here to the V0.2 at-rest layer).
+- Surface any bugs / friction / regression as Phase 4 sub-tasks before Phase 5 hard-gate close.
 
 ### 3. Reference — open work units (per T0.2.0 close-out plan iteration 1 + 4)
 
@@ -171,10 +211,10 @@ Floor +5 per iteration 4 §7.
 |---|---|---|
 | (a) vault-cli migration to sealed + ADR-041 keychain bridge | ✅ SHIPPED | `e27e6dc` (CI green run `25678902497`) |
 | (b)+(c) plaintext cfg-gate + Tier 1→Tier 2 collapse (P4 bundle) | ✅ SHIPPED | `27c141c` (CI green run `25687962807`) |
-| (d) unit-test surface migration to sealed (+ vault-retrieval) | ✅ SHIPPED | `2cc8c65` (CI `25717821471` in_progress at this session checkpoint) |
-| (e) V0.1 cleanup — migration code + ADR-010 controls + 5 Class B tests + spike examples DELETED (scope expanded by Shahbaz "no baggage" call) | ⏳ ready-for-commit (this session, 2026-05-12) | — (gated on (d) CI green + Shahbaz approval) |
-| (f) Phase 3 BRD §6 T0.2.0 acceptance suite (5 criteria) | NEXT CODING WORK (post-(e) CI green) | — |
-| Phase 4 — founder dogfood on sealed (Windows) | Blocked on (f) | — |
+| (d) unit-test surface migration to sealed (+ vault-retrieval) | ✅ SHIPPED | `2cc8c65` (CI `25717821471` CANCELLED ubuntu-clippy infra hang; covered by (e)'s CI) |
+| (e) V0.1 cleanup — migration code + ADR-010 controls + 5 Class B tests + spike examples DELETED (scope expanded by Shahbaz "no baggage" call) | ✅ SHIPPED | `d556b97` (CI `25723881794` ALL-GREEN matrix-wide at next-session open) |
+| (f) Phase 3 BRD §6 T0.2.0 acceptance suite (5 criteria) + γ unseal-site tightening + stale-doc ride-along | ⏳ ready-for-commit (this session, 2026-05-12) | — (pending Shahbaz approval) |
+| Phase 4 — founder dogfood on sealed (Windows-only) | Blocked on (f) CI green | — |
 | Phase 5 — T0.2.0 hard-gate clearance | Blocked on Phase 4 | — |
 
 ---
@@ -1909,8 +1949,8 @@ Phase 3 is no longer "mechanical work" as iteration 1 framed it. Six named sub-t
 |---|---|---|---|
 | **(a) vault-cli migration to sealed** | `vault-cli/src/main.rs`: (1) replaces `read_passphrase` + `open_backend(cli, key)` with keychain-aware `open_backend(cli)` that calls `vault_app::keychain::read_or_init_master_key(PRODUCTION_NAMESPACE, VAULT_ID)` → `derive_sqlcipher_passphrase` + `derive_at_rest_key` → `StorageBackend::open_with_at_rest_key`; (2) `make_backend` test helper migrates to `open_with_at_rest_key` with `TEST_AT_REST_KEY` const (single-helper migration covers all 10 vault-cli integration tests for free per sub-task (a) decision lock — folded into (a), not (d)). `Cargo.toml`: adds `vault-app` workspace dep; removes `rpassword` (vestigial on Windows keychain model). `VAULT_ID = "default"` const co-located in `vault_app::keychain` (moved from vault-tauri main.rs:94). | +2 firm (sealed-open success + keychain-missing fail-closed with generic auth-failed message per BRD §11.7.2; sub-task (a) decision lock 2026-05-11 narrowed the +2-3 variable). Optional wrong-at-rest-key test subsumed by sub-task (f) criterion (c). | Phase 1 (shipped); independent of (b)-(f) |
 | **(b)+(c) plaintext cfg-gate + Tier 1→Tier 2 collapse — P4 bundle, locked 2026-05-11** | (1) `crates/vault-storage/Cargo.toml` adds `[features] v0_1_migration = []`. (2) `vector_store.rs:247` plaintext `LanceVectorStore::open`: `#[cfg(any(test, feature = "v0_1_migration"))] pub(crate)` gate. (3) `cascading.rs:186` plaintext `StorageBackend::open`: same gate (cascade per option α). (4) `lib.rs` migration mod decl: `#[cfg(feature = "v0_1_migration")] pub mod migration;`. (5) `vault-tauri/Cargo.toml` enables feature on vault-storage dep (vault-cli does NOT — its per-package build excludes plaintext open from the binary). (6) `tests/migration_v0_1_to_sealed.rs` `create_v0_1_shape_data(dir)` helper at line 351 refactored to deep-copy Tier 2 fixture's `lance/` subdir into `dir` (P4 Tier 1→Tier 2 collapse per §5 amendment). (7) Spike `examples/v0_1_raw_parquet_read_spike.rs` retained in-tree per §6 (ran 2026-05-11, PASS exit 0). | 0 (cfg-gate is shape-change; helper restructure is single-helper, ~12 callers adapt for free; spike is example binary, not a `#[test]`) | (a) shipped; Tier 2 fixture committed in (a) at `e27e6dc` |
-| **(d) Unit-test surface migration to sealed — ✅ ready-for-commit 2026-05-12** | **Actual surface (recon-final):** 22 Class A vector_store.rs migrations + 5 Class B left-on-plaintext (defer to (e) per pre-approved decision; ADR-010 plaintext-control pins) + 1 Class C #1 DELETED (full-fragment privacy probe via on-disk probe-string scan — vacuous under sealed; partial-fragment companion provides stronger coverage via content-hash-set-difference) + 2 Class C #2 migrated unchanged (corruption tests; AEAD-auth-fail composes cleanly with ADR-018 `validate_readable` decode-path catch — empirically resolved). Helper-only migrations across cascading/divergence/retry_worker/adapter/semantic/common with TEST_AT_REST_KEY = [0xab; 32] per-mod local. vault-retrieval's `[dev-dependencies] vault-storage = { features = ["v0_1_migration"] }` activation dropped. `scan_all_rows_for_migration` gate narrowed `any(test, feature)` → `feature` (matches migration mod's gate exactly). | -1 net (Class C #1 deletion; plan-locked, pre-approved before any code per Shahbaz's (d) decision) | (b)+(c) shipped at `27c141c`; Tier 2 fixture committed at (a) |
-| **(e) V0.1 cleanup — SCOPE EXPANDED per Shahbaz "no baggage" call, ⏳ ready-for-commit 2026-05-12** | Original plan: remove 4 ADR-010 compensating controls (modal banner + persistent strip + WARN log + ALPHA file write) + plaintext-API-symbols grep-test. **Actual scope (Shahbaz scope-expansion mid-session):** delete the ENTIRE V0.1→V0.2 LanceDB migration code surface (no real V0.1 vaults exist anywhere; V0.1 was founder-only + test vault on dev box is throwaway). DELETED: (1) `migration.rs` whole module + cookie-recovery state machine + 6-state detector. (2) `migration_v0_1_to_sealed.rs` 16-test integration suite. (3) 3 spike examples (v0_1_lance_compat_spike, v0_1_raw_parquet_read_spike, lance_corruption_spike). (4) Tier 2 fixture `lance/` subdir (vault.db files kept for ADR-041 bridge test). (5) plaintext `LanceVectorStore::open` + `StorageBackend::open` + `ALPHA_WARNING_FILENAME` + `write_alpha_warning` + `scan_all_rows_for_migration`. (6) 5 Class B ADR-010 plaintext-control tests in vector_store.rs. (7) `[features] v0_1_migration` from vault-storage Cargo.toml + activation in vault-tauri. (8) `AlphaBannerAcknowledged` audit event variant + wire-string + parse arm. (9) `append_alpha_banner_acknowledged_audit` + `is_alpha_banner_acknowledged` in vault-app/src/adapter.rs. (10) `acknowledge_alpha_banner` Tauri command + permission + capability + dist/index.html UI surface (modal + persistent strip + Settings row + JS). (11) `format_migration_error_dialog` + spec-pin test in vault-tauri. (12) Step 5b migration call site in vault-tauri main.rs. KEPT: ADR-041 SQLCipher bridge + cross-device sync scope (BRD §6.2 T0.2.9-T0.2.13, separate feature for user backup/restore). Plaintext-API-symbols grep-test deferred to sub-task (f) where it's part of criterion (d). | -23 net (16 migration tests + 5 Class B + 1 dialog test + 1 ignored placeholder; planned +1 grep-test moved to (f)) | (a)+(b)+(c)+(d) shipped |
+| **(d) Unit-test surface migration to sealed — ✅ SHIPPED `2cc8c65` 2026-05-12** | **Actual surface (recon-final):** 22 Class A vector_store.rs migrations + 5 Class B left-on-plaintext (defer to (e) per pre-approved decision; ADR-010 plaintext-control pins) + 1 Class C #1 DELETED (full-fragment privacy probe via on-disk probe-string scan — vacuous under sealed; partial-fragment companion provides stronger coverage via content-hash-set-difference) + 2 Class C #2 migrated unchanged (corruption tests; AEAD-auth-fail composes cleanly with ADR-018 `validate_readable` decode-path catch — empirically resolved). Helper-only migrations across cascading/divergence/retry_worker/adapter/semantic/common with TEST_AT_REST_KEY = [0xab; 32] per-mod local. vault-retrieval's `[dev-dependencies] vault-storage = { features = ["v0_1_migration"] }` activation dropped. `scan_all_rows_for_migration` gate narrowed `any(test, feature)` → `feature` (matches migration mod's gate exactly). | -1 net (Class C #1 deletion; plan-locked, pre-approved before any code per Shahbaz's (d) decision) | (b)+(c) shipped at `27c141c`; Tier 2 fixture committed at (a) |
+| **(e) V0.1 cleanup — SCOPE EXPANDED per Shahbaz "no baggage" call, ✅ SHIPPED `d556b97` 2026-05-12** | Original plan: remove 4 ADR-010 compensating controls (modal banner + persistent strip + WARN log + ALPHA file write) + plaintext-API-symbols grep-test. **Actual scope (Shahbaz scope-expansion mid-session):** delete the ENTIRE V0.1→V0.2 LanceDB migration code surface (no real V0.1 vaults exist anywhere; V0.1 was founder-only + test vault on dev box is throwaway). DELETED: (1) `migration.rs` whole module + cookie-recovery state machine + 6-state detector. (2) `migration_v0_1_to_sealed.rs` 16-test integration suite. (3) 3 spike examples (v0_1_lance_compat_spike, v0_1_raw_parquet_read_spike, lance_corruption_spike). (4) Tier 2 fixture `lance/` subdir (vault.db files kept for ADR-041 bridge test). (5) plaintext `LanceVectorStore::open` + `StorageBackend::open` + `ALPHA_WARNING_FILENAME` + `write_alpha_warning` + `scan_all_rows_for_migration`. (6) 5 Class B ADR-010 plaintext-control tests in vector_store.rs. (7) `[features] v0_1_migration` from vault-storage Cargo.toml + activation in vault-tauri. (8) `AlphaBannerAcknowledged` audit event variant + wire-string + parse arm. (9) `append_alpha_banner_acknowledged_audit` + `is_alpha_banner_acknowledged` in vault-app/src/adapter.rs. (10) `acknowledge_alpha_banner` Tauri command + permission + capability + dist/index.html UI surface (modal + persistent strip + Settings row + JS). (11) `format_migration_error_dialog` + spec-pin test in vault-tauri. (12) Step 5b migration call site in vault-tauri main.rs. KEPT: ADR-041 SQLCipher bridge + cross-device sync scope (BRD §6.2 T0.2.9-T0.2.13, separate feature for user backup/restore). Plaintext-API-symbols grep-test deferred to sub-task (f) where it's part of criterion (d). | -23 net (16 migration tests + 5 Class B + 1 dialog test + 1 ignored placeholder; planned +1 grep-test moved to (f)) | (a)+(b)+(c)+(d) shipped |
 | **(f) Phase 3 acceptance suite (BRD §6 T0.2.0 a-e)** | (a) no plaintext on disk after write/close (entropy ≥ 7.9 + zero PAR1 magic — extends Phase 0d's `sealed_open_writes_framing_bytes_to_disk` to top-level integration). (b) round-trip identity encrypt → decrypt == original on CI matrix `[ubuntu-latest, windows-latest, macos-latest]`. (c) wrong key fails closed (extends Phase 0d's `sealed_open_with_wrong_key_fails_closed`). (d) four ADR-010 control STRINGS absent grep-test (banner text + persistent-strip text + WARN message text + ALPHA filename; distinct from sub-task (e)'s plaintext-API-symbols grep-test). (e) tampered ciphertext returns Err with AEAD authentication message — bit-flip a sealed byte, assert AEAD-auth message in returned VaultError. | +5 (one test per criterion (a)-(e); no double-count with sub-task (e)'s plaintext-symbols grep-test since scopes are distinct) | All preceding sub-tasks complete |
 
 **Sequencing locked (P4 amendment 2026-05-11):** (a) → (b)+(c) bundled → (d) → (e) → (f). Multi-session arc; no commit until a sub-task is independently DoD-green. **Sub-task (a) shipped at `e27e6dc` 2026-05-11** carrying the session-end-2 admin bundle (`.gitignore` negation + Tier 2 fixture binaries `vault.db` + `vault.db-wal` + HANDOFF.md session-end-2 checkpoint + iteration 4 §1-§10 initial draft) per `feedback_admin_changes_ride_with_code.md` — first code commit after those changes were generated. CI red on `ac577f4` (windows-latest fixture-missing) resolved at sub-task (a)'s push (CI run `25678902497` in flight at the time of this amendment). **Sub-task (b)+(c) bundles** Cargo.lock drift from (a) + iteration 4 §4/§5/§9 amendments + sub-task (b)+(c) source/config changes in one commit per P4 reasoning — eliminates the intermediate state where the integration test would have silently skipped without the feature flag (avoids the silent-failure pattern).
@@ -1976,7 +2016,7 @@ ADRs that pin V0.2 work — each MUST be addressed before V0.2 alpha-cohort dist
 
 | ADR | One-line summary | V0.2 trigger |
 |---|---|---|
-| **ADR-010** | LanceDB stores plaintext on disk for V0.1 only | **HARD GATE — controls REMOVED at T0.2.0 Phase 3 sub-task (e) (2026-05-12; ready-for-commit at this session)**. All four compensating controls deleted: (1) modal first-run banner + (2) persistent UI strip removed from vault-tauri dist/index.html + acknowledge_alpha_banner Tauri command/permission/capability; (3) WARN log at plaintext LanceDB open removed alongside the plaintext `LanceVectorStore::open` function itself; (4) ALPHA_DO_NOT_STORE_REAL_DATA.txt write-helper removed. Plus the entire V0.1→V0.2 LanceDB migration code path deleted per Shahbaz "no baggage" call (no real V0.1 vaults exist anywhere). Final hard-gate-cleared confirmation will land at sub-task (f) acceptance suite + Phase 4 founder dogfood + Phase 5 close. |
+| **ADR-010** | LanceDB stores plaintext on disk for V0.1 only | **HARD GATE — controls REMOVED at T0.2.0 Phase 3 sub-task (e) `d556b97` (2026-05-12)**. All four compensating controls deleted: (1) modal first-run banner + (2) persistent UI strip removed from vault-tauri dist/index.html + acknowledge_alpha_banner Tauri command/permission/capability; (3) WARN log at plaintext LanceDB open removed alongside the plaintext `LanceVectorStore::open` function itself; (4) ALPHA_DO_NOT_STORE_REAL_DATA.txt write-helper removed. Plus the entire V0.1→V0.2 LanceDB migration code path deleted per Shahbaz "no baggage" call (no real V0.1 vaults exist anywhere). Final hard-gate-cleared confirmation will land at sub-task (f) acceptance suite + Phase 4 founder dogfood + Phase 5 close. |
 | **ADR-031** | V0.1 unsigned Windows MSI deviation | **HARD GATE before V0.2 alpha-cohort opens** — Windows code-signing cert procurement (~$200-500/yr) + WiX signing pipeline + GitHub Actions secret + DoD test asserting signed MSI. Removes 3 V0.1 compensating controls (founder-only / SHA-256 record / SmartScreen Run-anyway). |
 | **ADR-029 amendment** | macOS signing pipeline (Apple Dev ID already enrolled) | **HARD GATE before V0.2 alpha-cohort opens (macOS portion)** — App Store Connect API key + GitHub Actions secret + notarization workflow (~1 day setup; cert procurement already done). |
 | **ADR-032** | V0.1 SQLCipher passphrase from `VAULT_KEY` env var | **V0.2 alpha-distribution must migrate to OS keychain** — keyring-core ecosystem mid-migration at V0.1; revisit at V0.2 plan time + spike picks branch (D) keychain. Plaintext-in-user-env-registry compensating control retired. |

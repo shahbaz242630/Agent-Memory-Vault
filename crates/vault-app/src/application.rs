@@ -142,7 +142,7 @@ impl Application {
 
         // 5. SemanticRetriever — shares storage's vector store Arc.
         //
-        //    DO NOT open a second `LanceVectorStore::open(vector_dir, …)`
+        //    DO NOT open a second `LanceVectorStore::open_with_at_rest_key(vector_dir, …)`
         //    handle here. LanceDB does not officially support concurrent
         //    dataset handles to the same data directory; the `Arc<dyn
         //    VectorStore>` already in `StorageBackend` is the correct

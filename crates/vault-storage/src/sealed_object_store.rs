@@ -207,7 +207,7 @@ fn unseal_file_bytes(sealed: &[u8], key: &[u8; 32], aad: &[u8; 32]) -> Result<Ve
     let aad_vec = aad.to_vec();
     let (plaintext, tag) = pull
         .pull_to_vec(&ciphertext, Some(&aad_vec))
-        .map_err(|e| format!("dryoc pull_to_vec: {e}"))?;
+        .map_err(|e| format!("AEAD authentication failed: {e}"))?;
 
     if !matches!(tag, Tag::FINAL) {
         return Err(format!("unexpected tag: {tag:?}"));
