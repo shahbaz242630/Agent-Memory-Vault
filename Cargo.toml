@@ -117,14 +117,22 @@ ort = { version = "=2.0.0-rc.10", default-features = false, features = ["load-dy
 # Tech-debt: re-verify the feature-trim survives any tokenizers upgrade
 # (HANDOFF.md monthly check, alongside OpenSSL / protobuf / chrono / ort).
 tokenizers = { version = "=0.20.4", default-features = false, features = ["onig"] }
-# llama-cpp-2: verify exact crate name and version at start of vault-llm task (BRD §4.3 note)
+# llama-cpp-2: Rust binding to llama.cpp for local LLM inference (T0.2.1 vault-llm).
+# Exact-pinned at T0.2.1 Phase 1 spike-2 (2026-05-13). Crate name + version verified
+# per BRD §4.3 placeholder discharge. Latest stable on crates.io as of spike date.
+# Exposes `LlamaSampler` + `json_schema_to_grammar()` for GBNF-constrained JSON
+# output — directly serves T0.2.3 consolidator merge-decision workload. Underlying
+# `llama-cpp-sys-2` is unsafe C++ FFI; walled off behind this safe wrapper.
+# `#![forbid(unsafe_code)]` cleanly applies in vault-llm crate per BRD §2.7.
+# Maintained by Marcus Dunn at utilityai/llama-cpp-rs (active as of 2026-04-30).
+llama-cpp-2 = "=0.1.146"
 
 # Sync (BRD §4.4) — yrs caret-pinned; exact-pin at T0.2.x (sync-engine first use).
 # dryoc consumed today as dev-dependency in vault-sync (dryoc spike); reqwest will
 # be exact-pinned-on-first-use too — declared but not yet consumed.
 yrs = "0.21"
 dryoc = "=0.7.2"
-reqwest = { version = "=0.12.28", features = ["json", "rustls-tls"] }
+reqwest = { version = "=0.12.28", features = ["json", "rustls-tls", "stream"] }
 
 # MCP (BRD §4.5) — exact-pinned at T0.1.9 (vault-mcp first use) per BRD §2.9 /
 # T0.1.5b discipline. rmcp 1.5.0 was released 2026-04-16, one day after the

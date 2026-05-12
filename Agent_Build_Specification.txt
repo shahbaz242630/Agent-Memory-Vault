@@ -1414,7 +1414,7 @@ V0.1 → V0.2 → V1.0. Build in order. Do not skip ahead.
 - Implement encrypted-at-rest storage for the LanceDB data directory using the chosen crypto crate — DONE at Phase 0d (`crates/vault-storage/src/sealed_object_store.rs` + `LanceVectorStore::open_with_at_rest_key`).
 - Migrate any existing V0.1 plaintext data on first launch (founder-only path; one-time conversion) — Phase 2 of T0.2.0 close-out plan iteration 1.
 - **Remove all four V0.1 compensating controls per ADR-010:** modal first-run banner, persistent UI banner, plaintext-data-dir WARN log, `ALPHA_DO_NOT_STORE_REAL_DATA.txt` file
-- Acceptance:
+- Acceptance (**ALL CLEARED 2026-05-13 — T0.2.0 Phase 5 hard-gate close; ADR-010 HARD GATE STATUS: CLEARED**; per-criterion evidence in HANDOFF.md "ADR-010 hard-gate-cleared note" section, integration tests at `crates/vault-storage/tests/t0_2_0_acceptance.rs`, real-world dogfood at Phase 4 Stages 1-5 founder Windows-dev-box):
   - Vector data dir contains no plaintext Parquet on disk after a write/close cycle (verified by reading raw bytes — entropy check + magic-bytes absence)
   - Round-trip identity: `encrypt → decrypt == original` across Mac, Windows, Linux
   - Decryption with wrong key fails closed (no partial reads, no information leakage in error)

@@ -1,7 +1,9 @@
 # Memory Vault — Build Handoff
 
 **Current version:** V0.2 Closed Beta (BRD §6.2 — sleep consolidator, boundaries hardening, cross-device sync, 30 beta users)
-**Last updated:** 2026-05-12 sub-task (f) shipped + Windows-OOM CI fix ready-for-commit. Sub-task (f) shipped at `ef88361` (push `d556b97..ef88361`) carrying the BRD §6 T0.2.0 acceptance suite + γ unseal-site tightening + stale-doc ride-along. CI run `25731903144` failed Windows-only TWICE in a row — first run `rustc-LLVM ERROR: out of memory` during vault-tauri codegen, second run (after `gh run rerun --failed`) `LINK : fatal error LNK1102: out of memory` during integration-test linking. Two distinct OOM stages on consecutive runs ruled out flake; confirmed Windows build is at the memory ceiling. **CI fix this commit:** `.github/workflows/ci.yml` adds a Windows-only `CARGO_BUILD_JOBS=2` env step before `cargo build` to cap peak-memory parallel codegen + linker invocations under the runner's ~16 GB ceiling. Linux + macOS runners unaffected (already pass; larger ceiling and lower link-stage overhead). Trade-off: Windows job runs ~5-10 min slower; succeeds reliably. **Next-session opener: verify the CI-fix commit's CI run green matrix-wide on Windows, then start Phase 4 founder dogfood on sealed (Windows-only).**
+**Last updated:** 2026-05-13 session open — **T0.2.0 CLOSED. ADR-010 HARD GATE CLEARED.** Phase 4 Stage 5 came back clean from Shahbaz (real-data dogfood across ~1 day of use — no crashes, no data loss, no surprises). Phase 5 hard-gate-clearance paperwork applied to working tree this session: HANDOFF status-table flips + new "ADR-010 hard-gate-cleared note" section below quoting ADR-010 verbatim against the five ticked acceptance criteria + Agent_Build_Specification.txt §6.2 T0.2.0 line 1417 acceptance-closure stamp. **No paperwork-only commit per `feedback_admin_changes_ride_with_code.md`** — admin diff rides with T0.2.1's first code commit. **Active task flips to T0.2.1 (vault-llm: Phi-4-mini local LLM integration)**; plan iteration 1 drafted inline this session, pending review-and-lock before any code lands per `feedback_plan_iterations_inline_not_handoff.md`. **Cumulative T0.2.0 arc:** 3 weeks across Phase 0a→0e foundation (lancedb 0.8→0.27.2 upgrade per ADR-037, ADR-038 memory regression fix, ADR-039 hard-delete privacy fix, sealing primitive runtime-confirmed in spike v2, production-wired Phase 0d, ADR-008 amendment + Phase 0e ADRs) + Phase 1 (keychain wiring per ADR-040) + Phase 2 (ADR-041 V0.1 VAULT_KEY → V0.2 keychain SQLCipher passphrase bridge) + Phase 3 sub-tasks (a)-(f) (vault-cli sealed migration / plaintext cfg-gate / unit-test surface migration / V0.1 cleanup "no baggage" sweep / BRD §6 acceptance suite + γ unseal-site) + Phase 4 Stages 1-5 dogfood + Phase 5 paperwork close. Net test-count reconciliation: cumulative -17 on the Phase 3 arc, entirely driven by sub-task (e)'s scope-expansion-call to wholesale-delete V0.1 migration code per Shahbaz's "no baggage" call.
+
+**Session close-a (2026-05-12, historical milestone record — Phase 3 + Phase 4 Stages 1-4):** T0.2.0 Phase 3 SHIPPED + Phase 4 Stages 1-4 PASSED in real-world dogfood. CI-fix commit `b6d72bc` (push `ef88361..b6d72bc`) ALL-GREEN matrix-wide on CI run `25736962490` — Windows job passed cleanly with `CARGO_BUILD_JOBS=2` cap. **Phase 3 formally CLOSED.** Phase 4 founder dogfood executed on Shahbaz's Windows dev box: pre-flight cleanup (V0.1 MSI uninstalled via `MsiExec.exe /X{4CF99BC2-2134-424E-ABF9-B64A80DA5EAB}` + old debug binary deleted + data dir wiped + 3 keychain entries deleted including production `default.com.memoryvault.v0.2`) → fresh `target/release/vault-tauri.exe` launch → **Stage 1 PASS** (no "Alpha" title, no ALPHA modal, no orange strip, clean Add Memory view) → **Stage 2 PASS** (add/search/delete smoke flows work) → **Stage 3 PASS — the real T0.2.0 hard-gate proof** (memories survive close+reopen cycle on real user data, sealed write+read round-trip verified) → **Stage 4 PASS** (Notepad on `<data>/lance/memories.lance/data/*.lance` shows random CJK-misinterpreted ciphertext, NO plaintext memory content). Working-tree HANDOFF.md state at session close: rides with next code commit (Phase 5 close or T0.2.1 first commit) per `feedback_admin_changes_ride_with_code.md`.
 
 **Session-end-1 (prior, still accurate as a milestone record):** Phase 2 + ADR-041 both SHIPPED. ADR-041 cfg-fix `ac577f4` (push 12:41Z, run `25670758274`). ADR-041 implementation landed at `6f2af9d` (push 12:21Z, run `25669781494`) BUT failed non-Windows clippy/build on unused-imports + dead-code; cfg-fix immediately followed in same session per `feedback_broken_ci_is_regression_not_techdebt.md`. Phase 2 fmt-fix `02799b5` (run `25660977905` GREEN matrix-wide 1h4m55s) preceded. All workspace DoD gates green pre-push: fmt clean, clippy `-D warnings` clean, build zero warns 41m38s, test 0 failures (vault-app: 27 passed +8 bridge tests; vault-storage lib: 232 stable; migration_v0_1_to_sealed: 16 stable; 17 pre-existing ignored markers preserved).
 
@@ -19,18 +21,26 @@
 
 ## Current Status
 
-**Active task:** **T0.2.0 Phase 4 — founder dogfood on sealed (Windows-only) — next coding work.** Sub-task (f) — BRD §6 T0.2.0 acceptance suite — implemented this session (2026-05-12); 5/5 integration tests pass, all local DoD gates green, pending Shahbaz commit approval. After (f)'s commit + CI green matrix-wide, T0.2.0 Phase 3 closes and Phase 4 unblocks. Phase 3 progression status:
+**Active task:** **T0.2.1 — vault-llm: Phi-4-mini local LLM integration.** T0.2.0 CLOSED 2026-05-13: Phase 4 Stage 5 clean from Shahbaz (~1 day real-data dogfood, no findings); Phase 5 paperwork-only updates (HANDOFF flips + BRD §6 T0.2.0 acceptance-closure stamp + ADR-010 hard-gate-cleared note below) applied to working tree this session and held for T0.2.1 first code commit per `feedback_admin_changes_ride_with_code.md`. T0.2.1 plan iteration 1 drafted inline in this session's chat for review-and-lock per `feedback_plan_iterations_inline_not_handoff.md`; once locked, plan + first code commit ship together with this admin diff. Phase 3 + Phase 4 + Phase 5 + T0.2.1 status (T0.2.0 progression closed; T0.2.1 in plan-iteration):
 
-| Sub-task | Status | Commit |
+| Sub-task / Phase | Status | Commit |
 |---|---|---|
 | (a) vault-cli migration to sealed + ADR-041 keychain bridge | ✅ SHIPPED | `e27e6dc` (CI green `25678902497`) |
 | (b)+(c) plaintext cfg-gate + Tier 1→Tier 2 collapse | ✅ SHIPPED | `27c141c` (CI green `25687962807`) |
 | (d) unit-test surface migration to sealed | ✅ SHIPPED | `2cc8c65` (CI `25717821471` CANCELLED — ubuntu clippy infra hang; covered by (e)'s CI per cumulative-commit property) |
-| (e) V0.1 cleanup — migration code + ADR-010 controls + plaintext open + 5 Class B tests + spike examples DELETED | ✅ SHIPPED | `d556b97` (CI `25723881794` ALL-GREEN matrix-wide at next-session open) |
-| (f) BRD §6 T0.2.0 acceptance suite (5 integration tests) + γ unseal-site tightening + stale-doc ride-along | ✅ SHIPPED | `ef88361` (CI run `25731903144` Windows-OOM x2 → CI-config fix follows) |
-| CI-config fix: Windows `CARGO_BUILD_JOBS=2` peak-memory ceiling | ⏳ ready-for-commit (this session, 2026-05-12) | — (pending Shahbaz approval) |
-| Phase 4 founder dogfood on sealed (Windows-only) | Blocked on CI-fix commit's matrix-wide green | — |
-| Phase 5 T0.2.0 hard-gate clearance | Blocked on Phase 4 | — |
+| (e) V0.1 cleanup — migration code + ADR-010 controls + plaintext open + 5 Class B tests + spike examples DELETED | ✅ SHIPPED | `d556b97` (CI `25723881794` ALL-GREEN matrix-wide) |
+| (f) BRD §6 T0.2.0 acceptance suite (5 integration tests) + γ unseal-site tightening + stale-doc ride-along | ✅ SHIPPED | `ef88361` (CI `25731903144` Windows-OOM x2 → CI-config fix below resolved) |
+| CI-config fix: Windows `CARGO_BUILD_JOBS=2` peak-memory ceiling | ✅ SHIPPED | `b6d72bc` (CI run `25736962490` ALL-GREEN matrix-wide) |
+| **Phase 3 — CLOSED** ✅ | — | — |
+| Phase 4 Stage 1 (launch — title/modal/strip/clean view) | ✅ PASSED real-world dogfood | (no code) |
+| Phase 4 Stage 2 (smoke flows — add/search/delete) | ✅ PASSED real-world dogfood | (no code) |
+| Phase 4 Stage 3 (persistence — close+reopen) | ✅ PASSED real-world dogfood | (no code; THIS is the T0.2.0 hard-gate proof) |
+| Phase 4 Stage 4 (visual proof — Notepad on `.lance` files) | ✅ PASSED real-world dogfood | (no code) |
+| Phase 4 Stage 5 (real-data usage ~1 day) | ✅ CLEAN — no findings from Shahbaz | (no code) |
+| Phase 4 Stage 6 (failure-mode spot checks, optional) | Skipped — Shahbaz's call (Stage 5 clean) | — |
+| Phase 5 — T0.2.0 formal hard-gate clearance | ✅ CLOSED (paperwork-only, working tree, rides with T0.2.1 first commit) | — |
+| **T0.2.0 — CLOSED** ✅ | — | — |
+| T0.2.1 — Phi-4-mini local LLM (active task) | 🟡 iteration 2 LOCKED post-spike-2; commit 1 in staging | spike-2 ALL STAGES PASS this session |
 
 **Sub-task (d) historical record (shipped at `2cc8c65` earlier this session):**
 
@@ -169,7 +179,23 @@ Sub-task (d) details preserved for audit-trail purposes. **Many of the reference
 - `crates/vault-storage/src/sealed_object_store.rs` (1-line γ unseal-site tightening)
 - `crates/vault-storage/tests/t0_2_0_acceptance.rs` (new — five acceptance tests)
 
-**Next coding work after (f) lands + CI green confirms:** **T0.2.0 Phase 4 — founder dogfood on sealed (Windows-only).** Phase 3 closes with (f)'s CI green; Phase 4 is the user-acceptance layer of T0.2.0's hard gate, then Phase 5 is the formal hard-gate clearance review before T0.2.16 alpha-cohort opens.
+**Phase 4 founder dogfood deliverables (this session, 2026-05-12) — Windows-only user-acceptance layer on the at-rest sealed stack:**
+
+**Pre-flight cleanup (this session).** Discovered Shahbaz's Windows dev box still had the V0.1 MSI install at `C:\Program Files\Memory Vault\` (product code `{4CF99BC2-2134-424E-ABF9-B64A80DA5EAB}`, V0.1.0, Publisher `shahbaz242630`, binary dated 2026-05-06) registered in Windows Add/Remove Programs — that's what was launching from the Start Menu shortcut, NOT either of the `target/` binaries. Explained why test launches kept showing the V0.1 ALPHA UI even after sub-task (e) shipped. Cleanup sweep (Shahbaz authorized): (1) V0.1 MSI uninstalled via `MsiExec.exe /X{4CF99BC2-2134-424E-ABF9-B64A80DA5EAB} /passive /norestart` (exit 0, removes Add/Remove Programs entry + Start Menu shortcut + `C:\Program Files\Memory Vault\` dir); (2) old `target/debug/vault-tauri.exe` deleted (255 MB, dated 2026-05-11 — last V0.1-shape debug build); (3) data dir `%APPDATA%\com.shahbaz242630.memory-vault\` deleted (~119 KB across 17 entries — V0.1 plaintext lance/ + ALPHA_DO_NOT_STORE_REAL_DATA.txt + V0.1 graph + vault.db); (4) all 3 keychain entries deleted via `cmdkey /delete` (both `test-bridge-rekey-fail.*` test fixtures + the production `default.com.memoryvault.v0.2` entry the new release binary had created on its first failed launch). Final state: ONLY `target/release/vault-tauri.exe` (117 MB, dated 2026-05-12 17:47, our fresh post-(f) build) on the system; no MSI entry, no data, no keychain.
+
+**Stage 1 PASS (launch).** Fresh `target/release/vault-tauri.exe` launched cleanly via File Explorer double-click. Confirmed visually: (a) title bar shows "Memory Vault" with NO "— Alpha" suffix; (b) NO ALPHA BUILD modal appeared over the screen; (c) NO orange "ALPHA — vector store is unencrypted" persistent strip across the top; (d) clean Add Memory view rendered. Behind the scenes: new master_key generated by `vault_app::keychain::read_or_init_master_key` and persisted to Windows Credential Manager as `default.com.memoryvault.v0.2`; K3 at-rest key derived; sealed `LanceVectorStore` opened on a fresh empty `%APPDATA%\com.shahbaz242630.memory-vault\` data dir. End-to-end visual confirmation of sub-task (e)'s deletions on a real-user launch.
+
+**Stage 2 PASS (smoke flows).** Add memory → search → delete all worked without error. Search relevance is V0.1-naive (always returns nearest neighbor regardless of cosine distance) — documented as expected per BRD T0.2.7 retrieval task; NOT a regression, deferred to T0.2.7 (threshold + hybrid + reranker).
+
+**Stage 3 PASS — the T0.2.0 HARD-GATE PROOF in real-world terms.** Closed the app window → reopened via double-click → searched for previously-added memories → all survived the close+reopen cycle. This is the empirical proof that the sealed write path AND sealed read path both work end-to-end on real user data, that the K3 KDF + per-file AAD scheme correctly round-trips, and that the entire Phase 0a-0e + (a)-(f) chain composes into a working privacy-preserving storage layer. The 3-week T0.2.0 saga (lance-io 0.15 spike v1 fail → lancedb 0.8→0.27.2 upgrade per ADR-037 → ADR-038 memory regression fix → ADR-039 hard-delete privacy fix → Phase 0c spike v2 → Phase 0d production wire → Phase 1 keychain → Phase 2 ADR-041 SQLCipher bridge → Phase 3 sub-tasks a-f acceptance suite → Phase 4 dogfood) is **functionally complete**.
+
+**Stage 4 PASS (visual encryption proof).** Opened `%APPDATA%\com.shahbaz242630.memory-vault\lance\memories.lance\data\*.lance` in Notepad. Notepad displayed random CJK ideographs / Unicode garbage — modern Notepad's UTF-8/16 interpretation of high-entropy random bytes lands on the BMP CJK Unicode blocks, which renders as Chinese-looking glyphs. NO plaintext memory content visible. Visual confirmation of: (a) sub-task (e)'s plaintext open removal worked; (b) Phase 0d's `SealedObjectStore` intercepts Lance's writes correctly; (c) ADR-008's K3 KDF + per-file AAD produces high-entropy AEAD ciphertext indistinguishable from random; (d) Phase 0b ADR-039 hard-delete fix composes cleanly with sealing.
+
+**Stage 5 in flight (passive, ~1 day).** Shahbaz uses the app over the next day or two with real-data content (BRD §6.1 V0.1 acceptance pattern — "founder uses it for a day" — applied here to V0.2 at-rest layer). No coding required; pure dogfood. Next session collects findings: bugs, friction, slowness, surprises. If empty → Phase 5 formal close. If any items → triage as blocker / polish / future before Phase 5.
+
+**Stage 6 optional (failure-mode spot checks).** Not run this session; Shahbaz's choice whether to add during Stage 5 day or skip to Phase 5.
+
+**Next coding work after Stage 5 triage:** **T0.2.0 Phase 5 — formal hard-gate clearance.** Paperwork-only commit: ADR-010 hard-gate-cleared note + HANDOFF.md Phase 4 results + (optional) BRD §6 T0.2.0 acceptance criteria checkbox flip. Then T0.2.1 (Phi-4-mini local LLM integration) unblocks.
 
 ---
 
@@ -177,46 +203,123 @@ Sub-task (d) details preserved for audit-trail purposes. **Many of the reference
 
 ---
 
-## T0.2.0 next-session opener (2026-05-12 — (f) shipped + CI-fix ready-for-commit)
+## ADR-010 hard-gate-cleared note (2026-05-13, T0.2.0 Phase 5 close)
 
-**On session open, do these two in order:**
+**Quoting ADR-010 verbatim** (HANDOFF_V0.1_ARCHIVE.md:756) per `feedback_quote_locked_artefacts_dont_paraphrase.md`:
 
-### 1. Verify CI green matrix-wide on the CI-fix commit
+> **HARD GATE — T0.2.0 before T0.2.16:** T0.2.0 (LanceDB Encryption at Rest) is added to BRD §6 V0.2 as a hard dependency for T0.2.16 (Beta Onboarding). **If T0.2.0 slips, V0.2 ship date slips.** No external user receives a build that contains the V0.1 plaintext-LanceDB code path. T0.2.0's Definition of Done includes a test that asserts the data dir contains no plaintext Parquet files after a write/close cycle, and that all four V0.1 compensating controls (below) are removed from the codebase.
 
-Sub-task (f) shipped at `ef88361` but CI run `25731903144` failed Windows-only twice with consecutive OOMs (see "Last updated" header for diagnosis). CI-fix commit (this session's pending push) adds Windows-only `CARGO_BUILD_JOBS=2` to `.github/workflows/ci.yml`. Verify final conclusion of the CI-fix push's run:
+**Status: CLEARED 2026-05-13.** Each ADR-010 test requirement (verbatim from HANDOFF_V0.1_ARCHIVE.md:777) mapped to the evidence that satisfies it:
 
-```powershell
-gh run list --workflow=ci.yml -L 1
-gh run view <run-id> --json status,conclusion,jobs -q '"status=" + .status + " conclusion=" + (.conclusion // "(empty)") + "\n" + (.jobs | map("  " + .name + ": " + (.conclusion // .status)) | join("\n"))'
-```
+1. **"all four V0.1 compensating controls fully removed from the build"** — DONE at sub-task (e) commit `d556b97`. Control #1 (modal first-run banner) + #2 (persistent UI strip) + their CSS / JS / `acknowledge_alpha_banner` Tauri command + permission + capability + `AlphaBannerAcknowledged` audit-event variant all deleted from `crates/vault-tauri/`. Control #3 (`tracing::warn!("LanceDB data dir is plaintext...")` site at `LanceVectorStore::open`) deleted at the same commit when the plaintext open function itself was deleted. Control #4 (`ALPHA_DO_NOT_STORE_REAL_DATA.txt` file) deleted by deletion of `write_alpha_warning` helper + `ALPHA_WARNING_FILENAME` const at the same commit; no first-run cleanup logic needed because the file is only ever created by code that no longer exists. Asserted absent by `crates/vault-storage/tests/t0_2_0_acceptance.rs` criterion (d) Block A four-string + Block B five-symbol grep (added at sub-task (f) commit `ef88361`).
+2. **"vector data dir contains no plaintext Parquet on disk after a write/close cycle (verified by reading raw bytes and checking entropy + magic-bytes absence)"** — DONE. Asserted by `t0_2_0_acceptance.rs` criterion (a): entropy floor ≥ `ENTROPY_FLOOR_BITS_PER_BYTE` = 7.5 bits/byte on files ≥ `ENTROPY_MIN_FILE_SIZE` = 512 B + PAR1-magic absence sweep across the post-write Lance data dir. Empirically calibrated against a 952-byte Lance fragment file scoring 7.7709 (finite-sample-bias-corrected against `E[H] ≈ 8.0 - 184/N`).
+3. **"decryption with wrong key fails closed (no partial reads, no information leakage in error)"** — DONE. Asserted by `t0_2_0_acceptance.rs` criterion (c): open with wrong K3 returns `Err`, asserts memory ids + boundary name strings absent from the rendered error message.
+4. **"round-trip identity (`encrypt → decrypt == original`) on the full vector store across all supported platforms (Mac, Windows, Linux)"** — DONE. Asserted by `t0_2_0_acceptance.rs` criterion (b), runs on CI matrix `[ubuntu-latest, windows-latest, macos-latest]`. Last CI green matrix-wide on `b6d72bc` run `25736962490`. Additionally verified end-to-end on real user data by Phase 4 Stage 3 (close+reopen persistence test, Windows dev box).
 
-Per CLAUDE.md per-step CI standing rule: don't stage Phase 4 work until the CI-fix commit is green matrix-wide.
+**Plus the BRD §6 T0.2.0 acceptance line 1422 (added post-ADR-010-draft, not in ADR-010 test-requirements verbatim list but in BRD acceptance criteria):**
 
-- **If (f) CI green matrix-wide:** T0.2.0 Phase 3 CLOSES. Proceed to step 2 (Phase 4 kickoff).
-- **If (f) CI failure:** broken CI is a regression — fix in this session per `feedback_broken_ci_is_regression_not_techdebt.md`. Likely failure surfaces given (f)'s scope: criterion (d)'s grep-walk hits a stale-doc reference on Linux/macOS that this Windows-only local DoD didn't surface (low likelihood — Block B caught one already, no others expected); criterion (b)'s round-trip identity fails on a non-Windows OS due to a path-separator or Url encoding edge case (lance-io 4.x already abstracts this); criterion (e)'s byte-flip offset lands somewhere that doesn't trigger AEAD failure on a particular OS's lance fragment layout. Diagnose via `gh run view <run-id> --log-failed`.
-- **If ubuntu clippy hangs again on apt step:** recurring GitHub Actions ubuntu-latest runner infra problem from prior sessions. Use `gh run rerun <run-id> --failed-only` to land on a fresh runner.
+5. **Tampered ciphertext is detected (AEAD authenticity check fires)** — DONE. Asserted by `t0_2_0_acceptance.rs` criterion (e): bit-flip a byte mid-ciphertext, open returns `VaultError::Storage(_)` with substring `"AEAD authentication failed"`. Wording tightened at sub-task (f)'s γ unseal-site edit (`crates/vault-storage/src/sealed_object_store.rs:210`) — survives crypto-crate swaps without test rot.
 
-### 2. T0.2.0 Phase 4 — founder dogfood on sealed (NEXT CODING WORK)
+**Real-world dogfood layer beyond the test suite (BRD §6 V0.1 "founder uses it for a day" pattern applied to V0.2 at-rest layer):** Phase 4 Stages 1-4 PASS on Shahbaz's Windows dev box (session close-a 2026-05-12), Stage 5 CLEAN across ~1 day of real-data usage (session 2026-05-13). No crashes, no data loss, no surprises.
 
-Per T0.2.0 close-out plan iteration 1 §Phase 4. Windows-only first-pass user-acceptance layer on top of T0.2.0's now-shipped sealed-storage hard-gate. Procedure outline (full session-open plan iteration at Phase 4 start):
+**ADR-010 status flip:** "HARD GATE — controls REMOVED at sub-task (e)" → **"HARD GATE — CLEARED at T0.2.0 Phase 5 (2026-05-13)"**. T0.2.16 (Beta Onboarding) is now unblocked from the ADR-010 dependency perspective (T0.2.16 has its own per-task DoD downstream).
 
-- Fresh install on Shahbaz's Windows dev box: `cargo run -p vault-tauri --release` (or build the MSI installer + install + launch fresh, depending on which surface Phase 4 elects).
-- Smoke flows: add memory → search → boundary check → delete → restart → verify persistence across the at-rest sealed wrapper end-to-end.
-- Keychain provenance: confirm first-run key generation persists, second-run key read works, wrong-key/missing-key fail-closed surfaces user-visible (not silent-empty vault).
-- Founder uses for ≥ a day with real data (consistent with BRD §6.1 V0.1 acceptance pattern — "founder uses it for a day" — applied here to the V0.2 at-rest layer).
-- Surface any bugs / friction / regression as Phase 4 sub-tasks before Phase 5 hard-gate close.
+---
 
-### 3. Reference — open work units (per T0.2.0 close-out plan iteration 1 + 4)
+## T0.2.1 Phase 1 spike-2 results + iteration 2 LOCKED (2026-05-13)
 
-| Sub-task | Status | Commit |
+**Status: spike-2 ALL STAGES PASS, iteration 2 LOCKED inline in chat, commit 1 in staging.**
+
+Locked plan iterations 1 + 2 + their amendment/clarification ledgers live inline in this session's chat thread per `feedback_plan_iterations_inline_not_handoff.md`. This HANDOFF section is the canonical durable record of (a) the spike-2 empirical findings and (b) the iteration 2 locked decisions — the chat thread itself is transient and won't be available post-session.
+
+### Spike-2 empirical findings (locked constants)
+
+| Constant / measurement | Value | Source |
 |---|---|---|
-| (a) vault-cli migration to sealed + ADR-041 keychain bridge | ✅ SHIPPED | `e27e6dc` (CI green run `25678902497`) |
-| (b)+(c) plaintext cfg-gate + Tier 1→Tier 2 collapse (P4 bundle) | ✅ SHIPPED | `27c141c` (CI green run `25687962807`) |
-| (d) unit-test surface migration to sealed (+ vault-retrieval) | ✅ SHIPPED | `2cc8c65` (CI `25717821471` CANCELLED ubuntu-clippy infra hang; covered by (e)'s CI) |
-| (e) V0.1 cleanup — migration code + ADR-010 controls + 5 Class B tests + spike examples DELETED (scope expanded by Shahbaz "no baggage" call) | ✅ SHIPPED | `d556b97` (CI `25723881794` ALL-GREEN matrix-wide at next-session open) |
-| (f) Phase 3 BRD §6 T0.2.0 acceptance suite (5 criteria) + γ unseal-site tightening + stale-doc ride-along | ⏳ ready-for-commit (this session, 2026-05-12) | — (pending Shahbaz approval) |
-| Phase 4 — founder dogfood on sealed (Windows-only) | Blocked on (f) CI green | — |
-| Phase 5 — T0.2.0 hard-gate clearance | Blocked on Phase 4 | — |
+| `MODEL_URL` (V0.2 lock) | `https://huggingface.co/unsloth/Phi-4-mini-instruct-GGUF/resolve/main/Phi-4-mini-instruct-Q4_K_M.gguf` | Stage A — Microsoft's official repo `microsoft/Phi-4-mini-instruct-GGUF` returned HTTP 401 (HF-gated, requires user account + license click-through), unsloth mirror is non-gated MIT-license-preserving redistribution |
+| `MODEL_SHA256` | `88c00229914083cd112853aab84ed51b87bdf6b9ce42f532d8c85c7c63b1730a` | Stage A |
+| `MODEL_BYTES` | `2_491_874_272` (~2.49 GB) | Stage A |
+| Sustained download speed | ~13.7 MB/s on Shahbaz's connection | Stage A (3 min for 2.49 GB) |
+| Cold-load wall time | 2.2-6.3s (run-to-run variance via OS file cache) | Stage B |
+| GGUF `general.architecture` | `phi3` (NOT `phi4` — surprise #4: Phi-4-mini reuses Phi-3's transformer architecture with Phi-4's instruction tuning) | Stage B metadata dump |
+| Native context capability | 131,072 tokens (V0.2 uses 1,024) | Stage B metadata |
+| GBNF size for merge-decision schema | 585 bytes | Stage C |
+| llama.cpp#18173 status against our schema | NOT triggered (sampler constructs cleanly) | Stage C adversarial probe |
+| `token_to_piece_bytes` buffer hint required | ≥64 (deprecated `token_to_bytes` default of 8 produced `Insufficient Buffer Space -10` on Phi-4-mini token output) | Stage D first attempt + iteration 2 surprise #2 |
+| Stage D JSON validity rate | 5/5 (100%) under GBNF grammar constraint | Stage D |
+| Stage D semantic correctness | 5/5 correct merge decisions; score gradient 1.0 / 1.0 / 0.85 / 0.0 / 0.0 (identical / identical / similar / unrelated / unrelated) | Stage D |
+| Stage E latency p50 | 9,815 ms | Stage E (100-call bench, fresh context per call, Windows i7-13620H CPU-only) |
+| Stage E latency p99 | 14,695 ms | Stage E |
+| Stage E latency mean | 9,886 ms | Stage E (cumulative 988.6s = 16.5 min) |
+| T0.2.3 budget check | PASS (p99 14.7s < 18s/call upper bound from "5-30 min for 100-1000 pairs" envelope) | Stage E |
+
+### Iteration 2 locked decisions (summary, full text in chat)
+
+- **Mirror lock:** unsloth (over bartowski) — already cached + verified on Shahbaz's box, organizational stability slightly preferred. Concern #7's revision-pin discipline now applies to unsloth commit hash, captured at ADR-043 drafting (Phase 3).
+- **Concern #1 (CI policy for `#[ignore]` real-model tests):** weekly cron `0 12 * * MON` OR PR label `[run-llm-smoke]`. Lands in **commit 2**'s `ci.yml` alongside the `#[ignore]` tests it gates (per clarification 1).
+- **Concern #2 (`MODEL_BYTES_EXPECTED` role):** streaming-abort heuristic only (reject if Content-Length wildly off ~2.49 GB); SHA-256 is the post-download integrity gate.
+- **Concern #3 (streaming-download error contract):** `.partial` cleanup is restart-not-resume; disk-full fail-closed with Tauri dialog; ADR-043 names all three failure modes.
+- **Concern #4 (`LlmProvider` error surface):** option (a) — `complete_json` returns raw `String`; caller deserializes; parse-failure is hard error, not retry.
+- **Concern #5 (`context_pool` shape):** single-context-no-pool for V0.2 (Stage E proved fresh-per-call latency fits budget; 16 GB RAM laptop tolerates 1 context safely).
+- **Concern #6 (hardware acceleration):** CPU-only on all platforms for V0.2; no `cfg_attr` complexity; Mac Metal autodetect deferred until first M1 beta user.
+- **Concern #7 (`MODEL_URL` revision-pin):** Phase 3 ADR-043 pins unsloth's commit hash via `?revision=<commit>` URL parameter (not floating `/resolve/main/`).
+- **Design detail (a):** `CompletionParams::seed: Option<u32>` (matches llama-cpp-2's `with_seed(u32)`; was `u64` in iter 1, corrected here).
+- **Design detail (b):** `[features] test-utils = []` declaration lands in commit 2's `vault-llm/Cargo.toml` alongside `MockLlmProvider`'s `#[cfg(any(test, feature = "test-utils"))]` gate.
+- **Air-gap fallback:** Phase 3 feature; production model loader checks cache path first, falls back to streaming download; operational doc `crates/vault-llm/docs/air_gap_install.md` lands at Phase 3.
+- **Observation 1(a) — canned prompts as fixture asset:** `crates/vault-llm/tests/fixtures/canned_merge_decisions.json` (5 cases captured this session, score gradient documented). Seed regression suite for T0.2.3 + future model swap evaluation. Lands in commit 1.
+- **Observation 1(b) — score gradient is empirical, NOT contract:** ADR-044 names "T0.2.3 must treat score as confidence signal (e.g., `if score > 0.7 merge`), NOT deterministic threshold-comparator (e.g., `if score == 1.0`). Score behavior may shift under model swap or quantization changes."
+- **Observation 3 — compile prereqs documented:** LLVM/libclang ≥17 + MSVC C++ Build Tools (VS 2019 or 2022) + cmake ≥3.24 + rustc with MSVC target. **End-user installers ship NONE of these** (llama-cpp-sys-2 statically compiles llama.cpp into binary). Commit 1's `ci.yml` adds LLVM setup to both `clippy` and `build-and-test` jobs on all 3 OS runners with robust per-OS path-derivation per clarification 4.
+- **Observation 4 — phi3 architecture in GGUF metadata:** ADR-042 one-line note documenting that `general.architecture = phi3` is correct (Phi-4-mini reuses Phi-3's architectural template with Phi-4's instruction tuning).
+- **Observation 5 — latency variance source:** ADR-044 locks "`#[ignore]` real-model tests assert correctness, NOT latency. Latency benchmarks are dev-box-or-dedicated-runner only and never gate CI pass/fail."
+- **ADR-044 bundling rule (clarification 2, mechanical):** if Phase 4 dogfood surfaces zero code changes → ADR-044 rides commit 2; if any production code change → commit 3.
+
+### Phase breakdown locked
+
+| Phase | Scope | Commit |
+|---|---|---|
+| **1 (spike-2)** | ✅ COMPLETE this session — Stages A-E all PASS | Bundled into commit 1 |
+| **2 (scaffold)** | vault-llm crate scaffold + spike-2 binary + canned prompts fixture JSON + fixture-smoke test (+1 test floor) + CI matrix LLVM setup | **Commit 1** |
+| **3 (production)** | `LlmProvider` trait + `MockLlmProvider` (feature-gated) + `Phi4MiniProvider` + model download with SHA-256 verify + air-gap fallback + ADR-043 + ADR-044 drafted + cron schedule for `#[ignore]` real-model CI tests (+10 firm test floor) | **Commit 2** |
+| **4 (founder dogfood)** | End-to-end real merge-decision via T0.2.1 surface on Shahbaz's Windows box | No separate commit (verified manually, results in HANDOFF) |
+| **5 (formal close)** | ADR-042 finalized with spike-2 evidence; HANDOFF + BRD acceptance flips | Bundled into commit 2 (if Phase 4 = 0 code change) or commit 3 (if any code change) per clarification 2 |
+
+### Cumulative test floor pre-declaration
+
+**Commit 1:** +1 (fixture-smoke parse-and-shape test). **Commit 2:** +10 firm (4 mock conformance + 6 Phi4MiniProvider/downloader). **Cumulative T0.2.1:** +11 firm.
+
+### ADR-042 / ADR-043 / ADR-044 prepared surface
+
+- **ADR-042 (Phase 5)** — Phi-4-mini-instruct as V0.2 local LLM. Model selection rationale + license verification + spike-2 evidence (5/5 correct, score gradient sensible, no fine-tuning needed) + phi3-architecture-in-GGUF note (obs 4) + alternative-candidate rejection record (Qwen3-4B alternate, Gemma rejected on license, Llama caveated, reasoning models rejected as wrong tool) + revisit triggers (drafted at Phase 5 with then-current evidence per Shahbaz's prior call).
+- **ADR-043 (Phase 3, commit 2)** — Model download discipline + SHA-256 hash pin + mirror revision-pin + air-gap fallback contract. URL pinned to unsloth `?revision=<commit-hash>`, SHA-256 `88c00229...30a`, MODEL_BYTES streaming-abort heuristic role (concern #2), `.partial` cleanup restart-not-resume (concern #3), disk-full fail-closed (concern #3), air-gap fallback branch + operational doc.
+- **ADR-044 (Phase 5)** — `LlmProvider` trait surface + `Phi4MiniProvider` implementation locks. Final trait shape + `CompletionParams::seed: Option<u32>` + raw-String return + caller-side parse-failure-is-contract-violation (concern #4) + single-context-no-pool (concern #5) + 64-byte `token_to_piece_bytes` buffer (surprise #2) + CPU-only V0.2 (concern #6) + score-gradient-is-empirical-not-contract (obs 1b) + latency-not-CI-gated (obs 5) + build-prereq matrix (obs 3).
+
+### Cross-references
+
+- BRD §6.2 T0.2.1 (`Agent_Build_Specification.txt:1425-1430`)
+- ADR-010 (HANDOFF_V0.1_ARCHIVE.md:737, hard-gate cleared at T0.2.0 Phase 5)
+- Saved memories applied this session: `feedback_plan_iterations_inline_not_handoff.md`, `feedback_plan_iteration_depth_scales_with_design_surface.md`, `feedback_floor_forecast_is_pre_declaration_not_estimate.md`, `feedback_runtime_confirmation_after_web_spike.md`, `feedback_spike_methodology_explicit.md`, `feedback_quote_locked_artefacts_dont_paraphrase.md`, `feedback_flag_reviewer_attribution_mismatch.md`, `feedback_broken_ci_is_regression_not_techdebt.md`, `feedback_cargo_on_windows_use_powershell.md`, `feedback_admin_changes_ride_with_code.md`, `feedback_git_status_check_between_fmt_and_add.md`, `feedback_no_parallel_cargo_invocations.md`, `feedback_standing_auth_dep_installs.md`, `feedback_surgical_cargo_clean_first.md` (informed by, not triggered)
+
+---
+
+## Reference — closed T0.2.0 work units (full sub-task / phase ledger)
+
+T0.2.1 plan iterations (and the prior spike report) live inline in chat per `feedback_plan_iterations_inline_not_handoff.md`. Locked plan lands in this file as part of T0.2.1's first code commit.
+
+| Sub-task / Phase | Status | Commit / Evidence |
+|---|---|---|
+| (a) vault-cli migration to sealed + ADR-041 keychain bridge | ✅ SHIPPED | `e27e6dc` (CI green `25678902497`) |
+| (b)+(c) plaintext cfg-gate + Tier 1→Tier 2 collapse | ✅ SHIPPED | `27c141c` (CI green `25687962807`) |
+| (d) unit-test surface migration to sealed | ✅ SHIPPED | `2cc8c65` (CI green via (e)'s cumulative-commit CI run) |
+| (e) V0.1 cleanup — migration + ADR-010 controls + plaintext open + 5 Class B + spike examples DELETED | ✅ SHIPPED | `d556b97` (CI `25723881794` ALL-GREEN matrix-wide) |
+| (f) BRD §6 acceptance suite + γ unseal-site + stale-doc | ✅ SHIPPED | `ef88361` (Windows-OOM x2 → CI-fix below) |
+| CI-config fix: Windows `CARGO_BUILD_JOBS=2` | ✅ SHIPPED | `b6d72bc` (CI `25736962490` ALL-GREEN matrix-wide) |
+| Phase 3 — closed ✅ | — | — |
+| Phase 4 Stages 1-4 (launch / smoke / persist / visual proof) | ✅ PASSED real-world dogfood | (no code; session 2026-05-12) |
+| Phase 4 Stage 5 (real-data ~1 day) | ✅ CLEAN — no findings | (no code; session 2026-05-13) |
+| Phase 4 Stage 6 (failure-mode spot checks, optional) | Skipped — Shahbaz's call | — |
+| Phase 5 — T0.2.0 formal hard-gate clearance | ✅ CLOSED — paperwork-only, working tree, rides with T0.2.1 first commit | — |
+| **T0.2.0 — CLOSED** ✅ | — | ADR-010 HARD GATE CLEARED |
+| T0.2.1 — Phi-4-mini local LLM (active task) | 🟡 iteration 2 LOCKED post-spike-2; commit 1 in staging | — |
 
 ---
 

@@ -88,6 +88,34 @@ jobs:
       - uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
+      # LLVM/libclang for llama-cpp-sys-2's bindgen step (T0.2.1 spike-2,
+      # 2026-05-13). Each OS uses its native package manager with robust
+      # post-install path discovery per iteration 2 clarification 4 (the
+      # chocolatey install path can shift across LLVM versions; the brew
+      # prefix varies between Apple Silicon and Intel macOS).
+      # libclang is a build-time prerequisite only — pre-built MSI / .app
+      # installers ship the statically-compiled llama.cpp binary and end
+      # users never need libclang on their machines.
+      - if: runner.os == 'Linux'
+        name: Install libclang-dev (for llama-cpp-sys-2 bindgen)
+        run: sudo apt-get install -y libclang-dev
+      - if: runner.os == 'Windows'
+        name: Install LLVM via chocolatey
+        shell: pwsh
+        run: choco install llvm -y --no-progress
+      - if: runner.os == 'Windows'
+        name: Set LIBCLANG_PATH via discovered clang location
+        shell: pwsh
+        run: |
+          $clangPath = (Get-Command clang.exe -ErrorAction SilentlyContinue).Source
+          if (-not $clangPath) { $clangPath = "C:\Program Files\LLVM\bin\clang.exe" }
+          $libclangDir = Split-Path $clangPath -Parent
+          "LIBCLANG_PATH=$libclangDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - if: runner.os == 'macOS'
+        name: Install LLVM via Homebrew + set LIBCLANG_PATH
+        run: |
+          brew install llvm
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -148,6 +176,30 @@ jobs:
       - uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
+      # See clippy job above for LLVM/libclang rationale + per-OS robust
+      # path-derivation discussion. Must be in BOTH jobs because GHA matrix
+      # runners don't share state across jobs (same pattern as protoc +
+      # Tauri Linux deps above).
+      - if: runner.os == 'Linux'
+        name: Install libclang-dev (for llama-cpp-sys-2 bindgen)
+        run: sudo apt-get install -y libclang-dev
+      - if: runner.os == 'Windows'
+        name: Install LLVM via chocolatey
+        shell: pwsh
+        run: choco install llvm -y --no-progress
+      - if: runner.os == 'Windows'
+        name: Set LIBCLANG_PATH via discovered clang location
+        shell: pwsh
+        run: |
+          $clangPath = (Get-Command clang.exe -ErrorAction SilentlyContinue).Source
+          if (-not $clangPath) { $clangPath = "C:\Program Files\LLVM\bin\clang.exe" }
+          $libclangDir = Split-Path $clangPath -Parent
+          "LIBCLANG_PATH=$libclangDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - if: runner.os == 'macOS'
+        name: Install LLVM via Homebrew + set LIBCLANG_PATH
+        run: |
+          brew install llvm
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Cache vault-embedding test fixtures (~165 MB total: model.onnx ~133 MB

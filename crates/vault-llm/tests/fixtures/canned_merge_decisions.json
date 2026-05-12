@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "captured_at": "2026-05-13",
+  "captured_with": "phi-4-mini-instruct-Q4_K_M (unsloth mirror) on Windows CPU-only via llama-cpp-2 0.1.146",
+  "captured_at_phase": "T0.2.1 Phase 1 spike-2 — runtime confirmation per feedback_runtime_confirmation_after_web_spike.md",
+  "score_caveat": "observed_score_spike_2 values are EMPIRICAL OBSERVATIONS from spike-2 runtime, NOT a locked contract. T0.2.3 consolidator MUST treat score as a confidence signal (e.g., threshold > 0.7) NOT a deterministic threshold-comparator (e.g., score == 1.0). Score behavior may shift under model swap, quantization changes, or prompt template revisions. The load-bearing assertion across model swaps is expected_merge (boolean); the score value is documentation.",
+  "schema_caveat": "expected_merge is the load-bearing semantic assertion. observed_merged_text_spike_2 is documentary only — the exact merged-text string may shift under model swap and is NOT a regression target.",
+  "cases": [
+    {
+      "label": "identical-A",
+      "memory_a": "Buy milk",
+      "memory_b": "Buy milk",
+      "expected_merge": true,
+      "observed_score_spike_2": 1.0,
+      "observed_merged_text_spike_2": "Buy milk",
+      "rationale": "exact duplicate — high-confidence merge expected"
+    },
+    {
+      "label": "identical-B",
+      "memory_a": "Meeting at 3pm Friday",
+      "memory_b": "Meeting at 3pm Friday",
+      "expected_merge": true,
+      "observed_score_spike_2": 1.0,
+      "observed_merged_text_spike_2": "Meeting at 3pm Friday",
+      "rationale": "exact duplicate with specific time/date — high-confidence merge expected"
+    },
+    {
+      "label": "similar-A",
+      "memory_a": "Bought groceries today",
+      "memory_b": "Picked up groceries this afternoon",
+      "expected_merge": true,
+      "observed_score_spike_2": 0.85,
+      "observed_merged_text_spike_2": "Bought groceries today and picked up groceries this afternoon",
+      "rationale": "paraphrase of same action — mid-to-high confidence merge expected; tests model's ability to recognize semantic equivalence across surface form variance"
+    },
+    {
+      "label": "unrelated-A",
+      "memory_a": "Buy milk",
+      "memory_b": "Tax return deadline April 15",
+      "expected_merge": false,
+      "observed_score_spike_2": 0.0,
+      "observed_merged_text_spike_2": "",
+      "rationale": "topically unrelated — no-merge expected; tests model's ability to reject false-positive merges of distinct topics"
+    },
+    {
+      "label": "unrelated-B",
+      "memory_a": "Doctor appointment Tuesday",
+      "memory_b": "Send invoice to client X",
+      "expected_merge": false,
+      "observed_score_spike_2": 0.0,
+      "observed_merged_text_spike_2": "",
+      "rationale": "different life-domain entries (health vs work) — no-merge expected"
+    }
+  ]
+}

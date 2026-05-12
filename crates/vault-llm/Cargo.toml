@@ -1,6 +1,6 @@
 [package]
 name = "vault-llm"
-description = "Local LLM inference using Phi-4-mini via llama.cpp bindings. See BRD §5.4."
+description = "Local LLM inference for Memory Vault — Phi-4-mini via llama.cpp. See BRD §5.5 / T0.2.1."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,3 +9,44 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+vault-core = { path = "../vault-core" }
+
+# LLM inference (T0.2.1 spike-2 lock — 2026-05-13). Safe wrapper over llama.cpp;
+# underlying `llama-cpp-sys-2` is unsafe FFI walled off behind this safe layer.
+# `#![forbid(unsafe_code)]` cleanly applies here per BRD §2.7.
+llama-cpp-2 = { workspace = true }
+
+# Async runtime + traits
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+# Error handling — VaultLlmError lands in src/error.rs at commit 2 (Phase 2).
+thiserror = { workspace = true }
+
+# Serialization — JSON schema → GBNF grammar conversion + structured output.
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Model download + integrity verification (ADR-043, drafted at Phase 5).
+# `reqwest` workspace dep has `stream` feature enabled at T0.2.1 spike-2 to
+# support streaming SHA-256 hashing of the 2.49 GB Phi-4-mini GGUF without
+# loading the whole file into memory.
+reqwest = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+# anyhow allowed in example binaries per BRD §2.4 (library code uses thiserror
+# + VaultLlmError). The spike-2 binary at examples/phi4_load_and_json_spike.rs
+# uses anyhow's `Context` trait for stage-by-stage error reporting.
+anyhow = { workspace = true }
+tempfile = { workspace = true }
+tracing-test = { workspace = true }
+
+# [features] test-utils = [] declaration for MockLlmProvider exposure lands
+# in commit 2 alongside the symbol it gates, per iteration 2 item 4 lock.
