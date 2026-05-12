@@ -202,5 +202,22 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: touch crates/vault-embedding/test-fixtures/bge-small-en-v1.5/onnxruntime.dll
+      # Windows-only: lower cargo build parallelism to 2 to avoid peak-memory
+      # OOM on the GitHub Actions windows-latest runner. T0.2.0 Phase 3
+      # sub-task (f) commit `ef88361` (2026-05-12) hit two consecutive
+      # Windows-only failures with different OOM stages: first run
+      # `rustc-LLVM ERROR: out of memory` during vault-tauri codegen, second
+      # run `LINK : fatal error LNK1102: out of memory` during integration-
+      # test linking. Two distinct stages OOM-ing in a row confirmed the
+      # Windows build is at the memory ceiling — not a transient flake.
+      # CARGO_BUILD_JOBS=2 caps parallel codegen + linker invocations so
+      # peak resident-set stays under the runner's ~16 GB ceiling. Linux +
+      # macOS runners are unaffected (larger memory ceiling and lower
+      # link-stage overhead per build unit). Trade-off: Windows job runs
+      # ~5-10 min slower; build succeeds reliably.
+      - if: runner.os == 'Windows'
+        name: Lower cargo build parallelism on Windows (peak-memory ceiling fix)
+        shell: bash
+        run: echo "CARGO_BUILD_JOBS=2" >> "$GITHUB_ENV"
       - run: cargo build --workspace --all-targets
       - run: cargo test --workspace

@@ -1,7 +1,7 @@
 # Memory Vault — Build Handoff
 
 **Current version:** V0.2 Closed Beta (BRD §6.2 — sleep consolidator, boundaries hardening, cross-device sync, 30 beta users)
-**Last updated:** 2026-05-12 sub-task (f) ready-for-commit. Sub-task (e) CI run `25723881794` confirmed ALL-GREEN matrix-wide at session open (Windows build+test completed success; covers (d)+(e) per cumulative-commit property). Sub-task (f) — BRD §6 T0.2.0 acceptance suite (5 integration tests at `crates/vault-storage/tests/t0_2_0_acceptance.rs`) + γ unseal-site tightening at `crates/vault-storage/src/sealed_object_store.rs:210` (`"dryoc pull_to_vec: {e}"` → `"AEAD authentication failed: {e}"`, ADR-008 amendment-class +1-line edit per (f) iteration #1 Q2 lock) + stale doc-comment fix at `crates/vault-app/src/application.rs:145` (Block B caught a real (e)-sweep miss: `LanceVectorStore::open(...)` → `LanceVectorStore::open_with_at_rest_key(...)`) — implemented this session, all local DoD gates green, pending Shahbaz commit approval. **Next-session opener: verify (f)'s CI green matrix-wide, then start Phase 4 founder dogfood on sealed (Windows-only).**
+**Last updated:** 2026-05-12 sub-task (f) shipped + Windows-OOM CI fix ready-for-commit. Sub-task (f) shipped at `ef88361` (push `d556b97..ef88361`) carrying the BRD §6 T0.2.0 acceptance suite + γ unseal-site tightening + stale-doc ride-along. CI run `25731903144` failed Windows-only TWICE in a row — first run `rustc-LLVM ERROR: out of memory` during vault-tauri codegen, second run (after `gh run rerun --failed`) `LINK : fatal error LNK1102: out of memory` during integration-test linking. Two distinct OOM stages on consecutive runs ruled out flake; confirmed Windows build is at the memory ceiling. **CI fix this commit:** `.github/workflows/ci.yml` adds a Windows-only `CARGO_BUILD_JOBS=2` env step before `cargo build` to cap peak-memory parallel codegen + linker invocations under the runner's ~16 GB ceiling. Linux + macOS runners unaffected (already pass; larger ceiling and lower link-stage overhead). Trade-off: Windows job runs ~5-10 min slower; succeeds reliably. **Next-session opener: verify the CI-fix commit's CI run green matrix-wide on Windows, then start Phase 4 founder dogfood on sealed (Windows-only).**
 
 **Session-end-1 (prior, still accurate as a milestone record):** Phase 2 + ADR-041 both SHIPPED. ADR-041 cfg-fix `ac577f4` (push 12:41Z, run `25670758274`). ADR-041 implementation landed at `6f2af9d` (push 12:21Z, run `25669781494`) BUT failed non-Windows clippy/build on unused-imports + dead-code; cfg-fix immediately followed in same session per `feedback_broken_ci_is_regression_not_techdebt.md`. Phase 2 fmt-fix `02799b5` (run `25660977905` GREEN matrix-wide 1h4m55s) preceded. All workspace DoD gates green pre-push: fmt clean, clippy `-D warnings` clean, build zero warns 41m38s, test 0 failures (vault-app: 27 passed +8 bridge tests; vault-storage lib: 232 stable; migration_v0_1_to_sealed: 16 stable; 17 pre-existing ignored markers preserved).
 
@@ -27,8 +27,9 @@
 | (b)+(c) plaintext cfg-gate + Tier 1→Tier 2 collapse | ✅ SHIPPED | `27c141c` (CI green `25687962807`) |
 | (d) unit-test surface migration to sealed | ✅ SHIPPED | `2cc8c65` (CI `25717821471` CANCELLED — ubuntu clippy infra hang; covered by (e)'s CI per cumulative-commit property) |
 | (e) V0.1 cleanup — migration code + ADR-010 controls + plaintext open + 5 Class B tests + spike examples DELETED | ✅ SHIPPED | `d556b97` (CI `25723881794` ALL-GREEN matrix-wide at next-session open) |
-| (f) BRD §6 T0.2.0 acceptance suite (5 integration tests) + γ unseal-site tightening + stale-doc ride-along | ⏳ ready-for-commit (this session, 2026-05-12) | — (pending Shahbaz approval) |
-| Phase 4 founder dogfood on sealed (Windows-only) | Blocked on (f) CI green | — |
+| (f) BRD §6 T0.2.0 acceptance suite (5 integration tests) + γ unseal-site tightening + stale-doc ride-along | ✅ SHIPPED | `ef88361` (CI run `25731903144` Windows-OOM x2 → CI-config fix follows) |
+| CI-config fix: Windows `CARGO_BUILD_JOBS=2` peak-memory ceiling | ⏳ ready-for-commit (this session, 2026-05-12) | — (pending Shahbaz approval) |
+| Phase 4 founder dogfood on sealed (Windows-only) | Blocked on CI-fix commit's matrix-wide green | — |
 | Phase 5 T0.2.0 hard-gate clearance | Blocked on Phase 4 | — |
 
 **Sub-task (d) historical record (shipped at `2cc8c65` earlier this session):**
@@ -176,20 +177,20 @@ Sub-task (d) details preserved for audit-trail purposes. **Many of the reference
 
 ---
 
-## T0.2.0 next-session opener (2026-05-12 sub-task (f) ready-for-commit)
+## T0.2.0 next-session opener (2026-05-12 — (f) shipped + CI-fix ready-for-commit)
 
 **On session open, do these two in order:**
 
-### 1. Verify CI green matrix-wide on sub-task (f)'s commit
+### 1. Verify CI green matrix-wide on the CI-fix commit
 
-Sub-task (f) commit hash + CI run ID pending Shahbaz approval. Verify final conclusion of the (f) push's CI run:
+Sub-task (f) shipped at `ef88361` but CI run `25731903144` failed Windows-only twice with consecutive OOMs (see "Last updated" header for diagnosis). CI-fix commit (this session's pending push) adds Windows-only `CARGO_BUILD_JOBS=2` to `.github/workflows/ci.yml`. Verify final conclusion of the CI-fix push's run:
 
 ```powershell
 gh run list --workflow=ci.yml -L 1
 gh run view <run-id> --json status,conclusion,jobs -q '"status=" + .status + " conclusion=" + (.conclusion // "(empty)") + "\n" + (.jobs | map("  " + .name + ": " + (.conclusion // .status)) | join("\n"))'
 ```
 
-Per CLAUDE.md per-step CI standing rule: don't stage Phase 4 work until (f)'s CI is green.
+Per CLAUDE.md per-step CI standing rule: don't stage Phase 4 work until the CI-fix commit is green matrix-wide.
 
 - **If (f) CI green matrix-wide:** T0.2.0 Phase 3 CLOSES. Proceed to step 2 (Phase 4 kickoff).
 - **If (f) CI failure:** broken CI is a regression — fix in this session per `feedback_broken_ci_is_regression_not_techdebt.md`. Likely failure surfaces given (f)'s scope: criterion (d)'s grep-walk hits a stale-doc reference on Linux/macOS that this Windows-only local DoD didn't surface (low likelihood — Block B caught one already, no others expected); criterion (b)'s round-trip identity fails on a non-Windows OS due to a path-separator or Url encoding edge case (lance-io 4.x already abstracts this); criterion (e)'s byte-flip offset lands somewhere that doesn't trigger AEAD failure on a particular OS's lance fragment layout. Diagnose via `gh run view <run-id> --log-failed`.
