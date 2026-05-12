@@ -297,6 +297,12 @@ mod tests {
     use vault_embedding::EMBEDDING_DIM;
     use vault_storage::SqlCipherKey;
 
+    /// Test-only at-rest key (32 bytes, fixed pattern). Per-mod local
+    /// const per HANDOFF sub-task (d) §"Const placement" decision lock;
+    /// matches the convention in `vault-storage/tests/migration_v0_1_to_sealed.rs:96`
+    /// and `vault-cli/src/main.rs:497`.
+    const TEST_AT_REST_KEY: [u8; 32] = [0xab; 32];
+
     // -----------------------------------------------------------------
     // Stub trait impls used across tests
     // -----------------------------------------------------------------
@@ -386,12 +392,13 @@ mod tests {
         // StorageBackend opens its own MetadataStore internally. Open
         // a SECOND MetadataStore for VaultAdapter.metadata. Both
         // point at the same SQLCipher file via separate connections.
-        let storage = StorageBackend::open(
+        let storage = StorageBackend::open_with_at_rest_key(
             &metadata_path,
             &vector_dir,
             &graph_path,
             key.clone(),
             EMBEDDING_DIM,
+            &TEST_AT_REST_KEY,
         )
         .await
         .unwrap();

@@ -20,6 +20,11 @@ use vault_embedding::{EmbeddingProvider, EMBEDDING_DIM};
 use vault_retrieval::{RetrievalOptions, RetrievalQuery, SemanticRetriever};
 use vault_storage::{LanceVectorStore, MetadataStore, SqlCipherKey, VectorStore};
 
+/// Test-only at-rest key (32 bytes, fixed pattern). Per-mod local
+/// const per HANDOFF sub-task (d) §"Const placement" decision lock;
+/// matches the convention in `vault-storage/tests/migration_v0_1_to_sealed.rs:96`.
+pub const TEST_AT_REST_KEY: [u8; 32] = [0xab; 32];
+
 /// A deterministic stub embedder. Returns a fixed unit vector
 /// `[1, 0, 0, ..., 0]` for every input, except inputs containing the
 /// marker `"FAIL"` (returns `VaultError::Embedding`) or `"DRIFT_<n>"`
@@ -100,9 +105,13 @@ pub async fn make_test_retriever() -> TestRetriever {
     let metadata = MetadataStore::open(dir.path().join("metadata.db"), key)
         .await
         .expect("open metadata");
-    let vectors = LanceVectorStore::open(&dir.path().join("vectors"), EMBEDDING_DIM)
-        .await
-        .expect("open vectors");
+    let vectors = LanceVectorStore::open_with_at_rest_key(
+        &dir.path().join("vectors"),
+        EMBEDDING_DIM,
+        &TEST_AT_REST_KEY,
+    )
+    .await
+    .expect("open vectors");
     let metadata = Arc::new(metadata);
     let vectors: Arc<dyn VectorStore> = Arc::new(vectors);
     let embedder = StubEmbedder::new();

@@ -345,15 +345,24 @@ mod tests {
         _dir: tempfile::TempDir,
     }
 
+    /// Test-only at-rest key (32 bytes, fixed pattern). Per-mod local
+    /// const per HANDOFF sub-task (d) §"Const placement" decision lock;
+    /// matches the convention in `vault-storage/tests/migration_v0_1_to_sealed.rs:96`.
+    const TEST_AT_REST_KEY: [u8; 32] = [0xab; 32];
+
     async fn make_bundle() -> Bundle {
         let dir = tempdir().expect("tempdir");
         let key = SqlCipherKey::new("test-only-passphrase");
         let metadata = MetadataStore::open(dir.path().join("metadata.db"), key)
             .await
             .expect("open metadata");
-        let vectors = LanceVectorStore::open(&dir.path().join("vectors"), EMBEDDING_DIM)
-            .await
-            .expect("open vectors");
+        let vectors = LanceVectorStore::open_with_at_rest_key(
+            &dir.path().join("vectors"),
+            EMBEDDING_DIM,
+            &TEST_AT_REST_KEY,
+        )
+        .await
+        .expect("open vectors");
         let metadata = Arc::new(metadata);
         let vectors: Arc<dyn VectorStore> = Arc::new(vectors);
         let embedder = StubEmbedder::new();

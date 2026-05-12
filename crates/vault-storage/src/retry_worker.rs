@@ -350,6 +350,12 @@ mod tests {
 
     const DIM: usize = 4;
 
+    /// Test-only at-rest key (32 bytes, fixed pattern). Per-mod local
+    /// const per HANDOFF sub-task (d) §"Const placement" decision lock;
+    /// matches the convention in `tests/migration_v0_1_to_sealed.rs:96`
+    /// and `crates/vault-cli/src/main.rs:497`.
+    const TEST_AT_REST_KEY: [u8; 32] = [0xab; 32];
+
     fn embedding(fill: f32) -> Vec<f32> {
         vec![fill; DIM]
     }
@@ -374,9 +380,16 @@ mod tests {
         let vector_dir = tmp.path().join("lance");
         let graph_path = tmp.path().join("graph.duckdb");
         let key = SqlCipherKey::new("retry-worker-test-key");
-        let backend = StorageBackend::open(&metadata_path, &vector_dir, &graph_path, key, DIM)
-            .await
-            .unwrap();
+        let backend = StorageBackend::open_with_at_rest_key(
+            &metadata_path,
+            &vector_dir,
+            &graph_path,
+            key,
+            DIM,
+            &TEST_AT_REST_KEY,
+        )
+        .await
+        .unwrap();
         (tmp, backend)
     }
 

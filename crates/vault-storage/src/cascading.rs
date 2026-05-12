@@ -709,6 +709,11 @@ mod tests {
 
     const DIM: usize = 4;
 
+    /// Test-only at-rest key (32 bytes, fixed pattern). Per-mod local
+    /// const per HANDOFF sub-task (d) §"Const placement" decision lock;
+    /// matches the convention in `tests/migration_v0_1_to_sealed.rs:96`.
+    const TEST_AT_REST_KEY: [u8; 32] = [0xab; 32];
+
     fn embedding(fill: f32) -> Vec<f32> {
         vec![fill; DIM]
     }
@@ -735,9 +740,16 @@ mod tests {
         let vector_dir = tmp.path().join("lance");
         let graph_path = tmp.path().join("graph.duckdb");
         let key = SqlCipherKey::new("cascading-test-key");
-        let backend = StorageBackend::open(&metadata_path, &vector_dir, &graph_path, key, DIM)
-            .await
-            .unwrap();
+        let backend = StorageBackend::open_with_at_rest_key(
+            &metadata_path,
+            &vector_dir,
+            &graph_path,
+            key,
+            DIM,
+            &TEST_AT_REST_KEY,
+        )
+        .await
+        .unwrap();
         (tmp, backend)
     }
 
@@ -765,10 +777,16 @@ mod tests {
 
         // First open: write 5 memories so there's data to corrupt.
         {
-            let backend =
-                StorageBackend::open(&metadata_path, &vector_dir, &graph_path, key.clone(), DIM)
-                    .await
-                    .unwrap();
+            let backend = StorageBackend::open_with_at_rest_key(
+                &metadata_path,
+                &vector_dir,
+                &graph_path,
+                key.clone(),
+                DIM,
+                &TEST_AT_REST_KEY,
+            )
+            .await
+            .unwrap();
             for i in 0..5 {
                 let m = sample_memory("work", &format!("memory-{i}"));
                 backend
@@ -817,9 +835,16 @@ mod tests {
         }
 
         // Reopen — must succeed with degraded mode.
-        let backend2 = StorageBackend::open(&metadata_path, &vector_dir, &graph_path, key, DIM)
-            .await
-            .unwrap();
+        let backend2 = StorageBackend::open_with_at_rest_key(
+            &metadata_path,
+            &vector_dir,
+            &graph_path,
+            key,
+            DIM,
+            &TEST_AT_REST_KEY,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             backend2.degraded(),
             DegradedMode::LanceUnreadable,
@@ -1248,17 +1273,30 @@ mod tests {
         let m = sample_memory("work", "recover me");
         let id = m.id;
         {
-            let backend1 =
-                StorageBackend::open(&metadata_path, &vector_dir, &graph_path, key.clone(), DIM)
-                    .await
-                    .unwrap();
+            let backend1 = StorageBackend::open_with_at_rest_key(
+                &metadata_path,
+                &vector_dir,
+                &graph_path,
+                key.clone(),
+                DIM,
+                &TEST_AT_REST_KEY,
+            )
+            .await
+            .unwrap();
             backend1.write_memory(&m, &embedding(0.9)).await.unwrap();
         }
         // Simulated process exit: backend1 dropped here. Files persist.
 
-        let backend2 = StorageBackend::open(&metadata_path, &vector_dir, &graph_path, key, DIM)
-            .await
-            .unwrap();
+        let backend2 = StorageBackend::open_with_at_rest_key(
+            &metadata_path,
+            &vector_dir,
+            &graph_path,
+            key,
+            DIM,
+            &TEST_AT_REST_KEY,
+        )
+        .await
+        .unwrap();
 
         // SQLite has the memory.
         assert!(backend2.metadata.get_memory(&id).await.unwrap().is_some());
