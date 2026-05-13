@@ -84,6 +84,24 @@ pub enum AuditEventType {
     /// ToolInvokeDetails keeps the audit-row schema simple; only the
     /// event_type discriminates UI commands from MCP tools.
     TauriCommandInvoke,
+
+    /// Recorded when [`StorageBackend::mark_superseded`] marks a memory as
+    /// superseded by another (Phase 3 consolidator primitive per ADR-046,
+    /// T0.2.3 commit 2). Distinct from [`Self::MemoryUpdate`] to preserve
+    /// provenance fidelity per BRD §5.6 line 948 ("do not delete — preserve
+    /// provenance"): consolidator-driven supersession is a semantically
+    /// distinct event class from user-driven content edits, and the audit
+    /// viewer (T0.2.15) filters supersession events by `event_type` rather
+    /// than by JSON-path query against the `details` field.
+    ///
+    /// `details_json` shape: `{"superseded_by":"<MemoryId>"}` — the
+    /// `resource_id` field carries the old (superseded) MemoryId; the
+    /// `details_json.superseded_by` field carries the new (superseding)
+    /// MemoryId. Downstream queries join `resource_id` ↔
+    /// `details.superseded_by` to render the supersession chain.
+    ///
+    /// [`StorageBackend::mark_superseded`]: crate::cascading::StorageBackend::mark_superseded
+    MemorySuperseded,
 }
 
 impl AuditEventType {
@@ -102,6 +120,7 @@ impl AuditEventType {
             Self::CascadeQueueOverflow => "cascade.queue_overflow",
             Self::McpToolInvoke => "mcp.tool_invoke",
             Self::TauriCommandInvoke => "ui.tauri_command_invoke",
+            Self::MemorySuperseded => "memory.superseded",
         }
     }
 
@@ -125,6 +144,7 @@ impl AuditEventType {
             "cascade.queue_overflow" => Some(Self::CascadeQueueOverflow),
             "mcp.tool_invoke" => Some(Self::McpToolInvoke),
             "ui.tauri_command_invoke" => Some(Self::TauriCommandInvoke),
+            "memory.superseded" => Some(Self::MemorySuperseded),
             _ => None,
         }
     }
@@ -482,6 +502,7 @@ mod tests {
             AuditEventType::StoreCorruption,
             AuditEventType::CascadeQueueOverflow,
             AuditEventType::McpToolInvoke,
+            AuditEventType::MemorySuperseded,
         ] {
             assert_eq!(AuditEventType::parse(et.as_str()), Some(et));
         }
@@ -490,6 +511,14 @@ mod tests {
         // load-bearing for the MCP tool-invocation audit contract per
         // T0.1.9_PLAN.md §6 / ADR-024.
         assert_eq!(AuditEventType::McpToolInvoke.as_str(), "mcp.tool_invoke");
+        // Pin the memory.superseded wire-format string per ADR-046 (T0.2.3
+        // commit 2) — load-bearing for the T0.2.15 Tauri audit-viewer filter
+        // (event_type == "memory.superseded" enumerates consolidator-driven
+        // supersession events distinctly from user-driven memory updates).
+        assert_eq!(
+            AuditEventType::MemorySuperseded.as_str(),
+            "memory.superseded"
+        );
         // Confirm the old v1.2 retrieval wire-format string no longer
         // round-trips — T0.1.9 §6.2 rule 1 specifies non-backward-compat.
         assert_eq!(AuditEventType::parse("retrieval.query"), None);

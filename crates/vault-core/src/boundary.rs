@@ -36,7 +36,7 @@ pub const MAX_BOUNDARY_LEN: usize = 64;
 /// assert_eq!(b.as_str(), "work");
 /// assert!(Boundary::new("").is_err());
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct Boundary(String);
 

@@ -27,16 +27,21 @@
 //! [`ConsolidationReport`] carries per-boundary sub-sections inside
 //! `summary_markdown`, not separate runs per boundary.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::NaiveTime;
+use chrono::{NaiveTime, Utc};
 use serde::{Deserialize, Serialize};
+use tracing::instrument;
 use uuid::Uuid;
-use vault_core::{Boundary, MemoryId, VaultResult};
+use vault_core::{Boundary, Memory, MemoryId, VaultResult};
 use vault_embedding::EmbeddingProvider;
 use vault_llm::LlmProvider;
-use vault_storage::StorageBackend;
+use vault_storage::{MemoryFilter, StorageBackend};
+
+use crate::phases::cluster::{find_candidate_clusters, Cluster};
+use crate::phases::merge::{apply_merge, decide_merge, AppliedMerge, MergeOutcome};
 
 /// Sleep-cycle orchestrator per BRD §5.6 lines 895-913.
 ///
@@ -44,13 +49,9 @@ use vault_storage::StorageBackend;
 /// at application startup; reuse across nightly runs.
 #[derive(Clone)]
 pub struct Consolidator {
-    #[allow(dead_code)] // wired at commit 2 in run_consolidation
     storage: Arc<StorageBackend>,
-    #[allow(dead_code)] // wired at commit 2 in run_consolidation
     llm: Arc<dyn LlmProvider>,
-    #[allow(dead_code)] // wired at commit 2 in run_consolidation
     embeddings: Arc<dyn EmbeddingProvider>,
-    #[allow(dead_code)] // wired at commit 2 in run_consolidation
     config: ConsolidatorConfig,
 }
 
@@ -111,14 +112,151 @@ impl Consolidator {
 
     /// Run a full consolidation cycle per BRD §5.6 lines 933-955.
     ///
-    /// **T0.2.3 commit 1 status: NOT IMPLEMENTED.** Body lands at commit 2
-    /// (Phase 3 `apply_merge` primitive + orchestrator boundary-iteration
-    /// loop + Phase 1→2→3 pipeline). The struct + this signature ship at
-    /// commit 1 so the public surface matches BRD §5.6 line 911 verbatim
-    /// from day one.
-    #[allow(clippy::todo)]
+    /// **Pipeline (T0.2.3 commit 2):**
+    /// 1. Enumerate every memory in the vault via
+    ///    [`StorageBackend::list_memories`] (default filter — excludes
+    ///    already-superseded memories per `MemoryFilter::include_superseded
+    ///    = false`).
+    /// 2. Group by boundary into a [`BTreeMap`] for deterministic per-
+    ///    boundary iteration order (drives the summary markdown's
+    ///    boundary-sub-section ordering at commit 3).
+    /// 3. For each boundary: Phase 1 ([`find_candidate_clusters`]) → for
+    ///    each cluster: Phase 2 ([`decide_merge`]) → dispatch on
+    ///    [`MergeOutcome`]:
+    ///    - `Merge`: call Phase 3 [`apply_merge`]; record
+    ///      [`AppliedMergeWithContext`] for the summary markdown.
+    ///    - `KeepSeparate`: no-op (vector similarity was a false positive).
+    ///    - `Contradiction`: build a [`ConflictReview`] row; surfaced via
+    ///      [`ConsolidationReport::conflicts_for_user_review`] (do not
+    ///      auto-resolve per BRD §5.6 line 944).
+    /// 4. Build the [`ConsolidationReport`] with aggregated counts +
+    ///    `summary_markdown: String::new()` (commit 3 fills it via
+    ///    `generate_summary_markdown(&run_state)`).
+    ///
+    /// **Phase 4 (decay/archive) is NOT YET WIRED** — `memories_archived`
+    /// returns 0 at commit 2. Phase 4 ships at T0.2.4 per BRD §6.2.
+    ///
+    /// **Checkpoints (BRD §5.6 line 957) are NOT YET WIRED** — checkpoint
+    /// creation + rollback ship at T0.2.5 per BRD §6.2. The
+    /// `since: Option<DateTime<Utc>>` parameter on
+    /// [`find_candidate_clusters`] is passed `None` (full-scan) at T0.2.3.
+    #[instrument(skip(self))]
     pub async fn run_consolidation(&self) -> VaultResult<ConsolidationReport> {
-        todo!("T0.2.3 commit 2 — Phase 3 apply_merge + orchestrator loop")
+        let started_at = Utc::now();
+
+        // Step 1: enumerate all non-superseded memories. Default filter
+        // excludes already-superseded rows so Phase 1 clustering never sees
+        // them (prevents re-supersession at this layer per ADR-046's
+        // single-supersession assumption).
+        let all_memories = self
+            .storage
+            .list_memories(MemoryFilter::default(), None)
+            .await?;
+
+        // Step 2: group by boundary. BTreeMap gives deterministic
+        // alphabetical iteration (Boundary derives Ord) which downstream
+        // summary-markdown generation (commit 3) relies on for stable
+        // sub-section ordering.
+        let mut by_boundary: BTreeMap<Boundary, Vec<Memory>> = BTreeMap::new();
+        for memory in all_memories {
+            by_boundary
+                .entry(memory.boundary.clone())
+                .or_default()
+                .push(memory);
+        }
+
+        // Step 3: per-boundary Phase 1 → Phase 2 → Phase 3 pipeline.
+        let mut run_state = RunState {
+            memories_processed: 0,
+            per_boundary: BTreeMap::new(),
+        };
+        for (boundary, memories) in by_boundary {
+            run_state.memories_processed += memories.len();
+
+            let clusters = find_candidate_clusters(
+                self.storage.as_ref(),
+                self.embeddings.as_ref(),
+                &boundary,
+                self.config.merge_similarity_threshold,
+                None, // T0.2.5 wires actual since-checkpoint values.
+            )
+            .await?;
+
+            let mut boundary_summary = BoundarySummary::default();
+            for cluster in &clusters {
+                let outcome =
+                    decide_merge(cluster, self.llm.as_ref(), self.storage.as_ref()).await?;
+                match outcome {
+                    MergeOutcome::Merge {
+                        merged_text,
+                        reasoning,
+                    } => {
+                        let applied = apply_merge(
+                            cluster,
+                            &merged_text,
+                            &reasoning,
+                            self.storage.as_ref(),
+                            self.embeddings.as_ref(),
+                        )
+                        .await?;
+                        boundary_summary
+                            .applied_merges
+                            .push(AppliedMergeWithContext {
+                                cluster: cluster.clone(),
+                                applied,
+                                reasoning,
+                            });
+                    }
+                    MergeOutcome::KeepSeparate { .. } => {
+                        // Vector similarity was a false positive per Phase 2's
+                        // judgement. Originals stay; no state change.
+                    }
+                    MergeOutcome::Contradiction { reasoning } => {
+                        boundary_summary.contradictions.push(ConflictReview {
+                            conflict_id: Uuid::new_v4(),
+                            boundary: boundary.clone(),
+                            conflicting_memory_ids: cluster.member_row_ids.clone(),
+                            reasoning,
+                            flagged_at: Utc::now(),
+                        });
+                    }
+                }
+            }
+            run_state.per_boundary.insert(boundary, boundary_summary);
+        }
+
+        // Step 4: build the report. summary_markdown stays empty at commit
+        // 2; commit 3 wires generate_summary_markdown(&run_state).
+        let duration = Utc::now()
+            .signed_duration_since(started_at)
+            .to_std()
+            .unwrap_or(Duration::ZERO);
+        let memories_merged: usize = run_state
+            .per_boundary
+            .values()
+            .flat_map(|b| &b.applied_merges)
+            .map(|m| m.applied.superseded_memory_ids.len())
+            .sum();
+        let contradictions_resolved: usize = run_state
+            .per_boundary
+            .values()
+            .map(|b| b.contradictions.len())
+            .sum();
+        let conflicts_for_user_review: Vec<ConflictReview> = run_state
+            .per_boundary
+            .values()
+            .flat_map(|b| b.contradictions.iter().cloned())
+            .collect();
+
+        Ok(ConsolidationReport {
+            memories_processed: run_state.memories_processed,
+            memories_merged,
+            contradictions_resolved,
+            memories_archived: 0, // Phase 4 ships at T0.2.4.
+            duration,
+            conflicts_for_user_review,
+            summary_markdown: String::new(), // commit 3 fills via generate_summary_markdown.
+        })
     }
 
     /// Schedule the consolidator to run at the configured `run_at` time.
@@ -186,6 +324,42 @@ pub struct ConflictReview {
     /// When the conflict was flagged. Useful for review-queue ordering
     /// and for the audit log.
     pub flagged_at: chrono::DateTime<chrono::Utc>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Private orchestration types — consumed by `run_consolidation` + commit 3's
+// `generate_summary_markdown`. Not part of the public crate surface.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Accumulator threaded through `run_consolidation` and (at commit 3)
+/// `generate_summary_markdown`. Captures everything the summary needs
+/// without re-reading state from storage.
+#[derive(Debug)]
+#[allow(dead_code)] // wired at commit 3 in generate_summary_markdown
+struct RunState {
+    memories_processed: usize,
+    per_boundary: BTreeMap<Boundary, BoundarySummary>,
+}
+
+/// One boundary's contribution to the run: applied merges + contradictions
+/// captured for that boundary. Decay (T0.2.4) extends this struct.
+#[derive(Debug, Default)]
+#[allow(dead_code)] // wired at commit 3 in generate_summary_markdown
+struct BoundarySummary {
+    applied_merges: Vec<AppliedMergeWithContext>,
+    contradictions: Vec<ConflictReview>,
+}
+
+/// An applied merge plus the inputs the summary markdown needs: the
+/// original cluster (for pre-merge memory IDs and snippets) and the LLM's
+/// reasoning (surfaced verbatim in the Merges section per BRD §5.6 line
+/// 966).
+#[derive(Debug)]
+#[allow(dead_code)] // wired at commit 3 in generate_summary_markdown
+struct AppliedMergeWithContext {
+    cluster: Cluster,
+    applied: AppliedMerge,
+    reasoning: String,
 }
 
 #[cfg(test)]

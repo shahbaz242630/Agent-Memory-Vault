@@ -1,7 +1,7 @@
 # Memory Vault — Build Handoff
 
 **Current version:** V0.2 Closed Beta (BRD §6.2 — sleep consolidator, boundaries hardening, cross-device sync, 30 beta users)
-**Last updated:** 2026-05-13 — **T0.2.3 commit 1 STAGED + awaiting commit + push approval.** **T0.2.2 SHIPPED** at commit 2 `a53e3a5` (CI ALL-GREEN matrix-wide on run `25795121248`). T0.2.3 work began immediately after T0.2.2 ship: iteration 1 (drafted inline) → iteration 2 (4 spec-verbatim corrections + source-read recon — Memory.superseded_by already in vault-core, no ConflictReview type exists anywhere yet, write_memory takes embedding as param, no list_boundaries API exists) → iteration 3 (6 lockdown items resolved + DuckDbGraphStore graph-update missing-primitive finding surfaced + α no-op + WARN lock + tech-debt entry path). T0.2.3 commit 1 contents (current working tree): file-layout refactor per BRD §5.6 lines 987-989 (`git mv src/clustering.rs → src/phases/cluster.rs` + new `src/phases/mod.rs` + new `src/consolidator.rs` + new `src/phases/merge.rs`) + lib.rs re-exports preserving T0.2.2 acceptance-test import path + **ADR-044 Amendment 1** (`CompletionParams::system_prompt: Option<String>` field + `DEFAULT_SYSTEM_PROMPT` const + `build_chatml_prompt` signature change) + **Consolidator struct materialisation** (BRD §5.6 lines 894-913 verbatim public surface — 4-field Arc-shared struct + `ConsolidatorConfig` defaults + `run_consolidation` todo!() stub + `schedule` todo!() stub per T0.2.6 forward-pointer) + **ConflictReview type** defined in vault-consolidator (conflict_id/boundary/conflicting_memory_ids/reasoning/flagged_at fields per iteration 3 lock) + **Phase 2 `decide_merge` primitive** (N-ary structured input + GBNF schema + system-prompt-override + cluster hydration via list_memories + MergeOutcome enum return) + cascading.rs:37-44 stale-comment fix (T0.2.2 forward-reference → T0.2.x tech-debt pointer) + **HANDOFF.md tech-debt entry** "T0.2.x — entity-extraction-at-consolidation + GraphStore relationship-rewrite primitive on merge" (below). Test floor: **+8 vs +6 locked** (commit 1 floor breach surfaced for partner approval, both pins kept on direction: 5 Phase 2 unit tests + 2 ADR-044 pins + 1 BRD-defaults pin). **Cumulative T0.2.3 floor adjusts to +23** from iteration-3-locked +21 (commits 2-3 stay at planned +5/+10). Local DoD gates all green pre-stage; cumulative T0.2.0/T0.2.1/T0.2.2 arcs all CLOSED + CI-green-matrix-wide; T0.2.3 arc in flight (1 of 3 commits staging now; commits 2-3 next sessions).
+**Last updated:** 2026-05-13 — **T0.2.3 commit 2 STAGED + awaiting commit + push approval.** **T0.2.3 commit 1 SHIPPED** at `5aeb5b3` (CI ALL-GREEN matrix-wide on run `25798562657`). T0.2.3 commit 2 contents (current working tree): **vault-storage** — new `AuditEventType::MemorySuperseded` variant (audit.rs:33+ enum + `as_str()`/`parse()` arms + round-trip test extension + wire-string pin) + new `StorageBackend::mark_superseded(old_id, new_id) -> VaultResult<Ack>` primitive (cascading.rs:358+ — metadata-only update, no cascade enqueue, dedicated audit-event variant per ADR-046) + 2 vault-storage pin tests (`mark_superseded_metadata_only_no_vector_write` + `mark_superseded_emits_memory_superseded_audit_event`); all 230 lib tests green. **vault-consolidator** — `AppliedMerge` struct + `apply_merge` Phase 3 primitive (BRD §5.6 lines 946-950 verbatim: hydrate cluster → sum access_count → max confidence → construct merged Memory with memory_type from first-by-id member → re-embed via `embeddings.embed(merged_text)` → `storage.write_memory(merged)` → `storage.mark_superseded` loop on originals → WARN graph-deferral) + 5 Phase 3 unit tests (writes_merged + sums_access + max_confidence + re_embeds + emits_warn_for_graph_deferral) + StubEmbedder local helper + `Consolidator::run_consolidation` orchestrator body (BTreeMap-by-boundary deterministic iteration + Phase 1 → Phase 2 → Phase 3 pipeline + private RunState/BoundarySummary/AppliedMergeWithContext types) + lib.rs re-exports for `AppliedMerge`/`apply_merge`; all 19 lib tests green + 1 T0.2.2 acceptance integration test still green. **vault-core** — `Boundary` gains `PartialOrd, Ord` derive (boundary.rs:39 — recon-class amendment surfaced inline during task #4 to satisfy orchestrator's `BTreeMap<Boundary, _>` deterministic-iteration requirement; strictly additive, matches existing MemoryId/EntityId/RelationshipId derive pattern; no behavior change; surfaced as plan-amendment paragraph in deliverables block below per `feedback_flag_review_as_plan_amendment.md`). **ADR-046** — full text below; LOCKED at T0.2.3 commit 2 per partner-direction (β over α; rejected `Option<&[f32]>` API extension + rejected `MemoryUpdate`-with-cause-field; single-supersession assumption documented with V0.3+ forward-revisit; 3 Q&A locks on details_json shape / method location / test pin mechanism). Test floor: **+7 firm** (5 Phase 3 consolidator + 2 vault-storage mark_superseded pins per ADR-046) — matches post-β lock exactly, no surplus. **Cumulative T0.2.3 floor: +25 firm** (commit 1 +8 + commit 2 +7 + commit 3 +10). **Plan amendment 2026-05-13:** archive split for V0.2 Part 1 deferred from commit 2 to T0.2.3 commit 3 first push per partner direction — full-freeze approach (`cp HANDOFF.md HANDOFF_V0.2_PART1_ARCHIVE.md` + write fresh slim HANDOFF.md ~200-300 lines at commit 3 first push); cleaner post-commit-2 boundary, lower mid-commit risk, faster commit 2. See "T0.2.3 commit 2 deliverables" block below for the full ride-along record. Local DoD gates all green pre-stage (vault-storage 230/230 lib + vault-consolidator 19 lib + 1 acceptance integration); cumulative T0.2.0/T0.2.1/T0.2.2 arcs all CLOSED + CI-green-matrix-wide; T0.2.3 arc in flight (2 of 3 commits staging now; commit 3 next session).
 
 **Session close-a (2026-05-12, historical milestone record — Phase 3 + Phase 4 Stages 1-4):** T0.2.0 Phase 3 SHIPPED + Phase 4 Stages 1-4 PASSED in real-world dogfood. CI-fix commit `b6d72bc` (push `ef88361..b6d72bc`) ALL-GREEN matrix-wide on CI run `25736962490` — Windows job passed cleanly with `CARGO_BUILD_JOBS=2` cap. **Phase 3 formally CLOSED.** Phase 4 founder dogfood executed on Shahbaz's Windows dev box: pre-flight cleanup (V0.1 MSI uninstalled via `MsiExec.exe /X{4CF99BC2-2134-424E-ABF9-B64A80DA5EAB}` + old debug binary deleted + data dir wiped + 3 keychain entries deleted including production `default.com.memoryvault.v0.2`) → fresh `target/release/vault-tauri.exe` launch → **Stage 1 PASS** (no "Alpha" title, no ALPHA modal, no orange strip, clean Add Memory view) → **Stage 2 PASS** (add/search/delete smoke flows work) → **Stage 3 PASS — the real T0.2.0 hard-gate proof** (memories survive close+reopen cycle on real user data, sealed write+read round-trip verified) → **Stage 4 PASS** (Notepad on `<data>/lance/memories.lance/data/*.lance` shows random CJK-misinterpreted ciphertext, NO plaintext memory content). Working-tree HANDOFF.md state at session close: rides with next code commit (Phase 5 close or T0.2.1 first commit) per `feedback_admin_changes_ride_with_code.md`.
 
@@ -312,6 +312,298 @@ Iteration 3 locked commit 1 floor at +6 (=+5 Phase 2 unit tests +1 ADR-044 amend
 ### Next coding work after commit 1 lands + CI greens
 
 **T0.2.3 commit 2:** Phase 3 `apply_merge` primitive (new merged memory with summed access_count + max confidence + fresh created_at; supersession via `Memory.superseded_by`; re-embed via `embeddings.embed(merged_text)` + `storage.write_memory(&merged, &embedding)`; **graph-update no-op + `tracing::warn!`** with doc-comment cross-link to the tech-debt entry above) + 5 Phase 3 unit tests + `Consolidator::run_consolidation` orchestrator body wired (boundary discovery via in-memory grouping + Phase 1 → Phase 2 → Phase 3 loops + accumulating `RunState` for commit 3's summary markdown). Test floor +5.
+
+---
+
+## T0.2.3 commit 2 deliverables (this session, 2026-05-13) — `mark_superseded` primitive + ADR-046 + Phase 3 `apply_merge` + orchestrator + Boundary-Ord recon-class amendment
+
+**Status:** STAGED + awaiting commit + push approval. Rides with this commit per `feedback_admin_changes_ride_with_code.md`.
+
+### Iteration arc (inline chat, 2026-05-13)
+
+- **Pre-implementation recon (task #2):** 3 source-reads confirmed `StorageBackend::update_memory(memory, embedding) -> VaultResult<Ack>` exists at cascading.rs:352 + `Memory.access_count: u32` / `Memory.confidence: f32` / `Memory.memory_type: MemoryType` / `Memory.superseded_by: Option<MemoryId>` all at memory.rs:88-97 + `Cluster.member_row_ids: Vec<MemoryId>` sorted ascending per ADR-045 §a + `MergeOutcome::Merge { merged_text, reasoning }` from commit 1's `decide_merge`. BRD §5.6 §946-950 silent on `memory_type` for merged memory → locked first-member-by-id-ascending per spec-silence resolution.
+- **Plan-amendment surface (task #2 → task #11 decision):** recon revealed that calling `storage.update_memory` to mark originals superseded requires re-embedding each original's content (cascade requires embedding param; `list_memories` returns `Memory.embedding = None`). Two paths surfaced — **α** (re-embed + cascade update; cheap delta, audit-fuzziness conflates "consolidator-marked-superseded" with "user-edited") vs **β** (new `mark_superseded` primitive + `MemorySuperseded` audit variant; ~80-100 LOC + ADR-046, perfect provenance fidelity). Partner locked **β** on second-order reasoning: BRD §5.6 line 948 verbatim "preserve provenance" is contract-class, cascade-bypass back-door for `Option<&[f32]>` weakens existing API, audit-chain is one of the three unimpeachable surfaces.
+- **ADR-046 inline draft + locks (task #10):** drafted in chat per `feedback_plan_iterations_inline_not_handoff.md`; 3 partner-decisions on details_json shape (locked α `{"superseded_by":"<new_id>"}`), method location (locked StorageBackend not MetadataStore), test pin #1 mechanism (locked α two-point `retry_queue.len()==0` assertion). ADR-046 final text rides with this commit at HANDOFF.md (below).
+- **Source-reads pre-impl (task #11):** confirmed `AuditEventType` enum at audit.rs:33 (11 existing variants, manual `as_str()` + `parse()` arms, round-trip test at audit.rs:475 enumerates all variants) + `tx_get_memory` / `tx_update_memory` / `tx_append_audit` at metadata_store.rs:698/704/799 + `delete_memory` body at cascading.rs:358 as canonical "metadata-only with audit emit" pattern to mirror + BLAKE3 chain via `compute_event_hash(prev_hash || canonical_bytes)` at audit.rs:343 (adding new variant is safe — old events keep their hashes, chain walks prev→curr correctly). 4 source-reads, all confirmed cleanly.
+- **Recon-class amendment surfaced inline (task #4):** orchestrator's `BTreeMap<Boundary, Vec<Memory>>` requires `Boundary: Ord` but Boundary only derived `Eq, Hash` at boundary.rs:39. Two paths surfaced — α HashMap fallback (no vault-core change, loses deterministic per-boundary iteration) vs β derive Ord (strictly additive, matches existing pattern). Locked **β**. See "Recon-class amendment: Boundary-Ord derive" paragraph below for the derive-vs-ADR discipline rationale.
+- **Plan amendment 2026-05-13 (mid-task-5):** archive split for V0.2 Part 1 deferred from commit 2 to T0.2.3 commit 3 first push per partner direction. Full-freeze approach at commit 3: `cp HANDOFF.md HANDOFF_V0.2_PART1_ARCHIVE.md` + write fresh slim HANDOFF.md (~200-300 lines, just current state + commit 3 deliverables-block-placeholder + commit 4 next-session opener + live ADR cross-link + standing rules + archive cross-link). Cleaner post-commit-2 boundary, lower mid-commit risk, faster commit 2. Mid-commit-2 script-based archive split attempt was prepared (`archive_split.ps1` drafted + ran successfully with all 3 verification gates green: line conservation 1122+2320==3431+11, section set-equality 18+34==52, per-section SHA-256 52/52 byte-identical) but rolled back from .bak per partner direction; the script + .bak + archive output artifacts all removed pre-commit-2-stage. The full-freeze + fresh-restart approach lands as the FIRST step of T0.2.3 commit 3 before any commit 3 code work.
+
+### Files in commit 2 (7 modified)
+
+- `crates/vault-core/src/boundary.rs` — `Boundary` gains `PartialOrd, Ord` derive (1-line additive change; recon-class amendment).
+- `crates/vault-storage/src/audit.rs` — new `AuditEventType::MemorySuperseded` variant + `as_str()` arm (`"memory.superseded"` wire format) + `parse()` arm + round-trip test extension + wire-string pin (load-bearing for T0.2.15 audit-viewer filter).
+- `crates/vault-storage/src/cascading.rs` — new `pub async fn mark_superseded(&self, old_id: MemoryId, new_id: MemoryId) -> VaultResult<Ack>` method on StorageBackend + 2 vault-storage pin tests (`mark_superseded_metadata_only_no_vector_write` + `mark_superseded_emits_memory_superseded_audit_event`).
+- `crates/vault-consolidator/src/phases/merge.rs` — new `AppliedMerge` struct + `apply_merge` Phase 3 primitive (BRD §5.6 lines 946-950 verbatim) + 5 Phase 3 unit tests + StubEmbedder local helper + insert_with_overrides helper.
+- `crates/vault-consolidator/src/consolidator.rs` — `Consolidator::run_consolidation` orchestrator body wired (replaces `todo!()` stub with full pipeline: list_memories → BTreeMap by boundary → per-boundary Phase 1 → Phase 2 dispatch on MergeOutcome → Phase 3 apply_merge or contradiction capture → ConsolidationReport with `summary_markdown: String::new()` for commit 3) + private RunState / BoundarySummary / AppliedMergeWithContext types + removed `#[allow(dead_code)]` / `#[allow(clippy::todo)]` attributes (no longer needed; fields are now used).
+- `crates/vault-consolidator/src/lib.rs` — re-exports for `AppliedMerge` + `apply_merge` (symmetric with `decide_merge` re-export pattern).
+- `HANDOFF.md` — this update (line-4 metadata fix + commit 2 deliverables block + OBSOLETE marker on commit 2 next-session opener + ADR-046 full text + ADR-046 entry in active-ADRs table).
+
+### Local DoD gate state (this session, 2026-05-13 pre-stage)
+
+| Gate | Result |
+|---|---|
+| `cargo check -p vault-storage --all-targets` | ✅ 38s, zero warnings |
+| `cargo test -p vault-storage --lib mark_superseded` | ✅ 2/2 pass (0.35s) |
+| `cargo test -p vault-storage --lib` | ✅ 230/230 pass (228 prior + 2 new) |
+| `cargo check -p vault-consolidator --all-targets` | ✅ 2.24s post-warning-fix, zero warnings |
+| `cargo test -p vault-consolidator --lib apply_merge` | ✅ 5/5 pass (0.89s) |
+| `cargo test -p vault-consolidator` | ✅ 19 lib + 1 integration + 1 ignored (2.67s + 26.77s) |
+| Full DoD gate chain (fmt + clippy + check + test + git status post-fmt) | task #6 — runs next |
+
+### Test floor reconciliation — commit 2 +7 firm (matches post-β lock exactly)
+
+Iteration arc locked commit 2 floor at +7 (= +5 Phase 3 consolidator + 2 vault-storage mark_superseded pins per ADR-046). Actual: **+7** — exact match, no breach, no surplus.
+
+| Pin | Locked? | Justification |
+|---|---|---|
+| 5 × Phase 3 `apply_merge` unit tests (writes_merged / sums_access / max_confidence / re_embeds / emits_warn_for_graph_deferral) | ✅ +5 | Iteration arc Phase-3 floor verbatim |
+| `mark_superseded_metadata_only_no_vector_write` | ✅ +1 | ADR-046 test pin (locked Q3 α two-point assertion) |
+| `mark_superseded_emits_memory_superseded_audit_event` | ✅ +1 | ADR-046 test pin (audit-event-class discrimination; includes MemoryUpdate-absence assertion) |
+
+**Cumulative T0.2.3 floor: +25 firm** (commit 1 +8 + commit 2 +7 + commit 3 +10). Revises from iteration-3-locked +21 → post-β-decision +25 (β added +4: 2 ADR-046 pins now + 2 absorbed from commit 1's earlier +8-vs-+6 reconciliation).
+
+### Recon-class amendment: Boundary-Ord derive (vault-core)
+
+Surfaced inline during task #4 orchestrator implementation per `feedback_flag_review_as_plan_amendment.md`. The opener's `BTreeMap<Boundary, Vec<Memory>>` requires `Boundary: Ord` but Boundary only derived `Eq, Hash` (boundary.rs:39). Locked **β** (derive `PartialOrd, Ord` on Boundary in vault-core) over α (HashMap fallback) on three grounds:
+
+1. Strictly additive — adds trait impls, doesn't change behavior, doesn't break any existing consumer.
+2. Matches existing pattern — every other ID newtype in vault-core (`MemoryId`, `EntityId`, `RelationshipId`) derives `PartialOrd, Ord` per the same convention.
+3. Deterministic per-boundary iteration order — needed for commit 3's summary markdown sub-section ordering + test reproducibility. HashMap would force non-deterministic ordering.
+
+**Not gated by ADR** — the discipline for ADRs in this codebase is "real architectural choices with rejected alternatives carrying second-order consequences" (compare ADR-046's cascade-bypass back-door / JSON-path-query cost / audit-event-type discrimination trade-offs). A `#[derive(Ord)]` on a String-newtype matching every other ID-newtype's pattern has no rejected alternatives worth documenting; ADR-047 would be 90% ceremony to 10% content. The implicit-exercise concrete-consumer-test passes (orchestrator's BTreeMap usage exercises Ord at compile time; future integration tests at commit 3 exercise it at runtime); a dedicated pin test would assert what `#[derive(Ord)]` already structurally guarantees from the stdlib.
+
+### Cross-references
+
+- BRD §5.6 line 948 verbatim "preserve provenance" — load-bearing anchor for ADR-046's audit-fidelity argument
+- ADR-046 (below) — `mark_superseded` primitive + `MemorySuperseded` audit variant lock
+- ADR-046 §"Test pins" — the 2 vault-storage pin tests bake into commit 2's floor
+- Tech-debt entry "T0.2.x — entity-extraction-at-consolidation" (above) — graph-update forward-pointer; `apply_merge` emits the WARN-no-op per iteration 3 §"open-items 6" lock
+- T0.2.3 commit 2 historical opener (below) — pre-execution scaffold; deliverables block (this) is the canonical record of what shipped
+
+### Next coding work after commit 2 lands + CI greens
+
+**T0.2.3 commit 3 (next session):** archive split FIRST (full-freeze + fresh slim HANDOFF per partner direction) → `generate_summary_markdown(&run_state)` function per BRD §5.6 lines 959-973 (Run header + per-boundary Merges/Contradictions sub-sections + aggregate Decay + Footer) → hand-curated `merge_acceptance_100.json` fixture (T0.2.3-dedicated; T0.2.2's `clustering_acceptance_100.json` stays frozen as Phase 1 regression) → 3 integration tests (Phase 1→2→3 end-to-end + rollback + summary-markdown-shape) → 2 property tests (idempotence + no-memory-lost) → N-ary canned LLM-response fixture. Test floor +10.
+
+---
+
+## T0.2.3 commit 2 — historical next-session opener (drafted 2026-05-13 session-pause, OBSOLETE — superseded by commit 2 deliverables block above; preserved as audit trail)
+
+**OBSOLETE post-commit-2-stage — see "T0.2.3 commit 2 deliverables" block above for the canonical record of what shipped.** Preserved here as audit trail; matches the T0.2.2 commit 2 historical-opener pattern. The 8-step plan below was the pre-execution scaffold drafted at session-pause; the deliverables block captures actual implementation outcomes including two recon-class amendments surfaced during task execution (β-lock on `mark_superseded` primitive + ADR-046 + Boundary-Ord derive) that weren't in the original opener.
+
+**Original opener text below (preserved verbatim from session-pause draft):**
+
+**Read this first when reopening.** Captures the exact state at session-pause + the deterministic 8-step path forward. Verbatim because chat thread iterations are transient; this is the durable handoff.
+
+### State at session-pause
+
+- **T0.2.3 commit 1** (`5aeb5b3`): SHIPPED. Push `a53e3a5..5aeb5b3 main -> main`. Contents: file-layout refactor (`src/clustering.rs` → `src/phases/cluster.rs` + new `phases/mod.rs`, `consolidator.rs`, `phases/merge.rs`) + ADR-044 Amendment 1 (`CompletionParams::system_prompt` field) + Consolidator struct materialisation (BRD §5.6 lines 894-928 verbatim) + ConflictReview type + Phase 2 `decide_merge` primitive + 8 tests (5 Phase 2 + 1 BRD-defaults pin + 2 ADR-044 amendment pins) + cascading.rs:37-50 stale-comment fix + tech-debt entry for T0.2.x entity-extraction. 10 files changed, 929 insertions, 52 deletions.
+- **Commit 1 CI** (run `25798562657`): `queued` at session-pause time. Verify via `gh run list --workflow=ci.yml -L 1`.
+- **Commit 2 working tree**: clean — no uncommitted changes at session-pause (this next-session opener IS the only working-tree edit, intended to ride with commit 2's code per `feedback_admin_changes_ride_with_code.md`).
+- **Per-action-approval state**: commit 1 approved + executed + pushed. Commit 2 commit + push NOT yet approved — re-ask per `feedback_confirm_before_commit_push.md` when staged (single approval covers both).
+
+### Environment notes (must set every fresh shell on Windows)
+
+- `LIBCLANG_PATH = C:\Users\shahb\scoop\apps\llvm\current\bin` (LLVM via scoop, installed at T0.2.1 spike-2 for llama-cpp-sys-2's bindgen). Persist at every fresh shell:
+  ```powershell
+  $env:LIBCLANG_PATH = "$env:USERPROFILE\scoop\apps\llvm\current\bin"
+  $env:PATH = "$env:LIBCLANG_PATH;$env:PATH"
+  ```
+- All `cargo` invocations on Windows via **PowerShell** (per `feedback_cargo_on_windows_use_powershell.md`).
+- All `cargo` invocations strictly serial (per `feedback_no_parallel_cargo_invocations.md`). Never run two cargo commands in parallel — kills incremental cache.
+- T0.2.2's bge-small-en-v1.5 fixtures already provisioned at `crates/vault-embedding/test-fixtures/bge-small-en-v1.5/` (model.onnx + tokenizer.json + onnxruntime.dll). No re-provisioning needed.
+- Phi-4-mini GGUF cached at `%APPDATA%\com.shahbaz242630.memory-vault\models\Phi-4-mini-instruct-Q4_K_M.gguf` (2.32 GiB, SHA-256 `88c00229...`). Not used by commit 2 (Phase 3 unit tests use `MockLlmProvider`); reused at commit 3 if any real-model integration tests need it.
+
+### Sequencing (deterministic 8 steps)
+
+**Step 1 — verify commit 1 CI green matrix-wide:**
+
+```bash
+gh run list --workflow=ci.yml -L 1 --json status,conclusion,headSha
+```
+
+Decision tree:
+- `status=completed`, `conclusion=success`, `headSha=5aeb5b3...` → proceed to Step 2.
+- `status=completed`, `conclusion=failure` → fix-forward per `feedback_broken_ci_is_regression_not_techdebt.md`. Read failure via `gh run view <run-id> --log-failed`; diagnose per OS; patch + commit + push as `5aeb5b3 + fix-forward`. After CI greens, proceed to Step 2.
+- `status=in_progress` or `queued` → wait. Standard poll cadence: `gh run list -L 1` every 5-10 min. **NEVER use `gh run watch`** per `feedback_gh_run_watch_exit_not_equal_run_status.md` (its exit code != run status).
+
+**Step 2 — Phase 3 `apply_merge` primitive in `crates/vault-consolidator/src/phases/merge.rs`.**
+
+Add to the existing `merge.rs` (which currently has `MergeOutcome` + `decide_merge` from commit 1). Locked surface per T0.2.3 iteration 2 §"Primitive signatures":
+
+```rust
+#[derive(Debug, Clone)]
+pub struct AppliedMerge {
+    pub new_memory_id: MemoryId,
+    pub superseded_memory_ids: Vec<MemoryId>,
+    pub summed_access_count: u32,
+    pub max_confidence: f32,
+}
+
+pub async fn apply_merge(
+    cluster: &Cluster,
+    merged_text: &str,
+    merged_reasoning: &str,
+    storage: &StorageBackend,
+    embeddings: &dyn EmbeddingProvider,
+) -> VaultResult<AppliedMerge>;
+```
+
+Implementation steps per BRD §5.6 lines 946-950 verbatim:
+
+1. **Hydrate cluster members** via `storage.list_memories(MemoryFilter::default(), None)` + filter by `cluster.member_row_ids` (same pattern as `decide_merge`).
+2. **Compute aggregated fields**: `summed_access_count = members.iter().map(|m| m.access_count).sum()` + `max_confidence = members.iter().map(|m| m.confidence).fold(0.0, f32::max)`.
+3. **Construct new merged Memory**: same boundary as cluster (all cluster members share a boundary per BRD §11.4.3); `content = merged_text`; `memory_type` carried from first member (or `MemoryType::Semantic` default — confirm at iter-3-equivalent recon if BRD specifies); fresh `created_at = Utc::now()`; `superseded_by = None` (merged memory is the head); `access_count = summed_access_count`; `confidence = max_confidence`.
+4. **Re-embed**: `let embedding = embeddings.embed(merged_text).await?;`
+5. **Write merged memory**: `let ack = storage.write_memory(&merged_memory, &embedding).await?;`
+6. **Mark originals superseded**: for each cluster member, set `superseded_by = Some(merged_memory.id)` + `storage.update_memory(&updated_member, &original_embedding).await?`. **Source-read needed at session open**: does `StorageBackend::update_memory` exist? If yes, use it. If not, may need a new `mark_superseded(old_id, new_id)` primitive added to vault-storage as part of commit 2 (recon-class amendment).
+7. **Graph update**: `tracing::warn!(merge_id = %merged_memory.id, "graph update deferred to T0.2.x — see HANDOFF tech-debt entry: entity-extraction-at-consolidation");` — **NO-op per iteration 3 §"open-items 6" lock**. Doc-comment cross-references the tech-debt entry above.
+8. **Return `AppliedMerge`**.
+
+**Source-reads needed at Step 2 open** (per `feedback_cfg_gate_recon_must_enumerate_6_cascade_classes.md` discipline):
+- `rg "pub async fn update_memory" crates/vault-storage/src/cascading.rs` — confirm signature + that it takes `&memory, &embedding` like `write_memory` does.
+- `rg "access_count|max_confidence" crates/vault-core/src/memory.rs` — confirm fields exist + their types (BRD §5.6 line 947 references them).
+- `rg "memory_type" crates/vault-core/src/memory.rs` — confirm `Memory.memory_type` is preserved or defaults sanely.
+
+**Step 3 — 5 Phase 3 unit tests** in `phases/merge.rs::tests` mod (add alongside the existing 5 Phase 2 unit tests):
+
+1. `apply_merge_writes_merged_memory_and_returns_id` — happy-path: 3 cluster members, merge succeeds, new MemoryId returned, all 3 originals marked superseded.
+2. `apply_merge_sums_access_count_across_members` — 3 members with `access_count = 5/10/15`, merged memory's `access_count` is 30.
+3. `apply_merge_takes_max_confidence_across_members` — 3 members with `confidence = 0.6/0.9/0.7`, merged memory's `confidence` is 0.9.
+4. `apply_merge_re_embeds_merged_text_via_provider` — uses `StubEmbedder` that records each `embed` call; assert the merged text was the input. **Adapt or import the StubEmbedder pattern from vault-retrieval/tests/common/mod.rs:36-85** OR define a local stub in this test module.
+5. `apply_merge_emits_warn_for_graph_update_deferral` — uses `tracing-test`'s `#[traced_test]` to assert the `WARN` log substring `"graph update deferred to T0.2.x"` fires on every successful merge. Defensive pin so the no-op disposition is locked-in.
+
+**Step 4 — `Consolidator::run_consolidation` orchestrator body** in `crates/vault-consolidator/src/consolidator.rs`.
+
+Replace the `todo!("T0.2.3 commit 2 — Phase 3 apply_merge + orchestrator loop")` stub with the full pipeline. Locked shape per iteration 2 §"Boundary handling" + iteration 3 §"(1) Orchestrator boundary discovery → (ii) in-memory grouping":
+
+```rust
+pub async fn run_consolidation(&self) -> VaultResult<ConsolidationReport> {
+    let started_at = Utc::now();
+
+    // Step 1: discover all boundaries by enumerating memories.
+    let all_memories = self.storage.list_memories(MemoryFilter::default(), None).await?;
+    let mut by_boundary: BTreeMap<Boundary, Vec<Memory>> = BTreeMap::new();
+    for memory in all_memories {
+        by_boundary.entry(memory.boundary.clone()).or_default().push(memory);
+    }
+
+    // Step 2-4: per-boundary Phase 1 → Phase 2 → Phase 3 pipeline.
+    let mut run_state = RunState {
+        started_at,
+        memories_processed: 0,
+        per_boundary: BTreeMap::new(),
+    };
+    for (boundary, memories) in by_boundary {
+        run_state.memories_processed += memories.len();
+        let clusters = find_candidate_clusters(
+            &self.storage,
+            self.embeddings.as_ref(),
+            &boundary,
+            self.config.merge_similarity_threshold,
+            None, // T0.2.5 wires actual since-checkpoint values
+        ).await?;
+
+        let mut boundary_summary = BoundarySummary::default();
+        for cluster in &clusters {
+            let outcome = decide_merge(cluster, self.llm.as_ref(), &self.storage).await?;
+            match outcome {
+                MergeOutcome::Merge { merged_text, reasoning } => {
+                    let applied = apply_merge(
+                        cluster,
+                        &merged_text,
+                        &reasoning,
+                        &self.storage,
+                        self.embeddings.as_ref(),
+                    ).await?;
+                    boundary_summary.applied_merges.push(AppliedMergeWithContext {
+                        cluster: cluster.clone(),
+                        applied,
+                        reasoning,
+                    });
+                }
+                MergeOutcome::KeepSeparate { .. } => { /* no-op */ }
+                MergeOutcome::Contradiction { reasoning } => {
+                    boundary_summary.contradictions.push(ConflictReview {
+                        conflict_id: Uuid::new_v4(),
+                        boundary: boundary.clone(),
+                        conflicting_memory_ids: cluster.member_row_ids.clone(),
+                        reasoning,
+                        flagged_at: Utc::now(),
+                    });
+                }
+            }
+        }
+        run_state.per_boundary.insert(boundary, boundary_summary);
+    }
+
+    // Step 5: build the ConsolidationReport (summary_markdown filled in by commit 3).
+    let duration = Utc::now().signed_duration_since(started_at).to_std()
+        .unwrap_or(Duration::ZERO);
+    Ok(ConsolidationReport {
+        memories_processed: run_state.memories_processed,
+        memories_merged: run_state.per_boundary.values()
+            .flat_map(|b| &b.applied_merges)
+            .map(|m| m.applied.superseded_memory_ids.len())
+            .sum(),
+        contradictions_resolved: run_state.per_boundary.values()
+            .map(|b| b.contradictions.len())
+            .sum(),
+        memories_archived: 0, // Phase 4 ships at T0.2.4
+        duration,
+        conflicts_for_user_review: run_state.per_boundary.values()
+            .flat_map(|b| b.contradictions.clone())
+            .collect(),
+        summary_markdown: String::new(), // commit 3 fills this via generate_summary_markdown(&run_state)
+    })
+}
+```
+
+Plus add the supporting types `RunState` + `BoundarySummary` + `AppliedMergeWithContext` as private structs in `consolidator.rs` (commit 3's `generate_summary_markdown` will consume them).
+
+**Step 5 — HANDOFF.md post-`5aeb5b3` admin update.**
+
+Bundle with commit 2's code per `feedback_admin_changes_ride_with_code.md`. Updates:
+- Top metadata: flip from "T0.2.3 commit 1 STAGED" → "T0.2.3 commit 2 STAGED" with the commit 1 SHIPPED + CI green confirmation.
+- Status table row for "T0.2.3 commit 1" → ✅ SHIPPED at `5aeb5b3` (CI run `25798562657` ALL-GREEN matrix-wide once confirmed).
+- New "T0.2.3 commit 2 deliverables" block with iteration notes (no plan iteration needed for commit 2 since iteration 3 already locked all primitive signatures; this block records the actual implementation outcomes + any recon discoveries during Step 2's source-reads).
+- Mark "T0.2.3 commit 2 — next-session opener" block (this very block) as OBSOLETE/historical per the precedent established by T0.2.1 commit 2 + T0.2.2 commit 2 openers.
+- Add a new "T0.2.3 commit 3 — next-session opener" block at the same drafting time pointing forward to summary markdown + acceptance fixture + property tests + N-ary canned fixture.
+
+**Step 6 — Local DoD gate chain (strictly serial per `feedback_no_parallel_cargo_invocations.md`):**
+
+```powershell
+$env:LIBCLANG_PATH = "$env:USERPROFILE\scoop\apps\llvm\current\bin"; $env:PATH = "$env:LIBCLANG_PATH;$env:PATH"
+cargo check --workspace --all-targets       # gate 1
+cargo test -p vault-consolidator            # gate 2 (8 lib + new Phase 3 tests + 1 T0.2.2 acceptance)
+cargo clippy --workspace --all-targets -- -D warnings   # gate 3
+cargo fmt --all --check                     # gate 4 (FINAL per `feedback_fmt_runs_last_before_commit.md`)
+git status --short                          # gate 5 (drift check per `feedback_git_status_check_between_fmt_and_add.md`)
+```
+
+If gate 4 fails on formatting → `cargo fmt --all` to apply + re-run gate 4 + git status. Any fmt-applied edits ride with commit 2.
+
+**Step 7 — Stage + ask Shahbaz for combined commit + push approval.** Per `feedback_confirm_before_commit_push.md`, single approval covers both. Show staged files + commit message draft + ask.
+
+**Step 8 — Verify commit 2 CI green matrix-wide** (same shape as Step 1 for commit 2's run). When green → **T0.2.3 commit 2 SHIPPED**. Move to **T0.2.3 commit 3** (summary markdown + acceptance + property tests).
+
+### Open items / discipline pointers for next session
+
+- **Phase 3 `apply_merge` source-reads first** — `StorageBackend::update_memory` signature, `Memory.access_count`/`Memory.confidence`/`Memory.memory_type` fields, `Boundary` clone/cmp behaviour. Recon BEFORE writing the primitive body per `feedback_cfg_gate_recon_must_enumerate_6_cascade_classes.md`.
+- **Test floor: +5 firm locked at iteration 3.** Breach (even by 1) requires plan-amendment surface BEFORE commit per `feedback_floor_forecast_is_pre_declaration_not_estimate.md` — same discipline that fired this session at commit 1's +8 vs +6.
+- **Graph update is no-op + WARN** — DO NOT implement entity extraction or relationship rewriting in commit 2. That's the deferred T0.2.x task; commit 2 just emits the WARN.
+- **Orchestrator drains the cascade queue** — `Consolidator::run_consolidation` writes new merged memories via `storage.write_memory`, which queues a LanceDB upsert via the retry-queue. The orchestrator does NOT need to call `RetryWorker::step_at` — the production worker spawned by `vault_app::Application::start` drains naturally. Phase 3 unit tests DO need explicit drain (same pattern as the commit 1 Phase 2 unit tests' `insert_and_drain` helper at `phases/merge.rs::tests`).
+- **N-ary canned fixture deferred to commit 3** — `canned_merge_decisions_nary.json` shape was sketched in iteration 3 but not built. Commit 3 builds it alongside `merge_acceptance_100.json`. Don't pre-build at commit 2.
+- **`schedule()` stays as `todo!()` stub** — body lands at T0.2.6 per BRD §6.2 line 1453. Don't touch.
+- **Cargo.lock drift** — likely on commit 2's first `cargo check` if Phase 3 primitive adds any new transitive deps. Post-fmt `git status --short` step catches this; include drift in commit 2's staging.
+
+### Cross-references
+- BRD §5.6 Phase 3 (`Agent_Build_Specification.txt:946-950`) — algorithm spec
+- BRD §6.2 T0.2.3 (`Agent_Build_Specification.txt:1436-1441`) — acceptance criterion (commit 3 covers the integration test)
+- T0.2.3 iteration 2 §"Primitive signatures" — `apply_merge` + `AppliedMerge` locked surface
+- T0.2.3 iteration 3 §"(1) Orchestrator boundary discovery" — in-memory grouping path locked
+- T0.2.3 iteration 3 §"open-items 6" — graph-update α no-op + WARN lock
+- Tech-debt entry "T0.2.x — entity-extraction-at-consolidation" (this HANDOFF, above) — graph-update forward-pointer
+- `feedback_cfg_gate_recon_must_enumerate_6_cascade_classes.md` — Step 2 source-read discipline
 
 ---
 
@@ -980,6 +1272,81 @@ Both amendments are real architectural surfaces that abstract reasoning couldn't
 - ADR-043 (below) — model download discipline; consumed transitively by §c S1 spike's `Phi4MiniProvider::v0_2_default`.
 - ADR-044 (below) — `LlmProvider` trait + `Phi4MiniProvider` impl locks; consumed transitively by §c S1 spike + §e contract-drift flag's redesign scope.
 - T0.2.2 iteration 1 lock — `feedback_plan_iterations_inline_not_handoff.md` (chat thread, 2026-05-13).
+
+---
+
+## ADR-046 — `mark_superseded` primitive + `MemorySuperseded` audit variant (T0.2.3 commit 2, drafted + locked 2026-05-13)
+
+**Status:** LOCKED at T0.2.3 commit 2 (drafted inline this session per `feedback_plan_iterations_inline_not_handoff.md`, partner-approved Q1/Q2/Q3 + β-over-α decision, rides with commit 2's code).
+
+### Context
+
+Phase 3 `apply_merge` (T0.2.3 commit 2) needs to mark each cluster member as `superseded_by = Some(merged_memory_id)` — a metadata-only field change per BRD §5.6 line 948 verbatim *"Mark original memories as `superseded_by` the new one (do not delete — preserve provenance)."* Existing options both fail:
+
+- `StorageBackend::update_memory(&memory, &embedding) -> VaultResult<Ack>` (cascading.rs:352) requires an embedding parameter. Originals' vectors live in LanceDB, not SQLite; `list_memories` returns `Memory.embedding = None`. Workaround: re-embed each original's content via `embeddings.embed(original.content).await?` — BGE-small at fp32 is deterministic so the re-embedded vector is byte-identical (or near-identical at sub-1e-6 noise per vault-consolidator/Cargo.toml:20) to the originally-stored vector. But the cascade still treats this as a vector write — `retry_queue` enqueue, LanceDB upsert via worker, divergence-detection counter increment — for an operation that touched zero bytes at the vector layer.
+- `MetadataStore::update_memory` (metadata_store.rs:205) is the metadata-only-update path. Takes just `&Memory`, no embedding. But `MetadataStore` is a private field on `StorageBackend` (cascading.rs:161); not reachable from vault-consolidator's consumer surface.
+
+Either path produces a `MemoryUpdate` audit event, conflating "consolidator marked superseded" with "user edited content" — actively damaging the BRD §5.6 line 948 "preserve provenance" load-bearing phrase.
+
+### Decision
+
+Add `pub async fn mark_superseded(&self, old_id: MemoryId, new_id: MemoryId) -> VaultResult<Ack>` to `StorageBackend`. Behaviour:
+
+1. Open `self.metadata.with_transaction(...)`.
+2. Inside the tx: `tx_get_memory(tx, &old_id)?` → mutate only `superseded_by = Some(new_id)` → `tx_update_memory(tx, &updated)?`.
+3. Inside the tx: emit `PendingAuditEvent::success(AuditEventType::MemorySuperseded, ActorKind::System).with_resource("memory", old_id.to_string()).with_boundary(boundary)` + `details_json = {"superseded_by":"<new_id>"}`.
+4. `tx_append_audit(tx, pending)?`.
+5. Commit. Return `Ack { memory_id: old_id, sqlite_committed_at }`.
+
+Explicitly **NO**: `cascading_write` call, `retry_queue` enqueue, LanceDB upsert, `pending_sync` row, divergence-detection counter increment, `MemoryUpdate` audit event.
+
+### New audit variant
+
+`AuditEventType::MemorySuperseded` — wire string `"memory.superseded"` (dot form per existing `as_str()` convention). `parse()` arm added symmetrically. Round-trip test at audit.rs:475 extended; wire-string pin added explicitly per the load-bearing-constant pattern alongside `McpToolInvoke`'s pin — load-bearing for T0.2.15 Tauri audit-viewer filter (filtering by `event_type` is a single index lookup vs. JSON-path query on every audit row).
+
+### BLAKE3 chain integrity
+
+New variant participates in `compute_event_hash(prev_hash || canonical_bytes)` identically to existing variants. Old events keep their hashes; new events get the new variant's canonical bytes; `verify_chain` continues to walk prev→curr correctly. No migration needed for existing audit chains.
+
+### Q1 — `details_json` shape: locked α `{"superseded_by":"<new_id>"}`
+
+`resource_id` captures `old_id` at the audit-event layer; `details_json.superseded_by` captures the `new_id`. T0.2.15 audit viewer joins `resource_id ↔ details.superseded_by` to render the supersession chain. Self-contained-shape β (`{"old_id":...,"new_id":...}`) rejected — forward-compat speculation for hypothetical query without `resource_id` in context; concrete-consumer-test fails.
+
+### Q2 — Method location: locked StorageBackend (cascading.rs), not MetadataStore
+
+Three grounds: (1) vault-consolidator's contract surface is StorageBackend per existing T0.2.2 + T0.2.3 commit 1 pattern; (2) audit-chain emission happens at StorageBackend-layer in all existing flows (cascading.rs orchestrates `tx_get_memory` → `tx_update_memory` → `tx_append_audit` inside a single transaction); (3) public-API surface stability — `MetadataStore` is a private field on `StorageBackend` (cascading.rs:161).
+
+### Q3 — Test pin #1 mechanism: locked α `retry_queue.len() == 0` two-point assertion
+
+Mirrors existing test patterns at cascading.rs:986-988 + cheaper single-state-check than divergence-counter-probe instrumentation. Two-point assertion (baseline pre-call + post-call `delta == 0`) more robust than absolute-zero against parallel-test state leakage.
+
+### Why not extend `update_memory` with `Option<&[f32]>` embedding
+
+Weakens existing contract — callers could pass `None` for any update, not just supersession. Opens cascade-bypass back-door for non-supersession paths and silently breaks divergence-detection invariant for routine updates. Discrimination at API surface is cleaner than discrimination by parameter shape.
+
+### Why not extend `MemoryUpdate` with `cause: UpdateCause` field
+
+Discrimination at event-type level beats discrimination by detail-field for downstream query/filter use cases. T0.2.15 (Tauri audit viewer per ADR-024 amendment Decision 5γ) wants to enumerate supersession events specifically — filtering by `event_type` is a single index lookup; filtering by a nested JSON field would require JSON-path queries on every audit row. Future ConflictReview UI has the same shape.
+
+### Single-supersession assumption
+
+`mark_superseded` does NOT check whether `old_id` is already superseded — sets unconditionally (last-write-wins). Consolidator's Phase 1 clustering filters out already-superseded memories via `MemoryFilter::include_superseded = false` (default; metadata_store.rs:757). Production code never invokes `mark_superseded` on an already-superseded memory. If the assumption is ever violated, the chain `m1 → m2 → m3` is supported by the schema (single-Option-write per call forms a chain through repeated supersession); a `tracing::warn!` records the case for observability. V0.3+ revisits iterative-supersession semantics if real consolidation-run data shows the need.
+
+### Test pins (vault-storage, +2 firm; counted in T0.2.3 commit 2's +7 floor)
+
+1. **`mark_superseded_metadata_only_no_vector_write`** — backend setup → `write_memory` baseline (1 `retry_queue` entry) → synthetic `new_id` → `mark_superseded(old_id, new_id)` → assert `retry_queue.len() == baseline` (delta == 0, per Q3 α) + assert `Memory.superseded_by == Some(new_id)` + assert all other `Memory` fields unchanged.
+2. **`mark_superseded_emits_memory_superseded_audit_event`** — write a memory → `mark_superseded` → assert most-recent audit event has `event_type == MemorySuperseded`, `resource_id == old_id.to_string()`, `details_json` contains `"superseded_by":"<new_id>"`, `actor_kind == System`. Also assert NO `MemoryUpdate` event emitted (event-class discrimination invariant — pins "MemorySuperseded NOT MemoryUpdate" so future regressions surface).
+
+### Single-commit-shape discipline (`feedback_forward_compat_concrete_vs_hypothetical.md`)
+
+`mark_superseded` ships with its concrete consumer (`apply_merge` in vault-consolidator) in the same commit. Not a forward-compat pull. Same SHA for primitive + audit variant + ADR + consumer = future readers see rationale and consumer together. Passes the discipline test.
+
+### Cross-references
+
+- BRD §5.6 line 948 verbatim "preserve provenance" — load-bearing phrase that anchors the audit-fidelity decision
+- ADR-024 + ADR-024 amendment Decision 5γ — audit chain as authoritative record of vault-state changes; this ADR extends the established pattern
+- ADR-009 amendment + ADR-018 — cascading retry queue + dead-letter (explicitly NOT participating in `mark_superseded`'s surface)
+- HANDOFF tech-debt entry "T0.2.x — entity-extraction-at-consolidation + GraphStore relationship-rewrite primitive on merge" — future graph-update primitive will follow the same shape (new pub method on StorageBackend or GraphStore + new audit variant if needed)
 
 ---
 
@@ -3095,6 +3462,7 @@ Beyond hard-gates above, the following V0.1-era ADRs remain active and shape V0.
 - **ADR-028** — Memory update semantics: preserve provenance, overwrite content + classification
 - **ADR-029** — V0.1 founder dogfood platform: Windows accepted, BRD amended (Mac → Mac or Windows)
 - **ADR-030** — vault-tauri MCP role: server-only, no host functionality in V0.1
+- **ADR-046** — `mark_superseded` primitive on StorageBackend + new `MemorySuperseded` audit variant (T0.2.3 commit 2, full text above) — metadata-only supersession update with no cascade enqueue; preserves BRD §5.6 line 948 provenance fidelity; emits `memory.superseded` audit event distinct from `memory.update`
 
 ---
 

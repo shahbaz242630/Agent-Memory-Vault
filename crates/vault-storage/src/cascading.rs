@@ -462,6 +462,94 @@ impl StorageBackend {
         })
     }
 
+    /// Mark a memory as superseded by another. **Phase 3 consolidator
+    /// primitive per ADR-046 (T0.2.3 commit 2).**
+    ///
+    /// Sets `superseded_by = Some(new_id)` on the memory identified by
+    /// `old_id`; no other fields change. Atomic with the audit event
+    /// emission via [`MetadataStore::with_transaction`].
+    ///
+    /// **Explicitly NOT a cascading write.** Unlike [`Self::update_memory`],
+    /// this:
+    /// - Does NOT enqueue a `retry_queue` / `pending_sync` row.
+    /// - Does NOT touch the vector store. A naive re-embed-then-update path
+    ///   would produce a byte-identical vector under BGE-small's fp32
+    ///   determinism — the LanceDB upsert would be a no-op. Bypassing the
+    ///   cascade avoids spurious `retry_queue` enqueue + LanceDB write +
+    ///   divergence-detection counter increment for a vector-layer no-op.
+    /// - Emits the dedicated [`AuditEventType::MemorySuperseded`] variant
+    ///   (NOT [`AuditEventType::MemoryUpdate`]) — preserves provenance
+    ///   fidelity per BRD §5.6 line 948 "do not delete — preserve
+    ///   provenance." Downstream audit viewer (T0.2.15) filters supersession
+    ///   events by `event_type` rather than by JSON-path query on `details`.
+    ///
+    /// **`details_json` shape:** `{"superseded_by":"<new_id>"}`. The
+    /// `resource_id` field carries the old (superseded) `MemoryId`; the
+    /// `details.superseded_by` field carries the new (superseding)
+    /// `MemoryId`. Audit viewer joins `resource_id` ↔
+    /// `details.superseded_by`.
+    ///
+    /// **Errors:**
+    /// - [`VaultError::NotFound`] if `old_id` doesn't exist.
+    /// - [`VaultError::Storage`] on transaction-side failure.
+    ///
+    /// **Single-supersession assumption:** caller is responsible for not
+    /// invoking this on a memory that's already superseded. Production
+    /// callers (Phase 3 `apply_merge` in `vault-consolidator`) filter
+    /// superseded memories via `MemoryFilter::include_superseded = false`
+    /// (default) before clustering, so production code never hits the
+    /// already-superseded path. If invoked on an already-superseded memory,
+    /// the new `superseded_by` value overwrites the existing one (last-
+    /// write-wins; the schema supports a chain via repeated single-Option
+    /// writes) and a `tracing::warn!` records the case for observability.
+    /// V0.3+ revisits iterative-supersession semantics if real
+    /// consolidation-run data shows the need.
+    #[instrument(skip(self), fields(old_id = %old_id, new_id = %new_id))]
+    pub async fn mark_superseded(&self, old_id: MemoryId, new_id: MemoryId) -> VaultResult<Ack> {
+        let metadata = self.metadata.clone();
+        let committed_at: DateTime<Utc> = metadata
+            .with_transaction(move |tx| {
+                let memory = tx_get_memory(tx, &old_id)?.ok_or_else(|| {
+                    VaultError::NotFound(format!("memory {old_id} does not exist"))
+                })?;
+
+                if let Some(existing) = memory.superseded_by {
+                    warn!(
+                        old_id = %old_id,
+                        existing_supersedence = %existing,
+                        new_supersedence = %new_id,
+                        "mark_superseded called on already-superseded memory — \
+                         chain extending (V0.3+ iterative-supersession behaviour; \
+                         production code shouldn't hit this path because Phase 1 \
+                         clustering filters superseded memories)"
+                    );
+                }
+
+                let mut updated = memory;
+                updated.superseded_by = Some(new_id);
+                let boundary_for_audit = updated.boundary.clone();
+                tx_update_memory(tx, &updated)?;
+
+                let mut pending =
+                    PendingAuditEvent::success(AuditEventType::MemorySuperseded, ActorKind::System)
+                        .with_resource("memory", old_id.to_string())
+                        .with_boundary(boundary_for_audit);
+                pending.details_json = format!(
+                    r#"{{"superseded_by":{}}}"#,
+                    json_string(&new_id.to_string())
+                );
+                let event = tx_append_audit(tx, pending)?;
+
+                Ok::<_, VaultError>(event.timestamp)
+            })
+            .await?;
+
+        Ok(Ack {
+            memory_id: old_id,
+            sqlite_committed_at: committed_at,
+        })
+    }
+
     /// List memories matching `filter`. The `limit` parameter accepts
     /// `None` (return ALL matching rows — no SQL `LIMIT` clause) or
     /// `Some(N)` (cap at `N`).
@@ -1130,6 +1218,114 @@ mod tests {
         assert!(matches!(err, VaultError::NotFound(_)));
         assert!(backend.metadata.get_memory(&m.id).await.unwrap().is_none());
         assert_eq!(backend.retry_queue.len().await.unwrap(), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // mark_superseded — ADR-046 (T0.2.3 commit 2)
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn mark_superseded_metadata_only_no_vector_write() {
+        // ADR-046 invariant: mark_superseded MUST NOT enqueue a cascade
+        // row for the vector store. The supersession is a metadata-only
+        // state change; the vector layer is untouched. Two-point assertion
+        // (baseline + post-call) proves the delta is zero, robust against
+        // test-process state leakage per ADR-046 Q3 (locked α).
+        let (_tmp, backend) = make_backend().await;
+        let m = sample_memory("work", "original content");
+        backend.write_memory(&m, &embedding(0.1)).await.unwrap();
+
+        // Baseline: exactly one Write enqueue from write_memory.
+        let baseline = backend.retry_queue.len().await.unwrap();
+        assert_eq!(baseline, 1, "baseline: one Write enqueue from write_memory");
+
+        // Synthetic new_id — mark_superseded only validates old_id's
+        // existence, not new_id's. (In production the new memory has
+        // already been written by the orchestrator via write_memory before
+        // apply_merge calls mark_superseded; we don't re-validate it here.)
+        let new_id = MemoryId::new();
+        backend.mark_superseded(m.id, new_id).await.unwrap();
+
+        // ADR-046 invariant: delta == 0. No cascade enqueue means no
+        // LanceDB upsert + no divergence counter increment downstream.
+        let after = backend.retry_queue.len().await.unwrap();
+        assert_eq!(
+            after, baseline,
+            "mark_superseded MUST NOT enqueue a cascade row — \
+             supersession is metadata-only"
+        );
+
+        // Metadata-side state: superseded_by is set + all other fields
+        // unchanged.
+        let back = backend.metadata.get_memory(&m.id).await.unwrap().unwrap();
+        assert_eq!(back.superseded_by, Some(new_id));
+        assert_eq!(back.content, m.content);
+        assert_eq!(back.confidence, m.confidence);
+        assert_eq!(back.access_count, m.access_count);
+        assert_eq!(back.memory_type, m.memory_type);
+        assert_eq!(back.boundary, m.boundary);
+    }
+
+    #[tokio::test]
+    async fn mark_superseded_emits_memory_superseded_audit_event() {
+        // ADR-046 invariant: mark_superseded emits the dedicated
+        // AuditEventType::MemorySuperseded variant (NOT MemoryUpdate). The
+        // event-class discrimination is the load-bearing property for
+        // T0.2.15 audit-viewer filtering and for preserving BRD §5.6 line
+        // 948 provenance fidelity.
+        let (_tmp, backend) = make_backend().await;
+        let m = sample_memory("work", "supersedable");
+        backend.write_memory(&m, &embedding(0.2)).await.unwrap();
+
+        let new_id = MemoryId::new();
+        backend.mark_superseded(m.id, new_id).await.unwrap();
+
+        let events = backend
+            .metadata
+            .list_audit_events(usize::MAX)
+            .await
+            .unwrap();
+        let supersession = events
+            .iter()
+            .find(|e| e.event_type == AuditEventType::MemorySuperseded)
+            .expect("memory.superseded event must exist after mark_superseded");
+
+        // Resource pairing: old_id at resource_id; new_id at
+        // details.superseded_by. Audit viewer joins these two fields to
+        // render the supersession chain.
+        assert_eq!(supersession.resource_type.as_deref(), Some("memory"));
+        assert_eq!(
+            supersession.resource_id.as_deref(),
+            Some(m.id.to_string().as_str())
+        );
+        let expected_details_substring = format!(r#""superseded_by":"{new_id}""#);
+        assert!(
+            supersession
+                .details_json
+                .contains(&expected_details_substring),
+            "details_json {} must contain {}",
+            supersession.details_json,
+            expected_details_substring
+        );
+
+        // Actor: System (consolidator runs as System actor per the
+        // existing cascade-path convention).
+        assert_eq!(supersession.actor_kind, ActorKind::System);
+
+        // ADR-046 discrimination property: NO MemoryUpdate event was
+        // emitted by mark_superseded. Only the initial write_memory's
+        // MemoryCreate + the new MemorySuperseded are present. Pins
+        // "MemorySuperseded NOT MemoryUpdate" at the test level so
+        // future regressions surface immediately.
+        let updates: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == AuditEventType::MemoryUpdate)
+            .collect();
+        assert!(
+            updates.is_empty(),
+            "mark_superseded must NOT emit MemoryUpdate events; found {} update events",
+            updates.len()
+        );
     }
 
     #[tokio::test]

@@ -26,6 +26,7 @@
 use serde::{Deserialize, Serialize};
 use tracing::{instrument, warn};
 use vault_core::{MemoryId, VaultError, VaultResult};
+use vault_embedding::EmbeddingProvider;
 use vault_llm::{CompletionParams, LlmProvider};
 use vault_storage::{MemoryFilter, StorageBackend};
 
@@ -191,6 +192,182 @@ pub async fn decide_merge(
     })?;
 
     Ok(outcome)
+}
+
+/// Phase 3 output — describes one applied merge.
+///
+/// Returned by [`apply_merge`] so the orchestrator (T0.2.3 commit 2's
+/// [`Consolidator::run_consolidation`]) has everything it needs to build
+/// `ConsolidationReport.summary_markdown` at commit 3 (new memory id,
+/// superseded ids, the two aggregated fields BRD §5.6 line 947 calls out)
+/// without re-reading state from storage.
+///
+/// [`Consolidator::run_consolidation`]: crate::Consolidator::run_consolidation
+#[derive(Clone, Debug)]
+pub struct AppliedMerge {
+    /// The id of the newly-written merged memory. Becomes the
+    /// `superseded_by` value on each cluster member.
+    pub new_memory_id: MemoryId,
+    /// The ids of the cluster members that were marked superseded. Same
+    /// length and order as `cluster.member_row_ids` (sort-by-id-ascending
+    /// per ADR-045 §a).
+    pub superseded_memory_ids: Vec<MemoryId>,
+    /// `Σ(member.access_count)` per BRD §5.6 line 947. Surfaced for the
+    /// summary markdown.
+    pub summed_access_count: u32,
+    /// `max(member.confidence)` per BRD §5.6 line 947. Surfaced for the
+    /// summary markdown.
+    pub max_confidence: f32,
+}
+
+/// Phase 3 primitive — write the merged memory + mark originals superseded.
+///
+/// Implements the steps at BRD §5.6 lines 946-950:
+/// 1. Create new merged memory with summed `access_count`, max `confidence`,
+///    fresh `created_at`.
+/// 2. Mark original memories as `superseded_by` the new one (do not delete
+///    — preserve provenance).
+/// 3. Re-embed the merged content, update vector store.
+/// 4. Update graph: relationships pointing to old memories now point to new
+///    merged memory.
+///
+/// **Step 4 is a no-op + WARN at T0.2.3** per the HANDOFF tech-debt entry
+/// "T0.2.x — entity-extraction-at-consolidation + GraphStore
+/// relationship-rewrite primitive on merge." Entity extraction at write
+/// time does not exist in V0.2, so there are no graph relationships to
+/// rewrite. The no-op is honest about scope; the WARN fires every merge so
+/// the gap is visible in production logs.
+///
+/// **Inputs:**
+/// - `cluster`: from Phase 1's [`find_candidate_clusters`].
+/// - `merged_text`: the consolidated content from Phase 2's
+///   [`decide_merge`] (the `merged_text` field of `MergeOutcome::Merge`).
+/// - `merged_reasoning`: the LLM's reasoning from `MergeOutcome::Merge`.
+///   Captured by the orchestrator into `AppliedMergeWithContext` for the
+///   summary markdown at commit 3; apply_merge itself does not store it
+///   on the merged Memory.
+/// - `storage`: source of cluster-member content (re-read at apply time so
+///   we operate on current state) + sink for the new merged memory + the
+///   supersession metadata updates (via ADR-046's `mark_superseded`).
+/// - `embeddings`: re-embed primitive for the merged content per step 3.
+///
+/// **Output:** [`AppliedMerge`] with the new merged memory id + the list of
+/// superseded original ids + the aggregated fields for the summary
+/// markdown.
+///
+/// **Errors:**
+/// - [`VaultError::Storage`] propagated from `list_memories` / `write_memory`
+///   / `mark_superseded`.
+/// - [`VaultError::Embedding`] propagated from `embeddings.embed`.
+/// - [`VaultError::Storage`] if the cluster's members can't all be hydrated
+///   from storage (concurrent delete or replication lag suspected).
+///
+/// [`find_candidate_clusters`]: crate::find_candidate_clusters
+#[instrument(
+    skip(cluster, storage, embeddings),
+    fields(cluster_id = cluster.id, cluster_size = cluster.size())
+)]
+pub async fn apply_merge(
+    cluster: &Cluster,
+    merged_text: &str,
+    merged_reasoning: &str,
+    storage: &StorageBackend,
+    embeddings: &dyn EmbeddingProvider,
+) -> VaultResult<AppliedMerge> {
+    // Reasoning is captured by the orchestrator into AppliedMergeWithContext
+    // for commit 3's summary markdown; apply_merge doesn't store it on the
+    // merged Memory.
+    let _ = merged_reasoning;
+
+    // 1. Hydrate cluster members from storage. Cluster carries IDs only;
+    //    we need the full Memory rows for access_count + confidence +
+    //    memory_type + boundary. Same re-read pattern as decide_merge.
+    let all_memories = storage.list_memories(MemoryFilter::default(), None).await?;
+    let member_set: std::collections::HashSet<MemoryId> =
+        cluster.member_row_ids.iter().copied().collect();
+    let mut hydrated: Vec<vault_core::Memory> = all_memories
+        .into_iter()
+        .filter(|m| member_set.contains(&m.id))
+        .collect();
+    // Sort by id ascending so "first member" is deterministic. Matches
+    // decide_merge's hydration ordering (cluster.member_row_ids is also
+    // sorted ascending per ADR-045 §a).
+    hydrated.sort_by_key(|m| m.id);
+
+    if hydrated.len() != cluster.size() {
+        return Err(VaultError::Storage(format!(
+            "Phase 3 cluster hydration mismatch: cluster has {} members, \
+             storage returned {} (concurrent delete or replication lag suspected)",
+            cluster.size(),
+            hydrated.len()
+        )));
+    }
+
+    // 2. Aggregate fields per BRD §5.6 line 947.
+    let summed_access_count: u32 = hydrated.iter().map(|m| m.access_count).sum();
+    let max_confidence: f32 = hydrated
+        .iter()
+        .map(|m| m.confidence)
+        .fold(0.0_f32, f32::max);
+
+    // 3. Construct the merged Memory. `memory_type` is carried from the first
+    //    cluster member after sort-by-id-ascending. BRD §5.6 §946-950 is
+    //    silent on memory_type for the merged memory — first-member-by-id
+    //    is deterministic and matches the typical semantic-cluster type
+    //    homogeneity (a Phase 1 similarity cluster won't mix Procedural with
+    //    Episodic memories at V0.2 scale; if it ever does, V0.3+ revisits
+    //    via a mode-or-most-recent tiebreaker).
+    let first = hydrated.first().expect("cluster.size() >= 2 invariant");
+    let mut merged_memory = vault_core::Memory::try_new(vault_core::NewMemory {
+        content: merged_text.to_string(),
+        memory_type: first.memory_type,
+        boundary: first.boundary.clone(),
+        source_agent: None, // Consolidator runs as system per BRD §5.6 line 901.
+        confidence: max_confidence,
+        valid_from: None, // Defaults to now in Memory::try_new.
+        valid_until: None,
+        metadata: serde_json::json!({}),
+    })?;
+    // access_count is system-managed and try_new initialises it to 0;
+    // override per BRD §5.6 line 947 "summed access_count."
+    merged_memory.access_count = summed_access_count;
+    let new_memory_id = merged_memory.id;
+
+    // 4. Re-embed the merged content per BRD §5.6 line 949.
+    let embedding = embeddings.embed(merged_text).await?;
+
+    // 5. Write the merged memory via the cascade (DOES touch the vector
+    //    store — the new memory needs its embedding in LanceDB for search).
+    storage.write_memory(&merged_memory, &embedding).await?;
+
+    // 6. Mark each original as superseded by the merged memory via the
+    //    new mark_superseded primitive (ADR-046). Metadata-only, no
+    //    cascade, emits MemorySuperseded audit events.
+    let mut superseded_memory_ids = Vec::with_capacity(hydrated.len());
+    for member in &hydrated {
+        storage.mark_superseded(member.id, new_memory_id).await?;
+        superseded_memory_ids.push(member.id);
+    }
+
+    // 7. Graph update deferred to T0.2.x — see HANDOFF tech-debt entry
+    //    "T0.2.x — entity-extraction-at-consolidation + GraphStore
+    //    relationship-rewrite primitive on merge." V0.2 cascade never
+    //    extracted entities at write time, so there are no graph
+    //    relationships to rewrite at merge time. The WARN keeps the
+    //    deferred surface visible in production logs.
+    warn!(
+        new_memory_id = %new_memory_id,
+        cluster_size = hydrated.len(),
+        "graph update deferred to T0.2.x — see HANDOFF tech-debt entry: \
+         entity-extraction-at-consolidation"
+    );
+
+    Ok(AppliedMerge {
+        new_memory_id,
+        superseded_memory_ids,
+        summed_access_count,
+        max_confidence,
+    })
 }
 
 #[cfg(test)]
@@ -394,5 +571,229 @@ mod tests {
                 "N={n} cluster must produce exactly one LLM call (single-decision shape per Q2)"
             );
         }
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // Phase 3 — apply_merge (T0.2.3 commit 2, BRD §5.6 lines 946-950)
+    // ───────────────────────────────────────────────────────────────────
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use vault_embedding::EmbeddingProvider;
+
+    /// Test-only embedder that records each call's text + count. Mirrors
+    /// the vault-retrieval/tests/common/mod.rs:36-85 pattern but defined
+    /// locally here per the T0.2.3 commit-2 opener's "define a local stub"
+    /// lean.
+    struct StubEmbedder {
+        last_text: tokio::sync::Mutex<Option<String>>,
+        call_count: AtomicU64,
+    }
+
+    impl StubEmbedder {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                last_text: tokio::sync::Mutex::new(None),
+                call_count: AtomicU64::new(0),
+            })
+        }
+
+        async fn last(&self) -> Option<String> {
+            self.last_text.lock().await.clone()
+        }
+
+        fn calls(&self) -> u64 {
+            self.call_count.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for StubEmbedder {
+        async fn embed(&self, text: &str) -> VaultResult<Vec<f32>> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            *self.last_text.lock().await = Some(text.to_string());
+            // Unit-norm vector — eager_validate accepts it (non-empty,
+            // finite, correct dimension).
+            let v = vec![1.0_f32 / (EMBEDDING_DIM as f32).sqrt(); EMBEDDING_DIM];
+            Ok(v)
+        }
+    }
+
+    /// Insert a memory with custom `access_count` + `confidence` so Phase 3
+    /// tests can exercise the aggregation math without needing a cascade
+    /// drain (apply_merge reads metadata-side state only; LanceDB is not
+    /// consulted for originals).
+    async fn insert_with_overrides(
+        storage: &StorageBackend,
+        boundary: &Boundary,
+        content: &str,
+        confidence: f32,
+        access_count: u32,
+    ) -> MemoryId {
+        let mut m = Memory::try_new(NewMemory {
+            content: content.into(),
+            memory_type: MemoryType::Semantic,
+            boundary: boundary.clone(),
+            source_agent: None,
+            confidence,
+            valid_from: None,
+            valid_until: None,
+            metadata: serde_json::json!({}),
+        })
+        .expect("valid memory");
+        m.access_count = access_count;
+        let embedding = vec![1.0_f32 / (EMBEDDING_DIM as f32).sqrt(); EMBEDDING_DIM];
+        storage
+            .write_memory(&m, &embedding)
+            .await
+            .expect("write_memory");
+        m.id
+    }
+
+    // ─── floor 1: writes_merged_memory_and_returns_id ─────────────────
+
+    #[tokio::test]
+    async fn apply_merge_writes_merged_memory_and_returns_id() {
+        let (storage, _dir) = open_test_storage().await;
+        let boundary = Boundary::new("test").unwrap();
+        let id1 = insert_with_overrides(&storage, &boundary, "milk a", 0.7, 1).await;
+        let id2 = insert_with_overrides(&storage, &boundary, "milk b", 0.8, 2).await;
+        let id3 = insert_with_overrides(&storage, &boundary, "milk c", 0.9, 3).await;
+        let cluster = cluster_of(0, vec![id1, id2, id3]);
+
+        let embedder = StubEmbedder::new();
+        let applied = apply_merge(
+            &cluster,
+            "Buy milk",
+            "all three were milk-shopping reminders",
+            &storage,
+            embedder.as_ref(),
+        )
+        .await
+        .unwrap();
+
+        // The new merged memory id + the three superseded ids are returned.
+        assert_eq!(applied.superseded_memory_ids.len(), 3);
+        assert!(applied.superseded_memory_ids.contains(&id1));
+        assert!(applied.superseded_memory_ids.contains(&id2));
+        assert!(applied.superseded_memory_ids.contains(&id3));
+
+        // All three originals now have superseded_by == new_id (read with
+        // include_superseded=true since the default filter excludes them).
+        let all = storage
+            .list_memories(
+                MemoryFilter {
+                    include_superseded: true,
+                    ..MemoryFilter::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        for original_id in [id1, id2, id3] {
+            let m = all
+                .iter()
+                .find(|m| m.id == original_id)
+                .expect("original must still exist (superseded, not deleted)");
+            assert_eq!(m.superseded_by, Some(applied.new_memory_id));
+        }
+    }
+
+    // ─── floor 2: sums_access_count_across_members ────────────────────
+
+    #[tokio::test]
+    async fn apply_merge_sums_access_count_across_members() {
+        let (storage, _dir) = open_test_storage().await;
+        let boundary = Boundary::new("test").unwrap();
+        // 5 + 10 + 15 = 30
+        let id1 = insert_with_overrides(&storage, &boundary, "a", 0.5, 5).await;
+        let id2 = insert_with_overrides(&storage, &boundary, "b", 0.5, 10).await;
+        let id3 = insert_with_overrides(&storage, &boundary, "c", 0.5, 15).await;
+        let cluster = cluster_of(0, vec![id1, id2, id3]);
+
+        let embedder = StubEmbedder::new();
+        let applied = apply_merge(&cluster, "merged", "", &storage, embedder.as_ref())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            applied.summed_access_count, 30,
+            "BRD §5.6 line 947: summed access_count"
+        );
+    }
+
+    // ─── floor 3: takes_max_confidence_across_members ─────────────────
+
+    #[tokio::test]
+    async fn apply_merge_takes_max_confidence_across_members() {
+        let (storage, _dir) = open_test_storage().await;
+        let boundary = Boundary::new("test").unwrap();
+        let id1 = insert_with_overrides(&storage, &boundary, "a", 0.6, 0).await;
+        let id2 = insert_with_overrides(&storage, &boundary, "b", 0.9, 0).await;
+        let id3 = insert_with_overrides(&storage, &boundary, "c", 0.7, 0).await;
+        let cluster = cluster_of(0, vec![id1, id2, id3]);
+
+        let embedder = StubEmbedder::new();
+        let applied = apply_merge(&cluster, "merged", "", &storage, embedder.as_ref())
+            .await
+            .unwrap();
+
+        assert!(
+            (applied.max_confidence - 0.9).abs() < 1e-6,
+            "BRD §5.6 line 947: max confidence (expected 0.9, got {})",
+            applied.max_confidence
+        );
+    }
+
+    // ─── floor 4: re_embeds_merged_text_via_provider ──────────────────
+
+    #[tokio::test]
+    async fn apply_merge_re_embeds_merged_text_via_provider() {
+        let (storage, _dir) = open_test_storage().await;
+        let boundary = Boundary::new("test").unwrap();
+        let id1 = insert_with_overrides(&storage, &boundary, "a", 0.5, 0).await;
+        let id2 = insert_with_overrides(&storage, &boundary, "b", 0.5, 0).await;
+        let cluster = cluster_of(0, vec![id1, id2]);
+
+        let embedder = StubEmbedder::new();
+        let merged_text = "consolidated content for re-embedding";
+        apply_merge(&cluster, merged_text, "", &storage, embedder.as_ref())
+            .await
+            .unwrap();
+
+        // Exactly one embed call — the merged text. Originals are NOT
+        // re-embedded (mark_superseded is metadata-only per ADR-046).
+        assert_eq!(
+            embedder.calls(),
+            1,
+            "apply_merge must call embeddings.embed exactly once (for merged_text); \
+             originals are marked superseded via mark_superseded (no re-embed)"
+        );
+        assert_eq!(embedder.last().await, Some(merged_text.to_string()));
+    }
+
+    // ─── floor 5: emits_warn_for_graph_update_deferral ────────────────
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn apply_merge_emits_warn_for_graph_update_deferral() {
+        let (storage, _dir) = open_test_storage().await;
+        let boundary = Boundary::new("test").unwrap();
+        let id1 = insert_with_overrides(&storage, &boundary, "a", 0.5, 0).await;
+        let id2 = insert_with_overrides(&storage, &boundary, "b", 0.5, 0).await;
+        let cluster = cluster_of(0, vec![id1, id2]);
+
+        let embedder = StubEmbedder::new();
+        apply_merge(&cluster, "merged", "", &storage, embedder.as_ref())
+            .await
+            .unwrap();
+
+        // Pin the WARN-log substring per ADR-046 + the T0.2.x tech-debt
+        // entry. If the no-op disposition is ever replaced with real
+        // graph-rewrite code, this test must be updated alongside.
+        assert!(
+            logs_contain("graph update deferred to T0.2.x"),
+            "apply_merge must emit a WARN log for the graph-update deferral"
+        );
     }
 }
