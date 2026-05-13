@@ -1,7 +1,7 @@
 # Memory Vault — Build Handoff
 
 **Current version:** V0.2 Closed Beta (BRD §6.2 — sleep consolidator, boundaries hardening, cross-device sync, 30 beta users)
-**Last updated:** 2026-05-13 session-pause — **T0.2.2 commit 1 STAGED, awaiting commit + push approval.** T0.2.1 closed earlier this session (commit 2 `fc6338b` ALL-GREEN matrix-wide on run `25781122452`; Phase 4 dogfood 3/3 PASS; Phase 5 paperwork rides with this T0.2.2 commit 1). T0.2.2 iteration 1 LOCKED inline post-recon: Amendment 1 (X-lock — vault-embedding becomes vault-consolidator production dep, re-embed-at-consolidation strategy with IEEE-754 determinism note in ADR-045 §c) + Amendment 2 (Q-1 lock — vault-storage MemoryFilter.since field + StorageBackend::list_memories public wrapper with Option<usize> limit semantic). Commit-shape γ-split adopted (algorithm-first / fixture+acceptance-second). Commit 1 working tree: 5 modified (HANDOFF.md, vault-storage's metadata_store.rs + cascading.rs, vault-consolidator's Cargo.toml + lib.rs) + 1 new (vault-consolidator/src/clustering.rs); 8 vault-consolidator unit tests + 2 vault-storage Amendment-2 tests passing locally. **Commit 2 (deferred to fresh session per γ-split):** Spike S1 Phi-4-mini-driven fixture-build binary + `clustering_acceptance_100.json` (20 topics × 5 paraphrastic variants) + acceptance integration test against the fixture (precision ≥ 0.95 + recall ≥ 0.90 floor, provisional, finalised post-S1). **Cumulative T0.2.0 arc** (CLOSED 2026-05-13 earlier this session): 3 weeks across Phase 0a→0e foundation + Phase 1-5; ADR-010 HARD GATE CLEARED. **Cumulative T0.2.1 arc** (CLOSED 2026-05-13 this session): ~2 weeks across spike-2 + iteration 1/2 + 2 commits + Phase 4 dogfood + Phase 5 paperwork. **T0.2.2 arc in flight** (commit 1 of 2, second commit next session).
+**Last updated:** 2026-05-13 session-pause — **T0.2.2 commit 2 STAGED + awaiting commit + push approval.** Commit 1 `a889931` CI ALL-GREEN matrix-wide on run `25790526645` (confirmed pre-Step-1 next-session opener; ✓ no fix-forward needed). T0.2.2 commit 2 contents: hand-curated 100-entry realistic-distribution fixture (`clustering_acceptance_100.json`) + acceptance integration test (`tests/acceptance.rs`) + γ unseal-site-style Gate A (NN-shared-topic baseline 100/100) + Gate B BRD §6 acceptance scoring (**precision 1.0, recall 0.93** — passes both floors). Plan amendment LOCKED inline (this session): ADR-045 §c fallback path adopted (hand-curated instead of Phi-4-driven S1 spike) because the shipped `Phi4MiniProvider` ships with a hardcoded merge-classifier system prompt (`phi4_mini.rs:292-301`) that cannot generate paraphrastic variants. Fixture went through 3 iterations under partner-direction: (i) narrow short-fragment-only — recall 0.23 (too loose for 0.92 threshold), (ii) realistic distribution spanning short + medium + long (coding decisions, agent task lists, debugging notes, errands, meetings) — recall 0.88, (iii) tightened 4 problem topics (`Buy milk` variants, cat-allergy, Q2 quarterly report agent paragraphs, Rust borrow-checker paragraphs) — recall 0.93, precision 1.0, ships. Topic 0 short "Buy milk today/later/..." variants stayed as 5 singletons even after tightening — documented as known V0.2 limitation: at threshold 0.92 + bge-small-en-v1.5, very-short (≤4 word) memory fragments don't cluster. Production users can lower `ConsolidatorConfig.merge_similarity_threshold` per BRD §5.6 line 904. T0.2.1 closed earlier this session (commit 2 `fc6338b` ALL-GREEN matrix-wide on run `25781122452`; Phase 4 dogfood 3/3 PASS). **Cumulative T0.2.0 arc** (CLOSED 2026-05-13): 3 weeks; ADR-010 HARD GATE CLEARED. **Cumulative T0.2.1 arc** (CLOSED 2026-05-13): ~2 weeks. **T0.2.2 arc** ships in 2 commits this 2-day session (commit 1 = scaffold + algorithm; commit 2 = fixture + acceptance test). Once commit 2 lands + CI greens → T0.2.2 SHIPPED, unblocks T0.2.3 (Phase 2 merge decisions + ADR-045 §e contract-drift hand-off: N-ary cluster schema redesign + N-ary fixture rebuild as locked-in scope).
 
 **Session close-a (2026-05-12, historical milestone record — Phase 3 + Phase 4 Stages 1-4):** T0.2.0 Phase 3 SHIPPED + Phase 4 Stages 1-4 PASSED in real-world dogfood. CI-fix commit `b6d72bc` (push `ef88361..b6d72bc`) ALL-GREEN matrix-wide on CI run `25736962490` — Windows job passed cleanly with `CARGO_BUILD_JOBS=2` cap. **Phase 3 formally CLOSED.** Phase 4 founder dogfood executed on Shahbaz's Windows dev box: pre-flight cleanup (V0.1 MSI uninstalled via `MsiExec.exe /X{4CF99BC2-2134-424E-ABF9-B64A80DA5EAB}` + old debug binary deleted + data dir wiped + 3 keychain entries deleted including production `default.com.memoryvault.v0.2`) → fresh `target/release/vault-tauri.exe` launch → **Stage 1 PASS** (no "Alpha" title, no ALPHA modal, no orange strip, clean Add Memory view) → **Stage 2 PASS** (add/search/delete smoke flows work) → **Stage 3 PASS — the real T0.2.0 hard-gate proof** (memories survive close+reopen cycle on real user data, sealed write+read round-trip verified) → **Stage 4 PASS** (Notepad on `<data>/lance/memories.lance/data/*.lance` shows random CJK-misinterpreted ciphertext, NO plaintext memory content). Working-tree HANDOFF.md state at session close: rides with next code commit (Phase 5 close or T0.2.1 first commit) per `feedback_admin_changes_ride_with_code.md`.
 
@@ -21,7 +21,7 @@
 
 ## Current Status
 
-**Active task:** **T0.2.2 — vault-consolidator: Phase 1 (Cluster). Commit 1 staged + awaiting commit + push approval.** T0.2.2 iteration 1 LOCKED inline in chat this session post-recon (Amendment 1 X-lock + Amendment 2 Q-1 lock both surfaced via pre-code recon per `feedback_flag_review_as_plan_amendment.md` discipline). Commit-shape split γ adopted (algorithm-first / fixture+acceptance-second) — commit 1 ships scaffold + algorithm + ADR-045 + ride-along Phase 5 paperwork; commit 2 ships spike S1 + fixture + acceptance integration test next session. Working tree at this commit: vault-storage Amendment 2 (MemoryFilter.since field + tx_list_memories Option<usize> + StorageBackend::list_memories public wrapper + 2 new tests pinning since-filter + None=unbounded), vault-consolidator scaffold-fill (Cargo.toml prod+dev deps including vault-embedding as production dep per Amendment 1 X-lock, lib.rs module decls, clustering.rs with Cluster type + find_candidate_clusters per BRD §5.6 Phase 1 algorithm verbatim + 8 unit tests all passing), HANDOFF.md (ADR-042 + ADR-045 + T0.2.1 Phase 5 close section + status flips). **Local DoD gates: gate 1 cargo check workspace green; remaining 4 gates (test workspace / clippy / fmt / git status post-fmt) staged for run.** Phase progression:
+**Active task:** **T0.2.2 — vault-consolidator: Phase 1 (Cluster). Commit 1 SHIPPED at `a889931` (CI ALL-GREEN matrix-wide on run `25790526645`). Commit 2 STAGED + awaiting commit + push approval.** Commit 2 contents: hand-curated `clustering_acceptance_100.json` (20 topics × 5 paraphrastic variants, realistic distribution: short errands + medium meeting/work notes + long coding/agent paragraphs) + `tests/acceptance.rs` integration test (BgeSmallProvider Gate A NN-shared-topic 100/100; sealed StorageBackend write path; RetryWorker drain; Phase 1 clustering; precision 1.0 + recall 0.93 against ground truth). Plan amendment LOCKED this session: ADR-045 §c hand-curated fallback path taken instead of Phi-4 spike (Phi4MiniProvider's hardcoded merge-classifier system prompt blocked the spike). ADR-045 §d floor finalised at precision ≥ 0.95 + recall ≥ 0.90 based on measurement. **See "T0.2.2 commit 2 deliverables" section below for the full ride-along record.** Phase progression:
 
 | Sub-task / Phase | Status | Commit |
 |---|---|---|
@@ -46,8 +46,8 @@
 | T0.2.1 Phase 5 — formal close + BRD §6.2 acceptance walkthrough + ADR-042 | ✅ CLOSED (paperwork rides with T0.2.2 commit 1, this commit) | — |
 | **T0.2.1 — CLOSED** ✅ (M1 Mac runtime dogfood deferred to first M1 beta user; CPU-only V0.2 per ADR-042) | — | — |
 | T0.2.2 iteration 1 lock + Amendments 1-2 locks (inline chat, 2026-05-13) | ✅ LOCKED | — |
-| T0.2.2 commit 1 (vault-storage Amendment 2 + vault-consolidator scaffold-fill + clustering algorithm + 8 unit tests + ADR-045 + T0.2.1 Phase 5 paperwork ride-along) | 🟡 staged + awaiting commit + push approval | working tree |
-| T0.2.2 commit 2 (Spike S1 binary + clustering_acceptance_100.json fixture + acceptance integration test) | 🟡 deferred to next session per γ-split decision (ADR-045 §f.7) | — |
+| T0.2.2 commit 1 (vault-storage Amendment 2 + vault-consolidator scaffold-fill + clustering algorithm + 8 unit tests + ADR-045 + T0.2.1 Phase 5 paperwork ride-along) | ✅ SHIPPED | `a889931` (CI run `25790526645` in flight at session-pause; 2/8 jobs green — fmt + clippy ubuntu) |
+| T0.2.2 commit 2 (hand-curated `clustering_acceptance_100.json` realistic-distribution fixture + `tests/acceptance.rs` BgeSmallProvider+Gate A+B integration test; precision 1.0 / recall 0.93 measured; γ-split per ADR-045 §f.7 + plan amendment hand-curated path per Phi4MiniProvider single-purpose constraint) | 🟡 STAGED + awaiting commit + push approval | working tree |
 
 **Sub-task (d) historical record (shipped at `2cc8c65` earlier this session):**
 
@@ -210,9 +210,210 @@ Sub-task (d) details preserved for audit-trail purposes. **Many of the reference
 
 ---
 
-## T0.2.1 commit 2 — next-session opener (drafted 2026-05-13 session-pause)
+## T0.2.2 commit 2 deliverables (this session, 2026-05-13) — hand-curated fixture + acceptance integration test
 
-**Read this first when reopening.** Captures the exact state at session-pause + the deterministic path forward. Verbatim because chat thread iterations are transient; this is the durable handoff.
+**Status:** STAGED + awaiting commit + push approval. Rides with this commit + the post-`a889931`-push admin section above per `feedback_admin_changes_ride_with_code.md`.
+
+### Plan amendment (locked inline this session)
+
+**The drift surfaced at session open:** ADR-045 §c "Primary generation method (S1 spike): Phi-4-mini-driven via the production `Phi4MiniProvider`" was unimplementable as-shipped. The T0.2.1 commit 2 `fc6338b` `Phi4MiniProvider::build_chatml_prompt` (`crates/vault-llm/src/phi4_mini.rs:292-301` verbatim) hardcodes a merge-classifier system prompt ("You are a JSON-only memory-merge classifier. Respond with strict JSON matching this schema: {merge: bool, score: float between 0 and 1, merged_text: optional string}..."). The model cannot be steered to generate paraphrastic variants from a user message alone — its semantic interpretation will be confused.
+
+**Three options surfaced inline at plan-amendment time** (per `feedback_flag_review_as_plan_amendment.md`):
+- (A) Hand-curate 100 entries directly per ADR-045 §c fallback. ~30-60 min focused work. No spike binary. Fully deterministic + auditable + reproducible.
+- (B) Generalize `Phi4MiniProvider` with an optional `system_prompt` field on `Phi4MiniConfig` + amend ADR-044 + run spike.
+- (C) Spike binary uses `llama-cpp-2` directly (mirror of T0.2.1 `phi4_load_and_json_spike.rs`) + amend ADR-045 §c.
+
+**Locked: option (A) hand-curate** on grounds (i) ADR-045 §c explicitly authorises hand-curated as fallback shape; no ADR amendment required; (ii) deterministic + reproducible — anyone reading the JSON understands the test; (iii) zero LLM-variance risk; (iv) smaller commit footprint (no spike binary); (v) the artifact that matters is the fixture, not the generator.
+
+### Fixture iteration audit trail (3 iterations, partner-direction at each)
+
+Per `feedback_floor_forecast_is_pre_declaration_not_estimate.md` discipline, surfacing the actual measurement journey:
+
+| Iteration | Fixture shape | Gate A (NN-shared-topic) | Gate B (precision / recall) | Outcome |
+|---|---|---|---|---|
+| 1 (narrow short-fragment-only) | 20 topics × 5 variants, errand-style short fragments only | 100/100 | 1.0 / **0.23** | Recall too low; fixture variants too loosely paraphrastic for 0.92 cosine in bge-small. Partner direction: expand to realistic distribution. |
+| 2 (realistic distribution) | 20 topics × 5 variants spanning short (errands), medium (meetings, observations, family), long (coding decisions, agent task paragraphs, debugging context, Rust borrow-checker explanations, cross-tool/agent context) | 100/100 | 1.0 / **0.88** | 18 of 20 topics formed perfect clusters; 4 had partial captures. Partner direction: tighten 4 problem topics, push for recall ≥ 0.90. |
+| 3 (tightened 4 topics) | Topic 0 (Buy milk variants → time-modifier suffix only), Topic 13 (cat allergy → unified leading clause), Topic 17 (Q2 quarterly report → unified prose stem), Topic 18 (Rust borrow checker → unified sentence structure) | 100/100 | 1.0 / **0.93** | **Ships.** 18 of 20 topics perfect clusters, Topic 13 4/5, Topic 0 all 5 singletons (known limitation, see below). |
+
+### Final measurement (ADR-045 §d finalisation)
+
+- **Precision: 1.0** (zero cross-topic false positives — algorithm correctly groups only same-topic memories)
+- **Recall: 0.93** (clearly above the 0.90 floor)
+- **Gate A NN-shared-topic baseline: 100/100** (fixture is semantically tight per ADR-045 §c sanity check)
+- **Cluster count: 19** (16 perfect 5-clusters + 1 size-4 cluster + 2 topics' worth of singletons)
+- **Wall time: ~22s** (BgeSmallProvider load + 100 embeddings + sealed StorageBackend setup + 100 cascading writes + retry-worker drain + Phase 1 clustering + scoring)
+- ADR-045 §d floor flipped from "provisional" to "**LOCKED at precision ≥ 0.95 AND recall ≥ 0.90**" per the measurement.
+
+### Topic 0 "very-short fragment" V0.2 limitation (documented, not blocking)
+
+Topic 0's tightened variants — "Buy milk today" / "Buy milk later" / "Buy milk on the way home" / "Buy milk after work" / "Buy milk this evening" — all stayed as singletons in the final run. NN-shared-topic Gate A passed (each milk variant's nearest neighbour IS another milk variant), but all pairwise cosines fell below 0.92.
+
+**Why:** bge-small-en-v1.5's embedding of a 3-4 word phrase puts heavy weight on each token. Shared "Buy milk" prefix isn't enough overhead to push cosine above 0.92 when 33-50% of the surface form differs (time modifier).
+
+**Implication:** at the BRD's default `merge_similarity_threshold = 0.92`, **very-short (≤4-word) memory fragments will not cluster** even when human-paraphrastic. Production users who write many such fragments (e.g., quick errand reminders) can lower their `ConsolidatorConfig.merge_similarity_threshold` per BRD §5.6 line 904 — this is configurable per the spec.
+
+**Forward-revisit triggers:**
+1. V0.3+ embedding-model upgrade (e.g., to a model better-tuned for short text) would reduce or eliminate this limitation.
+2. T0.2.7 retrieval-quality work — if production usage shows many short-fragment misses, consider adaptive thresholds or content-length-aware merge heuristics.
+3. T0.2.3 merge-decision empirical run on real V0.2 user data — if short-fragment duplicates are common AND a problem, ADR amendment + threshold revision triggered.
+
+### Files in commit 2
+
+- `crates/vault-consolidator/tests/fixtures/clustering_acceptance_100.json` (new, 100 entries)
+- `crates/vault-consolidator/tests/acceptance.rs` (new, ~290 LOC)
+- `HANDOFF.md` (this update + ADR-045 §d finalisation below)
+
+### Local DoD gate state (this session, 2026-05-13 post-iteration-3)
+
+| Gate | Result |
+|---|---|
+| `cargo check --workspace --all-targets` | ✅ clean (2.12s after warm cache) |
+| `cargo test -p vault-consolidator` (8 lib + 1 acceptance integration) | ✅ 9/9 pass, 22.3s wall on acceptance |
+| `cargo clippy --workspace --all-targets -- -D warnings` | ✅ clean (after doc-list-continuation fix on `tests/acceptance.rs:18-35`) |
+| `cargo fmt --all --check` | ✅ clean (after one `cargo fmt --all` apply that touched 3 sites in `tests/acceptance.rs`) |
+| `git status --short` post-fmt | ✅ 1 M + 1 ?? (HANDOFF.md modified + `crates/vault-consolidator/tests/` new); no Cargo.lock drift |
+
+### Test floor reconciliation
+
+Locked range for T0.2.2 was +12-14 firm cumulative. Commit 1 shipped +10. Commit 2 ships +1 integration test (single `#[tokio::test]` containing all 7 pipeline steps + 2 gates). Cumulative T0.2.2: **+11 firm**, sits at the low end of the locked range. Within range; no plan-amendment surface required.
+
+### Next-task pointer (T0.2.3 — Phase 2 merge decisions)
+
+Once commit 2 lands + CI greens matrix-wide → T0.2.2 SHIPPED. Move to **T0.2.3** (`Agent_Build_Specification.txt:1436-1442`).
+
+**ADR-045 §e MUST be honoured at T0.2.3 iteration 1.** Locked-in scope items for T0.2.3 iter 1 plan-draft:
+1. N-ary cluster prompt schema redesign (replace T0.2.1's pairwise `T0_2_3_MERGE_SCHEMA` in `phi4_mini_smoke.rs` + `canned_merge_decisions.json` with N-ary cluster-input shape per BRD §5.6 line 941 verbatim).
+2. N-ary canned fixture rebuild (`canned_merge_decisions.json` either deprecates or stays as pairwise-quality regression alongside a new N-ary fixture; T0.2.3 picks with then-current evidence).
+3. `Phi4MiniProvider::build_chatml_prompt` system-prompt generalisation OR additional method for non-merge-classifier prompts — surfaced by this commit's plan amendment; T0.2.3 will need it if N-ary cluster prompts diverge in shape from the locked-in merge-classifier prompt.
+4. `Consolidator` struct materialisation (BRD §5.6 lines 894-913) — T0.2.2 ships clustering primitive only; T0.2.3 is where `llm` + `embeddings` fields become load-bearing.
+
+---
+
+## T0.2.2 commit 2 — historical next-session opener (drafted 2026-05-13 session-pause, OBSOLETE — superseded by commit 2 deliverables block above; preserved as audit trail)
+
+**Read this first when reopening.** Captures the exact state at session-pause + the deterministic 7-step path forward. Verbatim because chat thread iterations are transient; this is the durable handoff.
+
+### State at session-pause
+
+- **Commit 1** (`a889931`): SHIPPED. Push `fc6338b..a889931 main -> main`. Contents: scaffold-fill + vault-storage Amendment 2 + clustering algorithm (BRD §5.6 Phase 1 verbatim) + 8 unit tests + ADR-045 + T0.2.1 Phase 5 paperwork ride-along. 7 files changed; 996 insertions, 22 deletions.
+- **Commit 1 CI** (run `25790526645`): `in_progress` at session-pause time, 2/8 jobs already green (fmt + clippy ubuntu); remaining 5 (clippy windows + macos + build+test ubuntu + macos + windows) still in flight; real-model smoke job correctly skipped (cron-or-PR-label-gated per ADR-044 §7). Verify via `gh run list --workflow=ci.yml -L 1`.
+- **Commit 2 working tree**: clean — no uncommitted changes at session-pause. Memory `feedback_read_spec_before_recommending_not_just_before_coding.md` was saved + indexed in MEMORY.md before push, so no working-tree paperwork awaiting next commit.
+- **Per-action-approval state**: commit 1 approved + executed. Commit 2 commit + push NOT yet approved — re-ask per `feedback_confirm_before_commit_push.md` when staged (single approval covers both).
+
+### Environment notes (must set every fresh shell on Windows)
+
+- `LIBCLANG_PATH = C:\Users\shahb\scoop\apps\llvm\current\bin` (LLVM via scoop, installed at T0.2.1 spike-2 for llama-cpp-sys-2's bindgen). Persist at every fresh shell:
+  ```powershell
+  $env:LIBCLANG_PATH = "$env:USERPROFILE\scoop\apps\llvm\current\bin"
+  $env:PATH = "$env:LIBCLANG_PATH;$env:PATH"
+  ```
+- All `cargo` invocations on Windows via **PowerShell** (per `feedback_cargo_on_windows_use_powershell.md` — Strawberry Perl path order matters for ADR-006 bundled-sqlcipher).
+- Phi-4-mini GGUF already cached at `%APPDATA%\com.shahbaz242630.memory-vault\models\Phi-4-mini-instruct-Q4_K_M.gguf` (2.32 GiB / 2.49 GB, SHA-256 `88c00229...`). Spike S1 reuses this; no fresh download needed unless the file is missing.
+
+### Sequencing (deterministic 7 steps)
+
+**Step 1 — verify commit 1 CI green matrix-wide:**
+
+```bash
+gh run list --workflow=ci.yml -L 1 --json status,conclusion,headSha
+```
+
+Decision tree:
+- `status=completed`, `conclusion=success`, `headSha=a889931...` → proceed to Step 2.
+- `status=completed`, `conclusion=failure` → fix-forward per `feedback_broken_ci_is_regression_not_techdebt.md`. Read failure via `gh run view <run-id> --log-failed`; diagnose per OS; patch + commit + push as `a889931 + fix-forward`. After CI greens, proceed to Step 2.
+- `status=in_progress` → wait. Standard poll cadence: `gh run list -L 1` every 5-10 min. **NEVER use `gh run watch`** per `feedback_gh_run_watch_exit_not_equal_run_status.md` (its exit code != run status).
+
+**Step 2 — Spike S1: build the synthetic acceptance fixture.**
+
+Write `crates/vault-consolidator/examples/build_clustering_fixture.rs`. Two halves:
+
+1. **Generate**: construct `Phi4MiniProvider::v0_2_default(model_dir)`. For each of 20 topics, prompt for 5 paraphrastic variants under GBNF JSON-array grammar. Topics drawn from realistic memory-vault domains (errands, meetings, ideas, contacts, reminders, observations). Output schema: `[{topic_id: u32, memory_text: String}]` × 100 entries.
+2. **Quality gate** (per Q2 refinement from iteration 1 lock): embed all 100 via `BgeSmallProvider`. For each variant, compute nearest neighbour (cosine, excluding self). If ≥ 90/100 variants have nearest-neighbour sharing `topic_id` → fixture **PASS** (write JSON). If < 90/100 → fixture **FAIL** (don't write; fall back to hand-curated). This is the operational equivalent of the locked "k-means baseline ≥ 0.90 precision" gate — catches semantically-distinct-to-humans-but-poorly-clustering-in-embedding-space failure mode.
+
+Run:
+```powershell
+$env:LIBCLANG_PATH = "$env:USERPROFILE\scoop\apps\llvm\current\bin"; $env:PATH = "$env:LIBCLANG_PATH;$env:PATH"
+cargo run -p vault-consolidator --example build_clustering_fixture
+```
+
+Expected ~5-10 min wall (model load + 20 generation calls + 100 embedding calls + baseline check).
+
+**Step 2 fallback (if hand-eyeball OR baseline gate fails):**
+Hand-curate the 100-entry fixture directly as a JSON file (no spike binary execution required). 20 topics × 5 variants per topic. ~30-60 min focused work. ADR-045 §c notes both methods.
+
+**Step 3 — Commit fixture to repo.**
+
+Once `crates/vault-consolidator/tests/fixtures/clustering_acceptance_100.json` exists and the quality gate passes:
+- The spike binary stays in-tree at `crates/vault-consolidator/examples/build_clustering_fixture.rs` per `feedback_spike_examples_bundle_with_consumer_code.md` (bundles with the production consumer — the acceptance test).
+- Both files (fixture JSON + spike binary) land in commit 2.
+
+**Step 4 — Acceptance integration test.**
+
+Write `crates/vault-consolidator/tests/acceptance.rs`. Setup:
+- tempdir-backed sealed vault-storage `StorageBackend` (use `TEST_AT_REST_KEY` pattern from existing vault-storage tests).
+- `BgeSmallProvider` constructed against `crates/vault-embedding/test-fixtures/bge-small-en-v1.5/`.
+- Load `clustering_acceptance_100.json`; embed each entry; `storage.write_memory` to insert into vault under a single test boundary.
+
+Test body:
+- Call `find_candidate_clusters(&storage, &embeddings, &boundary, 0.92, None)`.
+- Compute precision + recall against `topic_id` ground truth:
+  - For each pair (a, b) in same predicted cluster: increment TP if topic_id matches, else FP.
+  - For each same-`topic_id` pair NOT in same predicted cluster: increment FN.
+  - `precision = TP / (TP + FP)`; `recall = TP / (TP + FN)`.
+- Assert `precision ≥ 0.95 AND recall ≥ 0.90` per ADR-045 §d provisional floor.
+
+If observed precision/recall significantly different from floor (e.g., 0.99/0.99 trivially or 0.85/0.80), surface as plan amendment per `feedback_floor_forecast_is_pre_declaration_not_estimate.md` — either ship the actual measured floor OR revise the fixture difficulty before committing.
+
+**Step 5 — Local DoD gate chain (strictly serial per `feedback_no_parallel_cargo_invocations.md`):**
+
+```powershell
+$env:LIBCLANG_PATH = "$env:USERPROFILE\scoop\apps\llvm\current\bin"; $env:PATH = "$env:LIBCLANG_PATH;$env:PATH"
+cargo check --workspace --all-targets      # gate 1
+cargo test -p vault-consolidator           # gate 2 (8 lib + new acceptance)
+cargo clippy --workspace --all-targets -- -D warnings  # gate 3
+cargo fmt --all --check                    # gate 4 (FINAL per `feedback_fmt_runs_last_before_commit.md`)
+git status --short                         # gate 5 (drift check per `feedback_git_status_check_between_fmt_and_add.md`)
+```
+
+If gate 4 fails on formatting → `cargo fmt --all` to apply + re-run gate 4 + git status. The fmt-applied edits ride with commit 2.
+
+**Step 6 — Stage + ask Shahbaz for combined commit + push approval.**
+
+```bash
+git add crates/vault-consolidator/examples/build_clustering_fixture.rs \
+        crates/vault-consolidator/tests/fixtures/clustering_acceptance_100.json \
+        crates/vault-consolidator/tests/acceptance.rs \
+        HANDOFF.md
+# Plus any Cargo.lock if drift surfaced; any other ride-along admin updates.
+git status --short
+```
+
+Show staged + commit message draft + ask. On approval per `feedback_confirm_before_commit_push.md`: commit (via `git commit -F <tempfile>` to preserve § + other non-ASCII chars verbatim — commit 1 used this approach and preserved 8 § characters cleanly) + push.
+
+**Step 7 — Verify commit 2 CI green matrix-wide** (same shape as Step 1 for commit 2's run). When green matrix-wide → **T0.2.2 SHIPPED.** Move to **T0.2.3** (vault-consolidator Phase 2-3 Merge + Human-Readable Summary; BRD §6.2 lines 1436-1442). **ADR-045 §e mandates** that T0.2.3 iteration 1 plan-draft MUST include N-ary schema redesign + N-ary canned fixture rebuild as locked-in scope — not optional.
+
+### Open items / discipline pointers for next session
+
+- **ADR-045 §e contract-drift hand-off MUST be honoured at T0.2.3 iter 1.** T0.2.3 first iteration plan-draft has to include N-ary cluster prompt schema redesign + N-ary canned fixture rebuild as locked-in scope, not just "consider." T0.2.1's `T0_2_3_MERGE_SCHEMA` (in `crates/vault-llm/tests/phi4_mini_smoke.rs` + `canned_merge_decisions.json`) is pairwise; BRD §5.6 line 941 spec is N-ary cluster-shaped.
+- **Memory `feedback_read_spec_before_recommending_not_just_before_coding.md`** was saved at T0.2.2 commit 1 push. Indexed in MEMORY.md. Available to all future sessions — apply the discipline at T0.2.3 iter 1 (read BRD §5.6 Phase 2-3 + §6.2 T0.2.3 line 1436-1442 BEFORE drafting design recommendations).
+- **Test floor**: T0.2.2 commit 1 shipped +10 (8 vault-consolidator + 2 vault-storage Amendment 2). Commit 2 will add ~5-6 acceptance-related tests for cumulative T0.2.2 ~+15-16 firm. Locked range was +12-14; commit 2 may land slightly above the high end — surface explicitly in commit message per `feedback_test_forecast_is_floor_not_ceiling_for_adr_locked_work.md`.
+- **Cargo.lock drift**: likely on commit 2's first `cargo check` if vault-consolidator's dev-dep `vault-llm` activates new features. Per `feedback_git_status_check_between_fmt_and_add.md`, the post-fmt `git status --short` step catches this; include any Cargo.lock drift in commit 2's staging.
+- **Tasks 16 + 17 + 22 in the session task list** map to commit 2's deferred-work + CI-verification steps. Update as you progress (16 = spike S1, 17 = acceptance test, 22 = CI verify for commit 1).
+- **Phi-4-mini license sanity check** before re-running spike (cheap): verify `https://huggingface.co/microsoft/Phi-4-mini-instruct/blob/main/LICENSE` is still MIT. ADR-042 §when-to-revisit #1 says license change triggers model-swap reconsideration; not expected to have changed in 24 hr but trivial to confirm.
+
+### Cross-references
+- BRD §5.6 Phase 1 (`Agent_Build_Specification.txt:935-938`) — algorithm spec (implemented at commit 1; acceptance test at commit 2 verifies)
+- BRD §6.2 T0.2.2 (`Agent_Build_Specification.txt:1432-1434`) — acceptance criterion
+- ADR-045 §c — S1 fixture recipe + IEEE-754 determinism note
+- ADR-045 §d — precision/recall floor
+- ADR-045 §e — contract-drift hand-off contract for T0.2.3
+- ADR-045 §f — known limitations + γ-split rationale
+- T0.2.2 iteration 1 + Amendments 1 + 2 — locked inline in chat thread (this session, 2026-05-13)
+- `feedback_read_spec_before_recommending_not_just_before_coding.md` — memory saved this session
+
+---
+
+## T0.2.1 commit 2 — historical next-session opener (drafted 2026-05-13, OBSOLETE — T0.2.1 closed; preserved as audit trail)
 
 ### State at session-pause
 
@@ -609,7 +810,7 @@ The BRD §6.2 acceptance criterion is *"100 memories with known duplicates produ
 - **Recall**: of pairs that actually share `topic_id`, fraction in the same predicted cluster.
 - For 20-topic / 5-variant-per-topic synthetic data: 20 × C(5,2) = 200 same-topic pairs (true positives possible); C(100,2) - 200 = 4750 cross-topic pairs (true negatives possible).
 
-**Provisional floor: precision ≥ 0.95 AND recall ≥ 0.90.** Finalised after S1 generates the fixture and we measure baseline behaviour on a `find_candidate_clusters` run at the default 0.92 threshold. If the fixture is too easy (precision = recall = 1.0 trivially), tighten the threshold or noise the variants. If too hard (precision < 0.85 even on hand-curated), the fixture is over-aggressive on cross-topic similarity and needs revision.
+**Floor: precision ≥ 0.95 AND recall ≥ 0.90.** **LOCKED at T0.2.2 commit 2** (2026-05-13) — finalised based on real measurement after the hand-curated fallback path was taken (see commit 2 deliverables block above for the plan amendment + 3-iteration audit trail). Measured: **precision 1.0 / recall 0.93** at default 0.92 threshold across a realistic-distribution 100-entry fixture (short errands + medium meeting/work notes + long coding/agent paragraphs). 3-point margin above the recall floor preserves headroom for environmental drift (ort version updates, fixture re-curation, embedding-model patch revisions). Topic 0 short-fragment limitation documented separately in the commit 2 deliverables block; not a fixture revision trigger.
 
 ### (e) Contract-drift flag — T0.2.1 pairwise schema vs BRD §5.6 N-ary cluster prompt — option (α) with (β)'s strengthened wording
 
