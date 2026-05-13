@@ -9680,6 +9680,24 @@ version = "0.1.0"
 [[package]]
 name = "vault-consolidator"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "tracing-test",
+ "uuid",
+ "vault-core",
+ "vault-embedding",
+ "vault-llm",
+ "vault-storage",
+]
 
 [[package]]
 name = "vault-core"

@@ -61,7 +61,7 @@ use crate::dead_letter::DeadLetter;
 use crate::graph_store::{DuckDbGraphStore, GraphStore};
 use crate::key::SqlCipherKey;
 use crate::metadata_store::{
-    tx_append_audit, tx_get_memory, tx_insert_memory, tx_update_memory, MetadataStore,
+    tx_append_audit, tx_get_memory, tx_insert_memory, tx_update_memory, MemoryFilter, MetadataStore,
 };
 use crate::pending_sync::PendingSync;
 use crate::retry_queue::{CascadeOperation, RetryQueue, PAYLOAD_FORMAT_VERSION};
@@ -452,6 +452,40 @@ impl StorageBackend {
         })
     }
 
+    /// List memories matching `filter`. The `limit` parameter accepts
+    /// `None` (return ALL matching rows — no SQL `LIMIT` clause) or
+    /// `Some(N)` (cap at `N`).
+    ///
+    /// `limit: None` is locked as intentional unboundedness — used by
+    /// `vault-consolidator`'s clustering primitive (BRD §5.6 Phase 1)
+    /// where the algorithm needs every memory in the boundary for
+    /// union-find. Callers MUST NOT treat `None` as a "page size of
+    /// zero" footgun. At V0.2 alpha scale (100-1000 memories per
+    /// vault) the unbounded case is bounded by the vault size itself.
+    /// V0.3+ revisits if vaults grow to 10k+ memories with measurable
+    /// memory pressure — see ADR-045 §f pagination forward-compat call.
+    ///
+    /// Emits exactly one `memory.list` audit event regardless of how
+    /// many rows match (same contract as the underlying
+    /// [`MetadataStore::list_memories`]).
+    ///
+    /// First public read-side API on [`StorageBackend`] (T0.2.2
+    /// Amendment 2). Prior reads went through the type-specific store
+    /// handles (`vector_store()`, `graph_store()`) or the
+    /// `MetadataStore` was kept `pub(crate)`-gated. The
+    /// boundary-scoped enumeration use case is the first cross-crate
+    /// consumer (vault-consolidator); future consumers
+    /// (vault-cli triage, T0.2.4 decay/archive) can compose with the
+    /// same surface.
+    #[instrument(skip(self), fields(limit = ?limit, boundary = ?filter.boundary))]
+    pub async fn list_memories(
+        &self,
+        filter: MemoryFilter,
+        limit: Option<usize>,
+    ) -> VaultResult<Vec<Memory>> {
+        self.metadata.list_memories(filter, limit).await
+    }
+
     /// Eager-validate memory + embedding before any SQLite write. Drops
     /// [`VaultError::DimensionMismatch`] / invalid-memory cases on the
     /// floor so they never reach the cascading queue.
@@ -819,7 +853,7 @@ mod tests {
         // wrote on the first open.
         let memories = backend2
             .metadata
-            .list_memories(Default::default(), 100)
+            .list_memories(Default::default(), Some(100))
             .await
             .unwrap();
         assert_eq!(memories.len(), 5);

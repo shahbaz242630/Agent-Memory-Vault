@@ -1,7 +1,7 @@
 # Memory Vault — Build Handoff
 
 **Current version:** V0.2 Closed Beta (BRD §6.2 — sleep consolidator, boundaries hardening, cross-device sync, 30 beta users)
-**Last updated:** 2026-05-13 session-pause — **T0.2.1 Phase 1 SHIPPED at commit `85361ee` (push `b6d72bc..85361ee`).** CI run `25755423929` for that push was still **in_progress** when Shahbaz needed to leave (~22 min elapsed; new C++ build surface from llama-cpp-sys-2 expected to make first matrix run ~30-40 min). **Commit 2 production scope is WRITTEN locally + ALL tests pass (17 lib + 1 fixture-smoke + 3 ignored real-model smoke) but NOT staged/committed yet** — per item 5 / clarification 5 lock, commit 2 staging is gated on commit 1 CI green matrix-wide. **Next-session opener block below has the exact verification commands + decision tree + commit 2 message draft.** Iteration 2 LOCKED inline in chat this session post-spike-2 (Stages A-E all PASS with empirical findings table captured to HANDOFF). ADR-043 + ADR-044 drafted in this file below as part of the commit 2 working-tree bundle. **Cumulative T0.2.0 arc (CLOSED 2026-05-13 earlier this session):** 3 weeks across Phase 0a→0e foundation + Phase 1-5; ADR-010 HARD GATE CLEARED.
+**Last updated:** 2026-05-13 session-pause — **T0.2.2 commit 1 STAGED, awaiting commit + push approval.** T0.2.1 closed earlier this session (commit 2 `fc6338b` ALL-GREEN matrix-wide on run `25781122452`; Phase 4 dogfood 3/3 PASS; Phase 5 paperwork rides with this T0.2.2 commit 1). T0.2.2 iteration 1 LOCKED inline post-recon: Amendment 1 (X-lock — vault-embedding becomes vault-consolidator production dep, re-embed-at-consolidation strategy with IEEE-754 determinism note in ADR-045 §c) + Amendment 2 (Q-1 lock — vault-storage MemoryFilter.since field + StorageBackend::list_memories public wrapper with Option<usize> limit semantic). Commit-shape γ-split adopted (algorithm-first / fixture+acceptance-second). Commit 1 working tree: 5 modified (HANDOFF.md, vault-storage's metadata_store.rs + cascading.rs, vault-consolidator's Cargo.toml + lib.rs) + 1 new (vault-consolidator/src/clustering.rs); 8 vault-consolidator unit tests + 2 vault-storage Amendment-2 tests passing locally. **Commit 2 (deferred to fresh session per γ-split):** Spike S1 Phi-4-mini-driven fixture-build binary + `clustering_acceptance_100.json` (20 topics × 5 paraphrastic variants) + acceptance integration test against the fixture (precision ≥ 0.95 + recall ≥ 0.90 floor, provisional, finalised post-S1). **Cumulative T0.2.0 arc** (CLOSED 2026-05-13 earlier this session): 3 weeks across Phase 0a→0e foundation + Phase 1-5; ADR-010 HARD GATE CLEARED. **Cumulative T0.2.1 arc** (CLOSED 2026-05-13 this session): ~2 weeks across spike-2 + iteration 1/2 + 2 commits + Phase 4 dogfood + Phase 5 paperwork. **T0.2.2 arc in flight** (commit 1 of 2, second commit next session).
 
 **Session close-a (2026-05-12, historical milestone record — Phase 3 + Phase 4 Stages 1-4):** T0.2.0 Phase 3 SHIPPED + Phase 4 Stages 1-4 PASSED in real-world dogfood. CI-fix commit `b6d72bc` (push `ef88361..b6d72bc`) ALL-GREEN matrix-wide on CI run `25736962490` — Windows job passed cleanly with `CARGO_BUILD_JOBS=2` cap. **Phase 3 formally CLOSED.** Phase 4 founder dogfood executed on Shahbaz's Windows dev box: pre-flight cleanup (V0.1 MSI uninstalled via `MsiExec.exe /X{4CF99BC2-2134-424E-ABF9-B64A80DA5EAB}` + old debug binary deleted + data dir wiped + 3 keychain entries deleted including production `default.com.memoryvault.v0.2`) → fresh `target/release/vault-tauri.exe` launch → **Stage 1 PASS** (no "Alpha" title, no ALPHA modal, no orange strip, clean Add Memory view) → **Stage 2 PASS** (add/search/delete smoke flows work) → **Stage 3 PASS — the real T0.2.0 hard-gate proof** (memories survive close+reopen cycle on real user data, sealed write+read round-trip verified) → **Stage 4 PASS** (Notepad on `<data>/lance/memories.lance/data/*.lance` shows random CJK-misinterpreted ciphertext, NO plaintext memory content). Working-tree HANDOFF.md state at session close: rides with next code commit (Phase 5 close or T0.2.1 first commit) per `feedback_admin_changes_ride_with_code.md`.
 
@@ -21,7 +21,7 @@
 
 ## Current Status
 
-**Active task:** **T0.2.1 — vault-llm: Phi-4-mini local LLM integration. Commit 2 (Phase 3 production code) written locally + tested green, awaiting commit 1 CI green confirmation before staging.** Commit 1 (`85361ee`, scaffold + spike-2 + iteration 2 lock + admin) shipped this session; CI run `25755423929` was still `in_progress` at session-pause time. Commit 2 working-tree state: 4 modified files (ci.yml cron+real-model-smoke job, HANDOFF.md ADR-043+044 drafts, vault-llm/Cargo.toml test-utils feature, vault-llm/src/lib.rs module declarations) + 5 new files (error.rs, model_loader.rs, phi4_mini.rs, provider.rs, tests/phi4_mini_smoke.rs). Local cargo test on vault-llm: 17 lib + 1 fixture-smoke active passing + 3 real-model integration tests properly skipped via #[ignore]. **Next-session opener with exact commands + decision tree is the section immediately below** (per `feedback_quote_locked_artefacts_dont_paraphrase.md` — durable record, not paraphrased from memory). Phase progression:
+**Active task:** **T0.2.2 — vault-consolidator: Phase 1 (Cluster). Commit 1 staged + awaiting commit + push approval.** T0.2.2 iteration 1 LOCKED inline in chat this session post-recon (Amendment 1 X-lock + Amendment 2 Q-1 lock both surfaced via pre-code recon per `feedback_flag_review_as_plan_amendment.md` discipline). Commit-shape split γ adopted (algorithm-first / fixture+acceptance-second) — commit 1 ships scaffold + algorithm + ADR-045 + ride-along Phase 5 paperwork; commit 2 ships spike S1 + fixture + acceptance integration test next session. Working tree at this commit: vault-storage Amendment 2 (MemoryFilter.since field + tx_list_memories Option<usize> + StorageBackend::list_memories public wrapper + 2 new tests pinning since-filter + None=unbounded), vault-consolidator scaffold-fill (Cargo.toml prod+dev deps including vault-embedding as production dep per Amendment 1 X-lock, lib.rs module decls, clustering.rs with Cluster type + find_candidate_clusters per BRD §5.6 Phase 1 algorithm verbatim + 8 unit tests all passing), HANDOFF.md (ADR-042 + ADR-045 + T0.2.1 Phase 5 close section + status flips). **Local DoD gates: gate 1 cargo check workspace green; remaining 4 gates (test workspace / clippy / fmt / git status post-fmt) staged for run.** Phase progression:
 
 | Sub-task / Phase | Status | Commit |
 |---|---|---|
@@ -38,10 +38,16 @@
 | Phase 4 Stage 4 (visual proof — Notepad on `.lance` files) | ✅ PASSED real-world dogfood | (no code) |
 | Phase 4 Stage 5 (real-data usage ~1 day) | ✅ CLEAN — no findings from Shahbaz | (no code) |
 | Phase 4 Stage 6 (failure-mode spot checks, optional) | Skipped — Shahbaz's call (Stage 5 clean) | — |
-| Phase 5 — T0.2.0 formal hard-gate clearance | ✅ CLOSED (paperwork-only, working tree, rides with T0.2.1 first commit) | — |
+| Phase 5 — T0.2.0 formal hard-gate clearance | ✅ CLOSED (paperwork rode with T0.2.1 commit 1 `85361ee` 2026-05-12) | — |
 | **T0.2.0 — CLOSED** ✅ | — | — |
-| T0.2.1 commit 1 (scaffold + spike-2 + iteration 2 lock + admin) | ✅ SHIPPED | `85361ee` (CI run `25755423929` in_progress at session pause) |
-| T0.2.1 commit 2 (LlmProvider trait + Phi4MiniProvider + downloader + ADR-043 + ADR-044 + cron) | 🟡 written locally + tests green; awaiting commit 1 CI green to stage | working tree (see Next-session opener) |
+| T0.2.1 commit 1 (scaffold + spike-2 + iteration 2 lock + admin) | ✅ SHIPPED | `85361ee` (CI run `25755423929` ALL-GREEN matrix-wide 2026-05-13) |
+| T0.2.1 commit 2 (LlmProvider trait + Phi4MiniProvider + downloader + ADR-043 + ADR-044 + cron) | ✅ SHIPPED | `fc6338b` (CI run `25781122452` ALL-GREEN matrix-wide 2026-05-13) |
+| T0.2.1 Phase 4 founder dogfood (Windows) | ✅ PASSED 3/3 real-model smoke (190.51s wall, `cargo test -p vault-llm -- --ignored --nocapture`) | (no code) |
+| T0.2.1 Phase 5 — formal close + BRD §6.2 acceptance walkthrough + ADR-042 | ✅ CLOSED (paperwork rides with T0.2.2 commit 1, this commit) | — |
+| **T0.2.1 — CLOSED** ✅ (M1 Mac runtime dogfood deferred to first M1 beta user; CPU-only V0.2 per ADR-042) | — | — |
+| T0.2.2 iteration 1 lock + Amendments 1-2 locks (inline chat, 2026-05-13) | ✅ LOCKED | — |
+| T0.2.2 commit 1 (vault-storage Amendment 2 + vault-consolidator scaffold-fill + clustering algorithm + 8 unit tests + ADR-045 + T0.2.1 Phase 5 paperwork ride-along) | 🟡 staged + awaiting commit + push approval | working tree |
+| T0.2.2 commit 2 (Spike S1 binary + clustering_acceptance_100.json fixture + acceptance integration test) | 🟡 deferred to next session per γ-split decision (ADR-045 §f.7) | — |
 
 **Sub-task (d) historical record (shipped at `2cc8c65` earlier this session):**
 
@@ -451,6 +457,284 @@ Locked plan iterations 1 + 2 + their amendment/clarification ledgers live inline
 - BRD §6.2 T0.2.1 (`Agent_Build_Specification.txt:1425-1430`)
 - ADR-010 (HANDOFF_V0.1_ARCHIVE.md:737, hard-gate cleared at T0.2.0 Phase 5)
 - Saved memories applied this session: `feedback_plan_iterations_inline_not_handoff.md`, `feedback_plan_iteration_depth_scales_with_design_surface.md`, `feedback_floor_forecast_is_pre_declaration_not_estimate.md`, `feedback_runtime_confirmation_after_web_spike.md`, `feedback_spike_methodology_explicit.md`, `feedback_quote_locked_artefacts_dont_paraphrase.md`, `feedback_flag_reviewer_attribution_mismatch.md`, `feedback_broken_ci_is_regression_not_techdebt.md`, `feedback_cargo_on_windows_use_powershell.md`, `feedback_admin_changes_ride_with_code.md`, `feedback_git_status_check_between_fmt_and_add.md`, `feedback_no_parallel_cargo_invocations.md`, `feedback_standing_auth_dep_installs.md`, `feedback_surgical_cargo_clean_first.md` (informed by, not triggered)
+
+---
+
+## T0.2.1 Phase 4 founder dogfood + Phase 5 formal close (2026-05-13)
+
+**Status:** Phase 4 PASS 3/3 + Phase 5 paperwork DRAFTED in working tree. Per `feedback_admin_changes_ride_with_code.md`, this section + ADR-042 below + status-table flips above all ride with **T0.2.2's first code commit** (no paperwork-only commits).
+
+### Phase 4 founder dogfood
+
+Real Phi-4-mini-instruct Q4_K_M GGUF → real `Phi4MiniProvider` (commit 2 `fc6338b`) → real merge decisions through the production trait surface. Run command:
+
+```text
+cargo test -p vault-llm --test phi4_mini_smoke -- --ignored --nocapture --test-threads=1
+```
+
+| Test | Result | What it proved |
+|---|---|---|
+| `identical_memories_should_merge` | ✅ PASS | "Buy milk" vs "Buy milk" → model returned `merge=true` |
+| `unrelated_memories_should_not_merge` | ✅ PASS | "Buy milk" vs "Tax return deadline April 15" → model returned `merge=false` |
+| `model_id_matches_v0_2_default` | ✅ PASS | `provider.model_id() == "Phi-4-mini-instruct-Q4_K_M"` |
+
+Total wall: **190.51s** (3 fresh-context cold loads + 3 SHA-256 verifications + 3 inferences). In line with spike-2 Stage E envelope (p50 9.8s × 3 inferences + load/verify overhead).
+
+**Test-threads pinned to 1** because `LlamaBackend::init()` is a once-per-process operation per llama-cpp-2's documented contract (ADR-044 §1) — parallel test threads would race the `OnceLock` initialiser. Single-thread is the safe + correct default for any binary that uses `Phi4MiniProvider`.
+
+**Per-test JSON outputs not captured** because `provider.complete_json(...)`'s `String` return is consumed directly by `serde_json::from_str` and the test bodies assert on the parsed `merge` boolean without an intermediate `println!`. Pass/fail asserts ARE the evidence — assertion success at the parse + boolean layer means the model produced GBNF-valid JSON with the semantically-correct merge decision. Future dogfood that needs raw-JSON inspection can add `eprintln!("output={output}");` before the assert.
+
+### Phase 5 formal close — BRD §6.2 T0.2.1 acceptance walkthrough
+
+Quoting BRD lines 1425-1430 verbatim per `feedback_quote_locked_artefacts_dont_paraphrase.md`:
+
+> **T0.2.1 — vault-llm: Phi-4-mini Integration**
+> - Bundle Phi-4-mini-instruct Q4_K_M GGUF (~2.49GB) with the installer
+> - Integrate llama.cpp via Rust bindings
+> - Implement `LlmProvider` and `Phi4MiniProvider`
+> - Detect Metal (Mac) and CUDA (Windows) for hardware acceleration
+> - Acceptance: Model loads on M1 Mac and modern Windows PC, completion latency reasonable, structured JSON output works
+
+Per-line clearance + scope amendments:
+
+1. **"Bundle Phi-4-mini-instruct Q4_K_M GGUF (~2.49GB) with the installer"** — ⚠️ **SCOPE-AMENDED** to first-launch download (per Shahbaz's Q1 iteration 1 call). Reasoning + decision-trail captured at ADR-043. Implementation: `crates/vault-llm/src/model_loader.rs::ensure_model_at_path` shipped at commit 2 (`fc6338b`).
+
+2. **"Integrate llama.cpp via Rust bindings"** — ✅ **DONE** via `llama-cpp-2` crate (workspace dep added at commit 1 `85361ee`, consumed by `Phi4MiniProvider` at commit 2 `fc6338b`). Build-prereq matrix documented at iteration 2 observation 3 (LLVM/libclang ≥17 + MSVC C++ Build Tools + cmake ≥3.24 — end-user installers ship NONE of these; llama-cpp-sys-2 statically compiles llama.cpp into the binary).
+
+3. **"Implement `LlmProvider` and `Phi4MiniProvider`"** — ✅ **DONE** at commit 2 (`fc6338b`). Trait at `crates/vault-llm/src/provider.rs`, concrete impl at `crates/vault-llm/src/phi4_mini.rs`. Surface + invariants locked in ADR-044.
+
+4. **"Detect Metal (Mac) and CUDA (Windows) for hardware acceleration"** — ⚠️ **SCOPE-AMENDED** to CPU-only on all platforms for V0.2 (per iteration 2 concern #6). Reasoning + decision-trail captured at ADR-042 alternatives section below. Revisit trigger: first M1-Mac beta user reports inference unusably slow on Apple Silicon CPU.
+
+5. **"Acceptance: Model loads on M1 Mac and modern Windows PC, completion latency reasonable, structured JSON output works"**:
+   - **Modern Windows PC** ✅ Phase 4 dogfood 3/3 PASS on Shahbaz's i7-13620H Windows dev box.
+   - **M1 Mac** ⚠️ **UNTESTED at runtime.** CI macos-latest matrix is arm64 macOS per GitHub's 2024+ runner config and `cargo build --workspace` passes there (commit 1 + commit 2 both green), but the real-model smoke test (`#[ignore]` gated on weekly cron OR `run-llm-smoke` PR label per ADR-044 §7) is correctly skipped on the regular push that ran for commit 2. The real-model smoke job is pinned to `windows-latest` only per the matrix lock at `.github/workflows/ci.yml`. **Deferred to first M1 beta user** (or to first explicit Mac dogfood pass by Shahbaz on a borrowed Mac — neither in current scope).
+   - **Completion latency reasonable** ✅ Spike-2 Stage E (p50 9.8s, p99 14.7s) + Phase 4 dogfood (~63s per test inc. cold load + SHA verify) both confirmed acceptable for T0.2.3's "5-30 min for 100-1000 pairs" budget envelope at the 100-pair end. The 1000+ pair end is a future-revisit trigger per ADR-042 §"When to revisit" #4.
+   - **Structured JSON output works** ✅ Spike-2 Stage D 5/5 + Phase 4 3/3 confirmed GBNF-constrained JSON output produces valid + semantically-correct merge decisions across identical / similar / unrelated pairs.
+
+**T0.2.1 status flip:** "active" → **CLOSED (with M1 Mac runtime dogfood deferred to first M1 beta user)**.
+
+### Working-tree paperwork riding with T0.2.2's first code commit
+
+Per `feedback_admin_changes_ride_with_code.md` — no paperwork-only commits:
+
+- This Phase 4 + Phase 5 close section
+- ADR-042 below
+- Top-of-file status flips (commit 2 → SHIPPED, T0.2.1 Phase 4 → PASS, T0.2.1 Phase 5 → CLOSED, T0.2.1 → CLOSED)
+- "Last updated" summary update
+
+### Next coding work — T0.2.2 — vault-consolidator: Phase 1 (Cluster)
+
+BRD §6.2 T0.2.2 (`Agent_Build_Specification.txt:1432-1434`):
+
+> - Identify candidate clusters via vector similarity
+> - Acceptance: 100 memories with known duplicates produces correct clusters
+
+---
+
+## ADR-045 — T0.2.2 Phase 1 Cluster output contract + amendments (T0.2.2 iteration 1, drafted 2026-05-13)
+
+**Status:** LOCKED at T0.2.2 iteration 1 (2026-05-13, in-thread). Rides with T0.2.2 commit 1 per `feedback_admin_changes_ride_with_code.md`. Two pre-code amendments were absorbed at draft time (Amendment 1 / X-lock, Amendment 2 / Q-1 lock — see §g provenance note).
+
+**Context.** T0.2.2 implements BRD §5.6 Phase 1 (clustering) — the first phase of the four-phase sleep cycle consolidator. The clustering primitive produces N-ary cluster groups of memory rows that T0.2.3 will feed into LLM merge decisions. This ADR locks the cluster output contract, the V0.2 implementation strategy, the synthetic-fixture recipe for the BRD §6.2 acceptance criterion, the forward-pointer to T0.2.3 for downstream design decisions (including a contract-drift flag against T0.2.1's pairwise merge schema), and the provenance trail for two amendments that surfaced via pre-code recon.
+
+### (a) Cluster output shape — N-ary clusters with row-ID member references
+
+`Cluster` (defined at `crates/vault-consolidator/src/clustering.rs`) is a per-run output shape:
+
+```rust
+pub struct Cluster {
+    /// Per-run monotonic index (0..N). Not persistent across runs.
+    pub id: u32,
+    /// Sorted ascending. Always size ≥ 2 (singletons filtered).
+    pub member_row_ids: Vec<MemoryId>,
+}
+```
+
+**N-ary by mechanical derivation, not fresh design call.** BRD §5.6 line 937 verbatim: *"Group into clusters by transitive closure."* Transitive closure of pairwise NN-edges naturally produces N-ary connected components. The "N-ary vs pair-only" question that surfaced in T0.2.2 iteration 1 chat thread was a discipline-fail (spec not read before design recommendation drafting) — see §g.
+
+**Row-ID member references, not inline content** (instead of `Vec<Memory>` or `Vec<(MemoryId, String)>`):
+1. Lightweight — content lives in `MetadataStore`, embeddings in `LanceVectorStore`. T0.2.3 hydrates content per cluster via existing `MemoryRepository`-style reads as it builds LLM prompts; T0.2.2 doesn't need to materialise content upfront.
+2. Single source of truth — content stored once at write time, never copied into transient cluster outputs.
+3. Composes cleanly with the supersession-link model BRD §5.6 lines 947-948 lock at T0.2.3 (T0.2.3 writes a new merged row + marks originals `superseded_by` — row IDs are the only identifier needed for that operation).
+
+**Singleton filter is part of the type invariant.** `Cluster::member_row_ids` is always size ≥ 2 — singletons are filtered before construction, never returned. BRD §5.6 line 938 verbatim: *"Skip clusters of size 1 (no duplicates to merge)."*
+
+**Deterministic ordering for the acceptance test.** Within each `Cluster`, `member_row_ids` are sorted ascending. The output `Vec<Cluster>` is sorted by smallest-member-ID ascending; `Cluster::id` is assigned 0..N in that order. Given the same input memories + same embeddings, the output is bit-stable — which matters for the BRD §6.2 acceptance test's precision/recall scoring against ground-truth topic labels.
+
+### (b) Read-cost expectation pinned
+
+T0.2.3 will call `MemoryRepository`-style content reads twice per pairwise merge decision (each pair's two contents). For T0.2.3's "5-30 min for 100-1000 pairs" budget envelope (per ADR-042 §latency-budget-fit derived from spike-2 Stage E):
+
+- 100 pairs × 2 reads = 200 reads ≈ 200ms total at SQLCipher's ~1ms/row pace
+- 1000 pairs × 2 reads = 2000 reads ≈ 2s total
+
+**LLM latency dominates by ~7000× at the high end** (4 hr LLM vs 2 s storage). Storage read cost is sub-second per merge decision and not on any critical path that requires optimisation. If V0.3+ profiling shows storage dominating, revisit.
+
+### (c) Synthetic acceptance fixture recipe + re-embedding determinism
+
+**Fixture lives at `crates/vault-consolidator/tests/fixtures/clustering_acceptance_100.json`** (lands at T0.2.2 commit 2 — deferred from commit 1 per γ-split decision below). Schema:
+
+```json
+[
+  { "topic_id": 0, "memory_text": "Buy milk" },
+  { "topic_id": 0, "memory_text": "Pick up milk on way home" },
+  ...
+  { "topic_id": 19, "memory_text": "..." }
+]
+```
+
+20 topics × 5 paraphrastic variants per topic = 100 entries. `topic_id` is the ground-truth label used by the acceptance test's precision/recall scorer.
+
+**Primary generation method (S1 spike):** Phi-4-mini-driven via the production `Phi4MiniProvider` (vault-llm dev-dep) at `examples/build_clustering_fixture.rs`. One-shot generation; output JSON committed; no ongoing LLM-availability dependency. Reproducible via seeded `CompletionParams { seed: Some(...) }`.
+
+**Fallback method (if S1 hand-eyeball fails):** Hand-curate the 100 entries (~30-60 min focused work). The fallback ships an identically-shaped JSON; the acceptance test consumes the same shape either way.
+
+**S1 acceptance gate (both must pass to commit fixture):**
+- Hand-eyeball pass: variants within a topic_id look semantically equivalent; cross-topic variants look distinct.
+- k-means / nearest-neighbour-shared-topic_id baseline ≥ 0.90: for each variant's embedding (via `BgeSmallProvider`), its nearest neighbour (excluding self) must share its `topic_id` in ≥ 90/100 cases. Catches semantically-distinct-to-humans-but-poorly-clustering-in-embedding-space — a real failure mode that hand-eyeball alone wouldn't catch.
+
+If baseline fails, fall back to hand-curated regardless of hand-eyeball read.
+
+**Re-embedding determinism note (load-bearing for future readers).** `Memory.embedding` is `None` when loaded from `MetadataStore` — embeddings live in `LanceVectorStore`, not SQLite (see `vault-storage::metadata_store.rs:896`). `find_candidate_clusters` re-embeds each memory's content via `EmbeddingProvider::embed` at consolidation time to obtain the query vector for top-K NN search.
+
+bge-small-en-v1.5 under ONNX Runtime CPU is **deterministic at fp32** — ONNX `SessionOptions` defaults produce bit-reproducible output for identical input. The re-embed vs. stored-embed similarity is bounded by IEEE-754 rounding noise (sub-1e-6 per coordinate); **cosine similarity is invariant under such noise** (1e-3 worst-case headroom against the default 0.92 threshold). Future readers asking "why don't stored embeddings match re-embedded ones bit-exactly?" — IEEE-754 rounding, not a correctness issue.
+
+**Forward-revisit trigger for re-embedding strategy:** if T0.2.5 wires checkpoint state and at-rest embedding storage becomes load-bearing for incremental scope (e.g., checkpoint stores "embeddings as-of last consolidation" for content-drift detection), the alternative APIs `VectorStore::get_embedding(&MemoryId)` (lean Y) or `VectorStore::scan_all_embeddings_for_boundary(&Boundary)` (lean Z) reopen with concrete-current-consumer evidence. Until then, re-embed-at-consolidation-time is the right scope.
+
+### (d) Acceptance metric: precision + recall, provisional floor
+
+The BRD §6.2 acceptance criterion is *"100 memories with known duplicates produces correct clusters."* Operational definition:
+
+- **Precision**: of the pairs in the same predicted cluster, fraction that actually share `topic_id`.
+- **Recall**: of pairs that actually share `topic_id`, fraction in the same predicted cluster.
+- For 20-topic / 5-variant-per-topic synthetic data: 20 × C(5,2) = 200 same-topic pairs (true positives possible); C(100,2) - 200 = 4750 cross-topic pairs (true negatives possible).
+
+**Provisional floor: precision ≥ 0.95 AND recall ≥ 0.90.** Finalised after S1 generates the fixture and we measure baseline behaviour on a `find_candidate_clusters` run at the default 0.92 threshold. If the fixture is too easy (precision = recall = 1.0 trivially), tighten the threshold or noise the variants. If too hard (precision < 0.85 even on hand-curated), the fixture is over-aggressive on cross-topic similarity and needs revision.
+
+### (e) Contract-drift flag — T0.2.1 pairwise schema vs BRD §5.6 N-ary cluster prompt — option (α) with (β)'s strengthened wording
+
+**The drift, surfaced at T0.2.2 iteration 1 chat thread:** T0.2.1 shipped a pairwise merge-decision schema (`T0_2_3_MERGE_SCHEMA` + `canned_merge_decisions.json`, both in `crates/vault-llm/`):
+
+```json
+{ "merge": bool, "score": number, "merged_text": string }
+```
+
+Prompt shape: *"Memory A: '...' Memory B: '...' Should these be merged?"* — **pairwise**.
+
+BRD §5.6 line 941 verbatim:
+
+> **Phase 2: LLM merge decisions.**
+> - For each cluster, send the cluster contents to Phi-4-mini with a structured prompt
+> - LLM decides: "merge into one memory" / "keep separate" / "contradiction — flag for user"
+
+*"Send the cluster contents"* — that's **N-ary input to the LLM**, not pairwise. Spec-locked N-ary cluster prompts.
+
+**T0.2.1 was forward-pointed but wrong-shaped per spec.** Discoverable now because we read §5.6 before T0.2.2 starts; not discoverable at T0.2.1 time because no consumer existed yet.
+
+**Lock — option (α) with (β)'s strengthened wording:**
+- T0.2.2 ships unaffected — clustering correctness is independent of T0.2.3's prompt shape.
+- **T0.2.3 iteration 1 MUST include schema redesign + N-ary fixture as scope items.** Not "suggest" or "consider" — required.
+- T0.2.1's `canned_merge_decisions.json` fate is a T0.2.3-time call (deprecate vs retain as pairwise-quality regression alongside a new N-ary fixture). Don't force the call now; T0.2.3 picks with then-current evidence.
+
+**This is a load-bearing hand-off contract**, not a flag. T0.2.3's iteration 1 plan-draft cannot ship without acknowledging the schema redesign as locked-in scope.
+
+### (f) Known limitations + forward-compat notes
+
+1. **Full-scan, not incremental.** T0.2.2 ships with `find_candidate_clusters(..., since: None)` — every memory in the boundary is processed every run. BRD §5.6 line 936 prescribes "*for each memory added since last consolidation*" — incremental scope lands at **T0.2.5** (Checkpoint & Rollback), which is where the checkpoint timestamp becomes available. The `since: Option<DateTime<Utc>>` parameter is wired forward-compat through `MemoryFilter::since` (vault-storage Amendment 2 below) so T0.2.5's wiring is additive, not breaking.
+
+2. **`Consolidator` struct (BRD §5.6 lines 894-913) NOT constructed at T0.2.2.** T0.2.2 ships `find_candidate_clusters` as a pub-module clustering primitive (re-exported at `vault_consolidator::find_candidate_clusters`); the full `Consolidator` struct with all 4 fields (`storage`, `llm`, `embeddings`, `config`) materialises at **T0.2.3** when `llm` + `embeddings` fields become load-bearing for merge decisions. Spec-compliance contract per (ii) lock from iteration 1 chat thread: **BRD §5.6 lines 911-912 locks WHAT `Consolidator` exposes when complete, not WHEN the struct exists.** T0.2.3 close satisfies §5.6 compliance.
+
+3. **vault-storage `StorageBackend::list_memories` is a T0.2.2-time API addition.** First cross-crate consumer is vault-consolidator (this commit). Lives at `crates/vault-storage/src/cascading.rs::StorageBackend::list_memories(filter: MemoryFilter, limit: Option<usize>)`. Wraps the previously-`pub(crate)` `MetadataStore::list_memories`. Future consumers (vault-cli triage, T0.2.4 decay/archive, T0.2.7 retrieval test surfaces) can compose with the same API without further additions.
+
+4. **Pagination forward-compat call.** `limit: None` returns ALL matching rows (no SQL `LIMIT` clause). At V0.2 alpha scale (100-1000 memories per vault), the unbounded case is bounded by the vault size itself — each `Memory` row carries content (typically < 1 KB) + metadata (~100 B); 1000 rows in a single Vec is ~1 MB max. V0.3+ revisits if vaults grow to 10k+ memories with measurable memory pressure. Two clean migration paths preserved: (Q-1) keep `Vec<Memory>` + add cursor parameter as additive change; (Q-2) switch to `impl Stream<Item = VaultResult<Memory>>` as breaking-or-additive change. Decision deferred to V0.3+ with then-current scale evidence.
+
+5. **vault-embedding is a vault-consolidator PRODUCTION dep, not [dev-dependencies].** Forced by §c re-embedding strategy (Memory.embedding = None when loaded from MetadataStore). vault-llm stays [dev-dependencies] (fixture-build only; production T0.2.2 clustering is geometry, not semantics — no LLM call). vault-llm enters [dependencies] at T0.2.3 when merge decisions become load-bearing.
+
+6. **`canned_merge_decisions.json` fate deferred.** See (e). T0.2.3 picks.
+
+7. **Commit-shape split (γ).** Commit 1 (this commit): scaffold + vault-storage Amendment 2 + algorithm + 8 unit tests + ADR-045 + Phase 5 paperwork ride-along. Commit 2 (next session): spike S1 binary + fixture generation + acceptance integration test. Diverges from iteration 1 Flag #1's locked shape (which proposed scaffold-first / algorithm-second); empirical work-state went algorithm-first because the algorithm was the smaller unknown vs. the fixture. Locked at decision point per Flag #1's "decision point is during implementation, not pre-locked at iteration 1."
+
+### (g) Provenance — recommendation vs. lock + amendment audit trail
+
+**N-ary cluster output is mechanically derived from BRD §5.6 line 937's transitive-closure grouping (not a fresh design call).** Earlier-thread framing as a Claude recommendation was attribution-discipline-fail per ADR-045 drafting catching its own §5 read before recommendation drafting. Discipline-pattern saved as `feedback_read_spec_before_recommending_not_just_before_coding.md` after thread close.
+
+**Amendment audit trail (both surfaced via pre-code recon, not as fresh design calls):**
+
+- **Amendment 1 (X-lock): vault-embedding becomes a vault-consolidator PRODUCTION dep.** Original iteration 1 framing had vault-embedding as [dev-dependencies] only. Recon at `crates/vault-storage/src/metadata_store.rs:896` (`embedding: None, // lives in LanceDB, not SQLite`) surfaced that `find_candidate_clusters` must re-embed memory content at consolidation time — vault-embedding becomes production. Three options surfaced inline (X = re-embed-at-consolidation, Y = `VectorStore::get_embedding` new API, Z = `VectorStore::scan_all_embeddings_for_boundary` new API); X locked on grounds (determinism well-bounded, cost dominated by LLM latency, no API expansion to a Heavy crate, concrete-vs-hypothetical-consumer test for Y/Z).
+
+- **Amendment 2 (Q-1 lock): vault-storage public memory-read API addition.** Original iteration 1 framing assumed `StorageBackend` already had a public memory-read surface. Recon at `crates/vault-storage/src/cascading.rs:288` (`pub(crate) fn metadata(&self) -> &MetadataStore`) surfaced that no public read API existed. Three options surfaced inline (P = purpose-shaped wrapper, Q = general `list_memories(MemoryFilter, Option<usize>)`, R = make `metadata()` pub); Q-1 locked on grounds (mirrors existing internal API exactly, forward-compat for T0.2.3-T0.2.6 consumer roster, doesn't expose entire MetadataStore, pagination call deferred to V0.3+ per §f).
+
+Both amendments are real architectural surfaces that abstract reasoning couldn't have surfaced — verifiable only by reading the actual vault-storage source. **Discipline pattern fired correctly: recon-before-code surfaced both before any working-tree touch.** Same meta-pattern as the saved `feedback_read_spec_before_recommending_not_just_before_coding.md`: verify empirically, don't paraphrase from architectural intuition.
+
+### Cross-references
+
+- BRD §5.6 (`Agent_Build_Specification.txt:888-977`) — full consolidator public API + four-phase implementation spec.
+- BRD §6.2 T0.2.2 (`Agent_Build_Specification.txt:1432-1434`) — acceptance criterion ("100 memories with known duplicates produces correct clusters").
+- ADR-042 (above) — Phi-4-mini-instruct as V0.2 local LLM; spike-2 evidence; concrete-vs-hypothetical-consumer pattern.
+- ADR-043 (below) — model download discipline; consumed transitively by §c S1 spike's `Phi4MiniProvider::v0_2_default`.
+- ADR-044 (below) — `LlmProvider` trait + `Phi4MiniProvider` impl locks; consumed transitively by §c S1 spike + §e contract-drift flag's redesign scope.
+- T0.2.2 iteration 1 lock — `feedback_plan_iterations_inline_not_handoff.md` (chat thread, 2026-05-13).
+
+---
+
+## ADR-042 — Phi-4-mini-instruct as the V0.2 local LLM (T0.2.1 Phase 5, drafted 2026-05-13)
+
+**Status:** LOCKED at T0.2.1 Phase 5 (paperwork-only ride-along, drafted in working tree 2026-05-13 — rides with T0.2.2's first code commit per `feedback_admin_changes_ride_with_code.md`).
+
+**Context.** T0.2.1 needs a local-LLM that can drive structured-JSON outputs for the T0.2.3 consolidator merge-decision flow. The model has to (a) fit a 16 GB-RAM dev box plus typical user laptops, (b) ship under a permissive license to avoid dual-use clauses or revocability risk, (c) handle GBNF-constrained JSON output without semantic collapse, and (d) produce empirically-correct merge decisions on a representative test set. ADR-042 is the model-selection lock — ADR-043 and ADR-044 are the implementation details that hang off this choice.
+
+**Decision.** Microsoft **Phi-4-mini-instruct** at Q4_K_M quantisation (~2.49 GB GGUF) as the V0.2 local LLM. Sourced from the unsloth mirror (`unsloth/Phi-4-mini-instruct-GGUF`) per ADR-043; consumed via the `Phi4MiniProvider` impl per ADR-044.
+
+**Evidence supporting the choice.**
+
+1. **License: MIT.** Microsoft Phi-4-mini-instruct ships under MIT License — verified 2026-05-13 during T0.2.1 spike-2 Stage A by reading `https://huggingface.co/microsoft/Phi-4-mini-instruct/blob/main/LICENSE` directly. MIT is permissive (no field-of-use restrictions, no usage-reporting obligations), distributable in commercial products, redistributable by community quantisers (unsloth / bartowski) under the same terms. Compares favourably to Llama (custom community license with 700 M MAU acceptable-use clause) and Gemma (Google's "Gemma Terms of Use" with dual-use safety provisions + Google-side termination clause). Locked.
+
+2. **Empirical correctness — spike-2 Stage D 5/5 cases (HANDOFF "T0.2.1 Phase 1 spike-2 results" section above):**
+   - Identical pair → merge=true, score=1.0 ✅
+   - Identical pair (varied) → merge=true, score=1.0 ✅
+   - Similar pair (same topic, different phrasing) → merge=true, score=0.85 ✅
+   - Unrelated pair (different topics) → merge=false, score=0.0 ✅
+   - Unrelated pair (different topics) → merge=false, score=0.0 ✅
+   - 5/5 JSON validity rate under GBNF constraint (no llama.cpp#18173 trigger on our merge-decision schema, confirmed at Stage C adversarial probe).
+   - **Score gradient is empirical, NOT contract** (per iteration 2 observation 1(b)): T0.2.3 must treat score as a confidence signal (`if score > 0.7 merge`), NOT as a deterministic threshold-comparator (`if score == 1.0`). Score behaviour may shift under model swap or quantisation changes.
+
+3. **Phase 4 founder dogfood — 3/3 PASS on Windows dev box (HANDOFF "T0.2.1 Phase 4 + Phase 5 close" section above):** real Phi-4-mini → real `Phi4MiniProvider` → all three assertions (identical-merge / unrelated-no-merge / model_id-equality) held green. End-to-end production-trait validation against real model bytes.
+
+4. **Latency budget fit (spike-2 Stage E):** p50 9,815 ms, p99 14,695 ms over 100 sequential fresh-context calls on Shahbaz's Windows i7-13620H CPU-only. T0.2.3 consolidator budget envelope is "5-30 min for 100-1000 pairs" → p99 14.7s × 100 = 1,470s ≈ 24.5 min (comfortably within envelope at 100 pairs); 14.7s × 1000 = 14,700s ≈ 4 hr (above envelope at the 1000-pair extreme). Acceptable for V0.2 100-pair use case; future-revisit trigger if user runs grow into multi-thousand-pair territory.
+
+5. **No fine-tuning needed.** Off-the-shelf instruction-tuned base produces correct merge decisions under GBNF constraint with a hand-crafted ChatML prompt template (spike-2 Stage D empirically proven). Avoids the maintenance cost of a custom fine-tune (training data curation, eval suite, re-tuning per model swap).
+
+**Alternatives considered and rejected.**
+
+- **Qwen3-4B-Instruct (Alibaba, Apache 2.0 license).** Acceptable alternate; deferred to "swap candidate" status. Larger (4B vs 3.8B params); Apache 2.0 license is roughly Phi-4-mini's MIT-equivalent for our use case. Would re-run spike-2 Stage D against the same 5 cases before any swap. **Revisit trigger:** Microsoft changes Phi-4-mini license terms, OR Qwen3-4B publishes a benchmark demonstrably outperforming Phi-4-mini on consolidator-shape JSON output.
+
+- **Gemma 2/3 (Google).** REJECTED on license. "Gemma Terms of Use" has dual-use safety provisions and a Google-side termination clause; a personal memory vault product shouldn't depend on a model the upstream can revoke licensure of.
+
+- **Llama 3.x (Meta).** REJECTED on license caveat. Community license restricts use at >700 M MAU and has acceptable-use clauses that interact awkwardly with "personal vault" use cases. Re-evaluable if Meta switches to a fully-open license, but the current state makes Phi-4-mini's MIT a cleaner choice.
+
+- **Reasoning models (DeepSeek-R1, o1, o3 family).** REJECTED as wrong tool. Chain-of-thought reasoning models are designed to spend tokens on intermediate reasoning before output — that's ~10× the latency for marginal benefit on a structurally-simple binary merge decision under grammar constraint. Right tool for harder reasoning tasks; wrong tool for this one.
+
+- **Bundle model with installer (BRD §6.2 T0.2.1 line 1426 original spec).** Scope-amended per Shahbaz's Q1 iteration 1 call to "first-launch download." Reasoning: ~3 GB MSI is hostile to typical-broadband installer downloads; ~10× signing/notarisation burden; 3-min one-time download on first launch is better UX overall. ADR-043 owns the download discipline.
+
+- **Hardware acceleration on Metal/CUDA (BRD §6.2 T0.2.1 line 1429 original spec).** Scope-amended per iteration 2 concern #6 to "CPU-only on all platforms for V0.2." Reasoning: spike-2 Stage E confirmed CPU latency fits T0.2.3 budget on Shahbaz's i7-13620H; adding `cfg_attr` complexity for Metal/CUDA detection is a V0.3 optimisation that should be gated on a first M1-Mac beta user's empirical request, not pre-emptive engineering effort.
+
+**Architecture note (observation 4 from iteration 2).** `general.architecture = phi3` in the GGUF metadata is correct, not a packaging bug. Phi-4-mini reuses Phi-3's transformer architectural template with Phi-4's instruction-tuning data + tokeniser. Verified at spike-2 Stage B metadata dump and replayed at Phase 4 dogfood log (`llama_model_loader: - kv   0: general.architecture str = phi3`).
+
+**When to revisit.**
+
+1. Microsoft Phi-4-mini license changes from MIT to anything more restrictive.
+2. Qwen3-4B-Instruct (or successor) publishes a benchmark demonstrably outperforming Phi-4-mini on consolidator-shape JSON merge decisions.
+3. T0.2.3 consolidator empirically discovers that the score gradient is unreliable in production (currently the planned heuristic is `score > 0.7 merge`; if false-positive or false-negative rates exceed a threshold T0.2.3 will set during its own acceptance run, re-evaluation fires).
+4. User cohort grows to where multi-thousand-pair consolidator runs become typical and CPU-only latency starts pinching (~4 hr at 1000 pairs × p99 14.7s = unacceptable for repeat consolidation cadences). Then either (a) batch-API integration, (b) Metal/CUDA wiring per the deferred BRD §6.2 T0.2.1 line 1429 work, or (c) model swap to a faster smaller competitor.
+5. A first M1-Mac beta user reports the Phi-4-mini load/inference path is unusably slow on Apple Silicon CPU (then Metal autodetect work is no longer hypothetical).
+
+**Cross-references.**
+
+- BRD §6.2 T0.2.1 (`Agent_Build_Specification.txt:1425-1430`) — original task spec; scope amendments noted above.
+- ADR-043 — Model download discipline + integrity + air-gap fallback (below).
+- ADR-044 — `LlmProvider` trait + `Phi4MiniProvider` implementation locks (below).
+- Spike-2 empirical findings — HANDOFF "T0.2.1 Phase 1 spike-2 results + iteration 2 LOCKED" section above.
+- Phase 4 dogfood results — HANDOFF "T0.2.1 Phase 4 + Phase 5 close" section above.
 
 ---
 

@@ -9,3 +9,67 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Workspace-internal: domain types + storage + embeddings.
+vault-core = { path = "../vault-core" }
+vault-storage = { path = "../vault-storage" }
+# Production dep at T0.2.2 (Amendment 1, lean X, 2026-05-13): `Memory` rows
+# loaded from `MetadataStore` have `embedding: None` (vectors live in LanceDB,
+# not SQLite per metadata_store.rs:896). `find_candidate_clusters` re-embeds
+# each memory's content via `EmbeddingProvider::embed` before NN-querying
+# `VectorStore::search`. Determinism: bge-small-en-v1.5 under ONNX Runtime
+# on CPU is deterministic at fp32 — IEEE-754 rounding bounds re-embed vs.
+# stored-embed similarity at sub-1e-6 per coordinate, cosine invariant under
+# such noise. See ADR-045 §c.
+vault-embedding = { path = "../vault-embedding" }
+
+# Async runtime + traits
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+# Error handling per BRD §0.2 / §2.4. anyhow stays out of library code.
+thiserror = { workspace = true }
+
+# Timestamps for the `since: Option<DateTime<Utc>>` forward-compat parameter
+# (T0.2.5 wires actual checkpoint values; T0.2.2 passes None for full-scan).
+chrono = { workspace = true }
+
+# Logging — `#[tracing::instrument]` on the public algorithm entrypoint.
+tracing = { workspace = true }
+
+# Serde for the synthetic-fixture JSON shape (clustering_acceptance_100.json).
+# Production code does NOT serialise; only the fixture-build example + the
+# acceptance integration test parse JSON. Kept in [dependencies] (not
+# [dev-dependencies]) only because `Cluster` derives Serialize/Deserialize
+# for downstream consumers (T0.2.3 may serialise clusters to disk for the
+# consolidation REPORT.md audit trail per BRD §5.6 line 957).
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# T0.2.2 Spike S1 fixture-build (Phi-4-mini-driven paraphrastic-variant
+# generation). vault-llm is dev-only: production T0.2.2 clustering primitive
+# does NOT call into the LLM (BRD §5.6 Phase 1 is geometry, not semantics).
+# T0.2.3 (Phase 2 merge decisions) is when vault-llm becomes a production
+# dep — at that time, vault-consolidator's [dependencies] gains it and
+# Consolidator struct construction lands per ADR-045 §f deferral note.
+vault-llm = { path = "../vault-llm", features = ["test-utils"] }
+
+# Deterministic `MemoryId` construction in unit tests
+# (via `Uuid::from_u128(n)`). Production code goes through vault-core's
+# `MemoryId::new()` (random); tests need stable IDs for assertions on
+# cluster member ordering + union-find component identity.
+uuid = { workspace = true }
+
+# tempfile for in-memory LanceDB + MetadataStore fixtures in the acceptance
+# integration test (T0.2.0 pattern: build StorageBackend against a tempdir).
+tempfile = { workspace = true }
+
+# anyhow allowed in example binaries per BRD §2.4 (library code uses
+# thiserror + VaultConsolidatorError). The fixture-build binary at
+# examples/build_clustering_fixture.rs uses anyhow's `Context` trait for
+# stage-by-stage error reporting (mirror of vault-llm's spike-2 binary).
+anyhow = { workspace = true }
+
+# Logging in tests.
+tracing-test = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -25,7 +25,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row, Transaction};
 use tracing::{debug, instrument, warn};
 use uuid::Uuid;
@@ -49,6 +49,13 @@ pub struct MemoryFilter {
     /// consolidator merge. Set to `true` to include them (used by audit /
     /// debugging tooling, never by retrieval).
     pub include_superseded: bool,
+    /// If set, only return memories with `created_at >= since`. Used by
+    /// T0.2.5 (Checkpoint & Rollback) to drive incremental consolidation
+    /// scope — the consolidator processes only memories added since the
+    /// last checkpoint. T0.2.2 ships with the parameter forward-compat
+    /// but always passes `None` (full-scan); T0.2.5 wires actual values.
+    /// See ADR-045 §f.
+    pub since: Option<DateTime<Utc>>,
 }
 
 /// Async, encrypted SQLite-backed metadata store. Cheap to clone (it holds
@@ -258,11 +265,23 @@ impl MetadataStore {
     /// List memories matching `filter`, capped at `limit` results.
     /// Always emits exactly one `memory.list` audit event regardless of
     /// how many rows match.
-    #[instrument(skip(self), fields(limit = %limit))]
+    ///
+    /// `limit: None` returns ALL matching rows (no SQL `LIMIT` clause).
+    /// Used by `vault-consolidator`'s clustering primitive for
+    /// boundary-scoped enumeration where the algorithm needs every
+    /// memory in scope (BRD §5.6 Phase 1). `limit: Some(N)` caps results
+    /// at `N`. The semantic is locked here — `None` is intentional
+    /// unboundedness, NOT a "page size of zero" footgun.
+    ///
+    /// At V0.2 alpha scale (100-1000 memories per vault) the unbounded
+    /// case is bounded by the vault size itself. V0.3+ revisits if
+    /// vaults grow to 10k+ memories with measurable memory pressure —
+    /// see ADR-045 §f pagination forward-compat call.
+    #[instrument(skip(self), fields(limit = ?limit))]
     pub async fn list_memories(
         &self,
         filter: MemoryFilter,
-        limit: usize,
+        limit: Option<usize>,
     ) -> VaultResult<Vec<Memory>> {
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || {
@@ -712,7 +731,7 @@ pub(crate) fn tx_update_memory(tx: &Transaction<'_>, m: &Memory) -> VaultResult<
 fn tx_list_memories(
     tx: &Transaction<'_>,
     filter: &MemoryFilter,
-    limit: usize,
+    limit: Option<usize>,
 ) -> VaultResult<Vec<Memory>> {
     // Build SQL dynamically — but keep WHERE pieces parameterised. We never
     // splice user data into the query string.
@@ -737,12 +756,20 @@ fn tx_list_memories(
     if !filter.include_superseded {
         sql.push_str(" AND superseded_by IS NULL");
     }
+    // `created_at` is stored as RFC3339 with consistent UTC offset (see
+    // `tx_create_memory`'s `m.created_at.to_rfc3339()` binding). RFC3339
+    // with constant offset is lexicographically sortable, so a TEXT
+    // comparison is correct for the `>=` ordering.
+    if let Some(since) = filter.since {
+        sql.push_str(&format!(" AND created_at >= ?{}", bindings.len() + 1));
+        bindings.push(since.to_rfc3339().into());
+    }
 
-    sql.push_str(&format!(
-        " ORDER BY created_at DESC LIMIT ?{}",
-        bindings.len() + 1
-    ));
-    bindings.push((limit as i64).into());
+    sql.push_str(" ORDER BY created_at DESC");
+    if let Some(n) = limit {
+        sql.push_str(&format!(" LIMIT ?{}", bindings.len() + 1));
+        bindings.push((n as i64).into());
+    }
 
     let mut stmt = tx
         .prepare(&sql)
@@ -1101,7 +1128,7 @@ mod tests {
             store.create_memory(&m).await.unwrap();
         }
         let list = store
-            .list_memories(MemoryFilter::default(), 100)
+            .list_memories(MemoryFilter::default(), Some(100))
             .await
             .unwrap();
         assert_eq!(list.len(), 5);
@@ -1129,7 +1156,7 @@ mod tests {
                     boundary: Some(Boundary::new("personal").unwrap()),
                     ..Default::default()
                 },
-                100,
+                Some(100),
             )
             .await
             .unwrap();
@@ -1161,7 +1188,7 @@ mod tests {
                     memory_type: Some(MemoryType::Episodic),
                     ..Default::default()
                 },
-                100,
+                Some(100),
             )
             .await
             .unwrap();
@@ -1181,7 +1208,7 @@ mod tests {
         store.update_memory(&child).await.unwrap();
 
         let default_list = store
-            .list_memories(MemoryFilter::default(), 100)
+            .list_memories(MemoryFilter::default(), Some(100))
             .await
             .unwrap();
         assert_eq!(default_list.len(), 1);
@@ -1193,7 +1220,7 @@ mod tests {
                     include_superseded: true,
                     ..Default::default()
                 },
-                100,
+                Some(100),
             )
             .await
             .unwrap();
@@ -1208,10 +1235,73 @@ mod tests {
             store.create_memory(&m).await.unwrap();
         }
         let limited = store
-            .list_memories(MemoryFilter::default(), 3)
+            .list_memories(MemoryFilter::default(), Some(3))
             .await
             .unwrap();
         assert_eq!(limited.len(), 3);
+    }
+
+    // ─── T0.2.2 Amendment 2 pins — list_memories Option<usize> + since filter ───
+
+    /// `limit: None` returns ALL matching rows (no SQL `LIMIT` clause).
+    /// Locks the unbounded-enumeration semantic used by
+    /// `vault-consolidator`'s clustering primitive (BRD §5.6 Phase 1).
+    /// Per ADR-045 §f — `None` is intentional unboundedness, not a
+    /// "page size of zero" footgun.
+    #[tokio::test]
+    async fn list_with_limit_none_returns_all_matching_rows() {
+        let (_tmp, store) = make_store().await;
+        for i in 0..25 {
+            let m = sample_memory("work", MemoryType::Semantic, &format!("m-{i}"));
+            store.create_memory(&m).await.unwrap();
+        }
+        let unbounded = store
+            .list_memories(MemoryFilter::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            unbounded.len(),
+            25,
+            "limit: None must return every row, not a default-page sized slice"
+        );
+    }
+
+    /// `MemoryFilter::since` excludes memories with `created_at < since`.
+    /// Forward-compat pin for T0.2.5 (Checkpoint & Rollback) incremental
+    /// consolidation scope. T0.2.2 ships with `since: None` (full-scan);
+    /// T0.2.5 wires actual checkpoint timestamps. The filter shape is
+    /// locked at T0.2.2 even though the production caller passes `None`.
+    #[tokio::test]
+    async fn list_since_filter_excludes_older_memories() {
+        let (_tmp, store) = make_store().await;
+        // Insert one memory, sleep enough to span a millisecond, capture
+        // a cutoff, then insert two more. Filter with `since = cutoff`
+        // should return exactly the two later memories.
+        let early = sample_memory("work", MemoryType::Semantic, "early");
+        store.create_memory(&early).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let cutoff = chrono::Utc::now();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let late_a = sample_memory("work", MemoryType::Semantic, "late-a");
+        let late_b = sample_memory("work", MemoryType::Semantic, "late-b");
+        store.create_memory(&late_a).await.unwrap();
+        store.create_memory(&late_b).await.unwrap();
+
+        let after_cutoff = store
+            .list_memories(
+                MemoryFilter {
+                    since: Some(cutoff),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(after_cutoff.len(), 2);
+        assert!(
+            after_cutoff.iter().all(|m| m.id != early.id),
+            "memories with created_at < since must be excluded"
+        );
     }
 
     #[tokio::test]
