@@ -48,5 +48,12 @@ anyhow = { workspace = true }
 tempfile = { workspace = true }
 tracing-test = { workspace = true }
 
-# [features] test-utils = [] declaration for MockLlmProvider exposure lands
-# in commit 2 alongside the symbol it gates, per iteration 2 item 4 lock.
+[features]
+# `test-utils` exposes `MockLlmProvider` to downstream crates' `[dev-dependencies]`
+# so e.g. vault-consolidator (T0.2.3) test code can do
+#   vault-llm = { path = "../vault-llm", features = ["test-utils"] }
+# and substitute the mock for real `Phi4MiniProvider` in fast unit tests.
+# Mirrors vault-storage's `test_helpers` pattern from T0.2.0 sub-task (a).
+# Per iteration 2 design detail (b): the feature declaration lands alongside
+# the symbol it gates (this commit) — NOT at crate-birth in commit 1.
+test-utils = []

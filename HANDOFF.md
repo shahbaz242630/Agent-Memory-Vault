@@ -1,7 +1,7 @@
 # Memory Vault — Build Handoff
 
 **Current version:** V0.2 Closed Beta (BRD §6.2 — sleep consolidator, boundaries hardening, cross-device sync, 30 beta users)
-**Last updated:** 2026-05-13 session open — **T0.2.0 CLOSED. ADR-010 HARD GATE CLEARED.** Phase 4 Stage 5 came back clean from Shahbaz (real-data dogfood across ~1 day of use — no crashes, no data loss, no surprises). Phase 5 hard-gate-clearance paperwork applied to working tree this session: HANDOFF status-table flips + new "ADR-010 hard-gate-cleared note" section below quoting ADR-010 verbatim against the five ticked acceptance criteria + Agent_Build_Specification.txt §6.2 T0.2.0 line 1417 acceptance-closure stamp. **No paperwork-only commit per `feedback_admin_changes_ride_with_code.md`** — admin diff rides with T0.2.1's first code commit. **Active task flips to T0.2.1 (vault-llm: Phi-4-mini local LLM integration)**; plan iteration 1 drafted inline this session, pending review-and-lock before any code lands per `feedback_plan_iterations_inline_not_handoff.md`. **Cumulative T0.2.0 arc:** 3 weeks across Phase 0a→0e foundation (lancedb 0.8→0.27.2 upgrade per ADR-037, ADR-038 memory regression fix, ADR-039 hard-delete privacy fix, sealing primitive runtime-confirmed in spike v2, production-wired Phase 0d, ADR-008 amendment + Phase 0e ADRs) + Phase 1 (keychain wiring per ADR-040) + Phase 2 (ADR-041 V0.1 VAULT_KEY → V0.2 keychain SQLCipher passphrase bridge) + Phase 3 sub-tasks (a)-(f) (vault-cli sealed migration / plaintext cfg-gate / unit-test surface migration / V0.1 cleanup "no baggage" sweep / BRD §6 acceptance suite + γ unseal-site) + Phase 4 Stages 1-5 dogfood + Phase 5 paperwork close. Net test-count reconciliation: cumulative -17 on the Phase 3 arc, entirely driven by sub-task (e)'s scope-expansion-call to wholesale-delete V0.1 migration code per Shahbaz's "no baggage" call.
+**Last updated:** 2026-05-13 session-pause — **T0.2.1 Phase 1 SHIPPED at commit `85361ee` (push `b6d72bc..85361ee`).** CI run `25755423929` for that push was still **in_progress** when Shahbaz needed to leave (~22 min elapsed; new C++ build surface from llama-cpp-sys-2 expected to make first matrix run ~30-40 min). **Commit 2 production scope is WRITTEN locally + ALL tests pass (17 lib + 1 fixture-smoke + 3 ignored real-model smoke) but NOT staged/committed yet** — per item 5 / clarification 5 lock, commit 2 staging is gated on commit 1 CI green matrix-wide. **Next-session opener block below has the exact verification commands + decision tree + commit 2 message draft.** Iteration 2 LOCKED inline in chat this session post-spike-2 (Stages A-E all PASS with empirical findings table captured to HANDOFF). ADR-043 + ADR-044 drafted in this file below as part of the commit 2 working-tree bundle. **Cumulative T0.2.0 arc (CLOSED 2026-05-13 earlier this session):** 3 weeks across Phase 0a→0e foundation + Phase 1-5; ADR-010 HARD GATE CLEARED.
 
 **Session close-a (2026-05-12, historical milestone record — Phase 3 + Phase 4 Stages 1-4):** T0.2.0 Phase 3 SHIPPED + Phase 4 Stages 1-4 PASSED in real-world dogfood. CI-fix commit `b6d72bc` (push `ef88361..b6d72bc`) ALL-GREEN matrix-wide on CI run `25736962490` — Windows job passed cleanly with `CARGO_BUILD_JOBS=2` cap. **Phase 3 formally CLOSED.** Phase 4 founder dogfood executed on Shahbaz's Windows dev box: pre-flight cleanup (V0.1 MSI uninstalled via `MsiExec.exe /X{4CF99BC2-2134-424E-ABF9-B64A80DA5EAB}` + old debug binary deleted + data dir wiped + 3 keychain entries deleted including production `default.com.memoryvault.v0.2`) → fresh `target/release/vault-tauri.exe` launch → **Stage 1 PASS** (no "Alpha" title, no ALPHA modal, no orange strip, clean Add Memory view) → **Stage 2 PASS** (add/search/delete smoke flows work) → **Stage 3 PASS — the real T0.2.0 hard-gate proof** (memories survive close+reopen cycle on real user data, sealed write+read round-trip verified) → **Stage 4 PASS** (Notepad on `<data>/lance/memories.lance/data/*.lance` shows random CJK-misinterpreted ciphertext, NO plaintext memory content). Working-tree HANDOFF.md state at session close: rides with next code commit (Phase 5 close or T0.2.1 first commit) per `feedback_admin_changes_ride_with_code.md`.
 
@@ -21,7 +21,7 @@
 
 ## Current Status
 
-**Active task:** **T0.2.1 — vault-llm: Phi-4-mini local LLM integration.** T0.2.0 CLOSED 2026-05-13: Phase 4 Stage 5 clean from Shahbaz (~1 day real-data dogfood, no findings); Phase 5 paperwork-only updates (HANDOFF flips + BRD §6 T0.2.0 acceptance-closure stamp + ADR-010 hard-gate-cleared note below) applied to working tree this session and held for T0.2.1 first code commit per `feedback_admin_changes_ride_with_code.md`. T0.2.1 plan iteration 1 drafted inline in this session's chat for review-and-lock per `feedback_plan_iterations_inline_not_handoff.md`; once locked, plan + first code commit ship together with this admin diff. Phase 3 + Phase 4 + Phase 5 + T0.2.1 status (T0.2.0 progression closed; T0.2.1 in plan-iteration):
+**Active task:** **T0.2.1 — vault-llm: Phi-4-mini local LLM integration. Commit 2 (Phase 3 production code) written locally + tested green, awaiting commit 1 CI green confirmation before staging.** Commit 1 (`85361ee`, scaffold + spike-2 + iteration 2 lock + admin) shipped this session; CI run `25755423929` was still `in_progress` at session-pause time. Commit 2 working-tree state: 4 modified files (ci.yml cron+real-model-smoke job, HANDOFF.md ADR-043+044 drafts, vault-llm/Cargo.toml test-utils feature, vault-llm/src/lib.rs module declarations) + 5 new files (error.rs, model_loader.rs, phi4_mini.rs, provider.rs, tests/phi4_mini_smoke.rs). Local cargo test on vault-llm: 17 lib + 1 fixture-smoke active passing + 3 real-model integration tests properly skipped via #[ignore]. **Next-session opener with exact commands + decision tree is the section immediately below** (per `feedback_quote_locked_artefacts_dont_paraphrase.md` — durable record, not paraphrased from memory). Phase progression:
 
 | Sub-task / Phase | Status | Commit |
 |---|---|---|
@@ -40,7 +40,8 @@
 | Phase 4 Stage 6 (failure-mode spot checks, optional) | Skipped — Shahbaz's call (Stage 5 clean) | — |
 | Phase 5 — T0.2.0 formal hard-gate clearance | ✅ CLOSED (paperwork-only, working tree, rides with T0.2.1 first commit) | — |
 | **T0.2.0 — CLOSED** ✅ | — | — |
-| T0.2.1 — Phi-4-mini local LLM (active task) | 🟡 iteration 2 LOCKED post-spike-2; commit 1 in staging | spike-2 ALL STAGES PASS this session |
+| T0.2.1 commit 1 (scaffold + spike-2 + iteration 2 lock + admin) | ✅ SHIPPED | `85361ee` (CI run `25755423929` in_progress at session pause) |
+| T0.2.1 commit 2 (LlmProvider trait + Phi4MiniProvider + downloader + ADR-043 + ADR-044 + cron) | 🟡 written locally + tests green; awaiting commit 1 CI green to stage | working tree (see Next-session opener) |
 
 **Sub-task (d) historical record (shipped at `2cc8c65` earlier this session):**
 
@@ -203,6 +204,158 @@ Sub-task (d) details preserved for audit-trail purposes. **Many of the reference
 
 ---
 
+## T0.2.1 commit 2 — next-session opener (drafted 2026-05-13 session-pause)
+
+**Read this first when reopening.** Captures the exact state at session-pause + the deterministic path forward. Verbatim because chat thread iterations are transient; this is the durable handoff.
+
+### State at session-pause
+
+- **Commit 1** (`85361ee`): SHIPPED. Push `b6d72bc..85361ee main -> main`. Contains scaffold + spike-2 binary + canned-prompts fixture + fixture-smoke test + workspace dep updates (llama-cpp-2, reqwest stream feature) + CI matrix LLVM/libclang setup + HANDOFF 3-block admin (T0.2.0 Phase 5 closure paperwork + T0.2.1 iteration 2 lock + spike-2 results record) + BRD §6 T0.2.0 acceptance closure stamp.
+- **Commit 1 CI** (run `25755423929`): was `in_progress` at session-pause time, ~22 min elapsed. First matrix run with the brand-new llama-cpp-sys-2 C++ build surface; expect 30-40 min total. Verify via `gh run list --workflow=ci.yml -L 1`.
+- **Commit 2 working tree**: production code WRITTEN + LOCAL TESTS PASS. Not yet staged/committed.
+  - Modified (4): `.github/workflows/ci.yml`, `HANDOFF.md`, `crates/vault-llm/Cargo.toml`, `crates/vault-llm/src/lib.rs`
+  - New (5): `crates/vault-llm/src/error.rs`, `crates/vault-llm/src/model_loader.rs`, `crates/vault-llm/src/phi4_mini.rs`, `crates/vault-llm/src/provider.rs`, `crates/vault-llm/tests/phi4_mini_smoke.rs`
+- **Local cargo test** (run at session-pause): 17 lib unit tests pass (4 error + 7 provider + 3 model_loader + 3 phi4_mini) + 1 fixture_smoke integration test passes + 3 `#[ignore]` real-model integration tests properly skipped. Full DoD gate chain NOT yet run.
+- **Per-action-approval state**: commit 1 approved (`yes commit and push` covered both per `feedback_confirm_before_commit_push.md`). Commit 2 commit + push NOT yet approved.
+
+### Environment notes (must set every fresh shell on Windows)
+
+- `LIBCLANG_PATH = C:\Users\shahb\scoop\apps\llvm\current\bin` (LLVM 22.1.5 installed via scoop this session for llama-cpp-sys-2's bindgen step — see iteration 2 observation 3 / ADR-044 build-prereq matrix). Persisting via:
+  ```powershell
+  $env:LIBCLANG_PATH = "$env:USERPROFILE\scoop\apps\llvm\current\bin"
+  $env:PATH = "$env:LIBCLANG_PATH;$env:PATH"
+  ```
+
+### Sequencing (deterministic — no decision branches unless explicitly noted)
+
+**Step 1 — verify commit 1 CI green matrix-wide (gate per item 5 / clarification 5):**
+
+```bash
+gh run list --workflow=ci.yml -L 1 --json status,conclusion,headSha
+```
+
+Decision tree:
+- `status=completed`, `conclusion=success`, `headSha=85361ee4...` → proceed to Step 2.
+- `status=completed`, `conclusion=failure` → fix-forward per `feedback_broken_ci_is_regression_not_techdebt.md`. Read the failure via `gh run view <run-id> --log-failed`; diagnose per OS (Linux libclang-dev / Windows choco LLVM path / macOS brew prefix); patch + commit + push as commit `85361ee + fix-forward`. After CI greens, proceed to Step 2.
+- `status=in_progress` → wait. Standard poll cadence: `gh run list -L 1` every 5-10 min. Per `feedback_gh_run_watch_exit_not_equal_run_status.md`, NEVER use `gh run watch` (its exit code != run status).
+
+**Step 2 — local DoD gate chain for commit 2 (serial per `feedback_no_parallel_cargo_invocations.md`):**
+
+```powershell
+$env:LIBCLANG_PATH = "$env:USERPROFILE\scoop\apps\llvm\current\bin"; $env:PATH = "$env:LIBCLANG_PATH;$env:PATH"
+cargo check --workspace --all-targets      # gate 1 (~30s incremental from commit 1 cache; full ~10 min if cache cleaned)
+cargo test -p vault-llm                     # gate 2 (~30s; 17 lib + 1 fixture + 3 ignored)
+cargo clippy --workspace --all-targets -- -D warnings  # gate 3 (~3-5 min incremental)
+cargo fmt --all --check                     # gate 4 (FINAL — per `feedback_fmt_runs_last_before_commit.md`)
+git status --short                          # post-fmt drift check per `feedback_git_status_check_between_fmt_and_add.md`
+```
+
+If gate 4 fails on formatting → `cargo fmt --all` to apply + re-run gate 4 + git status. The fmt-applied edits ride with commit 2.
+
+**Step 3 — stage commit 2:**
+
+```bash
+git add .github/workflows/ci.yml HANDOFF.md crates/vault-llm/Cargo.toml crates/vault-llm/src/lib.rs crates/vault-llm/src/error.rs crates/vault-llm/src/model_loader.rs crates/vault-llm/src/phi4_mini.rs crates/vault-llm/src/provider.rs crates/vault-llm/tests/phi4_mini_smoke.rs
+git status --short  # verify staging shape; 4 M + 5 A; no untracked
+```
+
+**Step 4 — commit 2 message (draft below; copy verbatim into HEREDOC):**
+
+```
+T0.2.1 Phase 3: LlmProvider trait + Phi4MiniProvider + model downloader + ADRs
+
+Production code consuming the iteration 2 contract surface locked in commit
+1's HANDOFF. Trait + concrete provider + model downloader + air-gap fallback
++ ADR-043/044 drafts + CI cron schedule for real-model smoke tests.
+
+Trait surface (locked, ADR-044):
+- LlmProvider: complete_json(prompt, schema, params) -> VaultLlmResult<String>
+                + model_id() -> &str. async-trait, Send+Sync+Debug.
+- CompletionParams: max_tokens, temperature, top_p, seed: Option<u32>.
+                    V0.2 ignores temp/top_p/seed (greedy under grammar); WARN
+                    log emitted on non-default values. Non-greedy V0.3+.
+- MockLlmProvider: feature-gated #[cfg(any(test, feature = "test-utils"))];
+                   downstream T0.2.3 consolidator tests opt-in via
+                   [dev-dependencies] vault-llm = { ..., features = ["test-utils"] }.
+
+Phi4MiniProvider (ADR-044):
+- LlamaBackend singleton via OnceLock<Arc<...>> — once-per-process per
+  llama-cpp-2's documented contract.
+- Single-context-no-pool per concern #5 lock (spike-2 proved fresh-per-call
+  latency fits T0.2.3 budget on 16 GB-RAM dev box).
+- Inference wrapped in tokio::task::spawn_blocking — CPU-bound work doesn't
+  pin runtime worker.
+- token_to_piece_bytes(token, 64, false, None) — 64-byte buffer per
+  surprise #2 lock (8-byte default tripped at spike-2 Stage D).
+- LlamaSampler::chain_simple([grammar, greedy]) sampler chain for V0.2.
+- Hand-crafted ChatML prompt template (spike-2 Stage D empirically proven).
+- Manual Debug redaction on model + backend handles (ADR-007 pattern).
+
+Model downloader (ADR-043) at crates/vault-llm/src/model_loader.rs:
+- ensure_model_at_path: cache-hit OR air-gap (same code path) OR download.
+- Cache-hit / air-gap: SHA-256 re-verify, INFO log, return Ok without HTTP.
+- Stale-cache: hash mismatch -> delete + fall through to download (WARN log).
+- Streaming-abort heuristic: Content-Length wildly off expected -> abort
+  early (saves 2.49 GB bandwidth on wrong-file / redirect-HTML responses).
+- Restart-not-resume on partial files (concern #3).
+- Atomic finalize: write .partial, verify SHA-256, rename on pass; delete
+  on hash mismatch (returns IntegrityCheckFailed).
+- Disk-full fail-closed via std::io::Error propagation.
+
+VaultLlmError -> VaultError From impl:
+- 4 inference categories collapse into VaultError::Llm(String).
+- IntegrityCheckFailed maps to VaultError::ModelIntegrityFailed structured
+  variant (Tauri can pattern-match for SHA-mismatch-specific dialog).
+
+CI (concern #1 + ADR-044 §7):
+- New schedule: '0 12 * * MON' weekly cron trigger.
+- New real-model-smoke job (windows-latest, gated on schedule OR
+  run-llm-smoke PR label). Runs cargo test -- --ignored --nocapture
+  against the real Phi-4-mini GGUF.
+- Existing fmt/clippy/build-test jobs gated `if: github.event_name != 'schedule'`
+  to avoid duplicate weekly runs.
+
+Local DoD gates all green:
+- cargo check --workspace --all-targets
+- cargo test -p vault-llm (17 lib + 1 fixture + 3 ignored)
+- cargo clippy --workspace --all-targets -- -D warnings
+- cargo fmt --all --check
+
+Test count floor pre-declaration (iteration 2 §10): +10 firm in commit 2.
+Actual: +13 active (4 error + 7 provider + 3 model_loader + 3 phi4_mini -
+3 of the 7 provider tests are sync-helper bonus over the 4 floor mock
+conformance) + 3 #[ignore]'d real-model smoke. +3 bonus over floor for
+error-surface defensive pinning; surfaced per
+feedback_test_forecast_is_floor_not_ceiling_for_adr_locked_work.
+
+HANDOFF.md (rides with code per feedback_admin_changes_ride_with_code):
+- ADR-043 — Model download + integrity + air-gap (full text drafted)
+- ADR-044 — LlmProvider trait + Phi4MiniProvider impl locks (full text drafted)
+- Next-session opener block (this session's pause-point capture)
+- Status table updates (commit 1 SHIPPED, commit 2 staged)
+
+Cross-references:
+- BRD §6.2 T0.2.1 (Agent_Build_Specification.txt:1425-1430)
+- Iteration 1 + 2 + spike-2 in commit 1's HANDOFF block
+- ADR-043 + ADR-044 in this commit's HANDOFF additions
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+```
+
+**Step 5 — ask Shahbaz for commit + push approval.** Per `feedback_confirm_before_commit_push.md`, single approval covers both. Show the staged file list + commit message body + ask. On "yes" → execute `git commit -m "$(cat <<'EOF' ... EOF)"` then `git push origin main`.
+
+**Step 6 — verify commit 2 CI green** (same shape as Step 1 for commit 2's run). When CI greens matrix-wide → T0.2.1 Phase 3 is SHIPPED. Move to Phase 4 (founder dogfood: real merge-decision via T0.2.1 surface on Shahbaz's Windows box) + Phase 5 (formal close + ADR-042 with spike-2 evidence + HANDOFF/BRD acceptance flips).
+
+### Open items / discipline pointers for next session
+
+- **Phase 4 dogfood — manual one-off, no separate commit.** Run the `#[ignore]` real-model smoke tests on Shahbaz's box: `cargo test -p vault-llm -- --ignored --nocapture`. Output goes in HANDOFF as part of Phase 5 close commit. If real-model output diverges from the canned-prompt fixture (semantic, not exact text), surface as Phase 4 finding.
+- **ADR-042 — drafted at Phase 5** with then-current evidence per Shahbaz's iteration 2 attribution-call. Should include: spike-2 5/5 correctness + score gradient empirical record + alternative-candidate rejection record (Qwen3-4B as alternate, Gemma rejected, Llama caveated, reasoning models rejected) + revisit triggers (concrete: Microsoft Phi-4 license change OR Qwen3-4B publishes benchmark demonstrably outperforming on consolidator-shape JSON).
+- **Cron will fire next Monday 12:00 UTC** for the first weekly real-model-smoke run if commit 2 lands before then. First scheduled fire is the canonical proof that the cron-vs-PR gate works.
+- **Cargo.lock drift** likely on commit 2's first `cargo check` due to feature-flag activation. Per `feedback_git_status_check_between_fmt_and_add.md`, the post-fmt `git status --short` step catches this; include any Cargo.lock drift in commit 2's staging.
+- **Tasks 9 + 10 in the session task list** are the in-progress + pending entries that map to commit 2's "write code" + "stage/commit/push/CI" steps respectively. Update as you progress.
+
+---
+
 ## ADR-010 hard-gate-cleared note (2026-05-13, T0.2.0 Phase 5 close)
 
 **Quoting ADR-010 verbatim** (HANDOFF_V0.1_ARCHIVE.md:756) per `feedback_quote_locked_artefacts_dont_paraphrase.md`:
@@ -298,6 +451,153 @@ Locked plan iterations 1 + 2 + their amendment/clarification ledgers live inline
 - BRD §6.2 T0.2.1 (`Agent_Build_Specification.txt:1425-1430`)
 - ADR-010 (HANDOFF_V0.1_ARCHIVE.md:737, hard-gate cleared at T0.2.0 Phase 5)
 - Saved memories applied this session: `feedback_plan_iterations_inline_not_handoff.md`, `feedback_plan_iteration_depth_scales_with_design_surface.md`, `feedback_floor_forecast_is_pre_declaration_not_estimate.md`, `feedback_runtime_confirmation_after_web_spike.md`, `feedback_spike_methodology_explicit.md`, `feedback_quote_locked_artefacts_dont_paraphrase.md`, `feedback_flag_reviewer_attribution_mismatch.md`, `feedback_broken_ci_is_regression_not_techdebt.md`, `feedback_cargo_on_windows_use_powershell.md`, `feedback_admin_changes_ride_with_code.md`, `feedback_git_status_check_between_fmt_and_add.md`, `feedback_no_parallel_cargo_invocations.md`, `feedback_standing_auth_dep_installs.md`, `feedback_surgical_cargo_clean_first.md` (informed by, not triggered)
+
+---
+
+## ADR-043 — Model download + integrity verification + air-gap fallback (T0.2.1 Phase 3, drafted 2026-05-13)
+
+**Status:** DRAFT at T0.2.1 Phase 3 (commit 2, 2026-05-13). Finalized at T0.2.1 Phase 5 with then-current evidence.
+
+**Context.** T0.2.1 introduces Phi-4-mini-instruct Q4_K_M GGUF (~2.49 GB, MIT licensed) as the V0.2 local LLM. Per Shahbaz's Q1 lock during iteration 1, the delivery mode is **first-launch download** (installer stays light at ~120 MB; app downloads model on first run, verifies SHA-256, caches at the production app-data path). The download flow needs an integrity gate, a mirror URL pin, an error-handling contract, and an air-gap fallback for users who want to manually pre-place the file. This ADR locks all five.
+
+**Decision.**
+
+1. **Mirror lock: `unsloth/Phi-4-mini-instruct-GGUF`** (over Microsoft's official repo or `bartowski/microsoft_Phi-4-mini-instruct-GGUF`). Reasoning:
+   - Microsoft's official `microsoft/Phi-4-mini-instruct-GGUF` repo is HuggingFace-gated — returns HTTP 401 without an HF auth token + accepted-license click-through. Surfaced empirically at T0.2.1 spike-2 Stage A this session. **Disqualified as production auto-download source** for an installer that targets non-technical users.
+   - `unsloth` and `bartowski` are both MIT-license-preserving non-gated community redistributions. Verified 2026-05-13: both return HTTP 302 to public `xethub.hf.co` URLs without auth.
+   - **unsloth wins** on (i) organizational stability vs. single-maintainer (bartowski is solo maintainer; unsloth is a company with sustained release cadence), and (ii) spike-2 already cached + verified the file under the unsloth filename convention (saves a 3-min re-download for any contributor reproducing the spike).
+   - Trade-off acknowledged: community quantizers are higher-mutability than Microsoft's enterprise releases would have been. This makes the revision-pin (#3 below) more load-bearing not less.
+
+2. **Pinned SHA-256: `88c00229914083cd112853aab84ed51b87bdf6b9ce42f532d8c85c7c63b1730a`.** Captured at T0.2.1 spike-2 Stage A from a fresh download of `unsloth/Phi-4-mini-instruct-GGUF/resolve/main/Phi-4-mini-instruct-Q4_K_M.gguf` on 2026-05-13. Size: exactly 2,491,874,272 bytes (~2.49 GB).
+
+3. **Revision-pin discipline** (per iteration 2 §3 concern #7): the `/resolve/main/` URL points at a floating branch — unsloth could republish with re-quantized bytes at any time, breaking the SHA-256 match. **Production code MUST pin to a specific HF commit hash via `?revision=<commit>` URL parameter.** Captured at first commit-2 staging time via `gh api /repos/unsloth/Phi-4-mini-instruct-GGUF/commits/main` (cheap one-liner). Mirrors the workspace's `Cargo.toml` `=x.y.z` exact-version pinning discipline per BRD §0.2.
+
+4. **Compensating-control contract surface** (locked invariants — `crates/vault-llm/src/model_loader.rs::ensure_model_at_path` is the authoritative impl):
+   - **Cache hit / air-gap**: if file exists at expected path AND SHA-256 matches → return `Ok` immediately, INFO log naming the file. No HTTP call. **Air-gap fallback IS this branch** — there is no distinction in runtime behavior between (a) user manually placed the file before first launch and (b) prior cached download. Operational doc at `crates/vault-llm/docs/air_gap_install.md` (lands when first user needs it) names the user-facing workflow.
+   - **Stale cache**: if file exists but SHA-256 mismatches → delete the file (WARN log with expected + actual hashes) and fall through to fresh download.
+   - **Streaming-abort heuristic** (concern #2): if HTTP `Content-Length` is wildly off the pinned `expected_bytes` (`< expected_bytes / 2` or `> expected_bytes * 2`), abort with `VaultLlmError::DownloadFailed`. Catches HF serving redirect HTML or wrong-quantization-variant payloads early without burning 2.49 GB of bandwidth.
+   - **`.partial` strategy: restart-not-resume** (concern #3): any pre-existing `.partial` from a prior crashed run is clobbered by `tokio::fs::File::create`. No HTTP Range header use. SHA-256 verifies integrity post-stream; resume-from-offset would require partial-hash-state-restore which doesn't pay back for a 2.49 GB file that re-downloads in ~3 min.
+   - **Atomic finalize**: write to `<filename>.partial`, verify SHA-256 post-stream, only `tokio::fs::rename` to final path on hash pass. Failed hash → delete `.partial`, return `VaultLlmError::IntegrityCheckFailed { file, expected, actual }`.
+   - **Disk-full fail-closed**: any I/O error during write propagates as `VaultLlmError::Io`. Vault-tauri / vault-app can surface via fatal Tauri dialog ("Insufficient disk space — need ~3 GB free at `<path>`").
+
+5. **`MODEL_BYTES_EXPECTED` is a streaming-abort heuristic, NOT a post-download gate** (per iteration 2 §3 concern #2). SHA-256 is the cryptographically-sound integrity check; a separate post-download byte-count comparison adds zero security value (computationally infeasible to produce a file with the right SHA-256 AND a matching wrong byte count). The bytes-expected role is bandwidth-saving early-rejection only.
+
+**Alternatives considered.**
+- **Bundle the model in the installer.** Rejected at iteration 1 Q1: ~3 GB MSI is hostile to typical-broadband installers + slow CI artefact uploads + ~10× signing/notarization burden. The 3-min one-time download is better UX overall.
+- **Microsoft official `microsoft/Phi-4-mini-instruct-GGUF`.** Rejected at spike-2 Stage A: HF-gated, requires user account + license click-through, breaks the auto-download flow.
+- **bartowski `bartowski/microsoft_Phi-4-mini-instruct-GGUF`.** Acceptable equivalent to unsloth; chose unsloth on organizational-stability tie-breaker. Locked as the fallback-swap candidate if unsloth ever has issues.
+- **Resume-from-offset for downloads.** Rejected: complexity-vs-benefit doesn't pay for 2.49 GB at typical broadband speeds; restart-from-byte-0 is simpler + correct.
+
+**Test requirements** (`crates/vault-llm/src/model_loader.rs` unit tests — 3 firm tests in commit 2):
+- `sha256_of_known_content_matches_canonical_hash` — SHA-256 of "hello world" matches the canonical value.
+- `ensure_returns_ok_immediately_on_cache_hit_with_matching_hash` — unreachable URL + matching cache → cache-hit short-circuits before HTTP.
+- `ensure_with_mismatched_cached_hash_deletes_file_then_attempts_redownload` — bad hash + unreachable URL → file deleted before failed redownload (atomic-cleanup proof).
+
+**When to revisit.**
+- unsloth's repo SHA changes (re-quantization, bug fix, or maintainer change) → revision-pin update.
+- Model swap (Qwen3-4B-Instruct or future alternative) → new ADR or amendment.
+- Cross-platform model_dir resolution (currently caller-provided; could move to a `directories`-crate helper).
+
+**Cross-references.**
+- `crates/vault-llm/src/model_loader.rs` (impl)
+- `crates/vault-llm/src/phi4_mini.rs::Phi4MiniConfig::v0_2_default` (constant binding)
+- T0.2.1 iteration 2 lock — `feedback_plan_iterations_inline_not_handoff.md` (this session's chat thread)
+- Spike-2 Stage A evidence — in this HANDOFF section above
+
+---
+
+## ADR-044 — `LlmProvider` trait + `Phi4MiniProvider` implementation locks (T0.2.1 Phase 3, drafted 2026-05-13)
+
+**Status:** DRAFT at T0.2.1 Phase 3 (commit 2, 2026-05-13). Finalized at T0.2.1 Phase 5 with then-current evidence.
+
+**Context.** T0.2.1 establishes the local-LLM consume-site contract that T0.2.3 consolidator (and any future structured-JSON consumer) will hold. The trait shape needs to be (a) minimal enough that a Phi-4-mini → Qwen3-4B swap is a config-flag change, (b) async-clean for tokio runtime callers, (c) error-surface-shaped so caller-side failure handling is unambiguous, and (d) free of model-specific assumptions in the trait surface itself.
+
+**Decision.**
+
+1. **Trait surface** (locked from iteration 2 §8, vindicated by spike-2's clean integration with this shape):
+
+```rust
+#[async_trait]
+pub trait LlmProvider: Send + Sync + std::fmt::Debug {
+    async fn complete_json(
+        &self,
+        prompt: &str,
+        json_schema: &str,
+        params: &CompletionParams,
+    ) -> VaultLlmResult<String>;
+    fn model_id(&self) -> &str;
+}
+
+pub struct CompletionParams {
+    pub max_tokens: u32,
+    pub temperature: f32,
+    pub top_p: f32,
+    pub seed: Option<u32>,
+}
+```
+
+   - `async` because inference is CPU-bound (~9.8s p50 on Shahbaz's i7-13620H per spike-2 Stage E) — implementations wrap in `tokio::task::spawn_blocking` internally so the trait stays async-clean.
+   - Raw `String` return (NOT typed deserialize): consolidator owns the schema definition + deserialization; vault-llm doesn't need to know caller types.
+   - `model_id()` is the only model-introspection method on the trait surface — no Phi-specific tokens, no Qwen-specific config. Swap-clean.
+   - `Debug` requirement on the trait + manual redaction in concrete impls per the precedent in `vault-storage::sealed_object_store::SealedFileStoreProvider` (ADR-007 pattern).
+
+2. **Caller-side parse-failure contract** (iteration 2 §3 concern #4): `complete_json` returns raw `String`; the caller deserializes via `serde_json::from_str` and treats parse-failure as a **hard error**, not a retry case. Reasoning: GBNF grammar (#3 below) gives structural JSON validity at sample time; a parse failure means either (i) a llama.cpp#18173-class bug (would fire at sampler construction time, NOT here) or (ii) a real bug worth surfacing rather than silently retrying. T0.2.3 consolidator's call site logs the parse-failure prompt + output and propagates as `VaultError::Consolidation`.
+
+3. **Structured output via GBNF grammar.** `complete_json` accepts a JSON-Schema string; the concrete provider converts to GBNF via `llama_cpp_2::json_schema_to_grammar` and passes through `LlamaSampler::grammar(model, gbnf, "root")`. Spike-2 Stage C empirically confirmed this works on the T0.2.3 merge-decision schema without triggering [llama.cpp#18173](https://github.com/ggml-org/llama.cpp/issues/18173) ("Unexpected empty grammar stack after accepting piece").
+
+4. **`Phi4MiniProvider` implementation locks** (`crates/vault-llm/src/phi4_mini.rs`):
+   - **Single-context-no-pool** (concern #5): fresh `LlamaContext` per `complete_json` call, dropped at end. Spike-2 Stage E proved 100 sequential fresh-context calls fit T0.2.3 budget (p50 9.8s, p99 14.7s). Pool optimization deferred to V0.3 if profiling justifies. 16 GB-RAM laptops tolerate 1 resident context safely; 2-4 would risk OOM under concurrent Tauri UI + browsers.
+   - **CPU-only V0.2** (concern #6): no `cfg_attr` for Metal/CUDA acceleration in commit 2. Shahbaz's dev box has integrated Intel UHD only; Mac Metal autodetect deferred until first M1/M2 beta user.
+   - **`token_to_piece_bytes(token, 64, false, None)`** (surprise #2): 8-byte default of the deprecated `token_to_bytes` produced `Insufficient Buffer Space -10` on Phi-4-mini multi-byte tokens at spike-2 Stage D first attempt. 64 bytes is safely above the longest reasonable single-token UTF-8 sequence for this tokenizer family.
+   - **Greedy sampling under grammar constraint** for V0.2: `LlamaSampler::chain_simple([grammar, greedy])`. Deterministic argmax, no RNG, no seed needed. T0.2.3 uses temperature=0.0 + top_p=1.0 defaults, so greedy is correct in practice. Non-zero temperature / top_p / seed parameters log a WARN and are ignored in V0.2. Non-greedy support (with `LlamaSampler::temp` + `LlamaSampler::top_p` + `LlamaSampler::dist(seed)` in the chain) deferred to V0.3 if a consumer needs it.
+   - **Hand-crafted ChatML prompt template** for Phi-4-mini-instruct (spike-2 Stage D empirically proven). Production-V0.3+ could refactor to `model.chat_template(None)` + `apply_chat_template_oaicompat` for robustness across model swaps; V0.2 hand-crafted form is simpler + works.
+   - **`LlamaBackend` singleton** via `std::sync::OnceLock` — `LlamaBackend::init` documented as "should be called once per process"; multiple `Phi4MiniProvider::new` calls share a single backend instance.
+   - **Debug redaction** on `Phi4MiniProvider`: `model_id` only, `model` + `backend` handles intentionally omitted via `finish_non_exhaustive` (the raw C pointers fingerprintable / ASLR-defeating signal if logged).
+
+5. **Score gradient is empirical, NOT contract** (observation 1(b)): spike-2 Stage D observed score gradient 1.0 / 1.0 / 0.85 / 0.0 / 0.0 on the canned merge-decision pairs (preserved as fixture asset at `crates/vault-llm/tests/fixtures/canned_merge_decisions.json`). **T0.2.3 consolidator MUST treat the score as a confidence signal** (`if score > 0.7 merge`), NOT a deterministic threshold-comparator (`if score == 1.0`). Score behavior may shift under model swap, quantization changes, or prompt template revisions. The load-bearing assertion across model swaps is `merge` (boolean); the score value is documentation.
+
+6. **Latency is dev-box-or-dedicated-runner-only, NOT CI-gated** (observation 5): spike-2 Stage E p50 9.8s / p99 14.7s was measured on Shahbaz's specific i7-13620H CPU-only laptop. CI-runner latency under shared-tier contention may be 1.5-3× slower. Principle: **`#[ignore]` real-model integration tests assert *correctness*, NOT latency.** Latency benchmarks are dev-box-or-dedicated-runner only and never gate CI pass/fail.
+
+7. **CI policy for `#[ignore]` real-model tests** (concern #1, locked in commit 2's `ci.yml`):
+   - Weekly cron `0 12 * * MON` triggers `real-model-smoke` job, OR
+   - PR label `run-llm-smoke` triggers it on demand for a specific PR.
+   - NOT every-PR (50+ min CI runtime × 3 OS × 2.49 GB download bandwidth would be punishing).
+   - Single-OS (Windows) for V0.2; expand matrix when first M1/M2 beta user joins.
+
+8. **Build prerequisite matrix** (observation 3): developer-machine compile-prereqs (in priority order — first-compile diagnostic-to-fix mapping):
+   - **LLVM with libclang.dll ≥17** — `scoop install llvm` (Windows), `brew install llvm` (macOS), `apt install libclang-dev` (Linux). Failure mode: `bindgen panic: Unable to find libclang`. Set `LIBCLANG_PATH` if not on PATH.
+   - **MSVC C++ Build Tools on Windows** (VS 2019 or 2022 BuildTools, includes `cl.exe`). cc-crate auto-detects via vswhere lookup; failure mode: `failed to find tool. Is cl.exe installed?`.
+   - **cmake ≥3.24** — auto-detects VS 2019/2022 generators.
+   - **rustc with MSVC target** — rustup default for `x86_64-pc-windows-msvc`.
+   - **Pre-built MSI / .app installer ships NONE of these on end-user box** — llama-cpp-sys-2 statically compiles llama.cpp's C++ source into the `vault-tauri.exe` binary at build time.
+
+**Test requirements** (`crates/vault-llm/src/phi4_mini.rs` unit tests + `tests/phi4_mini_smoke.rs` integration tests — 3 firm unit + 3 `#[ignore]` integration in commit 2):
+- `v0_2_default_config_pins_spike_2_constants` — `Phi4MiniConfig::v0_2_default` produces correct constants.
+- `t0_2_3_merge_decision_schema_compiles_to_nonempty_gbnf` — `json_schema_to_grammar` on T0.2.3 schema succeeds.
+- `provider_debug_redaction_invariant_holds_structurally` — Debug uses `finish_non_exhaustive` (redaction marker).
+- `#[ignore]` `identical_memories_should_merge` — real-model integration smoke (weekly cron / `run-llm-smoke` label).
+- `#[ignore]` `unrelated_memories_should_not_merge` — same.
+- `#[ignore]` `model_id_matches_v0_2_default` — same.
+
+**Alternatives considered.**
+- **Typed-deserialize return on `complete_json`.** Rejected: forces vault-llm to depend on caller types; less swap-clean.
+- **`LlmContext` reuse / pool**. Rejected for V0.2: spike-2 evidence shows fresh-per-call fits budget; pool complexity unjustified.
+- **`#[ignore]` tests every-PR.** Rejected: 50+ min CI runtime per PR is hostile to fast iteration.
+- **Real-model latency assertions in CI.** Rejected: CI variance breaks them; observation 5 lock.
+
+**When to revisit.**
+- T0.2.3 consolidator integration surfaces a contract gap.
+- Model swap to Qwen3-4B-Instruct or future alternative.
+- V0.3 non-greedy sampling support.
+- M1/M2 beta user joins — add Mac to the `real-model-smoke` job matrix.
+
+**Cross-references.**
+- `crates/vault-llm/src/provider.rs` (trait + CompletionParams + MockLlmProvider impl)
+- `crates/vault-llm/src/phi4_mini.rs` (Phi4MiniProvider + Phi4MiniConfig + run_one_inference)
+- `crates/vault-llm/src/model_loader.rs` (download + verify; ADR-043 contract surface)
+- `crates/vault-llm/tests/phi4_mini_smoke.rs` (`#[ignore]` real-model integration tests)
+- `crates/vault-llm/tests/fixtures/canned_merge_decisions.json` (seed regression fixture; score gradient documented as empirical)
+- ADR-007 (V0.1 archive) — Debug-redaction pattern for crypto-sensitive types
 
 ---
 

@@ -5,6 +5,13 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # T0.2.1 ADR-044 / iteration 2 concern #1 lock: weekly cron triggers the
+  # `real-model-smoke` job that runs `#[ignore]`'d real-model integration
+  # tests against the actual 2.49 GB Phi-4-mini GGUF. The standard
+  # fmt/clippy/build-test jobs are gated `if: github.event_name != 'schedule'`
+  # to avoid burning CI on a duplicate run.
+  schedule:
+    - cron: '0 12 * * MON'  # Monday 12:00 UTC
 
 env:
   CARGO_TERM_COLOR: always
@@ -24,6 +31,7 @@ env:
 jobs:
   fmt:
     name: cargo fmt
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -34,6 +42,7 @@ jobs:
 
   clippy:
     name: cargo clippy
+    if: github.event_name != 'schedule'
     strategy:
       # fail-fast: false so a Windows-only failure (or vice versa) surfaces
       # both conclusions instead of cancelling the surviving runner. Important
@@ -140,6 +149,7 @@ jobs:
 
   build-and-test:
     name: cargo build + test
+    if: github.event_name != 'schedule'
     strategy:
       # fail-fast: false — see clippy job above for rationale.
       fail-fast: false
@@ -273,3 +283,38 @@ jobs:
         run: echo "CARGO_BUILD_JOBS=2" >> "$GITHUB_ENV"
       - run: cargo build --workspace --all-targets
       - run: cargo test --workspace
+
+  real-model-smoke:
+    # T0.2.1 ADR-044 / iteration 2 §3 concern #1 lock: weekly cron OR PR-label
+    # trigger only. NOT every-PR — `cargo test -p vault-llm -- --ignored`
+    # downloads the 2.49 GB Phi-4-mini GGUF and runs end-to-end inference
+    # (~10 min per call × 3 tests = 30+ min), which is punishing on every PR.
+    # Weekly cron + on-demand label is sufficient regression coverage.
+    #
+    # Single-OS (windows-latest) for V0.2 per concern #6 lock — Mac Metal
+    # autodetect deferred until first M1/M2 beta user joins; ubuntu-latest
+    # smoke deferred until Linux beta user joins.
+    name: real-model smoke (weekly cron + `run-llm-smoke` label)
+    if: github.event_name == 'schedule' || contains(github.event.pull_request.labels.*.name, 'run-llm-smoke')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install LLVM via chocolatey
+        shell: pwsh
+        run: choco install llvm -y --no-progress
+      - name: Set LIBCLANG_PATH via discovered clang location
+        shell: pwsh
+        run: |
+          $clangPath = (Get-Command clang.exe -ErrorAction SilentlyContinue).Source
+          if (-not $clangPath) { $clangPath = "C:\Program Files\LLVM\bin\clang.exe" }
+          $libclangDir = Split-Path $clangPath -Parent
+          "LIBCLANG_PATH=$libclangDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Run `#[ignore]`'d tests in vault-llm (the real-model smoke suite).
+      # `--nocapture` surfaces stdout from the spike-style stage logs so CI
+      # artifacts include the SHA-256 verification + per-call latency data.
+      - run: cargo test -p vault-llm -- --ignored --nocapture

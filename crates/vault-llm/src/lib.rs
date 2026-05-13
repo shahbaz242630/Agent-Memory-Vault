@@ -16,12 +16,31 @@
 //! and HANDOFF.md ADR-042 / ADR-043 / ADR-044 (drafted at T0.2.1 Phase 5) for the
 //! locked decision record.
 //!
-//! ## Crate state (commit 1, T0.2.1 Phase 1 spike-2)
+//! ## Public API surface
 //!
-//! Scaffold + workspace dep wiring only. The `examples/phi4_load_and_json_spike`
-//! binary carries the runtime-confirmation evidence per
-//! `feedback_runtime_confirmation_after_web_spike.md`. Production code
-//! (`LlmProvider` trait, `Phi4MiniProvider`, `MockLlmProvider`, model downloader)
-//! lands in commit 2 (Phase 2) of T0.2.1.
+//! - [`LlmProvider`] — capability trait for any local LLM serving T0.2.3
+//!   consolidator merge-decisions (or future structured-JSON workloads).
+//! - [`CompletionParams`] — per-call inference parameters (seed, temperature,
+//!   max_tokens, top_p).
+//! - [`Phi4MiniProvider`] — V0.2 concrete implementation backed by
+//!   `llama-cpp-2` (lands at T0.2.1 Phase 3, commit 2).
+//! - [`VaultLlmError`] / [`VaultLlmResult`] — crate-level error surface; converts
+//!   cleanly into `vault_core::VaultError` at the workspace boundary.
+//! - [`MockLlmProvider`] — deterministic mock for trait-conformance tests +
+//!   downstream consumer tests. Behind `#[cfg(any(test, feature = "test-utils"))]`
+//!   so it's available to downstream crates' `[dev-dependencies]` via
+//!   `vault-llm = { ..., features = ["test-utils"] }`.
 
 #![forbid(unsafe_code)]
+
+pub mod error;
+pub mod model_loader;
+pub mod phi4_mini;
+pub mod provider;
+
+pub use error::{VaultLlmError, VaultLlmResult};
+pub use phi4_mini::{Phi4MiniConfig, Phi4MiniProvider};
+pub use provider::{CompletionParams, LlmProvider};
+
+#[cfg(any(test, feature = "test-utils"))]
+pub use provider::MockLlmProvider;
