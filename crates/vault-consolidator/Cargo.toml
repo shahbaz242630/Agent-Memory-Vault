@@ -9,7 +9,7 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
-# Workspace-internal: domain types + storage + embeddings.
+# Workspace-internal: domain types + storage + embeddings + LLM.
 vault-core = { path = "../vault-core" }
 vault-storage = { path = "../vault-storage" }
 # Production dep at T0.2.2 (Amendment 1, lean X, 2026-05-13): `Memory` rows
@@ -21,6 +21,13 @@ vault-storage = { path = "../vault-storage" }
 # stored-embed similarity at sub-1e-6 per coordinate, cosine invariant under
 # such noise. See ADR-045 §c.
 vault-embedding = { path = "../vault-embedding" }
+# Production dep at T0.2.3 commit 1 (ADR-045 §f.5 forward-pointer
+# fulfillment): `Consolidator.llm: Arc<dyn LlmProvider>` field per BRD §5.6
+# line 897, plus `phases::merge::decide_merge` calls
+# `LlmProvider::complete_json`. T0.2.2 had vault-llm as dev-only because
+# Phase 1 clustering is geometry-only; T0.2.3 introduces Phase 2's LLM
+# merge decisions which makes it load-bearing in production.
+vault-llm = { path = "../vault-llm" }
 
 # Async runtime + traits
 tokio = { workspace = true }
@@ -45,20 +52,22 @@ tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
-[dev-dependencies]
-# T0.2.2 Spike S1 fixture-build (Phi-4-mini-driven paraphrastic-variant
-# generation). vault-llm is dev-only: production T0.2.2 clustering primitive
-# does NOT call into the LLM (BRD §5.6 Phase 1 is geometry, not semantics).
-# T0.2.3 (Phase 2 merge decisions) is when vault-llm becomes a production
-# dep — at that time, vault-consolidator's [dependencies] gains it and
-# Consolidator struct construction lands per ADR-045 §f deferral note.
-vault-llm = { path = "../vault-llm", features = ["test-utils"] }
-
-# Deterministic `MemoryId` construction in unit tests
-# (via `Uuid::from_u128(n)`). Production code goes through vault-core's
-# `MemoryId::new()` (random); tests need stable IDs for assertions on
-# cluster member ordering + union-find component identity.
+# Production dep at T0.2.3 commit 1: `ConflictReview.conflict_id: Uuid` per
+# BRD §5.6 line 921 (`Vec<ConflictReview>` field on `ConsolidationReport`).
+# Stable identifier for the review queue across consolidation runs; tests
+# also use uuid for deterministic MemoryId construction (`Uuid::from_u128(n)`)
+# which is why the workspace dep was already in dev-deps below — promote to
+# production now that ConflictReview makes it part of the public API.
 uuid = { workspace = true }
+
+[dev-dependencies]
+# Re-declare vault-llm with the `test-utils` feature for test-only
+# `MockLlmProvider` access. Cargo merges dev-deps onto deps at test-target
+# build time; production builds get the no-feature production-dep entry
+# above. `MockLlmProvider` is used by `phases::merge` Phase 2 unit tests
+# (mock-LLM scenarios per the +5 floor) and any future consolidator tests
+# that need a deterministic LLM substitute.
+vault-llm = { path = "../vault-llm", features = ["test-utils"] }
 
 # tempfile for in-memory LanceDB + MetadataStore fixtures in the acceptance
 # integration test (T0.2.0 pattern: build StorageBackend against a tempdir).

@@ -209,7 +209,7 @@ fn run_one_inference(
     json_schema: &str,
     params: &CompletionParams,
 ) -> VaultLlmResult<String> {
-    let full_prompt = build_chatml_prompt(user_prompt);
+    let full_prompt = build_chatml_prompt(user_prompt, params.system_prompt.as_deref());
     let gbnf = json_schema_to_grammar(json_schema)
         .map_err(|e| VaultLlmError::GrammarCompilation(format!("json_schema_to_grammar: {e}")))?;
 
@@ -282,19 +282,34 @@ fn run_one_inference(
     Ok(output)
 }
 
+/// Default system message — pairwise merge-classifier shape locked at
+/// T0.2.1 commit 2 (`fc6338b`) for the T0.2.3 consolidator merge-decision
+/// flow. Preserved as the default so every T0.2.1-era caller behaves
+/// identically.
+const DEFAULT_SYSTEM_PROMPT: &str =
+    "You are a JSON-only memory-merge classifier. \
+     Respond with strict JSON matching this schema: \
+     {\"merge\": bool, \"score\": float between 0 and 1, \"merged_text\": optional string}. \
+     If merge is true, set merged_text to the consolidated string; if false, set it to empty string.";
+
 /// Hand-crafted ChatML prompt template for Phi-4-mini-instruct.
 ///
 /// Spike-2 Stage D confirmed this template produces semantically-correct +
-/// valid-JSON merge decisions on all 5 canned test cases. Production-V0.3+
-/// could refactor to use `model.chat_template(None)` +
-/// `apply_chat_template_oaicompat` for robustness across model swaps; for
-/// V0.2 the hand-crafted form is empirically proven and simpler.
-fn build_chatml_prompt(user_msg: &str) -> String {
+/// valid-JSON merge decisions on all 5 canned test cases under the default
+/// (None) system prompt. Production-V0.3+ could refactor to use
+/// `model.chat_template(None)` + `apply_chat_template_oaicompat` for
+/// robustness across model swaps; for V0.2 the hand-crafted form is
+/// empirically proven and simpler.
+///
+/// `system_override: Option<&str>` per ADR-044 Amendment 1 (T0.2.3 commit
+/// 1): `None` uses [`DEFAULT_SYSTEM_PROMPT`] (T0.2.1 lock); `Some(s)`
+/// substitutes `s` for the system slot — used by T0.2.3 Phase 2's N-ary
+/// cluster merge-decision prompt and any future non-merge-classifier
+/// prompt shape.
+fn build_chatml_prompt(user_msg: &str, system_override: Option<&str>) -> String {
+    let system_msg = system_override.unwrap_or(DEFAULT_SYSTEM_PROMPT);
     format!(
-        "<|im_start|>system<|im_sep|>You are a JSON-only memory-merge classifier. \
-         Respond with strict JSON matching this schema: \
-         {{\"merge\": bool, \"score\": float between 0 and 1, \"merged_text\": optional string}}. \
-         If merge is true, set merged_text to the consolidated string; if false, set it to empty string.<|im_end|>\
+        "<|im_start|>system<|im_sep|>{system_msg}<|im_end|>\
          <|im_start|>user<|im_sep|>{user_msg}<|im_end|>\
          <|im_start|>assistant<|im_sep|>"
     )

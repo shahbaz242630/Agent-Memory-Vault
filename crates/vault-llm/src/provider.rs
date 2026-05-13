@@ -77,6 +77,16 @@ pub trait LlmProvider: Send + Sync + std::fmt::Debug {
 /// signature (corrected from iteration 1's `u64`). T0.2.3 consolidator will pass
 /// `seed = Some(hash_of_memory_pair)` so the same input pair produces the same
 /// merge decision across reruns (determinism for audit reproducibility).
+///
+/// `system_prompt: Option<String>` was added per **ADR-044 Amendment 1**
+/// (T0.2.3 commit 1) — the T0.2.2 commit 2 plan amendment surfaced that
+/// `Phi4MiniProvider`'s `build_chatml_prompt` hardcoded a merge-classifier
+/// system message, blocking N-ary cluster prompts and any future
+/// non-merge-classifier prompt shape (Phase 4 decay summaries,
+/// ConflictReview-resolution prompts, fixture-generation, etc.). `None`
+/// preserves the default hardcoded system message; `Some(s)` overrides at
+/// call time. `MockLlmProvider` ignores the field (canned response logic
+/// doesn't dispatch on prompt).
 #[derive(Debug, Clone)]
 pub struct CompletionParams {
     /// Hard upper bound on output tokens. T0.2.3 default ~256 (consolidator
@@ -96,6 +106,15 @@ pub struct CompletionParams {
     /// seed) — fine for ad-hoc inference, not for audit-replayable
     /// consolidator runs.
     pub seed: Option<u32>,
+
+    /// Optional system-prompt override (ADR-044 Amendment 1, T0.2.3
+    /// commit 1). `None` (default) preserves `Phi4MiniProvider`'s
+    /// hardcoded merge-classifier system message — backwards-compatible
+    /// with every T0.2.1-era caller. `Some(s)` swaps the system message
+    /// at call time, used by T0.2.3 Phase 2's N-ary cluster
+    /// merge-decision prompt and any future non-merge-classifier prompt
+    /// shape.
+    pub system_prompt: Option<String>,
 }
 
 impl Default for CompletionParams {
@@ -105,6 +124,7 @@ impl Default for CompletionParams {
             temperature: 0.0,
             top_p: 1.0,
             seed: None,
+            system_prompt: None,
         }
     }
 }
@@ -219,6 +239,16 @@ mod tests {
         assert_eq!(p.temperature, 0.0);
         assert_eq!(p.top_p, 1.0);
         assert_eq!(p.seed, None);
+        assert_eq!(p.system_prompt, None);
+    }
+
+    /// ADR-044 Amendment 1 (T0.2.3 commit 1) pin: `system_prompt` defaults
+    /// to `None` so every T0.2.1-era caller behaves identically. Breaking
+    /// this default would silently change how T0.2.1's smoke tests + the
+    /// merge-classifier prompt path behave.
+    #[test]
+    fn completion_params_default_system_prompt_is_none() {
+        assert_eq!(CompletionParams::default().system_prompt, None);
     }
 
     #[test]
@@ -291,6 +321,37 @@ mod tests {
 
         let mock2 = MockLlmProvider::new("qwen3-4b-instruct-Q4_K_M", r#"{}"#);
         assert_eq!(mock2.model_id(), "qwen3-4b-instruct-Q4_K_M");
+    }
+
+    /// ADR-044 Amendment 1 (T0.2.3 commit 1) regression pin: MockLlmProvider
+    /// MUST return its canned response unchanged whether `system_prompt`
+    /// is `None`, `Some("")`, or `Some("...")`. Confirms the mock's
+    /// canned-response dispatch doesn't accidentally start branching on
+    /// the new field. Source-read confirmed at iteration 3 recon:
+    /// `provider.rs::mock::complete_json` binds all params to `_`.
+    #[tokio::test]
+    async fn mock_provider_ignores_system_prompt_override() {
+        let canned = r#"{"decision":"merge","merged_text":"x","reasoning":"y"}"#;
+        let mock = MockLlmProvider::new("mock-sysprompt-pin", canned);
+
+        let p_none = CompletionParams::default();
+        let p_empty = CompletionParams {
+            system_prompt: Some(String::new()),
+            ..CompletionParams::default()
+        };
+        let p_set = CompletionParams {
+            system_prompt: Some("You are an N-ary cluster classifier.".to_string()),
+            ..CompletionParams::default()
+        };
+
+        for params in [&p_none, &p_empty, &p_set] {
+            let out = mock
+                .complete_json("test prompt", r#"{}"#, params)
+                .await
+                .expect("mock call");
+            assert_eq!(out, canned);
+        }
+        assert_eq!(mock.call_count(), 3);
     }
 
     #[tokio::test]

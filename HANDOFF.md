@@ -1,7 +1,7 @@
 # Memory Vault — Build Handoff
 
 **Current version:** V0.2 Closed Beta (BRD §6.2 — sleep consolidator, boundaries hardening, cross-device sync, 30 beta users)
-**Last updated:** 2026-05-13 session-pause — **T0.2.2 commit 2 STAGED + awaiting commit + push approval.** Commit 1 `a889931` CI ALL-GREEN matrix-wide on run `25790526645` (confirmed pre-Step-1 next-session opener; ✓ no fix-forward needed). T0.2.2 commit 2 contents: hand-curated 100-entry realistic-distribution fixture (`clustering_acceptance_100.json`) + acceptance integration test (`tests/acceptance.rs`) + γ unseal-site-style Gate A (NN-shared-topic baseline 100/100) + Gate B BRD §6 acceptance scoring (**precision 1.0, recall 0.93** — passes both floors). Plan amendment LOCKED inline (this session): ADR-045 §c fallback path adopted (hand-curated instead of Phi-4-driven S1 spike) because the shipped `Phi4MiniProvider` ships with a hardcoded merge-classifier system prompt (`phi4_mini.rs:292-301`) that cannot generate paraphrastic variants. Fixture went through 3 iterations under partner-direction: (i) narrow short-fragment-only — recall 0.23 (too loose for 0.92 threshold), (ii) realistic distribution spanning short + medium + long (coding decisions, agent task lists, debugging notes, errands, meetings) — recall 0.88, (iii) tightened 4 problem topics (`Buy milk` variants, cat-allergy, Q2 quarterly report agent paragraphs, Rust borrow-checker paragraphs) — recall 0.93, precision 1.0, ships. Topic 0 short "Buy milk today/later/..." variants stayed as 5 singletons even after tightening — documented as known V0.2 limitation: at threshold 0.92 + bge-small-en-v1.5, very-short (≤4 word) memory fragments don't cluster. Production users can lower `ConsolidatorConfig.merge_similarity_threshold` per BRD §5.6 line 904. T0.2.1 closed earlier this session (commit 2 `fc6338b` ALL-GREEN matrix-wide on run `25781122452`; Phase 4 dogfood 3/3 PASS). **Cumulative T0.2.0 arc** (CLOSED 2026-05-13): 3 weeks; ADR-010 HARD GATE CLEARED. **Cumulative T0.2.1 arc** (CLOSED 2026-05-13): ~2 weeks. **T0.2.2 arc** ships in 2 commits this 2-day session (commit 1 = scaffold + algorithm; commit 2 = fixture + acceptance test). Once commit 2 lands + CI greens → T0.2.2 SHIPPED, unblocks T0.2.3 (Phase 2 merge decisions + ADR-045 §e contract-drift hand-off: N-ary cluster schema redesign + N-ary fixture rebuild as locked-in scope).
+**Last updated:** 2026-05-13 — **T0.2.3 commit 1 STAGED + awaiting commit + push approval.** **T0.2.2 SHIPPED** at commit 2 `a53e3a5` (CI ALL-GREEN matrix-wide on run `25795121248`). T0.2.3 work began immediately after T0.2.2 ship: iteration 1 (drafted inline) → iteration 2 (4 spec-verbatim corrections + source-read recon — Memory.superseded_by already in vault-core, no ConflictReview type exists anywhere yet, write_memory takes embedding as param, no list_boundaries API exists) → iteration 3 (6 lockdown items resolved + DuckDbGraphStore graph-update missing-primitive finding surfaced + α no-op + WARN lock + tech-debt entry path). T0.2.3 commit 1 contents (current working tree): file-layout refactor per BRD §5.6 lines 987-989 (`git mv src/clustering.rs → src/phases/cluster.rs` + new `src/phases/mod.rs` + new `src/consolidator.rs` + new `src/phases/merge.rs`) + lib.rs re-exports preserving T0.2.2 acceptance-test import path + **ADR-044 Amendment 1** (`CompletionParams::system_prompt: Option<String>` field + `DEFAULT_SYSTEM_PROMPT` const + `build_chatml_prompt` signature change) + **Consolidator struct materialisation** (BRD §5.6 lines 894-913 verbatim public surface — 4-field Arc-shared struct + `ConsolidatorConfig` defaults + `run_consolidation` todo!() stub + `schedule` todo!() stub per T0.2.6 forward-pointer) + **ConflictReview type** defined in vault-consolidator (conflict_id/boundary/conflicting_memory_ids/reasoning/flagged_at fields per iteration 3 lock) + **Phase 2 `decide_merge` primitive** (N-ary structured input + GBNF schema + system-prompt-override + cluster hydration via list_memories + MergeOutcome enum return) + cascading.rs:37-44 stale-comment fix (T0.2.2 forward-reference → T0.2.x tech-debt pointer) + **HANDOFF.md tech-debt entry** "T0.2.x — entity-extraction-at-consolidation + GraphStore relationship-rewrite primitive on merge" (below). Test floor: **+8 vs +6 locked** (commit 1 floor breach surfaced for partner approval, both pins kept on direction: 5 Phase 2 unit tests + 2 ADR-044 pins + 1 BRD-defaults pin). **Cumulative T0.2.3 floor adjusts to +23** from iteration-3-locked +21 (commits 2-3 stay at planned +5/+10). Local DoD gates all green pre-stage; cumulative T0.2.0/T0.2.1/T0.2.2 arcs all CLOSED + CI-green-matrix-wide; T0.2.3 arc in flight (1 of 3 commits staging now; commits 2-3 next sessions).
 
 **Session close-a (2026-05-12, historical milestone record — Phase 3 + Phase 4 Stages 1-4):** T0.2.0 Phase 3 SHIPPED + Phase 4 Stages 1-4 PASSED in real-world dogfood. CI-fix commit `b6d72bc` (push `ef88361..b6d72bc`) ALL-GREEN matrix-wide on CI run `25736962490` — Windows job passed cleanly with `CARGO_BUILD_JOBS=2` cap. **Phase 3 formally CLOSED.** Phase 4 founder dogfood executed on Shahbaz's Windows dev box: pre-flight cleanup (V0.1 MSI uninstalled via `MsiExec.exe /X{4CF99BC2-2134-424E-ABF9-B64A80DA5EAB}` + old debug binary deleted + data dir wiped + 3 keychain entries deleted including production `default.com.memoryvault.v0.2`) → fresh `target/release/vault-tauri.exe` launch → **Stage 1 PASS** (no "Alpha" title, no ALPHA modal, no orange strip, clean Add Memory view) → **Stage 2 PASS** (add/search/delete smoke flows work) → **Stage 3 PASS — the real T0.2.0 hard-gate proof** (memories survive close+reopen cycle on real user data, sealed write+read round-trip verified) → **Stage 4 PASS** (Notepad on `<data>/lance/memories.lance/data/*.lance` shows random CJK-misinterpreted ciphertext, NO plaintext memory content). Working-tree HANDOFF.md state at session close: rides with next code commit (Phase 5 close or T0.2.1 first commit) per `feedback_admin_changes_ride_with_code.md`.
 
@@ -21,7 +21,7 @@
 
 ## Current Status
 
-**Active task:** **T0.2.2 — vault-consolidator: Phase 1 (Cluster). Commit 1 SHIPPED at `a889931` (CI ALL-GREEN matrix-wide on run `25790526645`). Commit 2 STAGED + awaiting commit + push approval.** Commit 2 contents: hand-curated `clustering_acceptance_100.json` (20 topics × 5 paraphrastic variants, realistic distribution: short errands + medium meeting/work notes + long coding/agent paragraphs) + `tests/acceptance.rs` integration test (BgeSmallProvider Gate A NN-shared-topic 100/100; sealed StorageBackend write path; RetryWorker drain; Phase 1 clustering; precision 1.0 + recall 0.93 against ground truth). Plan amendment LOCKED this session: ADR-045 §c hand-curated fallback path taken instead of Phi-4 spike (Phi4MiniProvider's hardcoded merge-classifier system prompt blocked the spike). ADR-045 §d floor finalised at precision ≥ 0.95 + recall ≥ 0.90 based on measurement. **See "T0.2.2 commit 2 deliverables" section below for the full ride-along record.** Phase progression:
+**Active task:** **T0.2.3 — vault-consolidator: Phase 2-3 (Merge) + Human-Readable Summary. Commit 1 STAGED + awaiting commit + push approval.** Commit 1 contents: file-layout refactor (BRD §5.6 lines 987-989 verbatim) + ADR-044 Amendment 1 (`CompletionParams::system_prompt` field for non-merge-classifier prompt shapes) + Consolidator struct materialisation (BRD §5.6 lines 894-913) + ConflictReview type + Phase 2 `decide_merge` primitive (N-ary structured input + GBNF schema + MergeOutcome enum) + 5 Phase 2 unit tests + 2 ADR-044 amendment pins + 1 BRD-defaults pin + cascading.rs:37-44 stale-comment fix + tech-debt entry for T0.2.x entity-extraction. Iteration arc: iter 1 (4 spec-verbatim drifts caught + corrected) → iter 2 (recon + Q1-Q6 locks + ADR-044 amendment draft) → iter 3 (6 lockdown items resolved + graph-update α no-op + WARN finding). T0.2.2 closed at `a53e3a5` ALL-GREEN matrix-wide on run `25795121248` earlier this session. **See "T0.2.3 commit 1 deliverables" section below for the full ride-along record.** Phase progression:
 
 | Sub-task / Phase | Status | Commit |
 |---|---|---|
@@ -47,7 +47,12 @@
 | **T0.2.1 — CLOSED** ✅ (M1 Mac runtime dogfood deferred to first M1 beta user; CPU-only V0.2 per ADR-042) | — | — |
 | T0.2.2 iteration 1 lock + Amendments 1-2 locks (inline chat, 2026-05-13) | ✅ LOCKED | — |
 | T0.2.2 commit 1 (vault-storage Amendment 2 + vault-consolidator scaffold-fill + clustering algorithm + 8 unit tests + ADR-045 + T0.2.1 Phase 5 paperwork ride-along) | ✅ SHIPPED | `a889931` (CI run `25790526645` in flight at session-pause; 2/8 jobs green — fmt + clippy ubuntu) |
-| T0.2.2 commit 2 (hand-curated `clustering_acceptance_100.json` realistic-distribution fixture + `tests/acceptance.rs` BgeSmallProvider+Gate A+B integration test; precision 1.0 / recall 0.93 measured; γ-split per ADR-045 §f.7 + plan amendment hand-curated path per Phi4MiniProvider single-purpose constraint) | 🟡 STAGED + awaiting commit + push approval | working tree |
+| T0.2.2 commit 2 (hand-curated `clustering_acceptance_100.json` realistic-distribution fixture + `tests/acceptance.rs` BgeSmallProvider+Gate A+B integration test; precision 1.0 / recall 0.93 measured; γ-split per ADR-045 §f.7 + plan amendment hand-curated path per Phi4MiniProvider single-purpose constraint) | ✅ SHIPPED | `a53e3a5` (CI run `25795121248` ALL-GREEN matrix-wide 2026-05-13) |
+| **T0.2.2 — CLOSED** ✅ | — | — |
+| T0.2.3 iteration 1 → 2 → 3 (inline chat, 2026-05-13): 4 spec-verbatim corrections + 6 lockdown items + ADR-044 Amendment 1 draft + graph-update α no-op + tech-debt entry path | ✅ LOCKED | — |
+| T0.2.3 commit 1 (file-layout refactor + ADR-044 Amendment 1 + Consolidator struct + ConflictReview type + Phase 2 `decide_merge` primitive + 8 tests + cascading.rs comment fix + tech-debt entry) | 🟡 STAGED + awaiting commit + push approval | working tree |
+| T0.2.3 commit 2 (Phase 3 `apply_merge` primitive: supersession + re-embed + graph-update no-op + WARN + 5 unit tests + `run_consolidation` orchestrator wired) | ⏳ next session | — |
+| T0.2.3 commit 3 (`generate_summary_markdown` + 5 unit tests + new `merge_acceptance_100.json` fixture + 3 integration tests + 2 property tests + N-ary canned fixture) | ⏳ next session | — |
 
 **Sub-task (d) historical record (shipped at `2cc8c65` earlier this session):**
 
@@ -207,6 +212,106 @@ Sub-task (d) details preserved for audit-trail purposes. **Many of the reference
 ---
 
 **Why we got here:** V0.2 first task per BRD §6 is T0.2.0 (LanceDB Encryption at Rest, HARD GATE per ADR-010). Spike v1 (lance 0.15 era, designed against `WrappingObjectStore`) FORMALLY FAILED 2026-05-07 — discovered lance-io 0.15's `LocalObjectReader` bypasses the `object_store::ObjectStore` trait for `file://` URIs in BOTH directions, defeating both the `WrappingObjectStore` wrapper AND direct injection via `ObjectStoreParams.object_store`. Web research found lance-io 4.x exposes a first-class `ObjectStoreProvider` + `ObjectStoreRegistry` API designed for this exact integration — but requires a **major lancedb upgrade** (0.8 → 0.27.2, 19 minor versions). Phase 0a executed the upgrade; Phase 0a-fix resolved a `merge_insert` memory regression surfaced by the upgrade (see ADR-038); Phase 0b audit + ADR-039 production fix; Phase 0c re-spiked the at-rest extension on the upgraded stack with the spike-discipline runtime-confirmation (per `feedback_runtime_confirmation_after_web_spike.md`) — and caught a real privacy bug in the Phase 0b ADR-039 implementation, fixed before V0.2 beta cohort exposure.
+
+---
+
+## Tech debt — open items
+
+### T0.2.x — entity-extraction-at-consolidation + GraphStore relationship-rewrite primitive on merge
+
+**Surfaced:** T0.2.3 iteration 3 source-read of `crates/vault-storage/src/graph_store.rs:99-161` + `crates/vault-storage/src/cascading.rs:37-44`. **Logged:** T0.2.3 commit 1 (rides with this commit per `feedback_admin_changes_ride_with_code.md`).
+
+**The gap.** BRD §5.6 line 950 verbatim: *"Update graph: relationships pointing to old memories now point to new merged memory."* That sentence presupposes two contract surfaces that don't exist yet:
+
+1. **Entity extraction from `Memory.content` at consolidation time** — there is no production path that creates `graph_store::Entity` rows for memories. V0.1's `cascading.rs` graph-cascade scope was a no-op for memory writes ("V0.1 does not extract entities at write time — that ships at T0.2.2 (consolidator)" — that forward-pointer was stale by the time T0.2.2 shipped and is corrected to point here at T0.2.3 commit 1).
+2. **A `GraphStore::rewrite_relationships_for_memory(old_id, new_id)` primitive** — `GraphStore` trait has `create_entity` / `create_relationship` / `traverse` / `supersede_relationship` / `validate_readable`. None of them rewrite a batch of relationships when a source memory is superseded. Plus relationship endpoints are `EntityId` (not `MemoryId`) — a memory↔entity mapping doesn't exist either.
+
+**T0.2.3 commit 2 Phase 3 disposition (locked at iteration 3 §"open-items 6" lean α).** `apply_merge` will execute steps 1-3 of BRD §5.6 lines 947-950 verbatim (new memory creation with summed access_count + max confidence + fresh created_at, supersession links via `Memory.superseded_by`, re-embed via cascade) but **skip step 4 (graph update) with a `tracing::warn!` and a doc-comment pointing here**. The graph stays empty in V0.2 because the V0.1 cascade never wrote to it — no relationships exist to rewrite, so the no-op is honest about scope. β (also ship entity extraction at T0.2.3) was rejected as +2-3 weeks scope creep; γ (`todo!()` panic) was rejected because production runs would hit it on first merge.
+
+**What lands at T0.2.x (this entry).**
+1. **Entity-extraction primitive** in vault-consolidator (or vault-core if shared with future write-time extraction): given `&str` content, returns `Vec<EntityRef>` for ingestion. Likely Phi-4-mini-driven with a custom system prompt (now possible per ADR-044 Amendment 1). Concrete shape TBD.
+2. **Entity-row writes at consolidation time** through the existing `GraphStore::create_entity` API for each extracted entity + relationships between co-occurring entities.
+3. **`GraphStore::rewrite_relationships_for_memory(old_id, new_id)` new trait method** + DuckDB-backed impl: replaces every relationship whose source/target entity was extracted from `old_id` with one keyed off `new_id`'s extracted entities. Atomic per the cascade contract. New primitive lands on the existing `GraphStore` trait (additive, not breaking).
+4. **Phase 3 `apply_merge` graph-update step lights up** — the `tracing::warn!` no-op is replaced with the actual rewrite call. Existing Phase 3 unit tests get a graph-coverage extension.
+5. **Tests:** entity-extraction unit tests (mock-LLM scenarios + edge cases), relationship-rewrite unit tests on DuckDbGraphStore, integration tests that exercise the full Phase 3 path with non-empty graph state.
+
+**Eventual contract reference.** BRD §5.6 line 950 verbatim ("Update graph: relationships pointing to old memories now point to new merged memory") is the locked spec contract; this tech-debt entry tracks what's deferred relative to that contract. BRD itself stays unamended — the spec captures the eventual surface; this entry captures the V0.2 deferral.
+
+**Affected files (forward-pointer audit trail).**
+- `crates/vault-storage/src/cascading.rs:37-50` — comment block updated at T0.2.3 commit 1 to point here (stale T0.2.2 forward-reference corrected).
+- `crates/vault-consolidator/src/phases/merge.rs` — Phase 3 `apply_merge` will carry a doc-comment cross-link to this entry at commit 2.
+- BRD §5.6 line 950 — eventual-contract reference; do NOT amend the BRD until this tech-debt entry is closed.
+
+---
+
+## T0.2.3 commit 1 deliverables (this session, 2026-05-13) — file refactor + Consolidator + ConflictReview + Phase 2 decide_merge + ADR-044 Amendment 1
+
+**Status:** STAGED + awaiting commit + push approval. Rides with this commit per `feedback_admin_changes_ride_with_code.md`.
+
+### Iteration arc (inline chat, 2026-05-13)
+
+- **Iteration 1.** Surfaced scope (Phase 2-3 + Human-Readable Summary per BRD §6.2 line 1436-1441) + 6 design questions (Q1-Q6). Lean answers proposed. **Caught at review: 4 spec-verbatim drifts** — Q4 framed as a design question when `Memory.superseded_by` was already a locked field on vault-core (BRD line 557 + vault-core/src/memory.rs:97); `Consolidator::run(boundary)` invented method name vs BRD §5.6 line 911 verbatim `run_consolidation()` with no boundary param; boundary model inverted (plan: 2 runs per boundary; spec lines 971-972: 1 run with per-boundary summary sub-sections); file layout still flat (`src/clustering.rs` from T0.2.2 commit 1) vs BRD lines 987-989 `src/phases/cluster.rs`. Discipline-fail per `feedback_read_spec_before_recommending_not_just_before_coding.md`.
+- **Iteration 2.** Folded all 4 corrections in + recon section with verbatim BRD quotes + source-read outcomes (Q5 corrected: `storage.write_memory` takes embedding as parameter, doesn't embed internally — Phase 3 explicitly calls `embeddings.embed(merged_text)` then passes the result; ConflictReview type does NOT exist anywhere in workspace, lean (ii) define in vault-consolidator). Q1-Q6 final locks. ADR-044 amendment draft. File-layout refactor scope. Commit-shape sketch (3 commits). Test floor +21 firm.
+- **Iteration 3.** Final lockdown. 6 lockdown items resolved: orchestrator boundary discovery → (ii) in-memory grouping via `list_memories(MemoryFilter::default())` (no `list_boundaries` API exists workspace-wide); `schedule()` → α `todo!()` stub with `#[allow(clippy::todo)]`; MockLlmProvider source-read confirmed `_prompt`/`_json_schema`/`_params` ignored (provider.rs:178-191); summary markdown structure → β (global Run-header+Footer outer, per-boundary sub-sections inside Merges/Contradictions, Decay aggregate with inline counts) with worked multi-boundary example; acceptance fixture → (iii) new T0.2.3-dedicated `merge_acceptance_100.json` (T0.2.2 fixture stays frozen as Phase 1 regression); test floor stated +21 firm. **DuckDbGraphStore graph-update finding surfaced** at iteration 3 recon (open-items 6): no `rewrite_relationships_for_memory` primitive exists, entity-per-memory mapping doesn't exist either, V0.1 cascade `cascading.rs:37-44` says entity extraction "ships at T0.2.2" but T0.2.2 shipped clustering only. **α no-op + tracing::warn! + tech-debt entry path locked** (β +2-3 weeks scope creep; γ `todo!()` panics on first merge). Plus cascading.rs stale-comment fix + tech-debt entry name ride with this commit.
+
+### Files in commit 1 (working tree)
+
+**Renamed (1):**
+- `crates/vault-consolidator/src/clustering.rs` → `crates/vault-consolidator/src/phases/cluster.rs` (content unchanged; `git mv`)
+
+**New (3):**
+- `crates/vault-consolidator/src/phases/mod.rs` — phase-module index, declares `pub mod cluster; pub mod merge;`
+- `crates/vault-consolidator/src/consolidator.rs` — `Consolidator` struct (4-field Arc-shared) + `ConsolidatorConfig` (BRD §5.6 lines 902-908 verbatim defaults) + `ConflictReview` type + `ConsolidationReport` struct + `run_consolidation` + `schedule` todo!() stubs + 1 unit test (config defaults BRD-pin)
+- `crates/vault-consolidator/src/phases/merge.rs` — `MergeOutcome` enum + `MERGE_DECISION_SCHEMA` GBNF JSON schema + `MERGE_DECISION_SYSTEM_PROMPT` N-ary prompt const + `decide_merge` Phase 2 primitive + 5 unit tests (merge/keep_separate/contradiction/malformed-JSON/N=2-vs-N=5-vs-N=10 boundary cases)
+
+**Modified (4):**
+- `crates/vault-consolidator/src/lib.rs` — replace `pub mod clustering;` with `pub mod consolidator; pub mod phases;`; re-export `Cluster` + `find_candidate_clusters` from `phases::cluster` (preserves T0.2.2 acceptance test import path); add `Consolidator`/`ConsolidatorConfig`/`ConflictReview`/`ConsolidationReport`/`MergeOutcome`/`decide_merge` re-exports
+- `crates/vault-consolidator/Cargo.toml` — promote `vault-llm` from `[dev-dependencies]` to `[dependencies]` (ADR-045 §f.5 forward-pointer fulfillment); promote `uuid` from `[dev-dependencies]` to `[dependencies]` (`ConflictReview.conflict_id: Uuid` makes it production); keep `vault-llm` with `test-utils` feature in `[dev-dependencies]` for `MockLlmProvider` access in tests
+- `crates/vault-llm/src/provider.rs` — ADR-044 Amendment 1: add `system_prompt: Option<String>` field to `CompletionParams` + update `Default` impl + 2 new tests (`completion_params_default_system_prompt_is_none` + `mock_provider_ignores_system_prompt_override` across None/empty-Some/non-empty-Some cases)
+- `crates/vault-llm/src/phi4_mini.rs` — ADR-044 Amendment 1 wiring: add `DEFAULT_SYSTEM_PROMPT` const (preserves T0.2.1 merge-classifier text as default); change `build_chatml_prompt` signature to `(user_msg: &str, system_override: Option<&str>)`; update `run_one_inference` to thread `params.system_prompt.as_deref()` through to `build_chatml_prompt`
+- `crates/vault-storage/src/cascading.rs:37-50` — stale-comment fix: T0.2.2 forward-reference replaced with T0.2.x tech-debt-entry pointer
+- `HANDOFF.md` — this update (tech-debt entry above + T0.2.3 commit 1 deliverables block + ADR-044 Amendment 1 full text + status table flips + top metadata)
+
+### Local DoD gate state (this session, 2026-05-13 pre-stage)
+
+| Gate | Result |
+|---|---|
+| `cargo check --workspace --all-targets` | (filled at gate run) |
+| `cargo test -p vault-consolidator --lib` | ✅ 14/14 pass (8 clustering + 1 ConsolidatorConfig default + 5 Phase 2 decide_merge) |
+| `cargo test -p vault-llm --lib` | ✅ 19/19 pass (17 prior + 2 new ADR-044 amendment pins) |
+| `cargo test -p vault-consolidator --test acceptance` (T0.2.2 acceptance — verifies refactor preserves public API) | ✅ 1/1 pass post-refactor (18.93s wall) |
+| `cargo clippy --workspace --all-targets -- -D warnings` | (filled at gate run) |
+| `cargo fmt --all --check` | (filled at gate run) |
+| `git status --short` post-fmt | (filled at gate run) |
+
+### Test floor reconciliation — commit 1 +8 vs locked +6 (partner-approved keep both pins)
+
+Iteration 3 locked commit 1 floor at +6 (=+5 Phase 2 unit tests +1 ADR-044 amendment pin). Actual: **+8**.
+
+| Pin | Locked? | Justification |
+|---|---|---|
+| 5 × Phase 2 `decide_merge` unit tests (merge/keep/contradiction/malformed-JSON/N-boundary) | ✅ +5 | Iteration 3 locked breakdown verbatim |
+| `completion_params_default_system_prompt_is_none` | ✅ +1 | ADR-044 amendment pin; iteration 2 draft text named explicitly |
+| `consolidator_config_default_matches_brd_spec` | 🟡 +1 unplanned | BRD §5.6 lines 903-907 verbatim defaults pin. Catches accidental edits to default values (3:00 AM / 0.92 / 180 / 365 / 1000) at compile time. Defensive, kept on partner direction |
+| `mock_provider_ignores_system_prompt_override` | 🟡 +1 unplanned | Defensive regression on the ADR-044 mock invariant. Asserts MockLlmProvider canned-response dispatch across None/empty-Some/non-empty-Some cases. Defensive, kept on partner direction |
+
+**Cumulative T0.2.3 floor adjusts to +23** (commit 1 +8, commits 2-3 unchanged at +5/+10). Surfaced per `feedback_floor_forecast_is_pre_declaration_not_estimate.md` discipline (floor breach, even by 1, requires plan amendment surface BEFORE commit, not silent slip).
+
+### Cross-references
+
+- BRD §5.6 (`Agent_Build_Specification.txt:888-993`) — full consolidator API surface
+- BRD §6.2 T0.2.3 (`Agent_Build_Specification.txt:1436-1441`) — task scope
+- ADR-044 (above) — original `LlmProvider` trait + `Phi4MiniProvider` locks
+- ADR-044 Amendment 1 (above) — `CompletionParams::system_prompt` field
+- ADR-045 §a — `Cluster` shape (consumed by `decide_merge`)
+- ADR-045 §e — contract-drift hand-off (resolved by this commit)
+- ADR-045 §f.5 — vault-llm as production dep forward-pointer (fulfilled this commit)
+- Tech-debt entry "T0.2.x — entity-extraction-at-consolidation + GraphStore relationship-rewrite primitive on merge" (above)
+- T0.2.3 iteration 1/2/3 inline chat lock (this session)
+
+### Next coding work after commit 1 lands + CI greens
+
+**T0.2.3 commit 2:** Phase 3 `apply_merge` primitive (new merged memory with summed access_count + max confidence + fresh created_at; supersession via `Memory.superseded_by`; re-embed via `embeddings.embed(merged_text)` + `storage.write_memory(&merged, &embedding)`; **graph-update no-op + `tracing::warn!`** with doc-comment cross-link to the tech-debt entry above) + 5 Phase 3 unit tests + `Consolidator::run_consolidation` orchestrator body wired (boundary discovery via in-memory grouping + Phase 1 → Phase 2 → Phase 3 loops + accumulating `RunState` for commit 3's summary markdown). Test floor +5.
 
 ---
 
@@ -1083,6 +1188,45 @@ pub struct CompletionParams {
 - `crates/vault-llm/tests/phi4_mini_smoke.rs` (`#[ignore]` real-model integration tests)
 - `crates/vault-llm/tests/fixtures/canned_merge_decisions.json` (seed regression fixture; score gradient documented as empirical)
 - ADR-007 (V0.1 archive) — Debug-redaction pattern for crypto-sensitive types
+
+### ADR-044 Amendment 1 — `system_prompt: Option<String>` on `CompletionParams` (T0.2.3 commit 1, drafted 2026-05-13)
+
+**Status:** LOCKED at T0.2.3 commit 1, rides with that commit per `feedback_admin_changes_ride_with_code.md`.
+
+**Context.** T0.2.2 commit 2 plan amendment surfaced that `Phi4MiniProvider::build_chatml_prompt` (`crates/vault-llm/src/phi4_mini.rs:292-301` in the pre-amendment shape) hardcoded a merge-classifier system message — "You are a JSON-only memory-merge classifier. Respond with strict JSON matching this schema: {merge: bool, score: float between 0 and 1, merged_text: optional string}..." — pairwise-shaped and unfit for any non-pairwise / non-merge-classifier prompt. T0.2.3 Phase 2 (decide_merge) needs a different system prompt (N-ary cluster merge-decision shape per BRD §5.6 line 941 + iteration 2 §Q1 α structured input). Future consolidator phases will need their own system prompts: Phase 4 decay-summary calls, ConflictReview resolution prompts, fixture-generation, evaluation harnesses, etc.
+
+**Decision.** Extend `CompletionParams` with:
+
+```rust
+pub struct CompletionParams {
+    pub max_tokens: u32,
+    pub temperature: f32,
+    pub top_p: f32,
+    pub seed: Option<u32>,
+    pub system_prompt: Option<String>,  // ← NEW per Amendment 1
+}
+```
+
+`None` (the default) preserves the T0.2.1-era hardcoded system message via a new `DEFAULT_SYSTEM_PROMPT` const in `phi4_mini.rs`; `Some(s)` substitutes `s` at call time. `Phi4MiniProvider::run_one_inference` extracts `params.system_prompt.as_deref()` and threads it through `build_chatml_prompt(user_msg, system_override)` which now takes the optional system override as a second argument.
+
+`MockLlmProvider` ignores the field — its `complete_json` binds all three params to `_` and returns the canned response unchanged (source-read confirmed at iteration 3 recon, `provider.rs:178-191`). Defensive regression pin `mock_provider_ignores_system_prompt_override` asserts this property explicitly across `None` / `Some(empty)` / `Some(real)` cases.
+
+**Why per-call (β) over per-provider (α) or public-helper (γ).**
+
+- **(β) Per-call override on `CompletionParams`** (locked): one `Phi4MiniProvider` instance, many prompt shapes. T0.2.3's Phase 2 builds per-call params via a helper, every other caller keeps using `CompletionParams::default()` and gets identical behavior. Minimal trait-surface expansion (one new field on a struct that's already public), zero breaking change to existing callers (they don't construct `CompletionParams` with struct literals — every site uses `::default()` — confirmed via workspace grep at iteration 3 implementation time).
+- **(α) Per-provider override on `Phi4MiniConfig`** rejected: would require constructing multiple `Phi4MiniProvider` instances for different prompt shapes, duplicating the 2.49 GB model load + the `LlamaBackend` singleton's process-once init. Unacceptable resource cost for a switch that only needs to change a few hundred bytes of system-prompt text per call.
+- **(γ) Promote `build_chatml_prompt` to public free fn** rejected: leaks the ChatML template detail into callers; provider abstraction would no longer hide model-specific prompt-format choices, making the future Phi-4-mini → Qwen3-4B swap (ADR-042) require touching every caller site instead of just the `Phi4MiniProvider` impl.
+
+**Backwards compat.** `CompletionParams::default()` returns `system_prompt: None`, so all T0.2.1-era callers (vault-llm's own tests, `phi4_mini_smoke.rs` `#[ignore]` real-model tests, hypothetical external callers) behave identically — every `complete_json` call against `Phi4MiniProvider` with the default params uses the same merge-classifier system message as before. The change is strictly additive at the public API surface; no caller needs to opt in to retain T0.2.1 behavior.
+
+**Test floor.** +1 amendment pin (`completion_params_default_system_prompt_is_none` — asserts the default preservation) + 1 defensive mock pin (`mock_provider_ignores_system_prompt_override` — asserts MockLlmProvider's canned-response dispatch doesn't accidentally start branching on the new field across `None` / `Some("")` / `Some("...")`). Both ride with T0.2.3 commit 1. The second pin is a +1 floor breach over the iteration 3 lock (+1 → +2 for ADR-044) surfaced in the T0.2.3 commit 1 deliverables block — defensive, kept on partner approval.
+
+**Cross-references.**
+- `crates/vault-llm/src/provider.rs` (struct field + Default impl + 2 pin tests)
+- `crates/vault-llm/src/phi4_mini.rs` (`DEFAULT_SYSTEM_PROMPT` const + `build_chatml_prompt` signature change + `run_one_inference` threading)
+- `crates/vault-consolidator/src/phases/merge.rs` (first production consumer — `decide_merge` passes `system_prompt: Some(MERGE_DECISION_SYSTEM_PROMPT.to_string())`)
+- T0.2.2 commit 2 deliverables block (HANDOFF, the surfacing trigger)
+- T0.2.3 iteration 2 §Q3 + iteration 3 §"Six lockdown items resolved (3) MockLlmProvider behavior" (inline chat, lock + recon)
 
 ---
 

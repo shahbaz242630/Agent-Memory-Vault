@@ -34,14 +34,24 @@
 //! schema drift), the worker dead-letters loudly with
 //! [`crate::retry_queue::DeadLetterReason::Permanent`].
 //!
-//! ## V0.1 graph-cascade scope
+//! ## Graph-cascade scope (still no-op in production at T0.2.3 commit 1)
 //!
-//! V0.1 does not extract entities at write time — that ships at T0.2.2
-//! (consolidator). The orchestrator's "graph-side" cascade is therefore
-//! a no-op in production for memory writes. The worker still consults
-//! the test-only `FaultInjector::graph_decision()` so adversarial tests
-//! can drive graph-side failure scenarios; V0.2 wires the actual
-//! consolidator-driven graph writes through the same retry plumbing.
+//! Memory writes do not extract entities at write time. The original V0.1
+//! comment in this slot said "ships at T0.2.2 (consolidator)" — that
+//! forward-reference is now stale: T0.2.2 (`a889931` + `a53e3a5`) shipped
+//! Phase 1 clustering only, and T0.2.3 commit 1 ships Phase 2 LLM
+//! merge-decisions but **without** entity extraction or graph-relationship
+//! rewriting. T0.2.3 commit 2's Phase 3 `apply_merge` will emit a `WARN`
+//! and skip graph updates pending a future entity-extraction task.
+//!
+//! See HANDOFF.md tech-debt entry on T0.2.x entity-extraction-at-consolidation
+//! and the `GraphStore` relationship-rewrite primitive on merge (added at
+//! T0.2.3 commit 1) for the forward-pointer.
+//!
+//! The orchestrator's "graph-side" cascade is therefore still a no-op in
+//! production for memory writes. The worker still consults the test-only
+//! `FaultInjector::graph_decision()` so adversarial tests can drive
+//! graph-side failure scenarios.
 
 #![allow(dead_code)] // RetryWorker lands in retry_worker.rs; some accessors are consumed there.
 

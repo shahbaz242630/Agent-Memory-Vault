@@ -5,31 +5,45 @@
 //! See `Agent Build Specification.txt` §5.6 for the public API specification.
 //! Real implementation lands across T0.2.2 → T0.2.6 (V0.2).
 //!
-//! ## Public surface (T0.2.2 — Phase 1 Cluster)
+//! ## Public surface (current state — through T0.2.3 commit 1 file-refactor step)
 //!
-//! - [`Cluster`] — N-ary cluster of memory-row references. Output type of
-//!   the clustering primitive; consumed by T0.2.3's merge phase.
-//! - [`find_candidate_clusters`] — the clustering primitive. Implements BRD
-//!   §5.6 Phase 1 (top-5 NN above `merge_similarity_threshold` + transitive
-//!   closure + singleton filter).
+//! - [`Cluster`], [`find_candidate_clusters`] — Phase 1 (T0.2.2). N-ary cluster
+//!   output from the geometry-only top-K NN search + transitive closure. See
+//!   [`phases::cluster`].
 //!
-//! Errors flow through `vault_core::VaultError` directly at T0.2.2 — no
+//! Consolidator orchestrator, ConflictReview, MergeOutcome, decide_merge land
+//! later in T0.2.3 commit 1 after the file-layout refactor verifies clean
+//! against the T0.2.2 acceptance test.
+//!
+//! Errors flow through `vault_core::VaultError` directly at T0.2.3 — no
 //! `VaultConsolidatorError` enum yet. Per the concrete-vs-hypothetical
 //! discipline, a crate-local error type lands when concrete category
 //! distinctions emerge (T0.2.3 merge failures vs T0.2.4 decay failures vs
-//! T0.2.5 checkpoint failures). At T0.2.2's clustering-only scope, every
-//! failure is either an invalid input (threshold range) or a propagated
-//! [`vault_core::VaultError`] from storage / embedding — both fit the
-//! workspace catalogue cleanly. See ADR-045 §f.
+//! T0.2.5 checkpoint failures). See ADR-045 §f.
 //!
-//! `Consolidator` struct (BRD §5.6 lines 894-913) is intentionally NOT
-//! constructed at T0.2.2 — its `llm` + `embeddings` fields become
-//! load-bearing at T0.2.3 (Phase 2 merge decisions) and that's where the
-//! struct materialises. T0.2.2 ships the clustering primitive only.
-//! See ADR-045 §f deferral note for the spec-compliance contract.
+//! ## File layout (per BRD §5.6 lines 984-993)
+//!
+//! T0.2.3 commit 1 corrected the T0.2.2-era flat layout (`src/clustering.rs`)
+//! to the BRD-specified hierarchical layout:
+//!
+//! ```text
+//! src/
+//!   lib.rs                       — this file
+//!   consolidator.rs              — main orchestrator (T0.2.3 +)
+//!   phases/
+//!     mod.rs                     — phase-module index
+//!     cluster.rs                 — Phase 1 (T0.2.2; moved here at T0.2.3 commit 1)
+//!     merge.rs                   — Phase 2 + 3 (T0.2.3)
+//!     decay.rs                   — Phase 4 (T0.2.4; not yet created)
+//!   checkpoint.rs                — Checkpoint & Rollback (T0.2.5; not yet created)
+//!   scheduler.rs                 — Scheduling (T0.2.6; not yet created)
+//! ```
 
 #![forbid(unsafe_code)]
 
-pub mod clustering;
+pub mod consolidator;
+pub mod phases;
 
-pub use clustering::{find_candidate_clusters, Cluster};
+pub use consolidator::{ConflictReview, ConsolidationReport, Consolidator, ConsolidatorConfig};
+pub use phases::cluster::{find_candidate_clusters, Cluster};
+pub use phases::merge::{decide_merge, MergeOutcome};
