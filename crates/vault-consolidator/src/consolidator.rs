@@ -27,11 +27,11 @@
 //! [`ConsolidationReport`] carries per-boundary sub-sections inside
 //! `summary_markdown`, not separate runs per boundary.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{NaiveTime, Utc};
+use chrono::{DateTime, NaiveTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 use uuid::Uuid;
@@ -42,6 +42,7 @@ use vault_storage::{MemoryFilter, StorageBackend};
 
 use crate::phases::cluster::{find_candidate_clusters, Cluster};
 use crate::phases::merge::{apply_merge, decide_merge, AppliedMerge, MergeOutcome};
+use crate::summary::generate_summary_markdown;
 
 /// Sleep-cycle orchestrator per BRD §5.6 lines 895-913.
 ///
@@ -167,6 +168,8 @@ impl Consolidator {
 
         // Step 3: per-boundary Phase 1 → Phase 2 → Phase 3 pipeline.
         let mut run_state = RunState {
+            started_at,
+            duration: Duration::ZERO, // populated after the loop completes.
             memories_processed: 0,
             per_boundary: BTreeMap::new(),
         };
@@ -191,6 +194,19 @@ impl Consolidator {
                         merged_text,
                         reasoning,
                     } => {
+                        // Capture pre-merge content snippets from the in-scope
+                        // per-boundary `memories` Vec BEFORE apply_merge runs
+                        // (apply_merge marks members superseded but preserves
+                        // their rows; we read from the pre-merge enumeration
+                        // here to avoid an extra storage round-trip).
+                        let member_ids: HashSet<MemoryId> =
+                            cluster.member_row_ids.iter().copied().collect();
+                        let pre_merge_contents: Vec<(MemoryId, String)> = memories
+                            .iter()
+                            .filter(|m| member_ids.contains(&m.id))
+                            .map(|m| (m.id, m.content.clone()))
+                            .collect();
+
                         let applied = apply_merge(
                             cluster,
                             &merged_text,
@@ -205,6 +221,8 @@ impl Consolidator {
                                 cluster: cluster.clone(),
                                 applied,
                                 reasoning,
+                                merged_text,
+                                pre_merge_contents,
                             });
                     }
                     MergeOutcome::KeepSeparate { .. } => {
@@ -225,12 +243,14 @@ impl Consolidator {
             run_state.per_boundary.insert(boundary, boundary_summary);
         }
 
-        // Step 4: build the report. summary_markdown stays empty at commit
-        // 2; commit 3 wires generate_summary_markdown(&run_state).
+        // Step 4: build the report. Populate RunState.duration first so
+        // generate_summary_markdown can render the header from it.
         let duration = Utc::now()
             .signed_duration_since(started_at)
             .to_std()
             .unwrap_or(Duration::ZERO);
+        run_state.duration = duration;
+
         let memories_merged: usize = run_state
             .per_boundary
             .values()
@@ -248,6 +268,13 @@ impl Consolidator {
             .flat_map(|b| b.contradictions.iter().cloned())
             .collect();
 
+        // T0.2.5 wires the real checkpoint identifier here; at T0.2.3 we
+        // pass a stable placeholder string so the footer renders the
+        // forward-pointer pinned by summary.rs's
+        // `footer_emits_checkpoint_placeholder_with_t025_rollback_note`.
+        let checkpoint_placeholder = "pending-T0.2.5";
+        let summary_markdown = generate_summary_markdown(&run_state, checkpoint_placeholder);
+
         Ok(ConsolidationReport {
             memories_processed: run_state.memories_processed,
             memories_merged,
@@ -255,7 +282,7 @@ impl Consolidator {
             memories_archived: 0, // Phase 4 ships at T0.2.4.
             duration,
             conflicts_for_user_review,
-            summary_markdown: String::new(), // commit 3 fills via generate_summary_markdown.
+            summary_markdown,
         })
     }
 
@@ -327,39 +354,56 @@ pub struct ConflictReview {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Private orchestration types — consumed by `run_consolidation` + commit 3's
-// `generate_summary_markdown`. Not part of the public crate surface.
+// Crate-private orchestration types — consumed by `run_consolidation` and by
+// `summary::generate_summary_markdown`. Visibility promoted from `private`
+// to `pub(crate)` at T0.2.3 commit 3 per ADR-047 §b (new `src/summary.rs`
+// module needs to name them in test helpers + its function signatures).
+// Not part of the public crate surface.
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Accumulator threaded through `run_consolidation` and (at commit 3)
-/// `generate_summary_markdown`. Captures everything the summary needs
-/// without re-reading state from storage.
+/// Accumulator threaded through `run_consolidation` and consumed by
+/// `summary::generate_summary_markdown`. Captures everything the summary
+/// renderer needs without re-reading state from storage.
+///
+/// `started_at` + `duration` populate the Run header (BRD §5.6 line 965);
+/// `memories_processed` populates the header's total; `per_boundary` drives
+/// per-boundary Merges + Contradictions sub-sections.
 #[derive(Debug)]
-#[allow(dead_code)] // wired at commit 3 in generate_summary_markdown
-struct RunState {
-    memories_processed: usize,
-    per_boundary: BTreeMap<Boundary, BoundarySummary>,
+pub(crate) struct RunState {
+    pub started_at: DateTime<Utc>,
+    pub duration: Duration,
+    pub memories_processed: usize,
+    pub per_boundary: BTreeMap<Boundary, BoundarySummary>,
 }
 
 /// One boundary's contribution to the run: applied merges + contradictions
-/// captured for that boundary. Decay (T0.2.4) extends this struct.
+/// captured for that boundary. Decay (T0.2.4) will extend this struct with
+/// per-boundary decay/archive counts.
 #[derive(Debug, Default)]
-#[allow(dead_code)] // wired at commit 3 in generate_summary_markdown
-struct BoundarySummary {
-    applied_merges: Vec<AppliedMergeWithContext>,
-    contradictions: Vec<ConflictReview>,
+pub(crate) struct BoundarySummary {
+    pub applied_merges: Vec<AppliedMergeWithContext>,
+    pub contradictions: Vec<ConflictReview>,
 }
 
-/// An applied merge plus the inputs the summary markdown needs: the
-/// original cluster (for pre-merge memory IDs and snippets) and the LLM's
-/// reasoning (surfaced verbatim in the Merges section per BRD §5.6 line
-/// 966).
+/// An applied merge plus the inputs the summary markdown needs:
+/// - `cluster`: pre-merge IDs (ADR-045 §a sort-by-id-ascending order).
+/// - `applied`: post-merge id + aggregated access/confidence per BRD §5.6
+///   line 947.
+/// - `reasoning`: LLM's natural-language explanation, surfaced verbatim in
+///   the Merges section per BRD §5.6 line 966.
+/// - `merged_text`: the consolidated content the LLM produced (captured
+///   from `MergeOutcome::Merge` before the apply step consumes it).
+/// - `pre_merge_contents`: each cluster member's original content (id,
+///   content) captured from the in-scope per-boundary memory enumeration
+///   BEFORE `apply_merge` marks members superseded. Required for BRD §5.6
+///   line 966 "pre-merge memory IDs (truncated content snippets)".
 #[derive(Debug)]
-#[allow(dead_code)] // wired at commit 3 in generate_summary_markdown
-struct AppliedMergeWithContext {
-    cluster: Cluster,
-    applied: AppliedMerge,
-    reasoning: String,
+pub(crate) struct AppliedMergeWithContext {
+    pub cluster: Cluster,
+    pub applied: AppliedMerge,
+    pub reasoning: String,
+    pub merged_text: String,
+    pub pre_merge_contents: Vec<(MemoryId, String)>,
 }
 
 #[cfg(test)]

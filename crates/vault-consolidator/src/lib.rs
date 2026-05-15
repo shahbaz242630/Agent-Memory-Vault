@@ -43,6 +43,7 @@
 
 pub mod consolidator;
 pub mod phases;
+mod summary;
 
 pub use consolidator::{ConflictReview, ConsolidationReport, Consolidator, ConsolidatorConfig};
 pub use phases::cluster::{find_candidate_clusters, Cluster};

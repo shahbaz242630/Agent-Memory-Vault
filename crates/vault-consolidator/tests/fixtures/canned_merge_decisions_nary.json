@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "description": "Canned MockLlmProvider responses for T0.2.3 commit 3 consolidator tests. Each entry is a MergeOutcome-shaped object the test loader serializes to a JSON string and feeds to MockLlmProvider::new (or a ScriptedLlmProvider variant that returns responses in sequence). Per ADR-044 §5 fixture-isolation: hand-curated, not Phi-4-generated. Cluster-size variants (2/5/10) reflect plausible N-ary inputs the orchestrator will see; the canned response shape is independent of cluster size (one decision per cluster) but the merged_text + reasoning vary so per-size tests can pin against distinct strings.",
+
+  "responses": {
+    "merge_size_2": {
+      "decision": "merge",
+      "merged_text": "Both memories describe the same upcoming event with paraphrased wording; consolidated into a single canonical statement.",
+      "reasoning": "Pairwise paraphrase: two memories restate the same fact (subject + date) with different surface wording. Merge is safe — no information lost."
+    },
+
+    "merge_size_5": {
+      "decision": "merge",
+      "merged_text": "All five memories restate the same underlying fact with varied phrasing; consolidated into a single canonical record preserving the key entity, date, and any qualifiers.",
+      "reasoning": "Five-way paraphrase cluster: each memory expresses the same fact in different words. No contradictions across the cluster; safe to merge. Preserved the longest-form variant as the canonical content."
+    },
+
+    "merge_size_10": {
+      "decision": "merge",
+      "merged_text": "All ten memories share the same core fact across slight phrasing variations and added qualifiers; consolidated into one canonical statement that captures the union of qualifiers present in the cluster.",
+      "reasoning": "Ten-way paraphrase cluster with no internal contradictions. Several memories carry supplementary qualifiers (e.g., timestamps, sources) — folded into the consolidated text as parenthetical detail rather than dropped."
+    },
+
+    "keep_separate_typical": {
+      "decision": "keep_separate",
+      "reasoning": "Vector-similarity flagged these memories as potential duplicates but they describe distinct subjects on closer reading (e.g., 'Sarah promoted to senior' vs 'Sarah's promotion announcement reviewed by HR' — overlapping name but different facts). Keeping both as independent records."
+    },
+
+    "contradiction_typical": {
+      "decision": "contradiction",
+      "reasoning": "Both memories describe the same subject (entity + attribute) but assert mutually exclusive facts (e.g., two different values for the same field). Per BRD §5.6 line 944, surfacing to user review queue rather than auto-resolving — the user has context the LLM lacks (which memory is newer, which source is more reliable)."
+    }
+  }
+}
