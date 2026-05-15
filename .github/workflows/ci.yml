@@ -125,6 +125,29 @@ jobs:
         run: |
           brew install llvm
           echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+      # Vulkan SDK install for Windows + Linux runners (T0.2.3 close commit 5
+      # fix-forward, 2026-05-15). Required by `llama-cpp-sys-2`'s build script
+      # when llama-cpp-2 is built with `features = ["vulkan"]` — the per-target
+      # Cargo.toml in `crates/vault-llm` enables this on Windows + Linux (Metal
+      # on macOS — see ADR-042 Amendment 1 / HANDOFF.md "V0.2 backend + tuning
+      # config locked" section). macOS skipped: Metal SDK ships with Xcode and
+      # is already on the macOS runner; no Vulkan needed there.
+      #
+      # Version 1.4.350.0 matches the locally-installed SDK from T0.2.3 t027b
+      # spike preparation. Cached per runner OS to avoid re-downloading the
+      # ~500 MB SDK installer on every CI run.
+      #
+      # **Process miss caught at T0.2.3 close commit 4 CI failure (run
+      # 25925478690, 2026-05-15):** the platform-conditional Cargo.toml change
+      # in commit 4 documented the CI requirement in HANDOFF.md but did NOT
+      # operationalise it in this workflow. Adding the install step in commit
+      # 5 closes the gap per `feedback_surface_ci_implications_before_new_build_features.md`.
+      - if: runner.os != 'macOS'
+        name: Install Vulkan SDK (Windows + Linux only — macOS uses Metal)
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.4.350.0
+          cache: true
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -210,6 +233,16 @@ jobs:
         run: |
           brew install llvm
           echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+      # Vulkan SDK install — see clippy job above for full rationale + the
+      # T0.2.3 close commit 5 fix-forward audit trail. Must be in BOTH jobs
+      # because GHA matrix runners don't share state across jobs (same
+      # pattern as the LLVM install above).
+      - if: runner.os != 'macOS'
+        name: Install Vulkan SDK (Windows + Linux only — macOS uses Metal)
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.4.350.0
+          cache: true
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Cache vault-embedding test fixtures (~165 MB total: model.onnx ~133 MB
