@@ -1,0 +1,241 @@
+{
+  "_schema_version": 1,
+  "_description": "T0.2.3 retrieval diagnostic spike — 22 hand-curated agent-realistic queries against the merge_acceptance_100.json fixture. Five query shapes: catch-me-up (5), specific-fact (5), decision-history (5), topic-synthesis (5), hard-negative (2). All authorize both boundaries (work + personal) — real agents do not pre-classify by boundary. expected_memory_ids is the STRICT ground truth: cluster members only, no plausibly-related stretching. hard-negative queries have empty expected_memory_ids and measure precision when nothing should match.",
+  "_authoring_notes": "Curated 2026-05-14 against fixture clusters confirmed by source-read of merge_acceptance_100.json. No queries gamed for outcome direction. Length tier tags load-bearing for the per-tier recall breakdown — if recall is healthy on short-only but degraded on mixed-length and long-form-dominant, that matches the consolidation length-variance pattern and confirms an embedding-layer limit.",
+  "queries": [
+    {
+      "id": "Q01",
+      "shape": "catch-me-up",
+      "length_tier": "short-only",
+      "query_text": "What did we decide about the engineering standup?",
+      "authorized_boundaries": ["work", "personal"],
+      "expected_memory_ids": ["mem-w-standup-001", "mem-w-standup-002", "mem-w-standup-003", "mem-w-standup-004"],
+      "notes": "standup-10am-change cluster (4 short memories)"
+    },
+    {
+      "id": "Q02",
+      "shape": "catch-me-up",
+      "length_tier": "short-only",
+      "query_text": "What's the plan around the alpha launch?",
+      "authorized_boundaries": ["work", "personal"],
+      "expected_memory_ids": ["mem-w-deadline-001", "mem-w-deadline-002", "mem-w-deadline-003"],
+      "notes": "alpha-launch-nov-15 cluster (3 short memories)"
+    },
+    {
+      "id": "Q03",
+      "shape": "catch-me-up",
+      "length_tier": "short-only",
+      "query_text": "Catch me up on Mike's situation.",
+      "authorized_boundaries": ["work", "personal"],
+      "expected_memory_ids": ["mem-w-hr-004", "mem-w-hr-005", "mem-w-hr-006"],
+      "notes": "mike-last-day cluster (3 short memories)"
+    },
+    {
+      "id": "Q04",
+      "shape": "catch-me-up",
+      "length_tier": "long-form-dominant",
+      "query_text": "What's going on with the beta launch?",
+      "authorized_boundaries": ["work", "personal"],
+      "expected_memory_ids": ["mem-w-deadline-004", "mem-w-deadline-005", "mem-w-deadline-006"],
+      "notes": "beta-launch-dec-5 cluster (3 paragraph-to-long-form memories)"
+    },
+    {
+      "id": "Q05",
+      "shape": "catch-me-up",
+      "length_tier": "short-only",
+      "query_text": "Where are we with Sarah's promotion?",
+      "authorized_boundaries": ["work", "personal"],
+      "expected_memory_ids": ["mem-w-hr-001", "mem-w-hr-002", "mem-w-hr-003"],
+      "notes": "sarah-promotion cluster (3 short memories)"
+    },
+    {
+      "id": "Q06",
+      "shape": "specific-fact",
+      "length_tier": "short-only",
+      "query_text": "When is rent due?",
+      "authorized_boundaries": ["work", "personal"],
+      "expected_memory_ids": ["mem-p-finance-001", "mem-p-finance-002", "mem-p-finance-003"],
+      "notes": "rent-due-1st cluster (3 short memories)"
+    },
+    {
+      "id": "Q07",
+      "shape": "specific-fact",
+      "length_tier": "short-only",
+      "query_text": "When is mom's birthday?",
+      "authorized_boundaries": ["work", "personal"],
+      "expected_memory_ids": ["mem-p-family-001", "mem-p-family-002", "mem-p-family-003"],
+      "notes": "mom-birthday-march-12 cluster (3 short memories)"
+    },
+    {
+      "id": "Q08",
+      "shape": "specific-fact",
+      "length_tier": "short-only",
+      "query_text": "How much is the Netflix subscription?",
+      "authorized_boundaries": ["work", "personal"],
+      "expected_memory_ids": ["mem-p-finance-004", "mem-p-finance-005"],
+      "notes": "netflix-monthly cluster (2 short memories)"
+    },
+    {
+      "id": "Q09",
+      "shape": "specific-fact",
+      "length_tier": "short-only",
+      "query_text": "When is our wedding anniversary?",
+      "authorized_boundaries": ["work", "personal"],
+      "expected_memory_ids": ["mem-p-family-004", "mem-p-family-005"],
+      "notes": "anniversary-oct-20 cluster (2 short memories)"
+    },
+    {
+      "id": "Q10",
+      "shape": "specific-fact",
+      "length_tier": "short-only",
+      "query_text": "What's the daily vitamin I take?",
+      "authorized_boundaries": ["work", "personal"],
+      "expected_memory_ids": ["mem-p-health-005", "mem-p-health-006"],
+      "notes": "vitamin-d-daily cluster (2 short memories)"
+    },
+    {
+      "id": "Q11",
+      "shape": "decision-history",
+      "length_tier": "long-form-dominant",
+      "query_text": "When did we decide GA launch?",
+      "authorized_boundaries": ["work", "personal"],
+      "expected_memory_ids": ["mem-w-deadline-007", "mem-w-deadline-008"],
+      "notes": "ga-launch-quarter CONTRADICTION PAIR (Q1 2027 vs Q2 2027, both long-form). Load-bearing for read-time re-rank architecture viability."
+    },
+    {
+      "id": "Q12",
+      "shape": "decision-history",
+      "length_tier": "mixed-length",
+      "query_text": "What did we pick for the primary data store?",
+      "authorized_boundaries": ["work", "personal"],
+      "expected_memory_ids": ["mem-w-tech-001", "mem-w-tech-002", "mem-w-tech-003"],
+      "notes": "use-postgres cluster (short + paragraph + long-form same fact)"
+    },
+    {
+      "id": "Q13",
+      "shape": "decision-history",
+      "length_tier": "long-form-dominant",
+      "query_text": "What's the Comcast bill?",
+      "authorized_boundaries": ["work", "personal"],
+      "expected_memory_ids": ["mem-p-finance-006", "mem-p-finance-007"],
+      "notes": "comcast-monthly-bill CONTRADICTION PAIR ($89 vs $109, both long-form). Second product-strategic gate."
+    },
+    {
+      "id": "Q14",
+      "shape": "decision-history",
+      "length_tier": "short-only",
+      "query_text": "Who owns the database migrations?",
+      "authorized_boundaries": ["work", "personal"],
+      "expected_memory_ids": ["mem-w-tech-004", "mem-w-tech-005"],
+      "notes": "bob-migrations-owner cluster (control case: short-only decision-history)"
+    },
+    {
+      "id": "Q15",
+      "shape": "decision-history",
+      "length_tier": "mixed-length",
+      "query_text": "What was my latest blood pressure reading?",
+      "authorized_boundaries": ["work", "personal"],
+      "expected_memory_ids": ["mem-p-health-001", "mem-p-health-002", "mem-p-health-003", "mem-p-health-004"],
+      "notes": "bp-reading-132-85 cluster (short + paragraph + paragraph + long-form)"
+    },
+    {
+      "id": "Q16",
+      "shape": "topic-synthesis",
+      "length_tier": "mixed-length",
+      "query_text": "What's my Spanish learning plan?",
+      "authorized_boundaries": ["work", "personal"],
+      "expected_memory_ids": ["mem-p-hobby-001", "mem-p-hobby-002", "mem-p-hobby-003"],
+      "notes": "learn-spanish cluster (short + paragraph + long-form). Same factual content at varying lengths."
+    },
+    {
+      "id": "Q17",
+      "shape": "topic-synthesis",
+      "length_tier": "multi-cluster",
+      "query_text": "What's my exercise routine looking like?",
+      "authorized_boundaries": ["work", "personal"],
+      "expected_memory_ids": ["mem-p-hobby-004", "mem-p-hobby-005", "mem-p-health-012"],
+      "notes": "weekly-5k-run cluster + yoga twice-weekly (cross-cluster topic synthesis)"
+    },
+    {
+      "id": "Q18",
+      "shape": "topic-synthesis",
+      "length_tier": "multi-cluster",
+      "query_text": "What's my health status overall?",
+      "authorized_boundaries": ["work", "personal"],
+      "expected_memory_ids": ["mem-p-health-001", "mem-p-health-002", "mem-p-health-003", "mem-p-health-004", "mem-p-health-005", "mem-p-health-006", "mem-p-health-011"],
+      "notes": "BP cluster (4 memories, mixed-length) + vitamin-d cluster (2 short) + iron levels (paragraph). Expanded per Shahbaz redline 2026-05-14."
+    },
+    {
+      "id": "Q19",
+      "shape": "topic-synthesis",
+      "length_tier": "multi-cluster",
+      "query_text": "Where are we with the launch timeline?",
+      "authorized_boundaries": ["work", "personal"],
+      "expected_memory_ids": ["mem-w-deadline-001", "mem-w-deadline-002", "mem-w-deadline-003", "mem-w-deadline-004", "mem-w-deadline-005", "mem-w-deadline-006", "mem-w-deadline-007", "mem-w-deadline-008"],
+      "notes": "Spans 3 clusters across 8 memories: alpha-launch-nov-15 (short) + beta-launch-dec-5 (paragraph) + ga-launch-quarter contradiction (long-form). Most ambitious recall query."
+    },
+    {
+      "id": "Q20",
+      "shape": "topic-synthesis",
+      "length_tier": "multi-cluster",
+      "query_text": "What are my recurring monthly bills?",
+      "authorized_boundaries": ["work", "personal"],
+      "expected_memory_ids": ["mem-p-finance-001", "mem-p-finance-002", "mem-p-finance-003", "mem-p-finance-004", "mem-p-finance-005", "mem-p-finance-006", "mem-p-finance-007"],
+      "notes": "Rent cluster (3 short) + Netflix cluster (2 short) + Comcast contradiction (2 long-form). Tightened per Shahbaz redline 2026-05-14 (was 'subscription bill breakdown' with 4 IDs; now broader cross-cluster synthesis test)."
+    },
+    {
+      "id": "Q21",
+      "shape": "hard-negative",
+      "length_tier": "hard-negative",
+      "query_text": "What did we decide about the Kubernetes migration?",
+      "authorized_boundaries": ["work", "personal"],
+      "expected_memory_ids": [],
+      "notes": "Vault has zero Kubernetes memories. Precision test: do retrieval scores correctly stay low (relative scoring) or does BGE return top-K of unrelated memories with high scores (absolute scoring)?"
+    },
+    {
+      "id": "Q22",
+      "shape": "hard-negative",
+      "length_tier": "hard-negative",
+      "query_text": "What's my dental insurance policy number?",
+      "authorized_boundaries": ["work", "personal"],
+      "expected_memory_ids": [],
+      "notes": "Vault has one dental-cleaning memory (mem-p-health-009) but no insurance policy info. Precision test: does BGE return health-009 as a high-score false positive?"
+    },
+    {
+      "id": "Q23",
+      "shape": "verbose-agent-reformulation",
+      "length_tier": "long-form-dominant",
+      "query_text": "Picking up the launch timeline work — what's the latest on GA timing? Were there any schedule revisions I should know about?",
+      "authorized_boundaries": ["work", "personal"],
+      "expected_memory_ids": ["mem-w-deadline-007", "mem-w-deadline-008"],
+      "notes": "Verbose reformulation of Q11 (GA launch contradiction pair). Same expected_memory_ids as Q11. Tests whether the contradiction-surfacing verdict survives when an agent catches up with multi-clause phrasing rather than a lexically-direct single-question. The GA noun is still present, but wrapped in catch-up context."
+    },
+    {
+      "id": "Q24",
+      "shape": "verbose-agent-reformulation",
+      "length_tier": "long-form-dominant",
+      "query_text": "Going through the recurring bills — what's the current Comcast charge, and has it changed recently?",
+      "authorized_boundaries": ["work", "personal"],
+      "expected_memory_ids": ["mem-p-finance-006", "mem-p-finance-007"],
+      "notes": "Verbose reformulation of Q13 (Comcast bill contradiction pair). Same expected_memory_ids as Q13. The 'Comcast' noun is still present, wrapped in multi-clause budget-review phrasing."
+    },
+    {
+      "id": "Q25",
+      "shape": "oblique-agent-reformulation",
+      "length_tier": "long-form-dominant",
+      "query_text": "Help me update the product roadmap doc with the latest milestone dates.",
+      "authorized_boundaries": ["work", "personal"],
+      "expected_memory_ids": ["mem-w-deadline-007", "mem-w-deadline-008"],
+      "notes": "Oblique reformulation of Q11. NO exact nouns from the GA contradiction memories ('GA', 'launch', 'Q1', 'Q2' all absent). Tests whether semantic generalization ('milestone dates', 'roadmap') still surfaces the contradiction pair. Expected set narrow on purpose — measures whether the contradiction-surfacing verdict survives oblique phrasing."
+    },
+    {
+      "id": "Q26",
+      "shape": "oblique-agent-reformulation",
+      "length_tier": "long-form-dominant",
+      "query_text": "Doing the monthly budget review — anything I should flag about household services costing more than expected?",
+      "authorized_boundaries": ["work", "personal"],
+      "expected_memory_ids": ["mem-p-finance-006", "mem-p-finance-007"],
+      "notes": "Oblique reformulation of Q13. NO 'Comcast' noun, no dollar amounts mentioned. Tests whether 'household services costing more than expected' semantically surfaces the Comcast contradiction pair (one paragraph says $89, the other says $109 — the price change IS what the agent is asking to flag)."
+    }
+  ]
+}

@@ -37,10 +37,16 @@ pub mod error;
 pub mod model_loader;
 pub mod phi4_mini;
 pub mod provider;
+pub mod qwen25;
 
 pub use error::{VaultLlmError, VaultLlmResult};
 pub use phi4_mini::{Phi4MiniConfig, Phi4MiniProvider};
 pub use provider::{CompletionParams, LlmProvider};
+pub use qwen25::{framework_defaults_probe, Qwen25_14BProvider, TuningConfig};
+
+/// Re-exported from `llama-cpp-2` so spike consumers can name KV cache
+/// quantisation types without taking a direct dep on llama-cpp-2.
+pub use llama_cpp_2::context::params::KvCacheType;
 
 #[cfg(any(test, feature = "test-utils"))]
 pub use provider::MockLlmProvider;

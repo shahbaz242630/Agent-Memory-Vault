@@ -40,7 +40,7 @@ use crate::provider::{CompletionParams, LlmProvider};
 /// backend (cheap clone-via-Arc per provider instance).
 static BACKEND: OnceLock<Arc<LlamaBackend>> = OnceLock::new();
 
-fn get_or_init_backend() -> VaultLlmResult<Arc<LlamaBackend>> {
+pub(crate) fn get_or_init_backend() -> VaultLlmResult<Arc<LlamaBackend>> {
     if let Some(b) = BACKEND.get() {
         return Ok(b.clone());
     }

@@ -24,9 +24,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod read_pipeline;
 pub mod retriever;
 pub mod strategies;
 
+pub use read_pipeline::{
+    ContradictionRef, ReadPipeline, ReadQuery, ReadResponse, DEFAULT_MAX_CANDIDATES,
+    READ_TIME_JSON_SCHEMA, READ_TIME_SYSTEM_PROMPT,
+};
 pub use retriever::{
     RetrievalOptions, RetrievalQuery, RetrievedMemory, Retriever, MAX_QUERY_BYTES, MAX_RESULTS_CAP,
 };

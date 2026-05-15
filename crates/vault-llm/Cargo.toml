@@ -14,7 +14,11 @@ vault-core = { path = "../vault-core" }
 # LLM inference (T0.2.1 spike-2 lock — 2026-05-13). Safe wrapper over llama.cpp;
 # underlying `llama-cpp-sys-2` is unsafe FFI walled off behind this safe layer.
 # `#![forbid(unsafe_code)]` cleanly applies here per BRD §2.7.
-llama-cpp-2 = { workspace = true }
+#
+# Backend selection is **per-target-OS** at the bottom of this file via
+# `[target.'cfg(...)'.dependencies]` blocks (T0.2.3 close, 2026-05-15 — see
+# HANDOFF.md "V0.2 backend + tuning config locked" section and the empirical
+# anchor at `crates/vault-retrieval/examples/t027b_qwen_7b_vulkan_results.md`).
 
 # Async runtime + traits
 tokio = { workspace = true }
@@ -39,6 +43,25 @@ reqwest = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 url = { workspace = true }
+
+# Per-target-OS llama-cpp-2 backend selection (T0.2.3 close, 2026-05-15).
+# - macOS uses Metal (Apple-native GPU API, the only GPU path on Apple Silicon)
+# - Windows + Linux use Vulkan (cross-platform; what t027b empirically validated)
+# CPU fallback at runtime: if `n_gpu_layers > 0` in TuningConfig doesn't light
+# up (no usable iGPU/dGPU), llama.cpp returns 0 offloaded layers and the same
+# binary runs CPU-only. One binary per platform — no separate CPU-only profile.
+#
+# **Empirical validation gap (load-bearing honesty):** ONE configuration was
+# empirically tested at t027b — Vulkan + Intel UHD Graphics + Windows 11 +
+# i7-13620H. Linux + Vulkan uses the identical code path (low risk). Metal +
+# macOS is an entirely different backend code path — UNTESTED; promotion of
+# Mac latency claims gated on first Apple Silicon beta user OR a borrowed-Mac
+# t027c-equivalent gauntlet pre-V0.2-launch.
+[target.'cfg(target_os = "macos")'.dependencies]
+llama-cpp-2 = { workspace = true, features = ["metal"] }
+
+[target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
+llama-cpp-2 = { workspace = true, features = ["vulkan"] }
 
 [dev-dependencies]
 # anyhow allowed in example binaries per BRD §2.4 (library code uses thiserror

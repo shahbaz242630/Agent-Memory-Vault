@@ -9773,7 +9773,9 @@ dependencies = [
 name = "vault-retrieval"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
+ "chrono",
  "proptest",
  "serde",
  "serde_json",
@@ -9784,6 +9786,7 @@ dependencies = [
  "tracing-test",
  "vault-core",
  "vault-embedding",
+ "vault-llm",
  "vault-storage",
 ]
 

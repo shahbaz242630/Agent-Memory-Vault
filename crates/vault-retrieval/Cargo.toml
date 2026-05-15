@@ -36,6 +36,20 @@ vault-storage = { path = "../vault-storage" }
 # EmbeddingProvider trait + EMBEDDING_DIM constant.
 vault-embedding = { path = "../vault-embedding" }
 
+# LlmProvider trait + CompletionParams consumed by the read-time pipeline
+# (`src/read_pipeline.rs`) — ADR-048 (T0.2.3 close, 2026-05-15). Production
+# dep, not dev-dep: ReadPipeline is the V0.2 read contract surface.
+# llama-cpp-2 backend selection happens in vault-llm's Cargo.toml via
+# per-target features (Metal on macOS, Vulkan on Windows/Linux); this
+# crate stays platform-agnostic.
+vault-llm = { path = "../vault-llm" }
+
+# serde_json — used in production by read_pipeline.rs to deserialise the
+# LLM's GBNF-constrained synthesis output. T0.1.9 §6 originally moved
+# this to dev-deps when the prior plaintext audit-append path was removed;
+# T0.2.3 close re-adds it as a production dep for read-pipeline parsing.
+serde_json = { workspace = true }
+
 # T0.1.9 §6 audit-removal sub-phase: chrono dropped (was wired in T0.1.8
 # Phase 1 for measuring latency_ms inside the audit-append builder; we
 # now measure with `std::time::Instant` only inside `retrieve()`, no
@@ -56,10 +70,23 @@ tokio = { workspace = true }
 tokio-test.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
-# serde_json — used only by test helpers (`make_memory` builds an empty
-# metadata JSON object). T0.1.9 §6 moved this from production deps to
-# dev-deps when audit append moved to vault-mcp.
-serde_json.workspace = true
+# serde_json — production dep above carries through to dev-builds, so
+# the prior dev-dep line was redundant after T0.2.3 close. Test helpers
+# (`make_memory` building empty metadata JSON) consume the production
+# import; no separate dev-dep needed.
+# anyhow + chrono for the T0.2.3 retrieval-diagnostic spike at
+# examples/t023_retrieval_diagnostic_spike.rs. anyhow per BRD §2.4 is
+# allowed in example/spike binaries (library code uses thiserror +
+# VaultError). chrono renders the run timestamp into the markdown
+# audit-trail header. Throwaway — not used by production paths.
+anyhow = { workspace = true }
+chrono = { workspace = true }
+# vault-llm with `test-utils` feature for `MockLlmProvider` in
+# read-pipeline unit tests (`src/read_pipeline.rs::tests`) — the
+# production import above carries through to dev-builds, and adding
+# `features = ["test-utils"]` here enables the mock for dev-only.
+# Mirrors vault-storage's `test_helpers` pattern from T0.2.0 sub-task (a).
+vault-llm = { path = "../vault-llm", features = ["test-utils"] }
 # tracing-test — used by:
 # - tests/retrieval_tests.rs::adversarial_deleted_but_not_purged_memory
 #   (T0.1.8 Phase 3) to verify the cross-crate `warn!` from
