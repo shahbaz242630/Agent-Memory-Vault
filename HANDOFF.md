@@ -2,7 +2,7 @@
 
 **Current version:** V0.2 Closed Beta (BRD §6.2 — sleep consolidator, boundaries hardening, cross-device sync, 30 beta users)
 
-**Last updated:** 2026-05-15 (T0.2.3 close session) — **T0.2.3 ARC CLOSED. Read-time pipeline shipped: Qwen2.5-7B-Instruct + Vulkan iGPU offload (Metal on macOS) + locked TuningConfig (n_threads=12, n_gpu_layers=99, KV f16). Empirical anchor on i7-13620H + Intel UHD Graphics + Windows 11: mean 86.0s · p99 119.7s · 4/4 contradictions + 2/2 hard-negatives (preserved from t026 baseline byte-for-byte).** ADR-048 (read-time pipeline) + ADR-049 (Qwen-7B model lock) drafted; backend selection moves to per-target-OS Cargo.toml (Metal/macOS, Vulkan/Windows+Linux) with CPU runtime fallback. Final commit arc: 2-commit split — consolidator commit-3 (summary.rs + acceptance tests) + read-time-pipeline commit-4 (vault-retrieval `ReadPipeline` + ADRs + Cargo.toml + acceptance integration test + spike artefacts). Next session: open the T0.2.4 vs T0.2.7 sequencing conversation given the architectural reframe.
+**Last updated:** 2026-05-16 (T0.2.3 close commit 6 ship, CI watch pending) — **T0.2.3 read-time-pipeline code SHIPPED across commits 3 + 4; commit 5 fix-forward (`humbletim/install-vulkan-sdk@v1.2`) failed CI on Linux + Windows (loader library missing on both OSes, headers also missing on Windows); commit 6 fix-forward SHIPPED — native installers per OS (chocolatey `vulkan-sdk` on Windows, LunarG apt repo on Linux). CI watch pending.** macOS green throughout (Metal via Xcode). Bundled with commit 6 per admin-rides-with-code: vault-storage `create_vector_index_hnsw_sq` method (T0.2.7 Phase 0 production code) + t028a Lance index encryption spike binary + this HANDOFF update. **T0.2.7 Phase 0 t028a security spike PASSED locally: 3078 of 3078 Lance HNSW index files inherit the `vault-sealed://` envelope — BRD §11.5.1 NOT violated, HNSW integration GREEN for envelope compliance.** **Next session opens with: (1) confirm commit 6 CI green across the 3-OS matrix → T0.2.3 CI-side closed, (2) T0.2.7 Phase 1 t028b benchmark spike unblocked. If commit 6 still red, the new error shape determines the commit 7 fix.** See "Next-session opener" below.
 
 **Slim-HANDOFF restart at T0.2.3 commit 2 ship (2026-05-13).** Full pre-restart HANDOFF (T0.2.0 + T0.2.1 + closed-T0.2.2 + T0.2.3 commits 1-2 narrative + ADRs 037-046 full text + all amendments + planning iterations) is frozen at `HANDOFF_V0.2_PART1_ARCHIVE.md` (3,582 lines, 54 sections). See "Archive cross-links" at the bottom of this file.
 
@@ -14,18 +14,97 @@
 
 ## Current Status
 
-**Active task:** **T0.2.3 ARC CLOSED — final commit arc staged for combined commit+push approval (2026-05-15).** Read-time pipeline production code, ADRs 048/049, Cargo.toml platform-conditional backend selection, HANDOFF lock, acceptance integration test, and spike artefacts (t027a, t027a-ext, t027b, t027 research backup) all on disk. **Next session: open the conversation on whether T0.2.4 (consolidator Phase 4 decay) or T0.2.7 (multi-strategy retrieval) is the right next task given the architectural reframe — consolidation is now housekeeping per ADR-048, so its priority relative to retrieval-side work is open.**
+**Active task:** **T0.2.3 read-time-pipeline code SHIPPED across commits 3 + 4. CI-side close attempted via commit 5 (humbletim action — failed on Linux: loader missing; failed on Windows: BOTH loader + headers missing) and commit 6 (drop humbletim, native installers per OS — chocolatey `vulkan-sdk` on Windows, LunarG apt repo on Linux). Commit 6 CI watch pending.** macOS green throughout (Metal). **Next session opens with: (1) confirm commit 6 CI green across the 3-OS matrix → T0.2.3 CI-side fully closed → T0.2.7 Phase 1 t028b benchmark spike unblocked. If commit 6 still red, the new error shape determines the commit 7 fix.** Also: T0.2.7 Phase 0 t028a security spike PASSED locally (3078/3078 Lance HNSW index files sealed via `vault-sealed://` envelope — BRD §11.5.1 compliance verified). Read the dedicated "Next-session opener" section below before touching any code.
 
-**T0.2.3 arc — CLOSED (4 commits, with commits 3+4 staged in this final arc):**
+**T0.2.3 arc — code SHIPPED, CI-side BLOCKED on commit 5 fix-forward:**
 
 | Commit | SHA | Scope | CI |
 |---|---|---|---|
 | 1 | `5aeb5b3` | File-layout refactor + ADR-044 Amendment 1 + Consolidator struct + ConflictReview type + Phase 2 `decide_merge` | ✅ ALL-GREEN run `25798562657` |
 | 2 | `17035ec` | ADR-046 + `mark_superseded` primitive + Phase 3 `apply_merge` + orchestrator body + Boundary-Ord recon-amendment | ✅ ALL-GREEN run `25807518081` |
-| 3 | STAGED (this arc) | ADR-047 + `summary.rs` (`generate_summary_markdown` + 8 unit tests) + 100-memory fixture (realism-rewritten) + canned LLM fixture + 3 integration tests + 2 property tests + RunState/AMWC field extensions | — staged with commit 4 below for combined commit+push |
-| 4 | STAGED (this arc) | **Read-time pipeline production code** (`vault-retrieval::ReadPipeline` + 10 unit tests) + **ADR-048** (read-time pipeline architecture) + **ADR-049** (Qwen-7B model lock) + **HANDOFF section** "V0.2 backend + tuning config locked" + **Cargo.toml platform-conditional backend selection** (Metal/macOS, Vulkan/Windows+Linux) + **acceptance integration test** (`tests/read_pipeline_acceptance.rs`, cron-gated `#[ignore]`) + spike artefacts (t027a + t027a-ext + t027b + research backup) + `TuningConfig` plumbing (n_gpu_layers, framework_defaults_probe) | — staged for combined commit+push approval |
+| 3 | `8293716` | ADR-047 + `summary.rs` (`generate_summary_markdown` + 8 unit tests) + 100-memory realism-rewritten fixture + canned LLM fixture + 3 integration tests + 2 property tests + RunState/AMWC field extensions + V0.2 Part 1 archive freeze | ✅ ALL-GREEN run `25923047902` (after one transient-failure rerun on macOS + Ubuntu CI runners — confirmed transient by clean re-run) |
+| 4 | `316b553` | **Read-time pipeline production code** (`vault-retrieval::ReadPipeline` + 10 unit tests) + **ADR-048** (read-time pipeline architecture) + **ADR-049** (Qwen-7B model lock) + **HANDOFF section** "V0.2 backend + tuning config locked" + **Cargo.toml platform-conditional backend selection** (Metal/macOS, Vulkan/Windows+Linux) + **acceptance integration test** (`tests/read_pipeline_acceptance.rs`, cron-gated `#[ignore]`) + spike artefacts (t023 + t024 + t025 + t026 + t027a + t027a-ext + t027b + research backup) + `TuningConfig` plumbing (n_gpu_layers, framework_defaults_probe) | ❌ FAILED run `25925478690` — Linux + Windows build/clippy died with `VULKAN_SDK: NotPresent` because the Cargo.toml-side platform-conditional change required a CI workflow update that wasn't in commit 4. Process miss caught by Shahbaz; fix-forward shipped at commit 5 below. |
+| 5 | `f2efc9d` | `.github/workflows/ci.yml` fix-forward: add `humbletim/install-vulkan-sdk@v1.2` step to clippy + build-and-test jobs, conditional on `runner.os != 'macOS'`, version pinned to 1.4.350.0, cache on. | ❌ FAILED run `25933341737` — install action ran clean, env var propagated (`VULKAN_SDK_VERSION: 1.4.350.0`, `VULKAN_SDK_PLATFORM: linux`/`windows`), but CMake's `find_package(Vulkan)` errored on Linux: `missing: Vulkan_LIBRARY (found version "1.4.350")` and worse on Windows: `missing: Vulkan_LIBRARY Vulkan_INCLUDE_DIR`. **Action installs SDK headers + glslc on Linux but NOT the runtime loader library; on Windows installs NEITHER headers nor loader.** Confirmed via CI-log re-read at 2026-05-16 session-open. |
+| 6 | `<pending push>` | `.github/workflows/ci.yml` fix-forward (replaces commit 5's approach): drop `humbletim/install-vulkan-sdk@v1.2`, install native per OS — chocolatey `vulkan-sdk` on Windows (wraps LunarG installer, lands full SDK under `C:\VulkanSDK\<ver>`, sets `VULKAN_SDK` env via glob-discovered path), LunarG apt repo + `apt install vulkan-sdk` on Linux (full SDK with loader + headers + glslc; Ubuntu codename auto-detected via `lsb_release` for runner-image-update resilience). Adds same Windows-only install step to the cron-only `real-model-smoke` job (was missing entirely from commit 5 — would have failed at next Monday's cron run). Bundled per admin-rides-with-code: vault-storage `create_vector_index_hnsw_sq` method (T0.2.7 Phase 0 production code, t028a-pass-gated) + t028a Lance index encryption spike binary (executable documentation — 3078/3078 PASS locally) + this HANDOFF update. | 🟡 watch pending |
 
-**Empirical anchor for T0.2.3 close:** i7-13620H + Intel UHD Graphics + Windows 11 + Vulkan iGPU offload — **mean 86.0s · p99 119.7s · 4/4 contradictions + 2/2 hard-negatives.** Full per-query detail at `crates/vault-retrieval/examples/t027b_qwen_7b_vulkan_results.md`.
+**Empirical anchor for T0.2.3 close (unchanged):** i7-13620H + Intel UHD Graphics + Windows 11 + Vulkan iGPU offload — **mean 86.0s · p99 119.7s · 4/4 contradictions + 2/2 hard-negatives.** Full per-query detail at `crates/vault-retrieval/examples/t027b_qwen_7b_vulkan_results.md`.
+
+**T0.2.7 Phase 0 t028a security spike — PASSED 2026-05-15 (locally, not in CI yet):**
+- **Question answered:** Does Lance's HNSW (IvfHnswSq) index emission route through the sealed `vault-sealed://` ObjectStoreProvider?
+- **Result:** 3078 of 3078 on-disk Lance files (data fragments + HNSW graph layers + IVF centroid arrays + index manifests) start with the locked `0x01 0x00` VAULT_SEALED prefix. Zero plaintext leaks. Zero empty/short files.
+- **Index creation latency:** 0.23s on 1024 synthetic random 384-dim vectors (lance build was efficient).
+- **Implication:** No Lance contribution / shim / BRD §11.5.1 amendment needed. The existing T0.2.0 Phase 0e ObjectStoreProvider integration already covers index file emission for free. T0.2.7 HNSW integration is GREEN for envelope compliance. **t028b (HNSW vs IVF benchmark on realism-rewritten fixture) is unblocked on the security axis** but waits on commit 6 + CI green to gate the T0.2.3 close.
+
+---
+
+## Next-session opener — T0.2.3 commit 6 CI verify + T0.2.7 Phase 1 t028b (drafted 2026-05-16 commit 6 ship)
+
+**Read this section first when reopening the session.** Two interlocking workstreams in priority order:
+
+### Priority 1 — Confirm commit 6 CI green (load-bearing; T0.2.7 doesn't ship without this)
+
+**State at commit 6 ship (2026-05-16):**
+- Read-time pipeline code + ADRs 047/048/049 + Cargo.toml platform-conditional + HANDOFF lock — all on `main` via commits 3 (`8293716`) + 4 (`316b553`) + 5 (`f2efc9d`) + 6 (`<pending push>`).
+- Commit 6 replaces commit 5's broken `humbletim/install-vulkan-sdk@v1.2` with native per-OS installers: chocolatey `vulkan-sdk` on Windows (wraps LunarG installer, lands full SDK under `C:\VulkanSDK\<ver>`), LunarG apt repo on Linux (full SDK with loader + headers + glslc; Ubuntu codename auto-detected via `lsb_release` for runner-image-update resilience). Same Windows-only Vulkan install also added to the cron-only `real-model-smoke` job (was missing entirely from commit 5).
+- Commit 6 CI watch was pending at session-wrap.
+
+**Diagnostic commands for session-open verify:**
+```powershell
+# 1. Confirm commit 6 is the latest run + see status across the 3-OS matrix
+gh run list --workflow=ci.yml -L 1
+gh run view <commit-6-run-id> --json jobs --jq '.jobs[] | {name, conclusion}'
+
+# 2. If all 3 OSes (ubuntu-latest + windows-latest + macos-latest) green:
+#    → T0.2.3 CI-side fully closed. Proceed to Priority 2.
+
+# 3. If still red, pull the failure to determine new error shape:
+gh run view <commit-6-run-id> --log-failed > commit6_failure.log
+```
+
+**If commit 6 still red, hypothesis tree for commit 7:**
+- **Linux side:** LunarG repo may not support ubuntu-latest's current codename (e.g., `noble` not yet covered for SDK 1.4.x) → fall back to `jammy` codename override OR pin to known-supported SDK version (e.g., `1.3.290` series via versioned LunarG URL).
+- **Windows side:** chocolatey `vulkan-sdk` package may have a different install path or a transient install timeout → check `C:\VulkanSDK` glob result; retry with `--execution-timeout 1800` flag if install timed out.
+- **Either side:** `glslc` shader compiler path may not be picked up by `find_package(Vulkan)` even with `VULKAN_SDK` set → explicit `Vulkan_GLSLC_EXECUTABLE` env override added to job env.
+
+**Confirm before commit + push** per the standing rule for commit 7 if needed.
+
+### Priority 2 — T0.2.7 Phase 1 t028b benchmark spike (unblocked after commit 6 CI green)
+
+Per the **T0.2.7 plan iteration 2 lock (2026-05-15)** the Phase 0 → 1 sequence is:
+- Phase 0 (t028a security spike): ✅ PASSED locally (3078/3078 sealed). Spike binary + production `create_vector_index_hnsw_sq` method shipped with commit 6 per admin-rides-with-code (executable-documentation pattern).
+- **Phase 1 (t028b HNSW vs IVF benchmark): unblocked on the security axis, gated on commit 6 CI close.**
+
+**t028b spike scope (locked iteration 2):**
+- File: `crates/vault-retrieval/examples/t028b_hnsw_vs_ivf_spike.rs`
+- **Fixture content shape MUST match t026 realism-rewrite** (long-form + paragraph + cross-agent voice, NOT synthetic short) per iteration-2 amendment A. Spike harness doc-comment must include the verbatim string: *"fixture content shape matches t026 realism-rewrite, not synthetic short."*
+- Benchmark axes:
+  - **Index choice**: HNSW (`IvfHnswSq`) vs IVF-only (`IvfPq` or `IvfSq`) — same `create_index` API surface.
+  - **Scale**: 100, 1K, 10K memories (multiply existing `merge_acceptance_100.json` content shape proportionally).
+  - **Metrics**: recall@10 + recall@20 vs brute-force-cosine ground truth; p50 + p99 latency; index build time.
+- Acceptance: data-only spike (no pass/fail gate at this stage). Partner reviews to decide HNSW vs IVF lock for T0.2.7 implementation phase.
+
+### Working-tree state at commit 6 ship
+
+Working tree empty post-commit-6. All three files that were uncommitted at 2026-05-15 session-wrap (vault-storage `create_vector_index_hnsw_sq` method + t028a spike binary + HANDOFF update) shipped with commit 6.
+
+### Decision tree at session-open
+
+1. Read this opener top to bottom.
+2. Verify working-tree state — `git status --short` should be empty.
+3. Verify commit 6 CI state — `gh run list --workflow=ci.yml -L 1`.
+4. **If commit 6 green across all 3 OS:** T0.2.3 CI-side fully closed. Open T0.2.7 Phase 1 plan-paragraph for t028b spike scope, surface for review, then write.
+5. **If commit 6 red:** consult the hypothesis tree above for commit 7 starting point. Pull the failure log, identify which OS / step failed, draft commit 7 fix-forward, surface for review.
+6. Skip the historical "T0.2.3 close — architectural reframe + latency optimization narrative" section below — it's the prior-session context; you don't need it for current work.
+
+### Cross-references
+
+- `crates/vault-retrieval/examples/t027b_qwen_7b_vulkan_results.md` — the locked empirical numbers (86s mean, 119.7s p99, 4/4 + 2/2 quality). Background for ADR-048/049 in HANDOFF.
+- `crates/vault-retrieval/src/read_pipeline.rs` — V0.2 production read contract (ADR-048 implementation).
+- `crates/vault-retrieval/tests/read_pipeline_acceptance.rs` — cron-gated `#[ignore]` acceptance test exercising the locked pipeline against the t026 8-query gauntlet.
+- `.github/workflows/ci.yml` — the file commit 6 modified (native Vulkan SDK installers per OS).
+- `feedback_surface_ci_implications_before_new_build_features.md` — the rule that should have prevented the gap that landed commit 5; reinforced via commits 5 + 6 commit messages.
+- `feedback_admin_changes_ride_with_code.md` — the working-tree-state rule that bundled vault-storage + t028a + HANDOFF with commit 6.
+- `feedback_broken_ci_is_regression_not_techdebt.md` — why commit 6 was priority over T0.2.7 Phase 1.
 
 ---
 

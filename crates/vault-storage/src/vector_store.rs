@@ -308,6 +308,52 @@ impl LanceVectorStore {
             _session: session,
         })
     }
+
+    /// Create an HNSW + Scalar-Quantization (IvfHnswSq) vector index over
+    /// the `embedding` column. **T0.2.7 spike-scoped (Phase 0 t028a security
+    /// spike).**
+    ///
+    /// This entry point lands BEFORE T0.2.7 architecture lock so the t028a
+    /// security spike (`examples/t028a_lance_index_encryption_spike.rs`)
+    /// can verify that LanceDB's index-file emission routes through the
+    /// sealed `vault-sealed://` ObjectStoreProvider. If t028a fails — i.e.
+    /// any index artifact does NOT match the VAULT_SEALED envelope
+    /// (`0x01 || 0x00 || dryoc_header || ciphertext`) — this entry point
+    /// AND the index intervention itself are hard-blocked on a BRD §11.5.1
+    /// amendment + design call per the T0.2.7 plan iteration 2 lock.
+    ///
+    /// Index choice rationale (locked T0.2.7 iteration 2):
+    /// - **HNSW** (the fine-search graph layer) dominates IVF-PQ on recall
+    ///   at our V0.2 vault size estimate (100–3K memories per beta user).
+    /// - **Scalar quantization** keeps memory footprint low without the
+    ///   recall hit Product Quantization shows on L2-normalised sentence
+    ///   embeddings (BGE-small).
+    /// - The lancedb 0.27.2 `Index::IvfHnswSq` variant is the closest match
+    ///   to "HNSW with quantization"; pure-HNSW without IVF isn't exposed
+    ///   by lancedb's current builder surface.
+    ///
+    /// **Parameter tuning deferred to T0.2.7 Phase 1 (t028b benchmark).**
+    /// This call uses `IvfHnswSqIndexBuilder::default()` — M, ef_construction,
+    /// num_partitions, etc. all at upstream defaults. Phase 1 spike measures
+    /// recall@K + p50/p99 latency across {100, 1K, 10K} synthetic scales
+    /// against the t026 realism-rewritten fixture content shape (long-form,
+    /// mixed-length, cross-agent voice — NOT synthetic short).
+    pub async fn create_vector_index_hnsw_sq(&self) -> VaultResult<()> {
+        use lancedb::index::vector::IvfHnswSqIndexBuilder;
+        use lancedb::index::Index;
+
+        let _guard = self.upsert_lock.lock().await;
+
+        self.table
+            .create_index(
+                &["embedding"],
+                Index::IvfHnswSq(IvfHnswSqIndexBuilder::default()),
+            )
+            .execute()
+            .await
+            .map_err(|e| VaultError::Storage(format!("create_vector_index_hnsw_sq: {e}")))?;
+        Ok(())
+    }
 }
 
 #[async_trait]
