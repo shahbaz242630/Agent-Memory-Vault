@@ -160,6 +160,15 @@ jobs:
           & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
           Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
           Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+          # T0.2.3 commit 8 fix-forward (2026-05-17): force inner cmake
+          # ExternalProject_Add try_compile probes to use Release config.
+          # Bypasses the Debug-mode MSBuild VCEnd batch-label / error C1083
+          # bug that broke `vulkan-shaders-gen` nested build on commits 6+7
+          # (OpenCV forum #12262 error class). llama-cpp-sys-2's build.rs
+          # passes CMAKE_* env vars through to cmake, so this reaches the
+          # outer cmake; outer cmake then propagates CMAKE_TRY_COMPILE_CONFIGURATION
+          # to ExternalProject_Add sub-builds.
+          Add-Content $env:GITHUB_ENV "CMAKE_TRY_COMPILE_CONFIGURATION=Release"
       - if: runner.os == 'Linux'
         name: Install Vulkan SDK via LunarG apt repo
         run: |
@@ -270,6 +279,15 @@ jobs:
           & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
           Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
           Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+          # T0.2.3 commit 8 fix-forward (2026-05-17): force inner cmake
+          # ExternalProject_Add try_compile probes to use Release config.
+          # Bypasses the Debug-mode MSBuild VCEnd batch-label / error C1083
+          # bug that broke `vulkan-shaders-gen` nested build on commits 6+7
+          # (OpenCV forum #12262 error class). llama-cpp-sys-2's build.rs
+          # passes CMAKE_* env vars through to cmake, so this reaches the
+          # outer cmake; outer cmake then propagates CMAKE_TRY_COMPILE_CONFIGURATION
+          # to ExternalProject_Add sub-builds.
+          Add-Content $env:GITHUB_ENV "CMAKE_TRY_COMPILE_CONFIGURATION=Release"
       - if: runner.os == 'Linux'
         name: Install Vulkan SDK via LunarG apt repo
         run: |
@@ -398,6 +416,15 @@ jobs:
           & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
           Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
           Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+          # T0.2.3 commit 8 fix-forward (2026-05-17): force inner cmake
+          # ExternalProject_Add try_compile probes to use Release config.
+          # Bypasses the Debug-mode MSBuild VCEnd batch-label / error C1083
+          # bug that broke `vulkan-shaders-gen` nested build on commits 6+7
+          # (OpenCV forum #12262 error class). llama-cpp-sys-2's build.rs
+          # passes CMAKE_* env vars through to cmake, so this reaches the
+          # outer cmake; outer cmake then propagates CMAKE_TRY_COMPILE_CONFIGURATION
+          # to ExternalProject_Add sub-builds.
+          Add-Content $env:GITHUB_ENV "CMAKE_TRY_COMPILE_CONFIGURATION=Release"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Run `#[ignore]`'d tests in vault-llm (the real-model smoke suite).
