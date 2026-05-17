@@ -13,6 +13,21 @@ on:
   schedule:
     - cron: '0 12 * * MON'  # Monday 12:00 UTC
 
+# Windows runner choice: T0.2.3 close commit 9 fix-forward (2026-05-17). The
+# clippy + build-and-test matrices + the real-model-smoke job use `windows-2025`
+# (Windows Server 2025 + Visual Studio 2026 / MSBuild 18), not `windows-latest`
+# (currently Windows Server 2022 + VS 2022 / MSBuild 17 until GitHub's
+# 2026-06-08→06-15 migration). Commits 5+6+7+8 all failed Windows CI on a
+# VS 2022 / MSBuild 17 bug where llama-cpp-sys-2's `vulkan-shaders-gen`
+# ExternalProject_Add sub-build hit `error C1083: Cannot open compiler
+# generated file: '': Invalid argument` + `The system cannot find the batch
+# label specified - VCEnd` in CMakeTestCCompiler. Hypothesis: VS 2026's
+# MSBuild 18 doesn't have the bug (ggml-org/llama.cpp's own release.yml CI
+# successfully ships Windows Vulkan binaries from `windows-2025` runners).
+# If commit 9 still red on `windows-2025`, candidates B (Ninja generator),
+# C (downgrade llama-cpp-2 to v0.1.139), D (accept Windows-CI-Vulkan gap +
+# document scope in ADR) are documented in HANDOFF.md next-session opener.
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -49,7 +64,7 @@ jobs:
       # for matrix verification — we need to see EACH OS's outcome.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, windows-2025, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       # Linux-only: free ~15-20GB by removing unused tooling. Windows runners
@@ -208,7 +223,7 @@ jobs:
       # fail-fast: false — see clippy job above for rationale.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, windows-2025, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       # Linux-only — see clippy job above for rationale.
@@ -323,7 +338,7 @@ jobs:
         if: steps.vault-embedding-fixtures.outputs.cache-hit != 'true' && runner.os == 'Linux'
         run: bash scripts/setup-dev-env.sh
       - name: Provision vault-embedding test fixtures (Windows)
-        # Strawberry Perl is preinstalled on windows-latest (Windows Server
+        # Strawberry Perl is preinstalled on windows-2025 (Windows Server
         # 2022) and required by ADR-006's bundled-sqlcipher-vendored-openssl
         # rusqlite feature for the SQLCipher build. If a future runner image
         # drops Strawberry Perl, add `shogo82148/actions-setup-perl@v1` step
@@ -353,7 +368,7 @@ jobs:
         shell: bash
         run: touch crates/vault-embedding/test-fixtures/bge-small-en-v1.5/onnxruntime.dll
       # Windows-only: lower cargo build parallelism to 2 to avoid peak-memory
-      # OOM on the GitHub Actions windows-latest runner. T0.2.0 Phase 3
+      # OOM on the GitHub Actions windows-2025 runner. T0.2.0 Phase 3
       # sub-task (f) commit `ef88361` (2026-05-12) hit two consecutive
       # Windows-only failures with different OOM stages: first run
       # `rustc-LLVM ERROR: out of memory` during vault-tauri codegen, second
@@ -379,12 +394,12 @@ jobs:
     # (~10 min per call × 3 tests = 30+ min), which is punishing on every PR.
     # Weekly cron + on-demand label is sufficient regression coverage.
     #
-    # Single-OS (windows-latest) for V0.2 per concern #6 lock — Mac Metal
+    # Single-OS (windows-2025) for V0.2 per concern #6 lock — Mac Metal
     # autodetect deferred until first M1/M2 beta user joins; ubuntu-latest
     # smoke deferred until Linux beta user joins.
     name: real-model smoke (weekly cron + `run-llm-smoke` label)
     if: github.event_name == 'schedule' || contains(github.event.pull_request.labels.*.name, 'run-llm-smoke')
-    runs-on: windows-latest
+    runs-on: windows-2025
     steps:
       - uses: actions/checkout@v6
       - uses: arduino/setup-protoc@v3
@@ -405,7 +420,7 @@ jobs:
       # vault-llm with `features = ["vulkan"]` (per crates/vault-llm/Cargo.toml
       # platform-conditional dep block), so the build script needs the loader +
       # headers + glslc. Windows-only by design (cron job runs only on
-      # windows-latest per ADR-044 / iteration 2 §3 concern #6 lock).
+      # windows-2025 per ADR-044 / iteration 2 §3 concern #6 lock).
       - name: Install Vulkan SDK (direct LunarG installer — matches llama.cpp upstream CI)
         shell: pwsh
         env:
