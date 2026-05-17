@@ -132,26 +132,34 @@ jobs:
       # / HANDOFF.md "V0.2 backend + tuning config locked" section). macOS skipped:
       # Metal SDK ships with Xcode and is already on the macOS runner.
       #
-      # T0.2.3 close commit 6 fix-forward (2026-05-16): replaced commit 5's
-      # `humbletim/install-vulkan-sdk@v1.2` with native installers per OS.
-      # Commit 5's CI run 25933341737 failed because humbletim installs SDK
-      # headers + version metadata on Linux but NOT the runtime loader
-      # (libvulkan.so), and on Windows installs NEITHER headers nor loader —
-      # CMake's `find_package(Vulkan)` errored "Could NOT find Vulkan (missing:
-      # Vulkan_LIBRARY)" on Linux and "missing: Vulkan_LIBRARY Vulkan_INCLUDE_DIR"
-      # on Windows. Native installers (chocolatey `vulkan-sdk` on Windows wrapping
-      # the LunarG installer, LunarG apt repo on Linux) install the full SDK
-      # (loader + headers + glslc shader compiler) in one tree where
-      # `find_package(Vulkan)` is wired to look.
+      # T0.2.3 close commit 7 fix-forward (2026-05-17): replaced commit 6's
+      # chocolatey `vulkan-sdk` install with the direct LunarG installer pattern
+      # used by llama.cpp's own release.yml CI for vulkan-x64 Windows builds.
+      # Commit 6's CI run 25985499148 passed on Linux but failed on Windows
+      # during llama-cpp-sys-2's nested ExternalProject_Add build of
+      # `vulkan-shaders-gen`: the inner CMakeTestCCompiler probe hit
+      # `error C1083: Cannot open compiler generated file: '': Invalid argument`
+      # with parent `The system cannot find the batch label specified - VCEnd`.
+      # Same error class as a known CMake/MSVC Debug-mode interaction (cf.
+      # OpenCV forum #12262); root cause is chocolatey's wrap of the LunarG
+      # installer differs subtly from running the installer directly.
+      #
+      # The LunarG-direct pattern below is verbatim from
+      # https://github.com/ggml-org/llama.cpp/blob/master/.github/workflows/release.yml
+      # which has been shipping Windows Vulkan binaries reliably. Version pinned
+      # to 1.4.313.2 (matches upstream pin). Linux side unchanged (commit 6
+      # confirmed green via LunarG apt repo).
       - if: runner.os == 'Windows'
-        name: Install Vulkan SDK via chocolatey (LunarG installer)
+        name: Install Vulkan SDK (direct LunarG installer — matches llama.cpp upstream CI)
         shell: pwsh
+        env:
+          VULKAN_VERSION: 1.4.313.2
         run: |
-          choco install vulkan-sdk -y --no-progress
-          $vulkanRoot = Get-ChildItem 'C:\VulkanSDK' -Directory | Sort-Object Name -Descending | Select-Object -First 1
-          if (-not $vulkanRoot) { throw "Vulkan SDK not found under C:\VulkanSDK after install" }
-          "VULKAN_SDK=$($vulkanRoot.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "$($vulkanRoot.FullName)\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L `
+            "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
       - if: runner.os == 'Linux'
         name: Install Vulkan SDK via LunarG apt repo
         run: |
@@ -248,18 +256,20 @@ jobs:
           brew install llvm
           echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
       # Vulkan SDK install — see clippy job above for full rationale + the
-      # T0.2.3 close commit 6 fix-forward audit trail. Must be in BOTH jobs
+      # T0.2.3 close commit 7 fix-forward audit trail. Must be in BOTH jobs
       # because GHA matrix runners don't share state across jobs (same
       # pattern as the LLVM install above).
       - if: runner.os == 'Windows'
-        name: Install Vulkan SDK via chocolatey (LunarG installer)
+        name: Install Vulkan SDK (direct LunarG installer — matches llama.cpp upstream CI)
         shell: pwsh
+        env:
+          VULKAN_VERSION: 1.4.313.2
         run: |
-          choco install vulkan-sdk -y --no-progress
-          $vulkanRoot = Get-ChildItem 'C:\VulkanSDK' -Directory | Sort-Object Name -Descending | Select-Object -First 1
-          if (-not $vulkanRoot) { throw "Vulkan SDK not found under C:\VulkanSDK after install" }
-          "VULKAN_SDK=$($vulkanRoot.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "$($vulkanRoot.FullName)\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L `
+            "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
       - if: runner.os == 'Linux'
         name: Install Vulkan SDK via LunarG apt repo
         run: |
@@ -373,19 +383,21 @@ jobs:
           $libclangDir = Split-Path $clangPath -Parent
           "LIBCLANG_PATH=$libclangDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       # Vulkan SDK install — see clippy job above for full rationale + the
-      # T0.2.3 close commit 6 fix-forward audit trail. real-model-smoke builds
+      # T0.2.3 close commit 7 fix-forward audit trail. real-model-smoke builds
       # vault-llm with `features = ["vulkan"]` (per crates/vault-llm/Cargo.toml
       # platform-conditional dep block), so the build script needs the loader +
       # headers + glslc. Windows-only by design (cron job runs only on
       # windows-latest per ADR-044 / iteration 2 §3 concern #6 lock).
-      - name: Install Vulkan SDK via chocolatey (LunarG installer)
+      - name: Install Vulkan SDK (direct LunarG installer — matches llama.cpp upstream CI)
         shell: pwsh
+        env:
+          VULKAN_VERSION: 1.4.313.2
         run: |
-          choco install vulkan-sdk -y --no-progress
-          $vulkanRoot = Get-ChildItem 'C:\VulkanSDK' -Directory | Sort-Object Name -Descending | Select-Object -First 1
-          if (-not $vulkanRoot) { throw "Vulkan SDK not found under C:\VulkanSDK after install" }
-          "VULKAN_SDK=$($vulkanRoot.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "$($vulkanRoot.FullName)\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L `
+            "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Run `#[ignore]`'d tests in vault-llm (the real-model smoke suite).

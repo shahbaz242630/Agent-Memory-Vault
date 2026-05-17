@@ -2,7 +2,7 @@
 
 **Current version:** V0.2 Closed Beta (BRD §6.2 — sleep consolidator, boundaries hardening, cross-device sync, 30 beta users)
 
-**Last updated:** 2026-05-16 (T0.2.3 close commit 6 ship, CI watch pending) — **T0.2.3 read-time-pipeline code SHIPPED across commits 3 + 4; commit 5 fix-forward (`humbletim/install-vulkan-sdk@v1.2`) failed CI on Linux + Windows (loader library missing on both OSes, headers also missing on Windows); commit 6 fix-forward SHIPPED — native installers per OS (chocolatey `vulkan-sdk` on Windows, LunarG apt repo on Linux). CI watch pending.** macOS green throughout (Metal via Xcode). Bundled with commit 6 per admin-rides-with-code: vault-storage `create_vector_index_hnsw_sq` method (T0.2.7 Phase 0 production code) + t028a Lance index encryption spike binary + this HANDOFF update. **T0.2.7 Phase 0 t028a security spike PASSED locally: 3078 of 3078 Lance HNSW index files inherit the `vault-sealed://` envelope — BRD §11.5.1 NOT violated, HNSW integration GREEN for envelope compliance.** **Next session opens with: (1) confirm commit 6 CI green across the 3-OS matrix → T0.2.3 CI-side closed, (2) T0.2.7 Phase 1 t028b benchmark spike unblocked. If commit 6 still red, the new error shape determines the commit 7 fix.** See "Next-session opener" below.
+**Last updated:** 2026-05-17 (T0.2.3 close commit 7 ship, CI watch pending) — **T0.2.3 read-time-pipeline code SHIPPED across commits 3 + 4; commit 5 fix-forward (humbletim action) failed CI on Linux + Windows (loader missing); commit 6 fix-forward (chocolatey on Windows + LunarG apt on Linux) PARTIAL — Linux + macOS green, Windows red on llama-cpp-sys-2 nested `vulkan-shaders-gen` ExternalProject_Add hitting `error C1083` + "VCEnd batch label" in CMakeTestCCompiler; commit 7 fix-forward SHIPPED — replaces chocolatey with the direct LunarG installer pattern verbatim from ggml-org/llama.cpp's own release.yml CI (pinned to 1.4.313.2). Linux untouched. CI watch pending.** macOS green throughout (Metal via Xcode). **T0.2.7 Phase 0 t028a security spike PASSED locally: 3078 of 3078 Lance HNSW index files inherit the `vault-sealed://` envelope — BRD §11.5.1 NOT violated, HNSW integration GREEN for envelope compliance.** **Next session opens with: (1) confirm commit 7 CI green across the 3-OS matrix → T0.2.3 CI-side closed, (2) T0.2.7 Phase 1 t028b benchmark spike unblocked. If commit 7 still red, the new error shape determines the commit 8 fix.** See "Next-session opener" below.
 
 **Slim-HANDOFF restart at T0.2.3 commit 2 ship (2026-05-13).** Full pre-restart HANDOFF (T0.2.0 + T0.2.1 + closed-T0.2.2 + T0.2.3 commits 1-2 narrative + ADRs 037-046 full text + all amendments + planning iterations) is frozen at `HANDOFF_V0.2_PART1_ARCHIVE.md` (3,582 lines, 54 sections). See "Archive cross-links" at the bottom of this file.
 
@@ -14,7 +14,7 @@
 
 ## Current Status
 
-**Active task:** **T0.2.3 read-time-pipeline code SHIPPED across commits 3 + 4. CI-side close attempted via commit 5 (humbletim action — failed on Linux: loader missing; failed on Windows: BOTH loader + headers missing) and commit 6 (drop humbletim, native installers per OS — chocolatey `vulkan-sdk` on Windows, LunarG apt repo on Linux). Commit 6 CI watch pending.** macOS green throughout (Metal). **Next session opens with: (1) confirm commit 6 CI green across the 3-OS matrix → T0.2.3 CI-side fully closed → T0.2.7 Phase 1 t028b benchmark spike unblocked. If commit 6 still red, the new error shape determines the commit 7 fix.** Also: T0.2.7 Phase 0 t028a security spike PASSED locally (3078/3078 Lance HNSW index files sealed via `vault-sealed://` envelope — BRD §11.5.1 compliance verified). Read the dedicated "Next-session opener" section below before touching any code.
+**Active task:** **T0.2.3 read-time-pipeline code SHIPPED across commits 3 + 4. CI-side close attempted via commit 5 (humbletim — failed both OSes, loader missing), commit 6 (chocolatey on Windows + LunarG apt on Linux — Linux + macOS GREEN, Windows red on nested vulkan-shaders-gen build hitting CMakeTestCCompiler + VCEnd batch-label error), and commit 7 (replace chocolatey with the direct LunarG installer pattern from ggml-org/llama.cpp's release.yml, pinned to 1.4.313.2; Linux untouched). Commit 7 CI watch pending.** macOS green throughout (Metal). **Next session opens with: (1) confirm commit 7 CI green across the 3-OS matrix → T0.2.3 CI-side fully closed → T0.2.7 Phase 1 t028b benchmark spike unblocked. If commit 7 still red, the new error shape determines the commit 8 fix.** Also: T0.2.7 Phase 0 t028a security spike PASSED locally (3078/3078 Lance HNSW index files sealed via `vault-sealed://` envelope — BRD §11.5.1 compliance verified). Read the dedicated "Next-session opener" section below before touching any code.
 
 **T0.2.3 arc — code SHIPPED, CI-side BLOCKED on commit 5 fix-forward:**
 
@@ -25,7 +25,8 @@
 | 3 | `8293716` | ADR-047 + `summary.rs` (`generate_summary_markdown` + 8 unit tests) + 100-memory realism-rewritten fixture + canned LLM fixture + 3 integration tests + 2 property tests + RunState/AMWC field extensions + V0.2 Part 1 archive freeze | ✅ ALL-GREEN run `25923047902` (after one transient-failure rerun on macOS + Ubuntu CI runners — confirmed transient by clean re-run) |
 | 4 | `316b553` | **Read-time pipeline production code** (`vault-retrieval::ReadPipeline` + 10 unit tests) + **ADR-048** (read-time pipeline architecture) + **ADR-049** (Qwen-7B model lock) + **HANDOFF section** "V0.2 backend + tuning config locked" + **Cargo.toml platform-conditional backend selection** (Metal/macOS, Vulkan/Windows+Linux) + **acceptance integration test** (`tests/read_pipeline_acceptance.rs`, cron-gated `#[ignore]`) + spike artefacts (t023 + t024 + t025 + t026 + t027a + t027a-ext + t027b + research backup) + `TuningConfig` plumbing (n_gpu_layers, framework_defaults_probe) | ❌ FAILED run `25925478690` — Linux + Windows build/clippy died with `VULKAN_SDK: NotPresent` because the Cargo.toml-side platform-conditional change required a CI workflow update that wasn't in commit 4. Process miss caught by Shahbaz; fix-forward shipped at commit 5 below. |
 | 5 | `f2efc9d` | `.github/workflows/ci.yml` fix-forward: add `humbletim/install-vulkan-sdk@v1.2` step to clippy + build-and-test jobs, conditional on `runner.os != 'macOS'`, version pinned to 1.4.350.0, cache on. | ❌ FAILED run `25933341737` — install action ran clean, env var propagated (`VULKAN_SDK_VERSION: 1.4.350.0`, `VULKAN_SDK_PLATFORM: linux`/`windows`), but CMake's `find_package(Vulkan)` errored on Linux: `missing: Vulkan_LIBRARY (found version "1.4.350")` and worse on Windows: `missing: Vulkan_LIBRARY Vulkan_INCLUDE_DIR`. **Action installs SDK headers + glslc on Linux but NOT the runtime loader library; on Windows installs NEITHER headers nor loader.** Confirmed via CI-log re-read at 2026-05-16 session-open. |
-| 6 | `<pending push>` | `.github/workflows/ci.yml` fix-forward (replaces commit 5's approach): drop `humbletim/install-vulkan-sdk@v1.2`, install native per OS — chocolatey `vulkan-sdk` on Windows (wraps LunarG installer, lands full SDK under `C:\VulkanSDK\<ver>`, sets `VULKAN_SDK` env via glob-discovered path), LunarG apt repo + `apt install vulkan-sdk` on Linux (full SDK with loader + headers + glslc; Ubuntu codename auto-detected via `lsb_release` for runner-image-update resilience). Adds same Windows-only install step to the cron-only `real-model-smoke` job (was missing entirely from commit 5 — would have failed at next Monday's cron run). Bundled per admin-rides-with-code: vault-storage `create_vector_index_hnsw_sq` method (T0.2.7 Phase 0 production code, t028a-pass-gated) + t028a Lance index encryption spike binary (executable documentation — 3078/3078 PASS locally) + this HANDOFF update. | 🟡 watch pending |
+| 6 | `99184e5` | `.github/workflows/ci.yml` fix-forward (replaces commit 5's approach): drop `humbletim/install-vulkan-sdk@v1.2`, install native per OS — chocolatey `vulkan-sdk` on Windows (wraps LunarG installer, lands full SDK under `C:\VulkanSDK\<ver>`, sets `VULKAN_SDK` env via glob-discovered path), LunarG apt repo + `apt install vulkan-sdk` on Linux (full SDK with loader + headers + glslc; Ubuntu codename auto-detected via `lsb_release` for runner-image-update resilience). Adds same Windows-only install step to the cron-only `real-model-smoke` job (was missing entirely from commit 5 — would have failed at next Monday's cron run). Bundled per admin-rides-with-code: vault-storage `create_vector_index_hnsw_sq` method (T0.2.7 Phase 0 production code, t028a-pass-gated) + t028a Lance index encryption spike binary (executable documentation — 3078/3078 PASS locally) + commit 6 HANDOFF update. | 🟡/❌ PARTIAL run `25985499148` — fmt + macOS clippy + Ubuntu clippy + Ubuntu build+test + macOS build+test ALL GREEN (LunarG-apt Linux strategy validated). Windows clippy + Windows build+test FAILED inside llama-cpp-sys-2's nested `vulkan-shaders-gen` ExternalProject_Add build: `error C1083: Cannot open compiler generated file: '': Invalid argument` in `CMakeTestCCompiler.cmake:67` with parent `The system cannot find the batch label specified - VCEnd` (same error class as OpenCV forum #12262 CMake/MSVC Debug-mode interaction). Vulkan SDK install itself worked (chocolatey installed 1.4.341.0, `VULKAN_SDK` env propagated, `find_package(Vulkan)` resolved). Commit 7 next replaces chocolatey with the direct LunarG installer pattern. |
+| 7 | `<pending push>` | `.github/workflows/ci.yml` fix-forward (Windows-only, Linux unchanged): drop chocolatey `vulkan-sdk` from all 3 jobs (clippy + build-and-test + real-model-smoke); install the direct LunarG installer via `curl.exe -o ... vulkansdk-windows-X64-${VULKAN_VERSION}.exe` then `--accept-licenses --default-answer --confirm-command install` silent flags, with `VULKAN_SDK` env + PATH set to `C:\VulkanSDK\${VULKAN_VERSION}` hardcoded. Pinned to 1.4.313.2 to match llama.cpp upstream `release.yml` Windows Vulkan job (verbatim pattern). Bundled per admin-rides-with-code: commit 7 HANDOFF update only (no Rust code changes). | 🟡 watch pending |
 
 **Empirical anchor for T0.2.3 close (unchanged):** i7-13620H + Intel UHD Graphics + Windows 11 + Vulkan iGPU offload — **mean 86.0s · p99 119.7s · 4/4 contradictions + 2/2 hard-negatives.** Full per-query detail at `crates/vault-retrieval/examples/t027b_qwen_7b_vulkan_results.md`.
 
@@ -37,36 +38,38 @@
 
 ---
 
-## Next-session opener — T0.2.3 commit 6 CI verify + T0.2.7 Phase 1 t028b (drafted 2026-05-16 commit 6 ship)
+## Next-session opener — T0.2.3 commit 7 CI verify + T0.2.7 Phase 1 t028b (drafted 2026-05-17 commit 7 ship)
 
 **Read this section first when reopening the session.** Two interlocking workstreams in priority order:
 
-### Priority 1 — Confirm commit 6 CI green (load-bearing; T0.2.7 doesn't ship without this)
+### Priority 1 — Confirm commit 7 CI green (load-bearing; T0.2.7 doesn't ship without this)
 
-**State at commit 6 ship (2026-05-16):**
-- Read-time pipeline code + ADRs 047/048/049 + Cargo.toml platform-conditional + HANDOFF lock — all on `main` via commits 3 (`8293716`) + 4 (`316b553`) + 5 (`f2efc9d`) + 6 (`<pending push>`).
-- Commit 6 replaces commit 5's broken `humbletim/install-vulkan-sdk@v1.2` with native per-OS installers: chocolatey `vulkan-sdk` on Windows (wraps LunarG installer, lands full SDK under `C:\VulkanSDK\<ver>`), LunarG apt repo on Linux (full SDK with loader + headers + glslc; Ubuntu codename auto-detected via `lsb_release` for runner-image-update resilience). Same Windows-only Vulkan install also added to the cron-only `real-model-smoke` job (was missing entirely from commit 5).
-- Commit 6 CI watch was pending at session-wrap.
+**State at commit 7 ship (2026-05-17):**
+- Read-time pipeline code + ADRs 047/048/049 + Cargo.toml platform-conditional + HANDOFF lock — all on `main` via commits 3 (`8293716`) + 4 (`316b553`) + 5 (`f2efc9d`) + 6 (`99184e5`) + 7 (`<pending push>`).
+- Commit 6 partial: Linux + macOS GREEN (validated LunarG-apt-repo on Linux + Metal on macOS). Windows FAILED on llama-cpp-sys-2's nested ExternalProject_Add build of `vulkan-shaders-gen`: `error C1083: Cannot open compiler generated file: '': Invalid argument` in `CMakeTestCCompiler.cmake:67`, parent `The system cannot find the batch label specified - VCEnd` (CMake/MSVC Debug-mode interaction, OpenCV forum #12262 class).
+- Commit 7 replaces chocolatey on Windows with the **direct LunarG installer pattern verbatim from ggml-org/llama.cpp's `release.yml` vulkan-x64 Windows job** (pinned to `VULKAN_VERSION=1.4.313.2`, `curl.exe -o ... vulkansdk-windows-X64-<ver>.exe` then `--accept-licenses --default-answer --confirm-command install` silent flags). Applied to all 3 Windows jobs (clippy + build-and-test + real-model-smoke). Linux + macOS untouched.
+- Commit 7 CI watch was pending at session-wrap.
 
 **Diagnostic commands for session-open verify:**
 ```powershell
-# 1. Confirm commit 6 is the latest run + see status across the 3-OS matrix
+# 1. Confirm commit 7 is the latest run + see status across the 3-OS matrix
 gh run list --workflow=ci.yml -L 1
-gh run view <commit-6-run-id> --json jobs --jq '.jobs[] | {name, conclusion}'
+gh run view <commit-7-run-id> --json jobs --jq '.jobs[] | {name, conclusion}'
 
 # 2. If all 3 OSes (ubuntu-latest + windows-latest + macos-latest) green:
 #    → T0.2.3 CI-side fully closed. Proceed to Priority 2.
 
 # 3. If still red, pull the failure to determine new error shape:
-gh run view <commit-6-run-id> --log-failed > commit6_failure.log
+gh run view <commit-7-run-id> --log-failed > commit7_failure.log
 ```
 
-**If commit 6 still red, hypothesis tree for commit 7:**
-- **Linux side:** LunarG repo may not support ubuntu-latest's current codename (e.g., `noble` not yet covered for SDK 1.4.x) → fall back to `jammy` codename override OR pin to known-supported SDK version (e.g., `1.3.290` series via versioned LunarG URL).
-- **Windows side:** chocolatey `vulkan-sdk` package may have a different install path or a transient install timeout → check `C:\VulkanSDK` glob result; retry with `--execution-timeout 1800` flag if install timed out.
-- **Either side:** `glslc` shader compiler path may not be picked up by `find_package(Vulkan)` even with `VULKAN_SDK` set → explicit `Vulkan_GLSLC_EXECUTABLE` env override added to job env.
+**If commit 7 still red on Windows, hypothesis tree for commit 8:**
+- **Same `vulkan-shaders-gen` ExternalProject_Add failure persists:** the OpenCV-forum-#12262 class fix is to switch to Ninja generator OR force Release config on the inner build. Inspect llama-cpp-sys-2's cmake invocation; consider env override `CMAKE_TRY_COMPILE_CONFIGURATION=Release`.
+- **LunarG installer silent-flags rejected:** verify `--accept-licenses --default-answer --confirm-command install` syntax is current; LunarG installer CLI flags occasionally shift between SDK versions.
+- **Version `1.4.313.2` unavailable:** LunarG retains older SDK versions but URLs may shift; verify via `curl.exe -I https://sdk.lunarg.com/sdk/download/1.4.313.2/windows/vulkansdk-windows-X64-1.4.313.2.exe` returns 200 before next commit.
+- **Path or env propagation issue:** verify `Add-Content $env:GITHUB_ENV` correctly persists `VULKAN_SDK` across step boundaries; check post-install via `dir C:\VulkanSDK\1.4.313.2`.
 
-**Confirm before commit + push** per the standing rule for commit 7 if needed.
+**Confirm before commit + push** per the standing rule for commit 8 if needed.
 
 ### Priority 2 — T0.2.7 Phase 1 t028b benchmark spike (unblocked after commit 6 CI green)
 
@@ -83,17 +86,17 @@ Per the **T0.2.7 plan iteration 2 lock (2026-05-15)** the Phase 0 → 1 sequence
   - **Metrics**: recall@10 + recall@20 vs brute-force-cosine ground truth; p50 + p99 latency; index build time.
 - Acceptance: data-only spike (no pass/fail gate at this stage). Partner reviews to decide HNSW vs IVF lock for T0.2.7 implementation phase.
 
-### Working-tree state at commit 6 ship
+### Working-tree state at commit 7 ship
 
-Working tree empty post-commit-6. All three files that were uncommitted at 2026-05-15 session-wrap (vault-storage `create_vector_index_hnsw_sq` method + t028a spike binary + HANDOFF update) shipped with commit 6.
+Working tree empty post-commit-7. Commit 7 was a pure CI fix-forward — only `ci.yml` + `HANDOFF.md` changed (no Rust code touched), so it rides as a code+admin combo where the "code" half is the ci.yml fix-forward per `feedback_admin_changes_ride_with_code.md` (CI-workflow changes are code, not admin-only).
 
 ### Decision tree at session-open
 
 1. Read this opener top to bottom.
 2. Verify working-tree state — `git status --short` should be empty.
-3. Verify commit 6 CI state — `gh run list --workflow=ci.yml -L 1`.
-4. **If commit 6 green across all 3 OS:** T0.2.3 CI-side fully closed. Open T0.2.7 Phase 1 plan-paragraph for t028b spike scope, surface for review, then write.
-5. **If commit 6 red:** consult the hypothesis tree above for commit 7 starting point. Pull the failure log, identify which OS / step failed, draft commit 7 fix-forward, surface for review.
+3. Verify commit 7 CI state — `gh run list --workflow=ci.yml -L 1`.
+4. **If commit 7 green across all 3 OS:** T0.2.3 CI-side fully closed. Open T0.2.7 Phase 1 plan-paragraph for t028b spike scope, surface for review, then write.
+5. **If commit 7 red:** consult the hypothesis tree above for commit 8 starting point. Pull the failure log, identify which OS / step failed, draft commit 8 fix-forward, surface for review.
 6. Skip the historical "T0.2.3 close — architectural reframe + latency optimization narrative" section below — it's the prior-session context; you don't need it for current work.
 
 ### Cross-references
