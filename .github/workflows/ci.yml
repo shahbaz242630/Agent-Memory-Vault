@@ -182,8 +182,22 @@ jobs:
           # (OpenCV forum #12262 error class). llama-cpp-sys-2's build.rs
           # passes CMAKE_* env vars through to cmake, so this reaches the
           # outer cmake; outer cmake then propagates CMAKE_TRY_COMPILE_CONFIGURATION
-          # to ExternalProject_Add sub-builds.
+          # to ExternalProject_Add sub-builds. Note: commit 8 falsified this
+          # hypothesis — Debug-config try_compile still ran inside the inner
+          # cmake. Kept as defense-in-depth alongside the Ninja switch below.
           Add-Content $env:GITHUB_ENV "CMAKE_TRY_COMPILE_CONFIGURATION=Release"
+          # T0.2.3 commit 10 fix-forward (2026-05-24): switch CMake generator
+          # to Ninja for Windows. Bypasses MSBuild entirely — Ninja does not
+          # have the VCEnd batch-label / error C1083 bug that blocked
+          # commits 6-9 in vulkan-shaders-gen ExternalProject_Add nested
+          # try_compile probes. llama-cpp-sys-2's build.rs passes CMAKE_*
+          # env vars through to cmake, which propagates CMAKE_GENERATOR to
+          # ExternalProject_Add sub-cmakes (unlike CMAKE_TRY_COMPILE_CONFIGURATION
+          # which doesn't propagate per commit 8 falsification). Ninja is
+          # preinstalled on windows-2025 runners (ships with Visual Studio
+          # Build Tools); choco install line is defensive idempotency.
+          choco install ninja -y --no-progress
+          Add-Content $env:GITHUB_ENV "CMAKE_GENERATOR=Ninja"
       - if: runner.os == 'Linux'
         name: Install Vulkan SDK via LunarG apt repo
         run: |
@@ -301,8 +315,22 @@ jobs:
           # (OpenCV forum #12262 error class). llama-cpp-sys-2's build.rs
           # passes CMAKE_* env vars through to cmake, so this reaches the
           # outer cmake; outer cmake then propagates CMAKE_TRY_COMPILE_CONFIGURATION
-          # to ExternalProject_Add sub-builds.
+          # to ExternalProject_Add sub-builds. Note: commit 8 falsified this
+          # hypothesis — Debug-config try_compile still ran inside the inner
+          # cmake. Kept as defense-in-depth alongside the Ninja switch below.
           Add-Content $env:GITHUB_ENV "CMAKE_TRY_COMPILE_CONFIGURATION=Release"
+          # T0.2.3 commit 10 fix-forward (2026-05-24): switch CMake generator
+          # to Ninja for Windows. Bypasses MSBuild entirely — Ninja does not
+          # have the VCEnd batch-label / error C1083 bug that blocked
+          # commits 6-9 in vulkan-shaders-gen ExternalProject_Add nested
+          # try_compile probes. llama-cpp-sys-2's build.rs passes CMAKE_*
+          # env vars through to cmake, which propagates CMAKE_GENERATOR to
+          # ExternalProject_Add sub-cmakes (unlike CMAKE_TRY_COMPILE_CONFIGURATION
+          # which doesn't propagate per commit 8 falsification). Ninja is
+          # preinstalled on windows-2025 runners (ships with Visual Studio
+          # Build Tools); choco install line is defensive idempotency.
+          choco install ninja -y --no-progress
+          Add-Content $env:GITHUB_ENV "CMAKE_GENERATOR=Ninja"
       - if: runner.os == 'Linux'
         name: Install Vulkan SDK via LunarG apt repo
         run: |
@@ -438,8 +466,22 @@ jobs:
           # (OpenCV forum #12262 error class). llama-cpp-sys-2's build.rs
           # passes CMAKE_* env vars through to cmake, so this reaches the
           # outer cmake; outer cmake then propagates CMAKE_TRY_COMPILE_CONFIGURATION
-          # to ExternalProject_Add sub-builds.
+          # to ExternalProject_Add sub-builds. Note: commit 8 falsified this
+          # hypothesis — Debug-config try_compile still ran inside the inner
+          # cmake. Kept as defense-in-depth alongside the Ninja switch below.
           Add-Content $env:GITHUB_ENV "CMAKE_TRY_COMPILE_CONFIGURATION=Release"
+          # T0.2.3 commit 10 fix-forward (2026-05-24): switch CMake generator
+          # to Ninja for Windows. Bypasses MSBuild entirely — Ninja does not
+          # have the VCEnd batch-label / error C1083 bug that blocked
+          # commits 6-9 in vulkan-shaders-gen ExternalProject_Add nested
+          # try_compile probes. llama-cpp-sys-2's build.rs passes CMAKE_*
+          # env vars through to cmake, which propagates CMAKE_GENERATOR to
+          # ExternalProject_Add sub-cmakes (unlike CMAKE_TRY_COMPILE_CONFIGURATION
+          # which doesn't propagate per commit 8 falsification). Ninja is
+          # preinstalled on windows-2025 runners (ships with Visual Studio
+          # Build Tools); choco install line is defensive idempotency.
+          choco install ninja -y --no-progress
+          Add-Content $env:GITHUB_ENV "CMAKE_GENERATOR=Ninja"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Run `#[ignore]`'d tests in vault-llm (the real-model smoke suite).

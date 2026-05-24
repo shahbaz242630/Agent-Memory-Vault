@@ -2,7 +2,7 @@
 
 **Current version:** V0.2 Closed Beta (BRD §6.2 — sleep consolidator, boundaries hardening, cross-device sync, 30 beta users)
 
-**Last updated:** 2026-05-24 (T0.2.7 **PHASE B COMPLETE — bi-temporal invalidation contract locked + retrieval-side `valid_until` filter wired + write-time `invalidate()` API shipped + 6/6 DoD gates GREEN. ADR-051 drafted. BRD v1.4 amended (correctness-is-the-product thesis + three-mode deployment + pricing).** Merged consolidator plan iteration 1 locked in chat (T0.2.4 + T0.2.5 + T0.2.6 + T0.3.x + write-time Mem0 loop + Zep bi-temporal + Hermes audit). **COMMITTED + PUSHED with Phase 5 bundle — CI run started concurrently; check status at next session-open per opener below.**) Headline:
+**Last updated:** 2026-05-24 (T0.2.7 **PHASE B COMPLETE — bi-temporal invalidation contract locked + retrieval-side `valid_until` filter wired + write-time `invalidate()` API shipped + 6/6 DoD gates GREEN. ADR-051 drafted. BRD v1.4 amended (correctness-is-the-product thesis + three-mode deployment + pricing).** Merged consolidator plan iteration 1 locked in chat. **PHASE B + PHASE 5 BUNDLE COMMITTED + PUSHED as `c091281`. T0.2.3 close commit 10 (Ninja CMake generator fix-forward for Windows) PUSHED as a follow-up — second CI run testing the Ninja hypothesis live.**) Headline:
 
 ---
 
