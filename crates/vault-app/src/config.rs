@@ -132,6 +132,25 @@ pub struct AppConfig {
     /// staging discipline (`#[allow(dead_code)]` + forward-pointer comment).
     #[allow(dead_code)] // Phase 2 migration consumer — see field-doc above
     pub at_rest_key: Zeroizing<[u8; 32]>,
+
+    /// Path to the Qwen2.5-7B-Instruct-Q4_K_M GGUF file (the V0.2
+    /// production read-time LLM per ADR-049). When `Some`,
+    /// [`crate::Application::new`] loads the model at startup and wires
+    /// a `vault_retrieval::ReadPipeline` into [`crate::VaultAdapter`],
+    /// enabling the `memory.read` MCP tool. When `None`, the read
+    /// pipeline is unwired and `memory.read` calls return
+    /// `VaultError::Config("read pipeline not configured")`.
+    ///
+    /// `Option`-al because:
+    /// - Integration tests don't have the 4.36 GB GGUF on disk and
+    ///   don't exercise the read pipeline at scale — they just verify
+    ///   composition.
+    /// - Future deployments may opt out of local LLM inference
+    ///   (cloud tier V0.3+, smaller-vault appliances, etc.).
+    ///
+    /// **Migration anchor:** new field at T0.2.7 Phase 4 (2026-05-20).
+    /// Not a rename — additive per the rename-prohibition discipline.
+    pub qwen_model_path: Option<PathBuf>,
 }
 
 impl fmt::Debug for AppConfig {
@@ -149,6 +168,7 @@ impl fmt::Debug for AppConfig {
             .field("tokenizer_path", &self.tokenizer_path)
             .field("ort_lib_path", &self.ort_lib_path)
             .field("at_rest_key", &"<redacted>")
+            .field("qwen_model_path", &self.qwen_model_path)
             .finish()
     }
 }
@@ -183,6 +203,7 @@ mod tests {
             tokenizer_path: PathBuf::new(),
             ort_lib_path: PathBuf::new(),
             at_rest_key: Zeroizing::new([0u8; 32]),
+            qwen_model_path: None,
         };
     }
 
@@ -203,6 +224,7 @@ mod tests {
             tokenizer_path: PathBuf::from("/tmp/tokenizer.json"),
             ort_lib_path: PathBuf::from("/tmp/libonnxruntime.so"),
             at_rest_key: at_rest_bytes,
+            qwen_model_path: Some(PathBuf::from("/tmp/qwen-7b.gguf")),
         };
         let dbg_str = format!("{config:?}");
         assert!(

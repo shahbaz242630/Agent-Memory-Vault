@@ -50,12 +50,34 @@ vault-llm = { path = "../vault-llm" }
 # T0.2.3 close re-adds it as a production dep for read-pipeline parsing.
 serde_json = { workspace = true }
 
-# T0.1.9 §6 audit-removal sub-phase: chrono dropped (was wired in T0.1.8
-# Phase 1 for measuring latency_ms inside the audit-append builder; we
-# now measure with `std::time::Instant` only inside `retrieve()`, no
-# chrono needed). serde_json moved to dev-deps (only used by
-# `serde_json::json!` in test-only `make_memory()` helpers — production
-# pipeline no longer builds JSON at this layer).
+# tantivy — BM25 full-text-search engine backing `strategies::keyword`
+# (`KeywordIndex` + `KeywordRetriever`). Promoted from dev-dep to
+# production at T0.2.7 Phase 1 (2026-05-20) after the Phase 0.b spike
+# (`examples/t028g_hybrid_retrieval_spike.rs`) validated the hybrid
+# BGE-dense + Tantivy-BM25 + RRF architecture at SCALE=10K (9/9 retrieval,
+# 9/9 structured contradictions under the refined verdict criterion).
+# Version pinned per BRD §2.9; 0.26.1 is the same version exercised by
+# the spike — no version drift.
+tantivy = "=0.26.1"
+
+# tokio — `KeywordIndex` uses `tokio::sync::Mutex<IndexWriter>` to
+# serialise writes against the single-writer Tantivy contract. Read
+# paths are concurrent (the underlying `IndexReader` is `Send + Sync`).
+# Promoted from dev-dep to production at T0.2.7 Phase 1 (2026-05-20).
+# Workspace pins `features = ["full"]`; the dev-dep entry below is now
+# redundant but kept to avoid Cargo.lock churn.
+tokio.workspace = true
+
+# chrono — re-added to production deps at T0.2.7 Phase B (ADR-051,
+# 2026-05-24): `semantic.rs` and `keyword.rs` filter `m.is_expired_at(Utc::now())`
+# on every retrieve() to skip memories whose bi-temporal `valid_until` has
+# passed. Was dropped at T0.1.9 §6 audit-removal sub-phase (latency now
+# measured via `std::time::Instant`); the bi-temporal retrieval filter
+# brings it back as the wall-clock provider for the expiration predicate.
+chrono.workspace = true
+
+# serde_json moved to dev-deps was reversed at T0.2.3 close (line 51) for
+# read_pipeline.rs JSON parsing.
 
 [dev-dependencies]
 # vault-storage as a dev-dep (no special features). Sub-task (d) of
@@ -74,13 +96,15 @@ tempfile.workspace = true
 # the prior dev-dep line was redundant after T0.2.3 close. Test helpers
 # (`make_memory` building empty metadata JSON) consume the production
 # import; no separate dev-dep needed.
-# anyhow + chrono for the T0.2.3 retrieval-diagnostic spike at
+# anyhow for the T0.2.3 retrieval-diagnostic spike at
 # examples/t023_retrieval_diagnostic_spike.rs. anyhow per BRD §2.4 is
 # allowed in example/spike binaries (library code uses thiserror +
-# VaultError). chrono renders the run timestamp into the markdown
-# audit-trail header. Throwaway — not used by production paths.
+# VaultError). chrono was previously listed here for the same spike's
+# markdown audit-trail header rendering, but at T0.2.7 Phase B (ADR-051)
+# chrono moved to production deps above (Utc::now() in retrieval filters);
+# the dev-dep entry was removed as redundant — production deps carry
+# through to dev-builds.
 anyhow = { workspace = true }
-chrono = { workspace = true }
 # vault-llm with `test-utils` feature for `MockLlmProvider` in
 # read-pipeline unit tests (`src/read_pipeline.rs::tests`) — the
 # production import above carries through to dev-builds, and adding
@@ -94,3 +118,10 @@ vault-llm = { path = "../vault-llm", features = ["test-utils"] }
 # - T0.1.9 §6 audit-removal tests (semantic.rs::tests + retrieval_tests.rs)
 #   to verify `tracing::info!` emission carries the diagnostic shape.
 tracing-test.workspace = true
+
+# NOTE: tantivy was previously a [dev-dependencies] entry (T0.2.7 Phase 0
+# hybrid retrieval spike). At Phase 1 (2026-05-20) it was promoted to
+# production deps above (`KeywordIndex` + `KeywordRetriever`); the dev-
+# dep entry was removed as redundant. The Phase 0 spike example
+# (`examples/t028g_hybrid_retrieval_spike.rs`) still compiles and runs
+# via the production dep.

@@ -243,6 +243,13 @@ fn main() {
             drop(master_key);
 
             // 5. Build AppConfig from resolved paths + the derived subkeys.
+            //
+            // T0.2.7 Phase 4 (2026-05-20): qwen_model_path is None for
+            // the V0.1 Tauri UI — the read-pipeline + Qwen-7B path is
+            // not yet wired into the Tauri shell (UI-only, no MCP
+            // server bound per ADR-034). A future Tauri wiring task
+            // will read the resolved model path and pass `Some(...)`
+            // when the UI surfaces a read-tool affordance.
             let config = AppConfig {
                 metadata_path,
                 vector_dir,
@@ -252,6 +259,7 @@ fn main() {
                 tokenizer_path,
                 ort_lib_path,
                 at_rest_key,
+                qwen_model_path: None,
             };
 
             // 6. Construct Application and spawn the cascading retry

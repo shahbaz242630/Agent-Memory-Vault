@@ -102,6 +102,21 @@ pub enum AuditEventType {
     ///
     /// [`StorageBackend::mark_superseded`]: crate::cascading::StorageBackend::mark_superseded
     MemorySuperseded,
+
+    /// Recorded when [`StorageBackend::invalidate`] sets a memory's `valid_until`
+    /// to mark its content as no longer true (bi-temporal invalidation per
+    /// ADR-051, T0.2.7 Phase B). Distinct from [`Self::MemorySuperseded`]:
+    /// supersession links a memory to its consolidated/replacement memory
+    /// (lineage), while invalidation marks the fact as false-in-the-world at a
+    /// specific time. Both fields may be set on the same memory by the
+    /// write-time `UPDATE` decision in Phase C.
+    ///
+    /// `details_json` shape:
+    /// `{"valid_until":"<ISO-8601>","reason":"<free-text>"}` — the
+    /// `resource_id` field carries the invalidated MemoryId.
+    ///
+    /// [`StorageBackend::invalidate`]: crate::cascading::StorageBackend::invalidate
+    MemoryInvalidated,
 }
 
 impl AuditEventType {
@@ -121,6 +136,7 @@ impl AuditEventType {
             Self::McpToolInvoke => "mcp.tool_invoke",
             Self::TauriCommandInvoke => "ui.tauri_command_invoke",
             Self::MemorySuperseded => "memory.superseded",
+            Self::MemoryInvalidated => "memory.invalidated",
         }
     }
 
@@ -145,6 +161,7 @@ impl AuditEventType {
             "mcp.tool_invoke" => Some(Self::McpToolInvoke),
             "ui.tauri_command_invoke" => Some(Self::TauriCommandInvoke),
             "memory.superseded" => Some(Self::MemorySuperseded),
+            "memory.invalidated" => Some(Self::MemoryInvalidated),
             _ => None,
         }
     }
@@ -503,6 +520,7 @@ mod tests {
             AuditEventType::CascadeQueueOverflow,
             AuditEventType::McpToolInvoke,
             AuditEventType::MemorySuperseded,
+            AuditEventType::MemoryInvalidated,
         ] {
             assert_eq!(AuditEventType::parse(et.as_str()), Some(et));
         }

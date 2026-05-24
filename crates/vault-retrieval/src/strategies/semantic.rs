@@ -58,6 +58,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
+use chrono::Utc;
 use tracing::instrument;
 use vault_core::{Memory, MemoryId, VaultError, VaultResult};
 use vault_embedding::EmbeddingProvider;
@@ -186,10 +187,13 @@ impl SemanticRetriever {
             .collect();
 
         // -- Q5b: include_archived filter ----------------------------------
-        // V0.1 has no superseded memories in production yet, but the
-        // filter is wired from day one so the V0.2 contract holds.
+        // Default (include_archived=false): skip both superseded AND
+        // expired memories. Per ADR-051 (T0.2.7 Phase B), the single
+        // `include_archived` flag controls both behaviors; archival
+        // visibility means full historical state.
         if !query.options.include_archived {
-            scored.retain(|(m, _)| !m.is_superseded());
+            let now = Utc::now();
+            scored.retain(|(m, _)| !m.is_superseded() && !m.is_expired_at(now));
         }
 
         // -- Q4: score_threshold filter ------------------------------------
@@ -640,6 +644,102 @@ mod tests {
         assert!(
             res.iter().any(|r| r.memory.id == parent.id),
             "parent (not superseded) must remain"
+        );
+    }
+
+    // --- 8b. ADR-051: expired memory (valid_until in the past) is filtered by default
+
+    #[tokio::test]
+    async fn expired_memory_is_filtered_by_default() {
+        let bundle = make_bundle().await;
+        let work = boundary("work");
+        let live = make_memory("still true", &work);
+        let expired = make_memory("became false yesterday", &work);
+        insert(&bundle, &live, 1).await;
+        insert(&bundle, &expired, 2).await;
+
+        // Mark `expired` as having become false 1 hour ago. Pin valid_from
+        // to 2 days ago so the Memory invariant (valid_until >= valid_from)
+        // holds independent of microsecond-scale clock skew.
+        let mut expired_mut = expired.clone();
+        expired_mut.valid_from = chrono::Utc::now() - chrono::Duration::days(2);
+        expired_mut.valid_until = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+        bundle
+            .metadata
+            .update_memory(&expired_mut)
+            .await
+            .expect("update");
+
+        let res = bundle
+            .retriever
+            .retrieve(query("memory", vec![work], 10))
+            .await
+            .expect("retrieve");
+
+        assert!(
+            !res.iter().any(|r| r.memory.id == expired.id),
+            "expired memory must be filtered out by default per ADR-051"
+        );
+        assert!(
+            res.iter().any(|r| r.memory.id == live.id),
+            "live memory (valid_until=None) must remain"
+        );
+    }
+
+    // --- 8c. ADR-051: expired memory included when include_archived=true
+
+    #[tokio::test]
+    async fn expired_memory_included_with_include_archived_true() {
+        let bundle = make_bundle().await;
+        let work = boundary("work");
+        let expired = make_memory("became false yesterday", &work);
+        insert(&bundle, &expired, 1).await;
+
+        let mut expired_mut = expired.clone();
+        expired_mut.valid_from = chrono::Utc::now() - chrono::Duration::days(2);
+        expired_mut.valid_until = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+        bundle
+            .metadata
+            .update_memory(&expired_mut)
+            .await
+            .expect("update");
+
+        let mut q = query("memory", vec![work], 10);
+        q.options.include_archived = true;
+        let res = bundle.retriever.retrieve(q).await.expect("retrieve");
+
+        assert!(
+            res.iter().any(|r| r.memory.id == expired.id),
+            "expired memory must surface when include_archived=true per ADR-051"
+        );
+    }
+
+    // --- 8d. ADR-051: future-dated valid_until does NOT exclude (planned expiration)
+
+    #[tokio::test]
+    async fn future_dated_valid_until_does_not_exclude() {
+        let bundle = make_bundle().await;
+        let work = boundary("work");
+        let planned = make_memory("expires next year", &work);
+        insert(&bundle, &planned, 1).await;
+
+        let mut planned_mut = planned.clone();
+        planned_mut.valid_until = Some(chrono::Utc::now() + chrono::Duration::days(365));
+        bundle
+            .metadata
+            .update_memory(&planned_mut)
+            .await
+            .expect("update");
+
+        let res = bundle
+            .retriever
+            .retrieve(query("memory", vec![work], 10))
+            .await
+            .expect("retrieve");
+
+        assert!(
+            res.iter().any(|r| r.memory.id == planned.id),
+            "future-dated valid_until must NOT exclude — fact is still currently true"
         );
     }
 

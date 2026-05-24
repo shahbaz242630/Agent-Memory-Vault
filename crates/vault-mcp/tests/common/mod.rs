@@ -47,7 +47,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use vault_core::{Boundary, Memory, MemoryId, MemoryType, NewMemory, VaultError, VaultResult};
 use vault_mcp::{Adapter, StdioServer, ToolInvokeDetails};
-use vault_retrieval::{RetrievalQuery, RetrievedMemory};
+use vault_retrieval::{ReadQuery, ReadResponse, RetrievalQuery, RetrievedMemory};
 
 /// Phase 1 stub adapter — every CRUD method panics with `unimplemented!()`.
 /// Trust-boundary tests catch the panic via `#[should_panic]`; the
@@ -80,6 +80,10 @@ impl StubAdapter {
 impl Adapter for StubAdapter {
     async fn search(&self, _query: RetrievalQuery) -> VaultResult<Vec<RetrievedMemory>> {
         unimplemented!("T0.1.9 Phase 2: wire SemanticRetriever via Application")
+    }
+
+    async fn read(&self, _query: ReadQuery) -> VaultResult<ReadResponse> {
+        unimplemented!("T0.2.7 Phase 4: wire ReadPipeline via Application")
     }
 
     async fn write(&self, _new_memory: NewMemory) -> VaultResult<MemoryId> {
@@ -160,6 +164,10 @@ impl Adapter for DimMismatchAdapter {
             expected: 384,
             actual: 256,
         })
+    }
+
+    async fn read(&self, _query: ReadQuery) -> VaultResult<ReadResponse> {
+        unimplemented!("DimMismatchAdapter: read() is not exercised by any current test")
     }
 
     async fn write(&self, _new_memory: NewMemory) -> VaultResult<MemoryId> {
@@ -263,6 +271,17 @@ impl Adapter for SuccessAdapter {
             score: 0.95,
             explanation: "semantic: cosine=0.9500 (rank 1/1)".to_string(),
         }])
+    }
+
+    async fn read(&self, _query: ReadQuery) -> VaultResult<ReadResponse> {
+        // Deterministic success fixture matching the search() shape:
+        // a single relevant memory's worth of synthesis prose, no
+        // contradictions, vault_has_no_relevant_content=false.
+        Ok(ReadResponse {
+            synthesis_markdown: "deterministic test synthesis".to_string(),
+            contradictions_flagged: Vec::new(),
+            vault_has_no_relevant_content: false,
+        })
     }
 
     async fn write(&self, _new_memory: NewMemory) -> VaultResult<MemoryId> {

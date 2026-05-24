@@ -221,6 +221,23 @@ impl Memory {
     pub fn is_superseded(&self) -> bool {
         self.superseded_by.is_some()
     }
+
+    /// True if this memory's `valid_until` is set AND has already passed
+    /// the provided point in time — i.e., the fact stopped being true at
+    /// or before `at`. Retrieval should skip these by default per
+    /// ADR-051 (T0.2.7 Phase B, bi-temporal storage semantics lock).
+    ///
+    /// `None` `valid_until` = currently valid. `Some(t)` where `t > at` =
+    /// has a future expiration but the fact is still true at `at`.
+    /// `Some(t)` where `t <= at` = expired.
+    ///
+    /// V0.2 callers pass `Utc::now()` for "currently expired" checks at
+    /// retrieval time. Time-travel queries ("as of 2025-Q1") are deferred
+    /// to V1.0+ per ADR-051 §boundary-of-this-ADR.
+    #[must_use]
+    pub fn is_expired_at(&self, at: DateTime<Utc>) -> bool {
+        self.valid_until.is_some_and(|t| t <= at)
+    }
 }
 
 #[cfg(test)]
@@ -349,6 +366,63 @@ mod tests {
             Memory::try_new(args),
             Err(VaultError::InvalidInput(_))
         ));
+    }
+
+    // ── ADR-051 (T0.2.7 Phase B): is_expired_at helper ──────────────
+
+    #[test]
+    fn is_expired_at_returns_false_for_none_valid_until() {
+        let memory = Memory::try_new(sample_args()).unwrap();
+        assert!(memory.valid_until.is_none());
+        assert!(
+            !memory.is_expired_at(Utc::now()),
+            "valid_until=None means currently true; never expired"
+        );
+    }
+
+    #[test]
+    fn is_expired_at_returns_true_when_valid_until_already_passed() {
+        let now = Utc::now();
+        let mut args = sample_args();
+        args.valid_from = Some(now - chrono::Duration::days(7));
+        args.valid_until = Some(now - chrono::Duration::hours(1));
+        let memory = Memory::try_new(args).unwrap();
+        assert!(
+            memory.is_expired_at(now),
+            "valid_until 1h ago must be expired at now"
+        );
+    }
+
+    #[test]
+    fn is_expired_at_returns_false_when_valid_until_in_future() {
+        let now = Utc::now();
+        let mut args = sample_args();
+        args.valid_until = Some(now + chrono::Duration::days(365));
+        let memory = Memory::try_new(args).unwrap();
+        assert!(
+            !memory.is_expired_at(now),
+            "future-dated valid_until must NOT be expired (fact still true today)"
+        );
+    }
+
+    #[test]
+    fn is_expired_at_returns_true_at_exact_valid_until_boundary() {
+        // ADR-051: `valid_until <= at` is the expiration predicate;
+        // equality at the boundary counts as expired.
+        //
+        // Pin valid_from explicitly to before the boundary timestamp so the
+        // Memory invariant (valid_until >= valid_from) holds independent of
+        // microsecond-scale clock skew between this test's `Utc::now()` and
+        // `try_new`'s internal `Utc::now()`.
+        let now = Utc::now();
+        let mut args = sample_args();
+        args.valid_from = Some(now - chrono::Duration::seconds(1));
+        args.valid_until = Some(now);
+        let memory = Memory::try_new(args).unwrap();
+        assert!(
+            memory.is_expired_at(now),
+            "valid_until == at must be expired (predicate is <=, not <)"
+        );
     }
 
     #[test]

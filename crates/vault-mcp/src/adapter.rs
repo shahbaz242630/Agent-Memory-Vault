@@ -21,7 +21,7 @@
 use async_trait::async_trait;
 
 use vault_core::{Boundary, MemoryId, NewMemory, VaultResult};
-use vault_retrieval::{RetrievalQuery, RetrievedMemory};
+use vault_retrieval::{ReadQuery, ReadResponse, RetrievalQuery, RetrievedMemory};
 
 use crate::audit::ToolInvokeDetails;
 
@@ -43,6 +43,29 @@ pub trait Adapter: Send + Sync {
     /// trusted slice — the caller (`StdioServer`) populates it from its
     /// own state, NOT from the JSON-RPC request body.
     async fn search(&self, query: RetrievalQuery) -> VaultResult<Vec<RetrievedMemory>>;
+
+    /// `memory.read` — read-time pipeline returning a structured
+    /// [`ReadResponse`] (LLM-synthesised narrative + the load-bearing
+    /// `contradictions_flagged` structured field + the boundary-of-
+    /// hard-negative `vault_has_no_relevant_content` flag).
+    ///
+    /// Added at T0.2.7 Phase 4 (2026-05-20). The agent contract per the
+    /// 2026-05-20 lock ([[structured-contract-user-sees-via-agent]]) is
+    /// that callers MUST consume `ReadResponse::contradictions_flagged`
+    /// as the authoritative contradiction signal —
+    /// `ReadResponse::synthesis_markdown` is a convenience summary
+    /// (per the structured-contract policy).
+    ///
+    /// The `ReadQuery::authorized_boundaries` field carries the trusted
+    /// slice — the caller (`StdioServer`) populates it from its own
+    /// state, NOT from the JSON-RPC request body, mirroring `search`.
+    ///
+    /// Implementations that do NOT have a wired-up `ReadPipeline`
+    /// (e.g., test stubs, or production binaries built without the
+    /// Qwen GGUF path configured) should return
+    /// `Err(VaultError::Config(...))` with a clear "read pipeline not
+    /// configured" diagnostic.
+    async fn read(&self, query: ReadQuery) -> VaultResult<ReadResponse>;
 
     /// `memory.write` — create a new memory in the given boundary.
     /// `new_memory.boundary` MUST appear in the trusted authorization

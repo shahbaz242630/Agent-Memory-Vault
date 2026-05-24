@@ -112,7 +112,8 @@ pub async fn assert_no_boundary_leak<R: Retriever>(
         let q = RetrievalQuery {
             query_text: "anything".into(),
             authorized_boundaries: authorised.clone(),
-            // Cap at 100 to honour MAX_RESULTS_CAP; corpus stays well below.
+            // 100 is well below MAX_RESULTS_CAP (200 post 2026-05-18); the
+            // synthetic property-test corpus stays well below this too.
             max_results: 100,
             options: RetrievalOptions::default(),
         };

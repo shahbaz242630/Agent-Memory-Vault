@@ -4,9 +4,16 @@
 //! and `T0.1.9_PLAN.md` for the V0.1 design (5 surfaces, 3-phase split,
 //! ADRs 023 / 024 / 025 / 026).
 //!
-//! V0.1 (T0.1.9) ships **stdio-only**, **single-user**, **strictly serial**
+//! V0.1 (T0.1.9) shipped **stdio-only**, **single-user**, **strictly serial**
 //! request handling, with four tools: `memory.search` / `memory.write` /
 //! `memory.update` / `memory.delete`.
+//!
+//! T0.2.7 Phase 4 (2026-05-20) added a fifth tool: `memory.read` —
+//! exposes the production [`vault_retrieval::ReadPipeline`]
+//! (hybrid retrieval + Qwen-7B synthesis) over the MCP wire. The
+//! agent-consumption contract on `ReadResponse::contradictions_flagged`
+//! is locked in the `memory.read` tool description (see
+//! [`crate::server::StdioServer::tool_read`]).
 //!
 //! ## Trust boundary (ADR-025 — load-bearing)
 //!

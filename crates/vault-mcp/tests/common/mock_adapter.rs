@@ -31,7 +31,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use vault_core::{Boundary, MemoryId, NewMemory, VaultResult};
 use vault_mcp::{Adapter, ToolInvokeDetails};
-use vault_retrieval::{RetrievalQuery, RetrievedMemory};
+use vault_retrieval::{ReadQuery, ReadResponse, RetrievalQuery, RetrievedMemory};
 
 /// One captured `Adapter::update` call. Named struct (not tuple) so
 /// Step 8 assertions read `mock.update_calls()[0].new_memory.boundary`
@@ -51,6 +51,7 @@ pub struct UpdateCall {
 #[derive(Default)]
 pub struct MockAdapter {
     searches: Mutex<Vec<RetrievalQuery>>,
+    reads: Mutex<Vec<ReadQuery>>,
     writes: Mutex<Vec<NewMemory>>,
     updates: Mutex<Vec<UpdateCall>>,
     deletes: Mutex<Vec<MemoryId>>,
@@ -86,6 +87,15 @@ impl MockAdapter {
         self.searches
             .lock()
             .expect("MockAdapter searches mutex poisoned")
+            .clone()
+    }
+
+    /// Snapshot of `read()` calls. Added at T0.2.7 Phase 4 alongside
+    /// the new `memory.read` tool surface.
+    pub fn read_calls(&self) -> Vec<ReadQuery> {
+        self.reads
+            .lock()
+            .expect("MockAdapter reads mutex poisoned")
             .clone()
     }
 
@@ -136,6 +146,18 @@ impl Adapter for MockAdapter {
             .expect("MockAdapter searches mutex poisoned")
             .push(query);
         Ok(Vec::new())
+    }
+
+    async fn read(&self, query: ReadQuery) -> VaultResult<ReadResponse> {
+        self.reads
+            .lock()
+            .expect("MockAdapter reads mutex poisoned")
+            .push(query);
+        Ok(ReadResponse {
+            synthesis_markdown: String::new(),
+            contradictions_flagged: Vec::new(),
+            vault_has_no_relevant_content: true,
+        })
     }
 
     async fn write(&self, new_memory: NewMemory) -> VaultResult<MemoryId> {

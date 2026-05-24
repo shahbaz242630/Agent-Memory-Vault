@@ -38,8 +38,20 @@ vault-mcp = { path = "../vault-mcp" }
 rmcp = { workspace = true, features = ["server", "transport-io"] }
 
 # Retriever trait — VaultAdapter::search delegates to the wired
-# `Arc<dyn Retriever>` (typically `SemanticRetriever` at T0.1.10).
+# `Arc<dyn Retriever>` (T0.2.7 Phase 4: AbstainingRetriever wrapping
+# HybridRetriever(SemanticRetriever, KeywordRetriever)). T0.2.7 Phase 4
+# also adds VaultAdapter::read delegating to a wired
+# Option<ReadPipeline>, which is constructed when AppConfig
+# `qwen_model_path` is `Some`.
 vault-retrieval = { path = "../vault-retrieval" }
+
+# LlmProvider trait + Qwen25_14BProvider + TuningConfig — VaultAdapter
+# holds Option<ReadPipeline> for `Adapter::read`. Only constructed at
+# Application::new when AppConfig.qwen_model_path is Some; tests + CI
+# leave it None (no 4.36 GB GGUF on disk). Per ADR-049 the locked
+# production model is Qwen2.5-7B-Instruct-Q4_K_M.gguf with the
+# llama-cpp-2 backend (Metal on macOS, Vulkan on Windows/Linux).
+vault-llm = { path = "../vault-llm" }
 
 # StorageBackend orchestrator + MetadataStore + audit primitives —
 # VaultAdapter holds StorageBackend + MetadataStore (separate handle

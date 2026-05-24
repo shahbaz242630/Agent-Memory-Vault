@@ -550,6 +550,121 @@ impl StorageBackend {
         })
     }
 
+    /// Mark a memory's content as no longer true in the world by setting
+    /// `valid_until`. Bi-temporal invalidation primitive per ADR-051
+    /// (T0.2.7 Phase B, merged-consolidator arc).
+    ///
+    /// `valid_until_at` is **fact-time** — the timestamp at which the
+    /// memory's content stopped being true. NOT vault-deletion time. NOT
+    /// garbage-collection time. Future-dated values (`valid_until_at >
+    /// now()`) are allowed and represent planned expirations; retrieval
+    /// continues to surface the memory until the timestamp passes.
+    ///
+    /// Orthogonal to [`Self::mark_superseded`]: both fields may be set on
+    /// the same memory by the Phase C write-time `UPDATE` decision (fact
+    /// stopped being true AND was replaced). `invalidate` does NOT touch
+    /// `superseded_by`.
+    ///
+    /// Returns [`Ack`] once the SQLite-side state (memory row + audit
+    /// chain entry) is durably committed. Metadata-only mutation —
+    /// downstream stores (LanceDB / DuckDB) are untouched (no
+    /// retry-queue row). The retrieval-side `valid_until` filter (Phase
+    /// B.2, semantic.rs / keyword.rs / list_memories) excludes the
+    /// memory by default after this call.
+    ///
+    /// **Boundary check is the caller's responsibility** per ADR-051 —
+    /// MCP-layer callers (vault-mcp tool handlers) authorize against
+    /// `authorized_boundaries` before invoking; internal callers
+    /// (consolidator, Phase C write-time loop) pre-filter by boundary
+    /// in their workflows. Mirrors the existing convention on
+    /// [`Self::mark_superseded`].
+    ///
+    /// **Latest-wins on repeat invalidation:** calling on an
+    /// already-invalidated memory overwrites `valid_until` with the new
+    /// timestamp + emits a `tracing::warn!`. The earliest-known
+    /// false-time edge case (rare — caller would need historical
+    /// knowledge of when the fact actually became false) is handled by
+    /// direct field write + admin path; V0.3+ revisits if telemetry
+    /// shows the case. Per ADR-051 §Decision — invalidation API surface.
+    ///
+    /// **Audit-logged:** emits exactly one [`AuditEventType::MemoryInvalidated`]
+    /// event per BRD §11.9.2. `details_json` shape:
+    /// `{"valid_until":"<ISO-8601>","reason":"<free-text>"}`.
+    ///
+    /// **Errors:**
+    /// - [`VaultError::NotFound`] if `memory_id` doesn't exist.
+    /// - [`VaultError::InvalidInput`] if `valid_until_at < memory.valid_from`
+    ///   (would violate the Memory bi-temporal invariant at
+    ///   `crates/vault-core/src/memory.rs:198-204`).
+    /// - [`VaultError::Storage`] on transaction-side failure.
+    #[instrument(
+        skip(self, reason),
+        fields(memory_id = %memory_id, valid_until_at = %valid_until_at)
+    )]
+    pub async fn invalidate(
+        &self,
+        memory_id: MemoryId,
+        valid_until_at: DateTime<Utc>,
+        reason: String,
+    ) -> VaultResult<Ack> {
+        let metadata = self.metadata.clone();
+        let committed_at: DateTime<Utc> = metadata
+            .with_transaction(move |tx| {
+                let memory = tx_get_memory(tx, &memory_id)?.ok_or_else(|| {
+                    VaultError::NotFound(format!("memory {memory_id} does not exist"))
+                })?;
+
+                if let Some(existing) = memory.valid_until {
+                    warn!(
+                        memory_id = %memory_id,
+                        existing_valid_until = %existing,
+                        new_valid_until = %valid_until_at,
+                        "invalidate called on already-invalidated memory — \
+                         latest-wins per ADR-051; earlier timestamp overwritten"
+                    );
+                }
+
+                // Enforce the Memory bi-temporal invariant (valid_until >=
+                // valid_from) before mutating. Memory::validate() also
+                // checks this, but rejecting early gives a clearer error
+                // and avoids the surprise of a validate() failure after
+                // tx_update_memory's body has already run.
+                if valid_until_at < memory.valid_from {
+                    return Err(VaultError::InvalidInput(format!(
+                        "valid_until_at {valid_until_at} precedes valid_from {} for memory {memory_id}",
+                        memory.valid_from
+                    )));
+                }
+
+                let mut updated = memory;
+                updated.valid_until = Some(valid_until_at);
+                let boundary_for_audit = updated.boundary.clone();
+                updated.validate()?;
+                tx_update_memory(tx, &updated)?;
+
+                let mut pending = PendingAuditEvent::success(
+                    AuditEventType::MemoryInvalidated,
+                    ActorKind::System,
+                )
+                .with_resource("memory", memory_id.to_string())
+                .with_boundary(boundary_for_audit);
+                pending.details_json = format!(
+                    r#"{{"valid_until":{},"reason":{}}}"#,
+                    json_string(&valid_until_at.to_rfc3339()),
+                    json_string(&reason)
+                );
+                let event = tx_append_audit(tx, pending)?;
+
+                Ok::<_, VaultError>(event.timestamp)
+            })
+            .await?;
+
+        Ok(Ack {
+            memory_id,
+            sqlite_committed_at: committed_at,
+        })
+    }
+
     /// List memories matching `filter`. The `limit` parameter accepts
     /// `None` (return ALL matching rows — no SQL `LIMIT` clause) or
     /// `Some(N)` (cap at `N`).
@@ -1325,6 +1440,224 @@ mod tests {
             updates.is_empty(),
             "mark_superseded must NOT emit MemoryUpdate events; found {} update events",
             updates.len()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // invalidate — ADR-051 (T0.2.7 Phase B, bi-temporal storage)
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn invalidate_sets_valid_until_and_returns_ack() {
+        let (_tmp, backend) = make_backend().await;
+        let m = sample_memory("work", "fact that becomes false");
+        backend.write_memory(&m, &embedding(0.1)).await.unwrap();
+
+        let cutoff = Utc::now();
+        let ack = backend
+            .invalidate(m.id, cutoff, "test reason".into())
+            .await
+            .unwrap();
+        assert_eq!(ack.memory_id, m.id);
+
+        let back = backend.metadata.get_memory(&m.id).await.unwrap().unwrap();
+        // RFC3339 round-trip can lose sub-millisecond precision; check
+        // equality at second resolution to avoid timestamp-noise flakes.
+        let stored = back.valid_until.expect("valid_until must be Some");
+        assert!(
+            (stored - cutoff).num_milliseconds().abs() < 1000,
+            "stored {stored} ~ cutoff {cutoff}",
+        );
+        // ADR-051 orthogonality: invalidate MUST NOT touch superseded_by.
+        assert_eq!(
+            back.superseded_by, None,
+            "invalidate must not touch superseded_by (orthogonal per ADR-051)"
+        );
+        assert_eq!(back.content, m.content);
+    }
+
+    #[tokio::test]
+    async fn invalidate_returns_not_found_on_missing_memory() {
+        let (_tmp, backend) = make_backend().await;
+        let id = MemoryId::new();
+        let err = backend
+            .invalidate(id, Utc::now(), "no such memory".into())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VaultError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn invalidate_rejects_valid_until_before_valid_from() {
+        let (_tmp, backend) = make_backend().await;
+        let m = sample_memory("work", "valid_from is now");
+        backend.write_memory(&m, &embedding(0.1)).await.unwrap();
+
+        // valid_from defaults to now() at create; a yesterday cutoff
+        // is before it, violating the Memory bi-temporal invariant.
+        let yesterday = Utc::now() - chrono::Duration::days(1);
+        let err = backend
+            .invalidate(m.id, yesterday, "wrong order".into())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VaultError::InvalidInput(_)));
+
+        // Memory must remain valid (valid_until still None) after the rejection.
+        let back = backend.metadata.get_memory(&m.id).await.unwrap().unwrap();
+        assert_eq!(back.valid_until, None);
+    }
+
+    #[tokio::test]
+    async fn invalidate_latest_wins_on_repeat() {
+        let (_tmp, backend) = make_backend().await;
+        let m = sample_memory("work", "double-invalidated");
+        backend.write_memory(&m, &embedding(0.1)).await.unwrap();
+
+        let first = Utc::now();
+        backend
+            .invalidate(m.id, first, "first".into())
+            .await
+            .unwrap();
+
+        // ADR-051 §Decision: latest-wins on repeat invalidation.
+        let second = first + chrono::Duration::seconds(60);
+        backend
+            .invalidate(m.id, second, "second".into())
+            .await
+            .unwrap();
+
+        let back = backend.metadata.get_memory(&m.id).await.unwrap().unwrap();
+        let stored = back.valid_until.expect("valid_until must be Some");
+        // Second invalidation wins (later timestamp); first is overwritten.
+        assert!(
+            (stored - second).num_milliseconds().abs() < 1000,
+            "stored {stored} must match second={second} (latest-wins per ADR-051)",
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidate_emits_memory_invalidated_audit_event() {
+        let (_tmp, backend) = make_backend().await;
+        let m = sample_memory("work", "audit me");
+        backend.write_memory(&m, &embedding(0.2)).await.unwrap();
+
+        let cutoff = Utc::now();
+        backend
+            .invalidate(m.id, cutoff, "test audit shape".into())
+            .await
+            .unwrap();
+
+        let events = backend
+            .metadata
+            .list_audit_events(usize::MAX)
+            .await
+            .unwrap();
+        let event = events
+            .iter()
+            .find(|e| e.event_type == AuditEventType::MemoryInvalidated)
+            .expect("memory.invalidated event must exist after invalidate");
+
+        assert_eq!(event.resource_type.as_deref(), Some("memory"));
+        assert_eq!(
+            event.resource_id.as_deref(),
+            Some(m.id.to_string().as_str())
+        );
+        assert_eq!(event.actor_kind, ActorKind::System);
+        // details_json shape per ADR-051: {"valid_until":<RFC3339>,"reason":<text>}.
+        // RFC3339 second-resolution prefix is enough for the substring assert.
+        let cutoff_prefix = cutoff.format("%Y-%m-%dT%H:%M:%S").to_string();
+        assert!(
+            event.details_json.contains(&cutoff_prefix),
+            "details_json {} must contain cutoff {}",
+            event.details_json,
+            cutoff_prefix
+        );
+        assert!(
+            event.details_json.contains("test audit shape"),
+            "details_json {} must contain the supplied reason",
+            event.details_json
+        );
+
+        // ADR-051 discrimination property: NO MemoryUpdate event from invalidate.
+        let updates: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == AuditEventType::MemoryUpdate)
+            .collect();
+        assert!(
+            updates.is_empty(),
+            "invalidate must NOT emit MemoryUpdate events; found {} update events",
+            updates.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidate_and_mark_superseded_are_orthogonal() {
+        // ADR-051 §Decision — relationship to mark_superseded:
+        // both fields may be set on the same memory by the Phase C
+        // write-time UPDATE decision. Test pins the orthogonality.
+        let (_tmp, backend) = make_backend().await;
+        let m = sample_memory("work", "false-AND-replaced");
+        backend.write_memory(&m, &embedding(0.3)).await.unwrap();
+
+        let new_id = MemoryId::new();
+        backend.mark_superseded(m.id, new_id).await.unwrap();
+
+        let cutoff = Utc::now();
+        backend
+            .invalidate(m.id, cutoff, "phase-C compose".into())
+            .await
+            .unwrap();
+
+        let back = backend.metadata.get_memory(&m.id).await.unwrap().unwrap();
+        assert_eq!(back.superseded_by, Some(new_id));
+        assert!(back.valid_until.is_some());
+        assert_eq!(back.content, m.content);
+    }
+
+    #[tokio::test]
+    async fn invalidate_does_not_enqueue_cascade_row() {
+        // Mirrors mark_superseded's metadata-only contract — invalidate
+        // is a metadata-only state change; LanceDB/DuckDB untouched.
+        let (_tmp, backend) = make_backend().await;
+        let m = sample_memory("work", "no cascade");
+        backend.write_memory(&m, &embedding(0.4)).await.unwrap();
+
+        let baseline = backend.retry_queue.len().await.unwrap();
+        assert_eq!(baseline, 1, "baseline: one Write enqueue from write_memory");
+
+        backend
+            .invalidate(m.id, Utc::now(), "no cascade".into())
+            .await
+            .unwrap();
+
+        let after = backend.retry_queue.len().await.unwrap();
+        assert_eq!(
+            after, baseline,
+            "invalidate MUST NOT enqueue a cascade row — metadata-only mutation"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidate_accepts_future_dated_valid_until() {
+        // ADR-051 §Decision: future-dated valid_until (planned expiration)
+        // is allowed. The retrieval-side filter is what decides whether
+        // the memory currently surfaces — invalidate() only persists.
+        let (_tmp, backend) = make_backend().await;
+        let m = sample_memory("work", "expires next year");
+        backend.write_memory(&m, &embedding(0.5)).await.unwrap();
+
+        let future = Utc::now() + chrono::Duration::days(365);
+        backend
+            .invalidate(m.id, future, "planned-expiration".into())
+            .await
+            .unwrap();
+
+        let back = backend.metadata.get_memory(&m.id).await.unwrap().unwrap();
+        assert!(back.valid_until.is_some());
+        let stored = back.valid_until.unwrap();
+        assert!(
+            stored > Utc::now(),
+            "future-dated valid_until must be preserved, got {stored}"
         );
     }
 

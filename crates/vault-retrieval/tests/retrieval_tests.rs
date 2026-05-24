@@ -503,36 +503,58 @@ async fn audit_chain_integrity_unaffected_by_retrieve() {
 // 17. Perf gate (BRD §5.5: end-to-end retrieval < 200ms over 1k memories)
 // =============================================================================
 
-/// **Status: investigation deferred to post-T0.1.10** — see HANDOFF.md
-/// tech-debt entry "vault-retrieval perf gate — investigation deferred."
+/// **Status: investigation COMPLETE at T0.1.10 Phase 3a (2026-05-04);
+/// intervention in flight at T0.2.7.** Gate remains `#[ignore]`-d until
+/// the intervention (hybrid retrieval + `bulk_upsert` promotion) is fully
+/// landed in production and benchmarked at SCALE=1K. See HANDOFF.md
+/// "Tech debt — open items" entry "Promote `bulk_upsert` from t028b spike
+/// to `VectorStore` trait + production."
 ///
+/// **Historical context (preserved for audit trail):**
 /// First end-to-end run of this gate (T0.1.8 Phase 3, 2026-05-01, idle
 /// machine + fresh build cache) measured **412ms** (run 1) and
 /// **1,852ms** (run 2) — both well over the 200ms BRD §5.5 ceiling.
 /// Phase 1 had `retrieve()` as `unimplemented!()` so this gate had
 /// never actually executed before; Phase 2 left it `#[ignore]`-d.
 ///
-/// **Suspected cause:** LanceDB fragmentation. The setup loop does
-/// 1000 individual `vectors.upsert` calls, creating 1000 fragments;
+/// **Root cause (confirmed at T0.1.10 Phase 3a, 2026-05-04 — see
+/// `HANDOFF_V0.1_ARCHIVE.md` line 1762 for the 5-run measurement results
+/// + outcome (i) confirmation):** LanceDB fragmentation. The setup loop
+/// does 1000 individual `vectors.upsert` calls, creating 1000 fragments;
 /// without an explicit vector index, search falls back to per-fragment
 /// full-scan cosine k-NN, so latency grows roughly
-/// `O(fragments × rows_per_fragment)`. Production V0.1 writes
-/// memories one-at-a-time, so fragmentation accumulates similarly —
-/// this isn't a synthetic-fixture artefact, it's a real V0.1 perf
-/// concern surfaced by the gate.
+/// `O(fragments × rows_per_fragment)`. Production V0.1 writes memories
+/// one-at-a-time, so fragmentation accumulates similarly — this isn't a
+/// synthetic-fixture artefact, it's a real V0.1 perf concern surfaced by
+/// the gate.
 ///
-/// **Why not fix in Phase 3:** lowering the fixture count, adding
-/// compaction in setup, or implementing indexing each papers over or
-/// pre-empts the real concern. Right time to investigate is
-/// post-T0.1.10 when integration smoke surfaces realistic workload
-/// patterns. Phase 3 ships proptest + warn-log assertion as the
-/// substantive deliverables; this gate stays honestly deferred.
+/// **Intervention in flight at T0.2.7 (this commit's parent task):**
+/// hybrid retrieval architecture (BGE + Tantivy BM25 + RRF + abstain)
+/// supersedes vanilla cosine-only retrieval as the production read path
+/// (`vault_retrieval::HybridRetriever` wired into vault-app at Phase 4).
+/// Tantivy is in-RAM, sidestepping LanceDB fragmentation for the keyword
+/// channel. The semantic channel still uses LanceDB and will benefit
+/// from the separately-tracked `bulk_upsert` promotion (HANDOFF.md tech
+/// debt) — spike measured **730× faster** insertion at 10K vs single-row
+/// upsert.
+///
+/// **Why this gate STAYS `#[ignore]`-d even after T0.2.7 ships:**
+/// 1. The hybrid retriever is the production read path; this gate
+///    measures `SemanticRetriever` (vanilla cosine) in isolation per
+///    BRD §5.5 wording. An independent gate for the hybrid path is a
+///    separate test that doesn't yet exist.
+/// 2. `bulk_upsert` promotion (the LanceDB fragmentation remediation)
+///    is itself open tech-debt; this gate's setup loop will benefit
+///    automatically once promoted (estimated 30–80ms PASS based on
+///    t028b spike measurements).
+/// 3. The assertion stays preserved as the contract pin — when
+///    `bulk_upsert` is promoted to production, light up the gate again,
+///    expect it to PASS comfortably under 200ms.
 ///
 /// The `assert!(elapsed.as_millis() < 200, ...)` line below stays
-/// load-bearing for whenever the investigation lands — the gate is
-/// preserved as the contract pin even though it's currently `#[ignore]`-d.
+/// load-bearing for whenever the relight happens.
 #[tokio::test]
-#[ignore = "T0.1.8 Phase 3 finding: gate exceeds 200ms ceiling on real measurement (412ms / 1852ms). Investigation deferred to post-T0.1.10. See HANDOFF.md tech-debt 'vault-retrieval perf gate — investigation deferred'."]
+#[ignore = "T0.1.10 Phase 3a (2026-05-04) confirmed root cause: LanceDB fragmentation from 1-at-a-time upserts in setup loop (412ms / 1852ms on first runs vs 200ms ceiling). Intervention in flight at T0.2.7 (hybrid retrieval) + bulk_upsert promotion (HANDOFF.md tech-debt). Relight gate when bulk_upsert lands; expect PASS at 30-80ms per t028b spike (730× speedup at 10K). See HANDOFF.md 'Tech debt — open items' for the bulk_upsert promotion ship-gate language."]
 async fn end_to_end_retrieval_latency_under_200ms_with_1k_memories() {
     let t = make_test_retriever().await;
     let b = boundary("work");

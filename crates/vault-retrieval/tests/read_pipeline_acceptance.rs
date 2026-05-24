@@ -4,6 +4,12 @@
 //! asserts the production quality contract: **4/4 contradictions surfaced
 //! + 2/2 hard-negatives correctly rejected**.
 //!
+//! Verdict criterion: refined per [[structured-contract-user-sees-via-agent]]
+//! (locked 2026-05-20). A contradiction query passes if either the synthesis
+//! prose contains both literal positions OR `contradictions_flagged[*].positions`
+//! does — either channel is sufficient because the agent consumes the
+//! structured field per the `memory.read` MCP tool description.
+//!
 //! # Gating
 //!
 //! Cron-gated `#[ignore]` because the test loads a 4.36 GB GGUF, runs ~10
@@ -37,7 +43,8 @@ use vault_core::{Boundary, Memory, MemoryId, MemoryType, NewMemory};
 use vault_embedding::{BgeSmallProvider, EmbeddingProvider, EMBEDDING_DIM};
 use vault_llm::{LlmProvider, Qwen25_14BProvider, TuningConfig};
 use vault_retrieval::{
-    ReadPipeline, ReadQuery, ReadResponse, SemanticRetriever, DEFAULT_MAX_CANDIDATES,
+    AbstainingRetriever, HybridRetriever, KeywordIndex, KeywordRetriever, ReadPipeline, ReadQuery,
+    ReadResponse, Retriever, SemanticRetriever, DEFAULT_MAX_CANDIDATES,
 };
 use vault_storage::{LanceVectorStore, MetadataStore, SqlCipherKey, VectorStore};
 
@@ -190,15 +197,42 @@ async fn read_pipeline_acceptance_8_query_gauntlet() -> Result<()> {
     }
     println!("Fixture inserted.");
 
-    let retriever = Arc::new(SemanticRetriever::new(
+    // T0.2.7 Phase 4: production retriever stack (matches Application::new's
+    // wiring exactly so the acceptance test exercises the same code path as
+    // the MCP-facing memory.read tool).
+    //
+    // Stack composition (bottom-up):
+    //   AbstainingRetriever            ← top-1 BM25 < 6.0 → empty result (Phase 3)
+    //       └── HybridRetriever        ← RRF fusion of semantic + keyword (Phase 2)
+    //              ├── SemanticRetriever   ← BGE dense cosine (V0.1)
+    //              └── KeywordRetriever    ← Tantivy BM25 (Phase 1)
+    //                       └── KeywordIndex (bulk-loaded from MetadataStore)
+    let semantic: Arc<dyn Retriever> = Arc::new(SemanticRetriever::new(
         metadata.clone(),
         bge,
         vectors.clone(),
     ));
+
+    let keyword_index = Arc::new(KeywordIndex::new()?);
+    // Bulk-load — the 100 fixture memories were created above; pull them
+    // back as a Vec<Memory> to feed Tantivy.
+    let bulk_ids: Vec<vault_core::MemoryId> = fixture_id_to_memory_id.values().copied().collect();
+    let bulk_memories = metadata.get_memories_batch(&bulk_ids).await?;
+    keyword_index.bulk_insert(&bulk_memories).await?;
+    println!("KeywordIndex bulk-loaded {} memories", bulk_memories.len());
+
+    let keyword: Arc<dyn Retriever> = Arc::new(KeywordRetriever::new(
+        keyword_index.clone(),
+        metadata.clone(),
+    ));
+    let hybrid: Arc<dyn Retriever> = Arc::new(HybridRetriever::new(semantic, keyword.clone()));
+    let retriever: Arc<dyn Retriever> = Arc::new(AbstainingRetriever::new(hybrid, keyword));
+
     let llm: Arc<dyn vault_llm::LlmProvider> = Arc::new(qwen);
     let pipeline = ReadPipeline::new(retriever, llm);
     println!(
-        "ReadPipeline ready (max_candidates={}, system prompt = production default)",
+        "ReadPipeline ready (production stack: Abstain → Hybrid → [Semantic + Keyword], \
+         max_candidates={}, system prompt = production v9 default)",
         DEFAULT_MAX_CANDIDATES
     );
 
@@ -337,14 +371,29 @@ fn assess_query(query_id: &str, resp: &ReadResponse) -> QualityVerdict {
         let Some((sub_a, sub_b)) = structural_substrings(query_id) else {
             return QualityVerdict::Observational;
         };
-        let contains_a = resp.synthesis_markdown.contains(sub_a);
-        let contains_b = resp.synthesis_markdown.contains(sub_b);
-        let flagged_nonempty = !resp.contradictions_flagged.is_empty();
+        // Refined verdict ([[structured-contract-user-sees-via-agent]], locked
+        // 2026-05-20): PASS = both literals in synthesis_markdown OR both
+        // literals anywhere in contradictions_flagged[*].positions[*].
+        // Either channel proves the vault did its job — the user never sees
+        // vault output directly; the agent (Claude / Codex / etc) consumes
+        // the structured field per the memory.read MCP tool description.
+        let prose_a = resp.synthesis_markdown.contains(sub_a);
+        let prose_b = resp.synthesis_markdown.contains(sub_b);
+        let prose_pass = prose_a && prose_b;
+        let structured_haystack: String = resp
+            .contradictions_flagged
+            .iter()
+            .flat_map(|c| c.positions.iter().cloned())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let struct_a = structured_haystack.contains(sub_a);
+        let struct_b = structured_haystack.contains(sub_b);
+        let struct_pass = struct_a && struct_b;
         let detail = format!(
-            "contradictions_flagged.len()={} · '{sub_a}'={contains_a} AND '{sub_b}'={contains_b}",
+            "contradictions_flagged.len()={} · prose: '{sub_a}'={prose_a} AND '{sub_b}'={prose_b} · structured: '{sub_a}'={struct_a} AND '{sub_b}'={struct_b}",
             resp.contradictions_flagged.len()
         );
-        if flagged_nonempty && contains_a && contains_b {
+        if prose_pass || struct_pass {
             QualityVerdict::ContradictionPass(detail)
         } else {
             QualityVerdict::ContradictionFail(detail)

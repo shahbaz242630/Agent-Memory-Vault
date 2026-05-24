@@ -28,9 +28,10 @@
 //!   and locked by `tests/retrieval_tests.rs::result_ordering_score_then_created_at_desc`.
 //!
 //! - **Result-limit contract (Q3):** `max_results == 0` and
-//!   `max_results > 100` are rejected as `VaultError::InvalidInput`.
-//!   Caller-side defaults (MCP = 10, UI = 20) live in those crates, not
-//!   here — keeping the retriever cap-only avoids hidden defaults.
+//!   `max_results > MAX_RESULTS_CAP` (currently 200) are rejected as
+//!   `VaultError::InvalidInput`. Caller-side defaults (MCP = 10, UI = 20)
+//!   live in those crates, not here — keeping the retriever cap-only
+//!   avoids hidden defaults.
 //!
 //! - **Query-text validation (Q2):** trim leading/trailing whitespace;
 //!   reject empty / whitespace-only / control-char-bearing inputs;
@@ -43,7 +44,15 @@ use vault_core::{Boundary, Memory, VaultResult};
 /// Hard upper bound on `max_results`. Rejecting values above this prevents
 /// callers from issuing unbounded retrievals; MCP / UI default to 10 / 20
 /// respectively at their own layer (BRD §5.5 implementation note).
-pub const MAX_RESULTS_CAP: usize = 100;
+///
+/// Raised 100 → 200 at T0.2.7 v8 10K Q25 diagnostic close (2026-05-18).
+/// The read-time pipeline's value-aware retrieval needs to widen well
+/// beyond the LLM-facing top-K=20 to detect contradiction pairs that span
+/// the cosine-rank boundary at scale. At SCALE=10K diverse corpus, the
+/// Q25 GA-launch contradiction's Memory B sat at brute-force cosine rank
+/// 172 — outside any top_n ≤ 200 widening would have missed it. 200 is
+/// the minimum sufficient cap for the V0.2 6-query gauntlet at 10K.
+pub const MAX_RESULTS_CAP: usize = 200;
 
 /// Hard upper bound on the post-trim query length, in bytes. 2,048 is
 /// generous for natural-language queries while preventing abuse of

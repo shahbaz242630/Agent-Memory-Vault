@@ -42,9 +42,13 @@ use std::sync::Arc;
 
 use vault_core::{Boundary, VaultError, VaultResult};
 use vault_embedding::{BgeSmallProvider, EmbeddingProvider, EMBEDDING_DIM};
+use vault_llm::{LlmProvider, Qwen25_14BProvider, TuningConfig};
 use vault_mcp::{Adapter, StdioServer};
-use vault_retrieval::{Retriever, SemanticRetriever};
-use vault_storage::{MetadataStore, RetryWorker, StorageBackend};
+use vault_retrieval::{
+    AbstainingRetriever, HybridRetriever, KeywordIndex, KeywordRetriever, ReadPipeline, Retriever,
+    SemanticRetriever,
+};
+use vault_storage::{MemoryFilter, MetadataStore, RetryWorker, StorageBackend};
 
 use crate::process_exit::{LiveProcessExit, ProcessExit};
 use crate::signal_source::{LiveSignalSource, SignalSource};
@@ -151,18 +155,96 @@ impl Application {
         //    under load — see the integration spike at
         //    `tests/integration_smoke.rs` trigger (b)/(c).
         let vector_store = storage.vector_store().clone();
-        let retriever = SemanticRetriever::new(retriever_metadata, embedder.clone(), vector_store);
-        let retriever: Arc<dyn Retriever> = Arc::new(retriever);
+        let semantic =
+            SemanticRetriever::new(retriever_metadata.clone(), embedder.clone(), vector_store);
+        let semantic: Arc<dyn Retriever> = Arc::new(semantic);
 
-        // 6. VaultAdapter — composes the four trait deps into the MCP
-        //    Adapter surface. Clone the StorageBackend so Application
-        //    retains a handle for `start()` to construct the worker
-        //    against. The `#[derive(Clone)]` on StorageBackend is
-        //    `Arc<Inner>`-shallow per cascading.rs:149 — both clones
-        //    share the same retry_queue so writes via the adapter are
-        //    drained by the worker constructed from Application's clone.
+        // 6. KeywordIndex (T0.2.7 Phase 1) — in-RAM BM25 over all
+        //    memory content. Bulk-loaded from the encrypted SQLite
+        //    metadata store at startup; subsequent writes/updates/
+        //    deletes maintain the index incrementally (vault-app's
+        //    write path is wired in a follow-on phase — Phase 1 left
+        //    a documented gap that lands when the read-path validation
+        //    proves the architecture).
+        //
+        //    Per [[run-cargo-gates-in-background]] memory: the bulk-
+        //    load completes in ~1 sec at 10K memories, ~10 sec at 100K
+        //    — fine for V0.2 beta scale. Future on-disk sealed-sidecar
+        //    persistence is deferred until startup-rebuild cost
+        //    matters in practice.
+        let keyword_index = Arc::new(KeywordIndex::new()?);
+        let all_memories = retriever_metadata
+            .list_memories(MemoryFilter::default(), None)
+            .await?;
+        keyword_index.bulk_insert(&all_memories).await?;
+        drop(all_memories);
+        let keyword = KeywordRetriever::new(keyword_index.clone(), retriever_metadata);
+        let keyword: Arc<dyn Retriever> = Arc::new(keyword);
+
+        // 7. HybridRetriever — fuses semantic + keyword via Reciprocal
+        //    Rank Fusion (k=60, top_n_each=200) per T0.2.7 Phase 2.
+        let hybrid: Arc<dyn Retriever> = Arc::new(HybridRetriever::new(semantic, keyword.clone()));
+
+        // 8. AbstainingRetriever — gates on top-1 BM25 score; below
+        //    threshold (default 6.0) returns empty result so the LLM
+        //    isn't asked to synthesise from a hard-negative corpus
+        //    (T0.2.7 Phase 3). Wraps the hybrid; probes the keyword
+        //    channel directly for the threshold check.
+        let retriever: Arc<dyn Retriever> = Arc::new(AbstainingRetriever::new(hybrid, keyword));
+
+        // 9. Optional ReadPipeline — wires the Qwen-7B LLM if the
+        //    config supplies a model path. `None` is the test /
+        //    cloud-tier path; the corresponding `memory.read` MCP
+        //    call surfaces `VaultError::Config("read pipeline not
+        //    configured")`.
+        //
+        //    Locked tuning config (HANDOFF.md V0.2 backend + tuning):
+        //    `n_threads = 12`, `n_threads_batch = 12`, `n_gpu_layers
+        //    = 99`. Empirically anchored on i7-13620H + Intel UHD +
+        //    Vulkan iGPU offload (mean 86.0s, p99 119.7s per
+        //    t027b_qwen_7b_vulkan_results.md).
+        let read_pipeline = match &config.qwen_model_path {
+            Some(path) => {
+                tracing::info!(
+                    target: "vault_app::startup",
+                    qwen_model_path = %path.display(),
+                    "loading Qwen-7B for read pipeline"
+                );
+                let tuning = TuningConfig {
+                    n_threads: Some(12),
+                    n_threads_batch: Some(12),
+                    n_gpu_layers: Some(99),
+                    ..TuningConfig::default()
+                };
+                let provider = Qwen25_14BProvider::open_with_tuning(path, tuning).await?;
+                let llm: Arc<dyn LlmProvider> = Arc::new(provider);
+                Some(ReadPipeline::new(retriever.clone(), llm))
+            }
+            None => {
+                tracing::info!(
+                    target: "vault_app::startup",
+                    "qwen_model_path is None; memory.read tool will return VaultError::Config"
+                );
+                None
+            }
+        };
+
+        // 10. VaultAdapter — composes the trait deps + optional read
+        //    pipeline into the MCP Adapter surface. Clone the
+        //    StorageBackend so Application retains a handle for
+        //    `start()` to construct the worker against. The
+        //    `#[derive(Clone)]` on StorageBackend is `Arc<Inner>`-
+        //    shallow per cascading.rs:149 — both clones share the
+        //    same retry_queue so writes via the adapter are drained
+        //    by the worker constructed from Application's clone.
         let adapter_storage = storage.clone();
-        let adapter = VaultAdapter::new(retriever, embedder, adapter_storage, adapter_metadata);
+        let adapter = VaultAdapter::new(
+            retriever,
+            read_pipeline,
+            embedder,
+            adapter_storage,
+            adapter_metadata,
+        );
 
         Ok(Self {
             adapter: Arc::new(adapter),

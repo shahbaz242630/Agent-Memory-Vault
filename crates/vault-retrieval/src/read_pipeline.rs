@@ -58,7 +58,7 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use vault_core::{Boundary, MemoryId, VaultError, VaultResult};
+use vault_core::{Boundary, VaultError, VaultResult};
 use vault_llm::{CompletionParams, LlmProvider};
 
 use crate::retriever::{
@@ -100,27 +100,136 @@ pub const READ_TIME_JSON_SCHEMA: &str = r#"{
   }
 }"#;
 
-/// Canonical V0.2 read-time system prompt. Promoted from the t026/t027b
-/// spike harness (`STANDALONE_SYSTEM_PROMPT`) — same text, same quality
-/// guarantees against the t026 gauntlet. Callers may override via
-/// [`ReadPipeline::with_system_prompt`] for per-tenant customisation, but
-/// the default is the production-validated text.
+/// Canonical V0.2 read-time system prompt. **v10** (T0.2.7 Phase 5 Step 2,
+/// 2026-05-23 — companion to the rank-indexed prompt format established
+/// by [`build_user_prompt`]). Supersedes v9 with two changes only:
+/// the Comcast example references `{memory_ids: ["3", "7"], ...}`
+/// (rank strings) instead of `{memory_ids: [M1, M2], ...}`, and the
+/// OUTPUT section explicitly teaches the LLM that candidates are
+/// 1-indexed and that the rank strings are what go in
+/// `contradictions_flagged.memory_ids`. All other v9 instructions —
+/// RELEVANCE, CONTRADICTIONS (VERBATIM RULE + TEMPORAL VALUE CHANGES),
+/// NARRATIVE COMPLIANCE anti-pattern, TASK-SHAPED QUERIES — are kept
+/// verbatim from v9.
+///
+/// **Why v10 supersedes v9 (and v9 superseded the earlier t026 prompt).**
+/// v9's validation chain at SCALE=10K (diverse corpus, 9-query gauntlet,
+/// v3a/v3b/v3c spike) closed the worst prose-elision patterns. v10
+/// targets a different layer entirely — input determinism. The T0.2.7
+/// Phase 5 Step 2 t030 byte-equality probe (2026-05-23) showed that
+/// retrieval is deterministic both in-process and across-process, but
+/// embedding random per-process UUIDv7 memory IDs in the prompt added
+/// ~300 BPE tokens of input randomness per query — enough to flip
+/// Qwen-7B's Q25 verdict at SCALE=1000 across runs even at
+/// temperature=0 with seed=42. v10 plus the rank-indexed
+/// [`build_user_prompt`] make the prompt a pure function of
+/// `(query, ordered candidate content)`.
+///
+/// **Quality contract context.** Per the 2026-05-20 verdict refinement
+/// ([[structured-contract-user-sees-via-agent]]), `contradictions_flagged`
+/// is the production-load-bearing field — the agent consumes it
+/// structurally. `synthesis_markdown` is convenience prose. v9/v10
+/// tighten the prose contract but the structured-field-is-contract
+/// policy makes the prose-substring gap non-blocking even if the prompt
+/// doesn't fully close it.
+///
+/// Callers may override via [`ReadPipeline::with_system_prompt`] for
+/// per-tenant customisation, but the default is the production text
+/// validated against the T0.2.7 spike's 10K-corpus 9-query gauntlet.
 pub const READ_TIME_SYSTEM_PROMPT: &str = r#"You are the read layer of a personal memory vault used by AI coding agents.
 
 You receive a query and a set of candidate memories retrieved via semantic similarity.
 In ONE pass you must: (a) filter to actually-relevant candidates, (b) detect any
-contradictions among the filtered set, and (c) produce a coherent synthesis the agent
-can use directly as context.
+contradictions among the filtered set, and (c) produce a coherent synthesis.
 
-Rules:
-- A candidate is relevant only if its content directly addresses the query's subject.
-  Topical overlap alone is NOT relevance.
-- If filtered memories contradict each other (different dates/values for the same fact),
-  you MUST surface each contradiction in synthesis_markdown with BOTH positions stated
-  AND populate contradictions_flagged to match.
-- Write a coherent narrative; cite memory IDs.
-- If no candidates are relevant, set vault_has_no_relevant_content=true AND state this
-  in synthesis_markdown explicitly. Do NOT fabricate.
+RELEVANCE:
+- A candidate is relevant ONLY if its content explicitly mentions the subject of the
+  query. Topical proximity is NOT relevance.
+- Example: a query about "Kubernetes migration" is NOT satisfied by memories about
+  database migrations, container tooling in general, or other infrastructure changes.
+  The subject is specifically "Kubernetes" — if no candidate uses that word (or a
+  direct synonym like "k8s"), the vault has no relevant content for this query.
+- When uncertain whether a candidate addresses the query's subject, prefer
+  vault_has_no_relevant_content=true over fabricating a relevance link. Conservative
+  beats over-confident.
+
+CONTRADICTIONS (load-bearing):
+- If two or more memories disagree on a value for the same fact — different numbers,
+  dates, amounts, names, choices, quantities — you MUST surface the disagreement.
+  This holds even when many memories support one value and only one supports the
+  other. Minority evidence is never optional.
+- VERBATIM RULE: when you state a contradictory value in synthesis_markdown, copy
+  the EXACT text from the source memory, including all modifiers (years, units,
+  qualifiers). Do NOT abbreviate, round, or paraphrase. If a memory says
+  "Q1 2027", write "Q1 2027" — not "Q1" alone. If a memory says "$89.99/month",
+  write "$89.99/month" — not "around $90".
+- For EACH contradiction detected you MUST do BOTH:
+    (a) Mention BOTH literal values in synthesis_markdown (verbatim, per the rule
+        above).
+    (b) Add an entry to contradictions_flagged with the participating candidate
+        indices (as strings, matching the [N] prefix on each candidate) and the
+        conflicting positions (also verbatim).
+- TEMPORAL VALUE CHANGES count as contradictions. If one memory says X has value A
+  and another memory says X has value B (or "X is now B", or "X increased to B",
+  or "B starting next cycle"), both memories disagree about what value X currently
+  carries — the older memory implies the answer is A; the newer implies B. You MUST
+  flag this in contradictions_flagged using the same dual-field rule above. A
+  monthly-review or audit query is asking precisely for these flags; reporting the
+  change in synthesis_markdown alone is NOT enough.
+- Example: if candidate [3] says "Comcast bill is $89/month" and candidate [7] says
+  "Comcast bill is now $109/month starting next cycle", BOTH values disagree about
+  the current Comcast cost — populate contradictions_flagged with
+  {memory_ids: ["3", "7"], positions: ["$89/month", "$109/month starting next cycle"]}.
+- Reporting only the majority value in synthesis_markdown while leaving
+  contradictions_flagged empty is a FAILURE. Both fields are required for every
+  contradiction.
+- NARRATIVE COMPLIANCE (load-bearing anti-pattern): synthesis_markdown is the
+  user-facing narrative. It MUST be self-contained — a reader who sees only
+  synthesis_markdown (not contradictions_flagged) must see BOTH literal values.
+  When the change has a documented reason (renewal, schedule push, status
+  update, evolution-with-justification), the temptation is to write only the
+  new value in prose and rely on the reader to infer the old one. This is
+  WRONG.
+- ANTI-PATTERN: "has been moved to Q2 2027", "renewed at $4,200/mo", "now
+  costs $109/month", "increased to 109" — any phrasing that mentions the
+  NEW value without literally writing the OLD value is non-compliant with
+  rule (a) above, even when the prose is otherwise coherent and the
+  structured field is correct. Phrases like "the previous agreement", "the
+  prior target", "up from before", "originally planned" do NOT satisfy the
+  rule — the OLD value must appear as the same literal token sequence as
+  in the source memory.
+- CORRECT: "The Wi-Fi vendor cost was $2,500/mo. and renewed at $4,200/mo.
+  at the 18-month mark (vendor cited square-footage expansion and SLA
+  upgrade)." Both literal values are present; the reason is preserved.
+- INCORRECT: "The Wi-Fi vendor renewed at $4,200/mo. (up from the previous
+  agreement, due to square-footage expansion)." Only the new value is
+  literal; the old value is implied — FAILS rule (a).
+- CORRECT: "The GA launch target was Q1 2027 but has been moved to Q2 2027
+  based on the latest beta-readiness assessment." Both Q1 2027 and Q2 2027
+  appear literally.
+- INCORRECT: "The GA launch timing has been moved to Q2 2027, based on the
+  latest beta-readiness assessment." Only Q2 2027 is literal — FAILS rule
+  (a) even though contradictions_flagged correctly lists both positions.
+
+TASK-SHAPED QUERIES:
+- Some queries are phrased as agent tasks ("help me update the X doc with the
+  latest milestone dates", "doing the monthly Y review — anything I should flag?",
+  "putting together Z, what should I include?").
+- Ignore the action verb ("help me update", "doing", "putting together"). Focus on
+  the NOUN PHRASE — what is the agent asking about? In "help me update the product
+  roadmap doc", the noun phrase is "product roadmap" and the agent needs to know
+  the current roadmap state and any contradictions.
+- Your output is NOT the completed task. Your output is a summary of relevant
+  memory content (including any contradictions), which the agent will use to
+  complete the task themselves. Do NOT generate boilerplate task text.
+
+OUTPUT:
+- Each candidate is prefixed with a 1-indexed bracketed rank like [1], [2], [3] —
+  use those rank strings as the values in contradictions_flagged.memory_ids and
+  for any inline citations in synthesis_markdown (e.g. "[3] notes Q1 2027 GA").
+- Write a coherent narrative in synthesis_markdown.
+- If no candidates are relevant: set vault_has_no_relevant_content=true and state
+  this in synthesis_markdown. Do NOT fabricate.
 - Keep synthesis_markdown under 250 words.
 - Return ONLY valid JSON matching the schema."#;
 
@@ -141,10 +250,10 @@ pub struct ReadQuery {
 }
 
 /// One contradiction record from the synthesis stage. Memory IDs and
-/// positions are returned as `String` (not [`MemoryId`]) because the
+/// positions are returned as `String` (not [`vault_core::MemoryId`]) because the
 /// model emits whatever short or long form the system prompt encouraged;
 /// consumers parse downstream if they need to resolve back to a typed
-/// [`MemoryId`].
+/// [`vault_core::MemoryId`].
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ContradictionRef {
     /// Memory IDs (as strings) that participate in the contradiction.
@@ -308,23 +417,53 @@ impl std::fmt::Debug for ReadPipeline {
 }
 
 /// Build the stage-2 user prompt. Each candidate is rendered as
-/// `[<memory-id>] <content>\n` so the model can cite by ID inline. The
-/// closing line tells the model to filter + flag + synthesise.
-fn build_user_prompt(query: &str, candidates: &[RetrievedMemory]) -> String {
-    // Estimate capacity to avoid repeated growth: ~query + candidates' content + 80-byte UUID-line overhead.
+/// `[<rank>] <content>\n` (1-indexed) so the model can cite by candidate
+/// index inline. The closing line tells the model to filter + flag +
+/// synthesise.
+///
+/// **Why rank indices and not memory IDs.** T0.2.7 Phase 5 Step 2
+/// (2026-05-23) t030 byte-equality probe confirmed that embedding random
+/// per-process UUIDv7 memory IDs into the LLM prompt was the load-bearing
+/// source of Q25 verdict variance at SCALE=1000. Retrieval was fully
+/// deterministic in-process AND across-process (same memories, same
+/// content, same order). The only byte differences across runs were the
+/// UUIDs themselves (~300 BPE tokens of randomness per prompt), which
+/// changed the model's tokenization and downstream attention patterns
+/// enough to flip Qwen-7B's verdict on borderline queries even at
+/// temperature=0 with seed=42. Switching to 1-indexed rank makes the
+/// prompt a pure function of `(query, ordered candidate content)` —
+/// both already deterministic — so the LLM input is identical per query
+/// regardless of process spawn timing.
+///
+/// The `ContradictionRef::memory_ids` field (typed `Vec<String>` per
+/// `READ_TIME_JSON_SCHEMA`) carries whatever the model emits; under the
+/// new format the model emits rank strings (`"1"`, `"5"`) which can be
+/// resolved back to real `vault_core::MemoryId` values downstream via
+/// the candidate list already in scope at call sites. The load-bearing
+/// field for the agent contract is `contradictions_flagged.positions`
+/// (literal values), which is unaffected.
+///
+/// **Public for diagnostic use only.** Exposed for byte-equality probes
+/// (e.g. `examples/t030_q25_byte_equality_probe.rs`) that need to confirm
+/// the same prompt bytes are sent to the LLM across runs. Production code
+/// calls this through [`ReadPipeline::read`]; no need to call it directly.
+pub fn build_user_prompt(query: &str, candidates: &[RetrievedMemory]) -> String {
+    // Estimate capacity to avoid repeated growth: ~query + candidates' content + 8-byte rank-line overhead.
     let est_cap: usize = query.len()
         + candidates
             .iter()
-            .map(|c| c.memory.content.len() + 80)
+            .map(|c| c.memory.content.len() + 8)
             .sum::<usize>()
         + 128;
     let mut s = String::with_capacity(est_cap);
     s.push_str("QUERY: ");
     s.push_str(query);
     s.push_str("\n\nCANDIDATES:\n");
-    for c in candidates {
+    for (rank, c) in candidates.iter().enumerate() {
+        // 1-indexed for human readability (matches the system-prompt example
+        // `{memory_ids: ["1", "5"], ...}` and reads naturally as "candidate 1").
         s.push('[');
-        s.push_str(&MemoryId::to_string(&c.memory.id));
+        s.push_str(&(rank + 1).to_string());
         s.push_str("] ");
         s.push_str(&c.memory.content);
         s.push('\n');
@@ -628,17 +767,103 @@ mod tests {
             "candidates must appear in input order"
         );
         assert!(prompt.trim_end().ends_with("Return JSON."));
+
+        // v10 rank-prefix contract (T0.2.7 Phase 5 Step 2, 2026-05-23): each
+        // candidate is rendered as `[<1-indexed rank>] <content>\n`. Pins
+        // the deterministic-prompt fix: NO UUIDs leak into the LLM input.
+        assert!(
+            prompt.contains("[1] first content"),
+            "first candidate must be rendered with [1] rank prefix"
+        );
+        assert!(
+            prompt.contains("[2] second content"),
+            "second candidate must be rendered with [2] rank prefix"
+        );
+        // Defence-in-depth: scan for any 36-char window matching the
+        // UUID 8-4-4-4-12 hex pattern. Catches accidental regressions to
+        // the old `[<uuid>]` format even if the [1]/[2] assertions above
+        // still hold (e.g. mixed format).
+        let bytes = prompt.as_bytes();
+        if bytes.len() >= 36 {
+            for start in 0..=bytes.len() - 36 {
+                let window = &bytes[start..start + 36];
+                if window[8] == b'-'
+                    && window[13] == b'-'
+                    && window[18] == b'-'
+                    && window[23] == b'-'
+                {
+                    let all_hex = window
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| ![8, 13, 18, 23].contains(i))
+                        .all(|(_, b)| b.is_ascii_hexdigit());
+                    assert!(
+                        !all_hex,
+                        "UUID-shaped substring detected in prompt; v10 prompt must use rank indices only. Window: {:?}",
+                        std::str::from_utf8(window).unwrap_or("<non-utf8>")
+                    );
+                }
+            }
+        }
     }
 
     #[test]
     fn read_time_system_prompt_contains_the_load_bearing_rules() {
         // Tripwire pin — if the prompt text drifts in a way that drops
-        // these instructions, the t026 quality gate is at risk and we
-        // want a unit-test failure before the integration test catches it.
+        // these instructions, the t026 / T0.2.7 quality gates are at
+        // risk and we want a unit-test failure before the integration
+        // test catches it.
+        //
+        // Original t026/t027b core (kept):
         assert!(READ_TIME_SYSTEM_PROMPT.contains("filter"));
         assert!(READ_TIME_SYSTEM_PROMPT.contains("contradictions"));
         assert!(READ_TIME_SYSTEM_PROMPT.contains("vault_has_no_relevant_content"));
         assert!(READ_TIME_SYSTEM_PROMPT.contains("Do NOT fabricate"));
+
+        // T0.2.7 Phase 4 v9 promotion (2026-05-20) — these additions
+        // are the empirical anchor for the 9/9 SCALE=10K validation:
+        assert!(
+            READ_TIME_SYSTEM_PROMPT.contains("VERBATIM RULE"),
+            "v9 verbatim rule must be present (locks the dual-field contract)"
+        );
+        assert!(
+            READ_TIME_SYSTEM_PROMPT.contains("TEMPORAL VALUE CHANGES"),
+            "v9 temporal-value-change clause must be present (locks Q11/Q13/Q25/Q26 etc.)"
+        );
+        assert!(
+            READ_TIME_SYSTEM_PROMPT.contains("NARRATIVE COMPLIANCE"),
+            "v9 narrative-compliance anti-pattern must be present"
+        );
+        assert!(
+            READ_TIME_SYSTEM_PROMPT.contains("ANTI-PATTERN"),
+            "v9 anti-pattern examples must be present (locks the moved-to/renewed-at guidance)"
+        );
+        assert!(
+            READ_TIME_SYSTEM_PROMPT.contains("CORRECT"),
+            "v9 CORRECT-example label must be present (paired with INCORRECT)"
+        );
+        assert!(
+            READ_TIME_SYSTEM_PROMPT.contains("INCORRECT"),
+            "v9 INCORRECT-example label must be present (paired with CORRECT)"
+        );
+
+        // T0.2.7 Phase 5 Step 2 v10 promotion (2026-05-23) — pins the
+        // rank-indexed prompt contract introduced to remove UUID-driven
+        // input variance. The Comcast example was rewritten to use rank
+        // strings; the OUTPUT section explicitly teaches the LLM that
+        // candidates are 1-indexed.
+        assert!(
+            READ_TIME_SYSTEM_PROMPT.contains(r#"{memory_ids: ["3", "7"]"#),
+            "v10 rank-string example must be present (locks the LLM-facing format)"
+        );
+        assert!(
+            READ_TIME_SYSTEM_PROMPT.contains("1-indexed"),
+            "v10 OUTPUT section must teach the LLM that candidates are 1-indexed"
+        );
+        assert!(
+            READ_TIME_SYSTEM_PROMPT.contains("matching the [N] prefix"),
+            "v10 CONTRADICTIONS section must reference the `[N] prefix` rank-string contract"
+        );
     }
 
     #[test]

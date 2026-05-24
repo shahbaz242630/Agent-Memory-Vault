@@ -137,7 +137,7 @@ fn empty_trusted_slice_is_valid_construction() {
 /// Protocol version is rmcp's choice. Instructions text is free-form.
 /// All three are deliberately NOT asserted.
 #[tokio::test]
-async fn full_initialize_round_trip_lists_four_tools_with_expected_names() {
+async fn full_initialize_round_trip_lists_five_tools_with_expected_names() {
     use std::collections::BTreeSet;
 
     use rmcp::ServiceExt;
@@ -188,19 +188,24 @@ async fn full_initialize_round_trip_lists_four_tools_with_expected_names() {
 
     // tools/list — exercises `#[tool_handler]` auto-routing through
     // the `tool_router` field that `#[tool_router]` populates from
-    // the four `#[tool]` decorators in `server.rs`. End-to-end macro
+    // the five `#[tool]` decorators in `server.rs`. End-to-end macro
     // chain verification.
+    //
+    // T0.2.7 Phase 4 (2026-05-20): `memory.read` joins the contract,
+    // exposing the production `ReadPipeline` (hybrid retrieval +
+    // Qwen-7B synthesis + `contradictions_flagged` structured field).
     let listed = client
         .peer()
         .list_tools(Default::default())
         .await
         .expect("list_tools succeeds");
 
-    assert_eq!(listed.tools.len(), 4, "expected exactly 4 tools advertised");
+    assert_eq!(listed.tools.len(), 5, "expected exactly 5 tools advertised");
 
     let names: BTreeSet<&str> = listed.tools.iter().map(|t| t.name.as_ref()).collect();
     let expected: BTreeSet<&str> = [
         "memory.search",
+        "memory.read",
         "memory.write",
         "memory.update",
         "memory.delete",
@@ -209,7 +214,7 @@ async fn full_initialize_round_trip_lists_four_tools_with_expected_names() {
     .collect();
     assert_eq!(
         names, expected,
-        "tool names must match the 4-tool contract — set comparison so emit order is not pinned"
+        "tool names must match the 5-tool contract — set comparison so emit order is not pinned"
     );
 
     // Drop the client to close the duplex; the spawned server task

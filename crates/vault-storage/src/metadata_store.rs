@@ -56,6 +56,15 @@ pub struct MemoryFilter {
     /// but always passes `None` (full-scan); T0.2.5 wires actual values.
     /// See ADR-045 §f.
     pub since: Option<DateTime<Utc>>,
+    /// If set, only return memories whose content was true (per
+    /// bi-temporal `valid_until`) at this point in time. Specifically:
+    /// `valid_until IS NULL` (still valid) OR `valid_until > valid_at`
+    /// (becomes false in the future). When `None` (default), no
+    /// `valid_until` filter is applied — both expired and non-expired
+    /// memories are returned. Per ADR-051 (T0.2.7 Phase B). V0.2
+    /// retrieval consumers pass `Some(Utc::now())` for "currently true"
+    /// queries; admin/audit callers leave it `None`.
+    pub valid_at: Option<DateTime<Utc>>,
 }
 
 /// Async, encrypted SQLite-backed metadata store. Cheap to clone (it holds
@@ -331,8 +340,9 @@ impl MetadataStore {
     /// **SQLite parameter limit.** SQLite's default `SQLITE_LIMIT_VARIABLE_NUMBER`
     /// is 32,766 in modern builds. We reject `ids.len() > 32_000` as
     /// `InvalidInput` rather than silently splitting into multiple
-    /// queries — V0.1's caller is bounded by `max_results = 100`, and
-    /// any caller approaching the limit deserves to see the error.
+    /// queries — V0.2's caller is bounded by `max_results = 200` (post
+    /// 2026-05-18 raise from 100 for value-aware retrieval), and any
+    /// caller approaching the SQLite limit deserves to see the error.
     ///
     /// # Errors
     ///
@@ -763,6 +773,18 @@ fn tx_list_memories(
     if let Some(since) = filter.since {
         sql.push_str(&format!(" AND created_at >= ?{}", bindings.len() + 1));
         bindings.push(since.to_rfc3339().into());
+    }
+    // ADR-051: bi-temporal validity filter — when set, exclude memories
+    // whose `valid_until` has already passed `valid_at` (the fact stopped
+    // being true). `valid_until IS NULL` (still true) and future-dated
+    // `valid_until > valid_at` (will expire later) both pass. Same
+    // RFC3339-with-UTC-offset lexicographic-sort rationale as `since`.
+    if let Some(valid_at) = filter.valid_at {
+        sql.push_str(&format!(
+            " AND (valid_until IS NULL OR valid_until > ?{})",
+            bindings.len() + 1
+        ));
+        bindings.push(valid_at.to_rfc3339().into());
     }
 
     sql.push_str(" ORDER BY created_at DESC");
@@ -1301,6 +1323,64 @@ mod tests {
         assert!(
             after_cutoff.iter().all(|m| m.id != early.id),
             "memories with created_at < since must be excluded"
+        );
+    }
+
+    /// `MemoryFilter::valid_at` excludes memories whose `valid_until` has
+    /// already passed the supplied timestamp. Locks the bi-temporal
+    /// filter contract from ADR-051 (T0.2.7 Phase B).
+    #[tokio::test]
+    async fn list_valid_at_filter_excludes_expired_memories() {
+        let (_tmp, store) = make_store().await;
+
+        // Memory A: still valid (valid_until=None).
+        let live = sample_memory("work", MemoryType::Semantic, "still-true");
+        store.create_memory(&live).await.unwrap();
+
+        // Memory B: expired one hour ago. `valid_from` pinned to 2 days
+        // ago so the Memory invariant (valid_until >= valid_from) holds
+        // independent of microsecond-scale clock skew between this test's
+        // `Utc::now()` and `sample_memory`'s internal default `now`.
+        let mut expired = sample_memory("work", MemoryType::Semantic, "expired-yesterday");
+        expired.valid_from = chrono::Utc::now() - chrono::Duration::days(2);
+        expired.valid_until = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+        store.create_memory(&expired).await.unwrap();
+
+        // Memory C: future-dated valid_until (still currently valid).
+        let mut future = sample_memory("work", MemoryType::Semantic, "expires-next-year");
+        future.valid_until = Some(chrono::Utc::now() + chrono::Duration::days(365));
+        store.create_memory(&future).await.unwrap();
+
+        // No filter — all three returned.
+        let unfiltered = store
+            .list_memories(MemoryFilter::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(unfiltered.len(), 3);
+
+        // valid_at = now — exclude `expired`, keep `live` and `future`.
+        let now = chrono::Utc::now();
+        let filtered = store
+            .list_memories(
+                MemoryFilter {
+                    valid_at: Some(now),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            filtered.len(),
+            2,
+            "valid_at filter must exclude memories whose valid_until has passed"
+        );
+        let ids: Vec<MemoryId> = filtered.iter().map(|m| m.id).collect();
+        assert!(ids.contains(&live.id), "live memory must remain");
+        assert!(ids.contains(&future.id), "future-dated memory must remain");
+        assert!(
+            !ids.contains(&expired.id),
+            "expired memory must be filtered out per ADR-051"
         );
     }
 

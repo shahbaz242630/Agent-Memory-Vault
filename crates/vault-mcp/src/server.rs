@@ -33,7 +33,7 @@ use rmcp::model::{CallToolResult, Content, ErrorCode, ServerCapabilities, Server
 use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
 use serde::{Deserialize, Serialize};
 use vault_core::{Boundary, MemoryId, MemoryType, NewMemory, VaultError, VaultResult};
-use vault_retrieval::{RetrievalOptions, RetrievalQuery};
+use vault_retrieval::{ReadQuery, ReadResponse, RetrievalOptions, RetrievalQuery};
 
 use crate::audit::{ToolInvokeDetails, ToolInvokeError};
 use crate::Adapter;
@@ -62,7 +62,7 @@ pub struct SearchToolParams {
     /// k-NN over the boundary-filtered vector store.
     pub query: String,
     /// Maximum number of results to return. Defaults to 10 (server side)
-    /// if omitted; capped at `vault_retrieval::MAX_RESULTS_CAP` (100).
+    /// if omitted; capped at `vault_retrieval::MAX_RESULTS_CAP` (200).
     #[serde(default)]
     pub max_results: Option<usize>,
     /// Drop results whose cosine similarity is below this threshold.
@@ -73,6 +73,23 @@ pub struct SearchToolParams {
     /// `false` (exclude archived).
     #[serde(default)]
     pub include_archived: Option<bool>,
+}
+
+/// JSON-RPC parameters for the `memory.read` tool. Added at T0.2.7
+/// Phase 4 (2026-05-20) to expose the production read pipeline
+/// (`vault_retrieval::ReadPipeline`) over MCP.
+///
+/// **NOTE (ADR-025 trust boundary):** like `SearchToolParams`, this
+/// schema does NOT contain an `authorized_boundaries` field. The
+/// handler uses `self.authorized_boundaries` (trusted, set at
+/// `StdioServer::new` time); request-body data NEVER influences the
+/// auth gate.
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ReadToolParams {
+    /// Free-text query — handed to the read pipeline's retrieval stage
+    /// (hybrid BGE + BM25 + abstain gate) and then synthesised by the
+    /// Qwen-7B LLM into a `ReadResponse`.
+    pub query: String,
 }
 
 /// JSON-RPC parameters for the `memory.write` tool.
@@ -204,6 +221,24 @@ impl StdioServer {
             options,
         };
         self.adapter.search(query).await
+    }
+
+    /// `memory.read` handler. Constructs the [`ReadQuery`] using the
+    /// TRUSTED `self.authorized_boundaries` (NEVER the request body),
+    /// then dispatches to `self.adapter.read()`.
+    ///
+    /// Added at T0.2.7 Phase 4 (2026-05-20). The read pipeline returns
+    /// a structured [`ReadResponse`] with the load-bearing
+    /// `contradictions_flagged` field — see the `tool_read` tool
+    /// description for the agent-consumption contract.
+    pub async fn handle_read(&self, params: ReadToolParams) -> VaultResult<ReadResponse> {
+        let query = ReadQuery {
+            query_text: params.query,
+            // Trust boundary (ADR-025): the trusted slice goes here,
+            // NOT anything from the request body.
+            authorized_boundaries: self.authorized_boundaries.clone(),
+        };
+        self.adapter.read(query).await
     }
 
     /// `memory.write` Phase 1 stub. Validates that `params.boundary` is
@@ -415,6 +450,103 @@ impl StdioServer {
 
         let memories = dispatch_result.map_err(vault_error_to_mcp)?;
         success_json_result(&memories)
+    }
+
+    /// `memory.read` MCP tool — the agent-facing surface for the
+    /// production [`vault_retrieval::ReadPipeline`] (hybrid BGE+BM25
+    /// retrieval + Qwen-7B synthesis).
+    ///
+    /// **Agent consumption contract (T0.2.7 Phase 4 lock,
+    /// 2026-05-20):** the tool description below tells calling agents
+    /// they MUST consume the `contradictions_flagged` structured field
+    /// as the authoritative contradiction signal (the
+    /// `synthesis_markdown` field is a convenience summary). This is
+    /// the lock from the 2026-05-20 HANDOFF Phase 0 amendment #3 ---
+    /// without this language in the tool description, agents that only
+    /// read the synthesis prose would miss contradictions when the LLM
+    /// elides the prior value in evolution-with-reason phrasing
+    /// ([[structured-contract-user-sees-via-agent]]).
+    ///
+    /// Audit + tracing wired with the same handler-mediated pattern as
+    /// `tool_search`: timer brackets the handler dispatch,
+    /// `ToolInvokeDetails` records `boundary_count` from the trusted
+    /// slice + `result_count = 1` on success (single
+    /// `ReadResponse`) / `0` on error.
+    #[tool(
+        name = "memory.read",
+        description = "Read-time pipeline: retrieves relevant memories AND \
+                       synthesises a coherent narrative answer in ONE call. \
+                       Returns a JSON object with three fields: \
+                       `synthesis_markdown` (convenience narrative summary), \
+                       `contradictions_flagged` (structured list of \
+                       contradictions detected across the retrieved set, with \
+                       memory_ids + literal positions), and \
+                       `vault_has_no_relevant_content` (true when the vault \
+                       has no memory matching the query). \
+                       \n\n\
+                       CRITICAL — agent contract: when \
+                       `contradictions_flagged` is non-empty you MUST \
+                       surface every contradiction in your response to the \
+                       user. The `synthesis_markdown` field is a \
+                       convenience summary; `contradictions_flagged` is the \
+                       authoritative contradiction signal. Treating \
+                       synthesis_markdown alone as ground truth may cause \
+                       you to miss contradictions when the LLM elides a \
+                       prior value in evolution-with-reason phrasing. \
+                       \n\n\
+                       Authorization is mediated by the host application, \
+                       not by this tool's parameters."
+    )]
+    pub async fn tool_read(
+        &self,
+        params: Parameters<ReadToolParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let Parameters(p) = params;
+        let query_length_recorded: u32 = p.query.len() as u32;
+        let boundary_count_recorded: u32 = self.authorized_boundaries.len() as u32;
+
+        let start = Instant::now();
+        let dispatch_result = self.handle_read(p).await;
+        let duration_ms: u64 = start.elapsed().as_millis() as u64;
+
+        let (result_count, error_for_audit) = match &dispatch_result {
+            Ok(_) => (1_u32, None),
+            Err(e) => (0_u32, Some(ToolInvokeError::from_vault_error(e))),
+        };
+
+        let details = ToolInvokeDetails {
+            tool: "memory.read",
+            duration_ms,
+            result_count,
+            boundary_count: boundary_count_recorded,
+            // Search-only fields: query_length applies here too; the
+            // other three (max_results, score_threshold, include_archived)
+            // are search-specific and stay ABSENT per Q1.
+            max_results: None,
+            score_threshold: None,
+            include_archived: None,
+            query_length: Some(query_length_recorded),
+            error: error_for_audit,
+        };
+
+        tracing::info!(
+            target: "vault_mcp::tool_invoke",
+            tool = details.tool,
+            duration_ms = details.duration_ms,
+            result_count = details.result_count,
+            boundary_count = details.boundary_count,
+            query_length = ?details.query_length,
+            error = ?details.error,
+            "memory.read tool invocation completed"
+        );
+
+        self.adapter
+            .append_tool_invoke_audit(details)
+            .await
+            .map_err(vault_error_to_mcp)?;
+
+        let response = dispatch_result.map_err(vault_error_to_mcp)?;
+        success_json_result(&response)
     }
 
     /// `memory.write` MCP tool — create a new memory in a boundary the

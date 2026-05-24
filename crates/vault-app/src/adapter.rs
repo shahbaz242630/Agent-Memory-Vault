@@ -62,7 +62,9 @@ use chrono::Utc;
 use vault_core::{Boundary, Memory, MemoryId, NewMemory, VaultError, VaultResult};
 use vault_embedding::EmbeddingProvider;
 use vault_mcp::{Adapter, ToolInvokeDetails};
-use vault_retrieval::{RetrievalQuery, RetrievedMemory, Retriever};
+use vault_retrieval::{
+    ReadPipeline, ReadQuery, ReadResponse, RetrievalQuery, RetrievedMemory, Retriever,
+};
 use vault_storage::{
     ActorKind, AuditEventType, AuditResult, MetadataStore, PendingAuditEvent, StorageBackend,
 };
@@ -76,25 +78,44 @@ use vault_storage::{
 /// can hold clones without locking.
 pub struct VaultAdapter {
     retriever: Arc<dyn Retriever>,
+    /// Optional read pipeline for the `memory.read` MCP tool. When
+    /// `None`, `Adapter::read` returns
+    /// `VaultError::Config("read pipeline not configured")`. The field
+    /// is `Option` because:
+    /// - Integration tests don't have the 4.36 GB Qwen GGUF on disk;
+    ///   they wire `qwen_model_path: None` and skip read-pipeline
+    ///   testing.
+    /// - Future deployments may opt out of local LLM inference (cloud
+    ///   tier V0.3+).
+    ///
+    /// Added at T0.2.7 Phase 4 (2026-05-20).
+    read_pipeline: Option<ReadPipeline>,
     embedding: Arc<dyn EmbeddingProvider>,
     storage: StorageBackend,
     metadata: MetadataStore,
 }
 
 impl VaultAdapter {
-    /// Construct from the four trait deps. Caller (T0.1.10
-    /// `Application::start`) is responsible for wiring concrete
-    /// implementations and passing a `MetadataStore` handle that
-    /// points at the same encrypted SQLite file used in the
+    /// Construct from the four trait deps + an optional read pipeline.
+    /// Caller (T0.1.10 `Application::start`) is responsible for wiring
+    /// concrete implementations and passing a `MetadataStore` handle
+    /// that points at the same encrypted SQLite file used in the
     /// `StorageBackend` open.
+    ///
+    /// **T0.2.7 Phase 4 addition (2026-05-20):** the `read_pipeline`
+    /// parameter accepts `None` for absent-LLM deployments (tests,
+    /// cloud tier). When `None`, `memory.read` MCP calls return
+    /// `VaultError::Config("read pipeline not configured")`.
     pub fn new(
         retriever: Arc<dyn Retriever>,
+        read_pipeline: Option<ReadPipeline>,
         embedding: Arc<dyn EmbeddingProvider>,
         storage: StorageBackend,
         metadata: MetadataStore,
     ) -> Self {
         Self {
             retriever,
+            read_pipeline,
             embedding,
             storage,
             metadata,
@@ -108,6 +129,22 @@ impl Adapter for VaultAdapter {
         // Trust-boundary auth-gating already done at the StdioServer
         // layer (Step 4). Pass through to the Retriever.
         self.retriever.retrieve(query).await
+    }
+
+    async fn read(&self, query: ReadQuery) -> VaultResult<ReadResponse> {
+        // Trust-boundary auth-gating already done at the StdioServer
+        // layer per ADR-025 (handle_read populates query.authorized_
+        // boundaries from the trusted slice). Pass through to the
+        // wired ReadPipeline; if no pipeline was configured (absent
+        // GGUF in tests / opted-out deployments), return Config error.
+        match &self.read_pipeline {
+            Some(pipeline) => pipeline.read(query).await,
+            None => Err(VaultError::Config(
+                "read pipeline not configured (AppConfig.qwen_model_path was None at \
+                 Application::new)"
+                    .into(),
+            )),
+        }
     }
 
     async fn write(&self, new_memory: NewMemory) -> VaultResult<MemoryId> {
@@ -368,6 +405,11 @@ mod tests {
 
         let adapter = VaultAdapter::new(
             retriever.clone() as Arc<dyn Retriever>,
+            // T0.2.7 Phase 4: read_pipeline = None for unit tests
+            // (no Qwen GGUF, no need for the read path here). The
+            // VaultAdapter::read tests live elsewhere; these inner
+            // unit tests cover the cascading + audit paths only.
+            None,
             embedder.clone() as Arc<dyn EmbeddingProvider>,
             storage,
             metadata,

@@ -55,6 +55,23 @@ use crate::sealed_object_store::{
 
 const TABLE_NAME: &str = "memories";
 
+/// Maximum rows per internal sub-batch in [`VectorStore::bulk_upsert`].
+///
+/// Picked to keep each chunked merge_insert's serialised Lance file
+/// comfortably below the object_store multipart threshold (~5 MB in
+/// upstream defaults). At dim=384 each row is ~1.5 KB of embedding
+/// payload + ~0.5 KB of Arrow/metadata overhead, so 2000 rows ≈ 3-4 MB
+/// per chunk — under threshold with a ~25% safety margin.
+///
+/// The V0.2 SealedObjectStore wrapper (ADR-008 + ADR-040) intentionally
+/// does not implement `put_multipart` because each file gets sealed
+/// atomically by the zero-knowledge envelope and sealing partial bytes
+/// would break that invariant. T0.2.7 Phase 5 Step 2 (2026-05-23)
+/// SCALE=10000 acceptance run surfaced the failure mode: a single 10K
+/// merge_insert tried to use `put_multipart` and the sealed wrapper
+/// returned `Operation not supported`. Chunking unblocks the path.
+const BULK_UPSERT_CHUNK_ROWS: usize = 2000;
+
 /// Async vector-store contract. Speaks the workspace's domain types
 /// (`MemoryId`, `Boundary`, `&[f32]`) only — never LanceDB internals
 /// (`RecordBatch`, Arrow types) per BRD §2.2.
@@ -75,6 +92,47 @@ pub trait VectorStore: Send + Sync {
         embedding: &[f32],
         boundary: &Boundary,
     ) -> VaultResult<()>;
+
+    /// Bulk-insert or update N `(id, embedding, boundary)` rows in a single
+    /// transactional unit. **Production: prefer this over a loop of
+    /// [`Self::upsert`] for any batch write (sync import, connector
+    /// ingestion, consolidator output materialisation).**
+    ///
+    /// Promoted from t028b spike helper at T0.2.7 Phase 5 Step 2 (2026-05-22).
+    /// Spike measurement: ~730× faster than per-row `upsert` at SCALE=10K
+    /// (~21 ms/memory single-row degrades to ~264 ms/memory at SCALE=10K
+    /// due to LanceDB fragment scanning cost; bulk amortises to ~30 µs/memory).
+    /// See ADR-051 for the full promotion rationale + ship-gate consumers
+    /// (V0.2 sync, V1.0 connectors).
+    ///
+    /// **Contract (load-bearing):**
+    /// - Empty `rows` slice is a no-op success — returns `Ok(())` without
+    ///   touching the store.
+    /// - Every embedding in `rows` MUST be length [`Self::dimension`].
+    ///   Implementations validate ALL rows upfront and return
+    ///   [`VaultError::DimensionMismatch`] on the FIRST offending row.
+    ///   **Atomicity:** on dimension mismatch, NO rows are written.
+    /// - For inputs above the implementation-defined chunk size, the
+    ///   implementation MAY internally split the batch into sub-batches
+    ///   to stay within backend write limits (e.g. the V0.2 SealedObjectStore
+    ///   per-file granularity lock — see [`LanceVectorStore::bulk_upsert`]).
+    ///   When chunked, sub-batches are committed in order, and a storage-IO
+    ///   failure mid-batch may leave EARLIER sub-batches persisted. Callers
+    ///   MUST be retry-safe: a re-call with the SAME rows is idempotent
+    ///   because the merge-insert key is `id` (already-persisted rows are
+    ///   updated in place to identical content). Dimension validation
+    ///   atomicity is unaffected — it happens before any write.
+    /// - Upsert match key is `id` ONLY (NOT `(id, boundary)`) — same security
+    ///   invariant as single-row [`Self::upsert`]. Matching on `(id, boundary)`
+    ///   would create duplicate rows when a memory moves boundaries.
+    ///
+    /// **Call-site sizing guidance.** At dim=384, a batch of ~500 rows is
+    /// ~768 KB embedding + ~80 KB metadata — well under the 256 MiB
+    /// LANCE_MEM_POOL_SIZE ceiling per ADR-038. There is no caller-side
+    /// upper bound: implementations chunk internally to stay below storage
+    /// thresholds. The T0.2.7 scale-acceptance harness submits the full
+    /// 10K corpus in one call; the implementation chunks transparently.
+    async fn bulk_upsert(&self, rows: &[(MemoryId, Vec<f32>, Boundary)]) -> VaultResult<()>;
 
     /// Delete the embedding for `id`. Idempotent: deleting an absent id is
     /// not an error.
@@ -354,6 +412,44 @@ impl LanceVectorStore {
             .map_err(|e| VaultError::Storage(format!("create_vector_index_hnsw_sq: {e}")))?;
         Ok(())
     }
+
+    /// Create an IVF + Scalar-Quantization (IvfSq) vector index over the
+    /// `embedding` column. **T0.2.7 spike-scoped (Phase 1 t028b benchmark)**.
+    ///
+    /// Twin of [`create_vector_index_hnsw_sq`] without the HNSW fine-search
+    /// graph layer. Lands as the IVF-only arm of the HNSW-vs-IVF comparison
+    /// that the t028b spike (`crates/vault-retrieval/examples/t028b_hnsw_vs_ivf_spike.rs`)
+    /// runs against {100, 1K, 10K} synthetic scales on the t026
+    /// realism-rewritten fixture content shape (per T0.2.7 iteration 2
+    /// amendment A).
+    ///
+    /// The post-t028b production decision picks ONE of HNSW or IVF for the
+    /// V0.2 vector index. The losing arm's method may be removed in a
+    /// follow-up commit or retained if both have legitimate use cases —
+    /// that call is locked at the T0.2.7 architecture-decision commit, not
+    /// here.
+    ///
+    /// Uses `IvfFlatIndexBuilder::default()` for now (Scalar-Quantization
+    /// for IVF is `IvfFlat` with the default scalar-quantizer setting in
+    /// lancedb 0.27.2); per the spike playbook all index params stay at
+    /// upstream defaults so the comparison measures *upstream-out-of-the-box*
+    /// behavior, not parameter-tuning skill.
+    pub async fn create_vector_index_ivf_flat(&self) -> VaultResult<()> {
+        use lancedb::index::vector::IvfFlatIndexBuilder;
+        use lancedb::index::Index;
+
+        let _guard = self.upsert_lock.lock().await;
+
+        self.table
+            .create_index(
+                &["embedding"],
+                Index::IvfFlat(IvfFlatIndexBuilder::default()),
+            )
+            .execute()
+            .await
+            .map_err(|e| VaultError::Storage(format!("create_vector_index_ivf_flat: {e}")))?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -399,6 +495,74 @@ impl VectorStore for LanceVectorStore {
             .execute(Box::new(reader))
             .await
             .map_err(|e| VaultError::Storage(format!("merge_insert: {e}")))?;
+
+        Ok(())
+    }
+
+    #[instrument(
+        skip(self, rows),
+        fields(
+            n_rows = rows.len(),
+            dim = rows.first().map(|(_, e, _)| e.len()).unwrap_or(0),
+        ),
+    )]
+    async fn bulk_upsert(&self, rows: &[(MemoryId, Vec<f32>, Boundary)]) -> VaultResult<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        for (_, emb, _) in rows {
+            if emb.len() != self.dimension {
+                return Err(VaultError::DimensionMismatch {
+                    expected: self.dimension,
+                    actual: emb.len(),
+                });
+            }
+        }
+
+        // ADR-038: bound peak memory by serialising concurrent merge_insert
+        // calls. Same lock as single-row upsert; held interval is per-batch
+        // rather than per-row, so amortises lock contention over N rows.
+        let _guard = self.upsert_lock.lock().await;
+
+        let schema = Arc::new(make_schema(self.dimension));
+
+        // T0.2.7 Phase 5 Step 2 follow-up (2026-05-23): chunk the input to
+        // stay below the object_store multipart threshold (~5 MB in
+        // upstream defaults). The V0.2 SealedObjectStore wrapper
+        // intentionally does not implement `put_multipart` — each file
+        // gets sealed atomically by the zero-knowledge envelope, and
+        // sealing partial bytes would break that invariant (ADR-008 +
+        // ADR-040). Lance's writer falls back to multipart once a
+        // single-part write would exceed the threshold; at dim=384,
+        // ~2000 rows ≈ 3-4 MB per chunk, comfortably below 5 MB.
+        //
+        // Each chunk runs its own merge_insert. See trait doc for the
+        // retry-safe contract: a storage failure mid-batch may leave
+        // earlier chunks persisted, and the caller MUST re-run with the
+        // same rows (idempotent via `id`-keyed merge_insert).
+        for (chunk_idx, chunk) in rows.chunks(BULK_UPSERT_CHUNK_ROWS).enumerate() {
+            let batch = build_record_batch_bulk(schema.clone(), chunk)?;
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+            // SECURITY-CRITICAL: matching column is `id` ONLY (NOT
+            // `(id, boundary)`) — same invariant as single-row upsert.
+            // Matching on (id, boundary) would create duplicate rows on
+            // boundary moves. See single-row upsert above +
+            // `upsert_with_same_id_different_boundary_updates_existing_no_duplicate`
+            // test for the pin. The chunked-merge_insert path preserves
+            // this invariant: each chunk sees the SAME `id`-only key.
+            let mut builder = self.table.merge_insert(&["id"]);
+            builder.when_matched_update_all(None);
+            builder.when_not_matched_insert_all();
+            builder.execute(Box::new(reader)).await.map_err(|e| {
+                VaultError::Storage(format!(
+                    "bulk_upsert merge_insert (chunk {}/{}, {} rows): {e}",
+                    chunk_idx + 1,
+                    rows.len().div_ceil(BULK_UPSERT_CHUNK_ROWS),
+                    chunk.len(),
+                ))
+            })?;
+        }
 
         Ok(())
     }
@@ -725,6 +889,48 @@ fn build_record_batch(
 
     RecordBatch::try_new(schema, vec![id_array, embedding_array, boundary_array])
         .map_err(|e| VaultError::Storage(format!("record batch: {e}")))
+}
+
+/// Build a multi-row Arrow `RecordBatch` for N (id, embedding, boundary)
+/// triples. Used by [`LanceVectorStore::bulk_upsert`].
+///
+/// Caller is responsible for embedding-length validation (the inherent
+/// method checks against `self.dimension` before calling). All embeddings
+/// in `rows` MUST be the same length; assertion-failure if not.
+fn build_record_batch_bulk(
+    schema: Arc<Schema>,
+    rows: &[(MemoryId, Vec<f32>, Boundary)],
+) -> VaultResult<RecordBatch> {
+    debug_assert!(!rows.is_empty(), "build_record_batch_bulk on empty rows");
+    let n = rows.len();
+    let dimension = rows[0].1.len();
+
+    let id_array = Arc::new(StringArray::from(
+        rows.iter()
+            .map(|(id, _, _)| id.0.to_string())
+            .collect::<Vec<_>>(),
+    ));
+    let boundary_array = Arc::new(StringArray::from(
+        rows.iter()
+            .map(|(_, _, b)| b.as_str().to_string())
+            .collect::<Vec<_>>(),
+    ));
+
+    let mut all_values: Vec<f32> = Vec::with_capacity(n * dimension);
+    for (_, emb, _) in rows {
+        all_values.extend_from_slice(emb);
+    }
+    let values = Float32Array::from(all_values);
+    let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+    let embedding_array = Arc::new(FixedSizeListArray::new(
+        item_field,
+        dimension as i32,
+        Arc::new(values),
+        None,
+    ));
+
+    RecordBatch::try_new(schema, vec![id_array, embedding_array, boundary_array])
+        .map_err(|e| VaultError::Storage(format!("bulk record batch: {e}")))
 }
 
 /// Build the LanceDB `only_if` boundary filter for a search.
@@ -1169,6 +1375,228 @@ mod tests {
     }
 
     // ============================================================
+    //   bulk_upsert — T0.2.7 promotion from t028b spike (ADR-051)
+    // ============================================================
+
+    /// Empty input is a no-op success — the trait doc-comment promises
+    /// `Ok(())` without touching the store. Pin so the early-return
+    /// short-circuit is never accidentally removed.
+    #[tokio::test]
+    async fn bulk_upsert_empty_slice_is_no_op() {
+        let tmp = TempDir::new().unwrap();
+        let store = LanceVectorStore::open_with_at_rest_key(tmp.path(), 4, &TEST_AT_REST_KEY)
+            .await
+            .unwrap();
+        store.bulk_upsert(&[]).await.unwrap();
+        assert_eq!(store.count(None).await.unwrap(), 0);
+    }
+
+    /// Single-row batch is functionally equivalent to one `upsert` —
+    /// searchable, counted, no surprises from the batching path.
+    #[tokio::test]
+    async fn bulk_upsert_single_row_is_searchable() {
+        let tmp = TempDir::new().unwrap();
+        let store = LanceVectorStore::open_with_at_rest_key(tmp.path(), 4, &TEST_AT_REST_KEY)
+            .await
+            .unwrap();
+        let work = Boundary::new("work").unwrap();
+        let id = new_id();
+        store
+            .bulk_upsert(&[(id, embedding(4, 1.0), work.clone())])
+            .await
+            .unwrap();
+        assert_eq!(store.count(None).await.unwrap(), 1);
+        let hits = store
+            .search(&embedding(4, 1.0), 5, std::slice::from_ref(&work))
+            .await
+            .unwrap();
+        assert!(hits.iter().any(|(rid, _)| *rid == id));
+    }
+
+    /// N-row batch: every inserted id surfaces in subsequent search.
+    /// 100 rows is well below the LANCE_MEM_POOL_SIZE ceiling
+    /// (~76KB embedding at dim=4) — exercises the batching path
+    /// without stressing memory.
+    #[tokio::test]
+    async fn bulk_upsert_n_rows_all_searchable() {
+        let tmp = TempDir::new().unwrap();
+        let store = LanceVectorStore::open_with_at_rest_key(tmp.path(), 4, &TEST_AT_REST_KEY)
+            .await
+            .unwrap();
+        let work = Boundary::new("work").unwrap();
+        let rows: Vec<(MemoryId, Vec<f32>, Boundary)> = (1..=100)
+            .map(|i| (new_id(), embedding(4, i as f32), work.clone()))
+            .collect();
+        store.bulk_upsert(&rows).await.unwrap();
+        assert_eq!(store.count(None).await.unwrap(), 100);
+        let hits = store
+            .search(&embedding(4, 1.0), 200, std::slice::from_ref(&work))
+            .await
+            .unwrap();
+        let hit_ids: std::collections::HashSet<MemoryId> =
+            hits.into_iter().map(|(id, _)| id).collect();
+        for (id, _, _) in &rows {
+            assert!(
+                hit_ids.contains(id),
+                "bulk-inserted id missing from search: {}",
+                id.0
+            );
+        }
+    }
+
+    /// **Chunking-path pin.** When the input exceeds
+    /// `BULK_UPSERT_CHUNK_ROWS`, the implementation splits the batch
+    /// internally into sub-batches. This test exercises the
+    /// `>BULK_UPSERT_CHUNK_ROWS` path against the sealed envelope:
+    /// 2500 rows = 2 chunks (2000 + 500). Pins the row-count semantics
+    /// (all rows persisted + searchable) under chunking. The
+    /// V0.2 ship-blocker for this path was discovered at T0.2.7
+    /// Phase 5 Step 2 (2026-05-23) — a single 10K merge_insert hit the
+    /// SealedObjectStore's "put_multipart not implemented" error.
+    #[tokio::test]
+    async fn bulk_upsert_above_chunk_threshold_chunks_internally() {
+        let tmp = TempDir::new().unwrap();
+        let store = LanceVectorStore::open_with_at_rest_key(tmp.path(), 4, &TEST_AT_REST_KEY)
+            .await
+            .unwrap();
+        let work = Boundary::new("work").unwrap();
+        let n_rows = BULK_UPSERT_CHUNK_ROWS + 500;
+        let rows: Vec<(MemoryId, Vec<f32>, Boundary)> = (0..n_rows)
+            .map(|i| (new_id(), embedding(4, (i + 1) as f32), work.clone()))
+            .collect();
+        store.bulk_upsert(&rows).await.unwrap();
+        assert_eq!(store.count(None).await.unwrap(), n_rows);
+        // Search for the highest-magnitude embedding — should be near
+        // the top of the result set. This sanity-checks that the chunked
+        // rows are not just counted but also indexed for retrieval.
+        let hits = store
+            .search(
+                &embedding(4, n_rows as f32),
+                10,
+                std::slice::from_ref(&work),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !hits.is_empty(),
+            "search after chunked bulk_upsert returned zero hits"
+        );
+    }
+
+    /// **Atomicity contract pin.** When a batch contains a row with
+    /// the wrong embedding dimension, `bulk_upsert` returns
+    /// `DimensionMismatch` AND writes ZERO rows. Partial-batch state
+    /// must never occur — the upfront-validate loop in the impl is
+    /// load-bearing for this guarantee.
+    #[tokio::test]
+    async fn bulk_upsert_dimension_mismatch_writes_no_rows() {
+        let tmp = TempDir::new().unwrap();
+        let store = LanceVectorStore::open_with_at_rest_key(tmp.path(), 4, &TEST_AT_REST_KEY)
+            .await
+            .unwrap();
+        let work = Boundary::new("work").unwrap();
+        // Two valid rows + one with wrong dim (3 instead of 4).
+        // If the impl ever switched to "validate-per-row-as-we-go",
+        // the first two rows would land before the error — that
+        // partial-batch state is what this test prevents.
+        let rows = vec![
+            (new_id(), embedding(4, 1.0), work.clone()),
+            (new_id(), embedding(4, 2.0), work.clone()),
+            (new_id(), embedding(3, 3.0), work.clone()),
+        ];
+        let result = store.bulk_upsert(&rows).await;
+        match result {
+            Err(VaultError::DimensionMismatch { expected, actual }) => {
+                assert_eq!(expected, 4);
+                assert_eq!(actual, 3);
+            }
+            _ => panic!("expected DimensionMismatch, got {result:?}"),
+        }
+        assert_eq!(
+            store.count(None).await.unwrap(),
+            0,
+            "atomicity violated: partial-batch write occurred on dimension error"
+        );
+    }
+
+    /// **Security pin** — mirrors `upsert_with_same_id_different_boundary_*`
+    /// for the bulk path. The `merge_insert` matching column is `id`
+    /// only; re-bulk-upserting with the same id under a different
+    /// boundary must update in place, NOT create a duplicate row. If
+    /// the matching column ever silently widened to `(id, boundary)`,
+    /// this test fails loudly.
+    #[tokio::test]
+    async fn bulk_upsert_same_id_different_boundary_updates_existing_no_duplicate() {
+        let tmp = TempDir::new().unwrap();
+        let store = LanceVectorStore::open_with_at_rest_key(tmp.path(), 4, &TEST_AT_REST_KEY)
+            .await
+            .unwrap();
+        let work = Boundary::new("work").unwrap();
+        let personal = Boundary::new("personal").unwrap();
+        let id = new_id();
+
+        store
+            .bulk_upsert(&[(id, embedding(4, 1.0), work.clone())])
+            .await
+            .unwrap();
+        assert_eq!(store.count(None).await.unwrap(), 1);
+
+        store
+            .bulk_upsert(&[(id, embedding(4, 0.5), personal.clone())])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.count(None).await.unwrap(),
+            1,
+            "bulk_upsert must not duplicate when boundary changes"
+        );
+        assert_eq!(store.count(Some(&work)).await.unwrap(), 0);
+        assert_eq!(store.count(Some(&personal)).await.unwrap(), 1);
+
+        let personal_hits = store
+            .search(&embedding(4, 1.0), 5, std::slice::from_ref(&personal))
+            .await
+            .unwrap();
+        assert!(
+            personal_hits.iter().any(|(rid, _)| *rid == id),
+            "id missing from new boundary's search result after bulk_upsert replacement"
+        );
+    }
+
+    /// Bulk-upsert + delete: ids deleted after a bulk-upsert must not
+    /// surface in subsequent search. Pins the bulk+delete composition
+    /// contract — delete should treat bulk-inserted rows identically
+    /// to single-row-inserted ones (no leaked rows from the batch path).
+    #[tokio::test]
+    async fn bulk_upsert_then_delete_removes_id() {
+        let tmp = TempDir::new().unwrap();
+        let store = LanceVectorStore::open_with_at_rest_key(tmp.path(), 4, &TEST_AT_REST_KEY)
+            .await
+            .unwrap();
+        let work = Boundary::new("work").unwrap();
+        let rows: Vec<(MemoryId, Vec<f32>, Boundary)> = (1..=5)
+            .map(|i| (new_id(), embedding(4, i as f32), work.clone()))
+            .collect();
+        store.bulk_upsert(&rows).await.unwrap();
+        assert_eq!(store.count(None).await.unwrap(), 5);
+
+        let deleted_id = rows[2].0;
+        store.delete(&deleted_id).await.unwrap();
+        assert_eq!(store.count(None).await.unwrap(), 4);
+        assert!(!store.contains(&deleted_id).await.unwrap());
+
+        let hits = store
+            .search(&embedding(4, 1.0), 10, std::slice::from_ref(&work))
+            .await
+            .unwrap();
+        assert!(
+            hits.iter().all(|(rid, _)| *rid != deleted_id),
+            "deleted id leaked into search after bulk_upsert + delete"
+        );
+    }
+
+    // ============================================================
     //   Construction-site safety: SQL string quoting + filter shape
     // ============================================================
 
@@ -1586,6 +2014,84 @@ mod tests {
                         "boundary leak: id {} from unauthorised boundary {} surfaced",
                         rid.0,
                         names[*bi],
+                    );
+                }
+                Ok(())
+            })?;
+        }
+
+        /// **Bulk-specific property test (ADR-051, T0.2.7 Phase 5 Step 2):**
+        /// For any random partition of N (id, boundary) rows into K batches,
+        /// after executing all K `bulk_upsert` calls in sequence:
+        /// - total row count equals N (no duplicates created across batches)
+        /// - every planted id surfaces in a search authorised for its own
+        ///   boundary
+        /// - empty batches interspersed in the sequence don't corrupt the
+        ///   store (mid-sequence empty-input idempotency)
+        ///
+        /// Different from `search_never_returns_unauthorized_boundary`:
+        /// that test pins per-row write + boundary auth contract; this one
+        /// pins the batch composition contract (multi-batch sequences
+        /// compose cleanly, no row loss across batch boundaries).
+        #[test]
+        fn bulk_upsert_round_trip_preserves_all_rows_across_random_partitions(
+            n_rows in 1usize..30,
+            n_batches in 1usize..6,
+            boundary_indices in proptest::collection::vec(0u8..3, 1..30),
+        ) {
+            tokio_test::block_on(async move {
+                let tmp = TempDir::new().unwrap();
+                let store = LanceVectorStore::open_with_at_rest_key(tmp.path(), 4, &TEST_AT_REST_KEY).await.unwrap();
+
+                let n = n_rows.min(boundary_indices.len());
+                if n == 0 {
+                    return Ok(());
+                }
+
+                let boundaries: [Boundary; 3] = [
+                    Boundary::new("alpha").unwrap(),
+                    Boundary::new("beta").unwrap(),
+                    Boundary::new("gamma").unwrap(),
+                ];
+
+                // Generate N (id, boundary_index) pairs.
+                let planted: Vec<(MemoryId, usize)> = (0..n)
+                    .map(|i| (new_id(), boundary_indices[i] as usize))
+                    .collect();
+
+                // Partition round-robin into K batches. With n_batches > n,
+                // some batches stay empty — exercises mid-sequence empty
+                // idempotency.
+                let mut batches: Vec<Vec<(MemoryId, Vec<f32>, Boundary)>> =
+                    vec![Vec::new(); n_batches];
+                for (i, (id, bi)) in planted.iter().enumerate() {
+                    let b = boundaries[*bi].clone();
+                    batches[i % n_batches].push((*id, embedding(4, 1.0), b));
+                }
+
+                // Execute each batch (including empty ones).
+                for batch in &batches {
+                    store.bulk_upsert(batch).await.unwrap();
+                }
+
+                // Count must equal N (no duplicates across batches).
+                let count = store.count(None).await.unwrap();
+                proptest::prop_assert_eq!(
+                    count, n,
+                    "bulk_upsert sequence produced count {} for {} distinct ids",
+                    count, n,
+                );
+
+                // Every planted id must surface in its boundary's search.
+                for (id, bi) in &planted {
+                    let auth = std::slice::from_ref(&boundaries[*bi]);
+                    let hits = store.search(&embedding(4, 1.0), 100, auth).await.unwrap();
+                    let found = hits.iter().any(|(rid, _)| *rid == *id);
+                    proptest::prop_assert!(
+                        found,
+                        "bulk-inserted id {} missing from boundary-index-{} search after K-batch partition",
+                        id.0,
+                        bi,
                     );
                 }
                 Ok(())

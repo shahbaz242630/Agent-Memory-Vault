@@ -35,4 +35,7 @@ pub use read_pipeline::{
 pub use retriever::{
     RetrievalOptions, RetrievalQuery, RetrievedMemory, Retriever, MAX_QUERY_BYTES, MAX_RESULTS_CAP,
 };
-pub use strategies::SemanticRetriever;
+pub use strategies::{
+    AbstainConfig, AbstainingRetriever, HybridConfig, HybridRetriever, KeywordIndex,
+    KeywordRetriever, SemanticRetriever,
+};

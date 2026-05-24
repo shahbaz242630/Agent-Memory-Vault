@@ -49,19 +49,30 @@ vault-retrieval = { path = "../vault-retrieval" }
 #   to drive the server over a `tokio::io::duplex()` pair instead of
 #   real stdin/stdout).
 #
-# **schemars feature DELIBERATELY excluded** at T0.1.9 Phase 1: rmcp 1.5.0's
-# schemars feature pulls schemars 1.0, which in turn requires chrono ^0.4.39.
-# Our workspace pins `chrono = "=0.4.38"` per ADR-013 to avoid a transitive
-# `Datelike::quarter()` collision in arrow-arith 52.x via lancedb's tree.
-# Path forward: revisit when chrono pin can advance OR when rmcp ships a
-# version that uses schemars 0.8 / makes schemars optional. Tracked in
-# tech-debt; T0.1.9 Phase 1 uses untyped `serde_json::Value` parameters
-# instead of `#[derive(schemars::JsonSchema)]`-typed structs.
+# **schemars usage (current state at T0.2.x):** typed tool param structs
+# (`SearchToolParams`, `ReadToolParams`, `WriteToolParams`, `UpdateToolParams`,
+# `DeleteToolParams` in `src/server.rs`) derive `schemars::JsonSchema` so
+# rmcp's `#[tool]` macro can generate the JSON Schema 2020-12 input schema
+# published in `tools/list`. `schemars` is consumed via `rmcp::schemars`
+# (re-exported by rmcp's `server` feature) — do NOT add a separate
+# `schemars` workspace dep. Verified at runtime by `examples/macro_spike.rs`.
+#
+# **History (preserved for audit trail):** at T0.1.9 Phase 1 (2026-04-30)
+# schemars was deliberately excluded because rmcp 1.5.0's schemars feature
+# pulls schemars 1.0 which required `chrono ^0.4.39`, conflicting with our
+# then-pin `chrono = "=0.4.38"` per ADR-013. ADR-013 amendment (2026-05-01,
+# `HANDOFF_V0.1_ARCHIVE.md` line 603) advanced chrono past the original
+# blocker (currently `=0.4.44` per workspace `Cargo.toml`); typed-params
+# migration landed at T0.1.9 Phase 2 via the macro_spike.rs contract
+# verification. The previous "tracked in tech-debt" framing is therefore
+# obsolete — this comment block replaces a 2026-04-30 description that
+# silently rotted across T0.1.9 Phase 2 → T0.2.x. Updated 2026-05-22 at
+# T0.2.7 Phase 5 Step 2 audit.
 rmcp = { workspace = true, features = ["server", "macros", "transport-io", "transport-async-rw"] }
 
 # serde + serde_json — tool param/result types serialise via serde; rmcp's
-# protocol layer handles the JSON-RPC envelope. Phase 1 uses untyped
-# `serde_json::Value` for tool parameters (see schemars note above).
+# protocol layer handles the JSON-RPC envelope. Tool params are typed
+# structs with `schemars::JsonSchema` derives (see rmcp note above).
 serde = { workspace = true }
 serde_json = { workspace = true }
 

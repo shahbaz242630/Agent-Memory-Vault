@@ -1,11 +1,12 @@
 # Agent Build Specification — Personal Memory Vault
 
 **Document type:** Agent BRD (read by Claude Code and Codex as the working spec)
-**Version:** 1.3
+**Version:** 1.4
 **Status:** Active — agents must read this end-to-end before writing any code
-**Last updated:** 2026-05-04
+**Last updated:** 2026-05-24
 
 **Changelog:**
+- **v1.4 (2026-05-24)** — Added §1.6 "Deployment Modes & Pricing" locking the three-mode go-to-market shape (Mode 1 Local one-time $10 · Mode 2 BYOK $5/mo · Mode 3 Managed pay-as-you-go). Added the **Correctness-is-the-product** thesis to §1.3 as the principle underneath the six engineering bets. Amended §1.4 to remove the "Self-hosting backend (never — managed services only)" exclusion — user-self-hosted-with-BYOK is now Mode 2, supported as a primary deployment shape alongside our managed service. Reason: founder product discussion 2026-05-24 locked the three-mode strategy; BRD must reflect the same so agent decisions stay aligned across sessions and pricing/architecture are not relitigated.
 - **v1.3 (2026-05-04)** — Amended T0.2.7 (vault-retrieval Multi-Strategy + Reranker) to make the vector index intervention an explicit deliverable + acceptance bar, promoted from HANDOFF tech-debt cross-link to BRD task spec. Reason: T0.1.10 Phase 3a empirically confirmed 1K-memory retrieval at ~382ms median (vs BRD §5.5's 200ms ceiling) due to LanceDB fragmentation without an index; codifying the fix in the BRD removes the dependency on tech-debt-cross-link discipline at T0.2.7 planning time.
 - **v1.2 (2026-05-04)** — Clarified per-runtime adapter pattern in §1.4.1: MCP-native agents work automatically with no per-runtime work; runtimes with proprietary plugin systems get case-by-case thin adapters following the T1.0.16 Hermes pattern. T1.0.16 reframed as the first instance of a reusable pattern, not a one-off.
 - **v1.1 (2026-05-04)** — Added §1.4.1 ecosystem positioning (substrate vs. runtime); added Skills Hub compatibility note to §5.1 `MemoryType::Procedural`; added human-readable consolidation summary requirement to §5.6 + T0.2.3 acceptance criterion; added T1.0.16 Hermes memory provider plugin (post-V1.0 distribution channel).
@@ -83,6 +84,8 @@ The user populates the vault once. Any AI agent reads from it via MCP. The user 
 
 ### 1.3 What Makes This 10x Better Than Current Memory Systems
 
+**The thesis underneath everything in this section:** *Storage and retrieval are table stakes. **Correctness of output is the differentiator.*** A memory system that returns wrong, contradictory, stale, or hallucinated content has negative value — worse than no memory at all, because it pollutes the agent's response to the user with confident-but-wrong context. Every architectural bet below is a means to one end: the answer the agent surfaces to the user must reflect the truth in the vault. This thesis takes precedence over any feature, speed, scale, or convenience consideration that would compromise it. *"Memory is only useful if correct output otherwise it is not."* — founder thesis, 2026-05-24, locked at T0.2.7 close after empirical 9/9-across-scale-ladder confirmation.
+
 Current memory systems (Mem0, Zep, Letta) fail because they treat memory as a database with search. We build it as a **cognitive substrate that thinks about its own contents**. Six engineering bets that compound:
 
 1. **Confidence-decay knowledge graph** — every fact has `valid_from`, `valid_until`, `confidence`, `superseded_by`. Time-aware retrieval, contradiction-aware updates.
@@ -102,7 +105,7 @@ Current memory systems (Mem0, Zep, Letta) fail because they treat memory as a da
 - Mobile apps (planned V1.1+, see version roadmap section)
 - Team/shared memory (V1.2)
 - Premium TEE cloud consolidation (V2.0)
-- Self-hosting backend (never — managed services only)
+- ~~Self-hosting backend (never — managed services only)~~ — **REMOVED in v1.4 (2026-05-24).** User-self-hosted-with-BYOK is now Mode 2 in §1.6, a primary supported deployment shape alongside our managed service (Mode 3). The original "never" stance was based on the assumption of a single-mode cloud-managed business; the three-mode shape supersedes it.
 - Training our own models (never — we use open-weight Phi-4-mini)
 - Browser extension (potential later)
 - Voice interface (potential later)
@@ -164,6 +167,44 @@ Power users with these characteristics:
 - Have hardware capable of running a 3.8B parameter model (M1+ Mac, modern Windows PC with 16GB+ RAM)
 
 Build the V1 product for this user. Do not optimize for grandma-friendly UX or low-end hardware in V1.
+
+### 1.6 Deployment Modes & Pricing
+
+**Locked v1.4 (2026-05-24).** Memory Vault is a **single product** delivered in three deployment modes, sharing one codebase / one storage layer / one MCP surface / one consolidator pipeline. Modes differ ONLY at four seams: the LLM provider, the storage host, the identity/auth surface, and the billing surface. Core retrieval + consolidator + MCP must be identical bytes across all three modes — no mode-specific branches in core code.
+
+| Mode | Name | Who it's for | LLM | Storage host | Pricing |
+|---|---|---|---|---|---|
+| **1** | **Local** | Power users, privacy-first, modern hardware (the §1.5 target user) | Local Qwen-7B (ADR-049) / Phi family | User's laptop, sealed at rest | **One-time $10** (lifetime licence for the local binary) |
+| **2** | **BYOK** | Tech-comfortable users who find Mode 1 too slow but want to keep ownership of the vault | User-supplied API key via `LlmProvider` trait → OpenAI / Anthropic / Google / etc. | User's own VPS (user-managed infrastructure), sealed at rest with the same envelope as Mode 1 | **$5/month** subscription for the vault binary + licence + updates; user pays their LLM provider separately |
+| **3** | **Managed** | Non-tech users who want speed without setup or infra | User picks model at signup; we provision via cloud LLM APIs and charge accordingly | Our managed VPS (sealed at rest — we cannot read content, zero-knowledge invariant preserved) | **Pay-as-you-go OR monthly credits** based on per-call volume; scale by adding VPS as users grow |
+
+**Why three modes:**
+
+- Mode 1 alone caps TAM at "users with modern hardware + technical comfort + patience for ~150s/query." Necessary but not sufficient for a viable business.
+- Mode 2 expands TAM to users who want ownership without local compute, at recurring revenue. Hermes Agent + OpenClaw have already proven the user-deploys-on-own-VPS pattern; we adopt it without reinventing distribution mechanics.
+- Mode 3 expands TAM to non-tech users (the majority of agentic-era AI users by 2027) at metered revenue. Required to compete with cloud-hosted memory products (Mem0 Cloud, etc.) on convenience while preserving the zero-knowledge differentiator via the sealed-object-store envelope (ADR-008 + ADR-040).
+
+**Architectural seams already in place that make the three modes mode-agnostic:**
+
+- **`LlmProvider` trait (ADR-049, T0.2.1)** — swaps local Qwen-7B ↔ cloud LLM keys with zero core-code changes.
+- **Sealed object store envelope (ADR-008 + ADR-040, T0.2.0)** — same per-file XChaCha20-Poly1305 sealing works on local disk (Mode 1), user VPS disk (Mode 2), or our managed VPS disk (Mode 3). Zero-knowledge invariant holds in all three.
+- **MCP server (T0.1.9, T0.2.7 Phase 4)** — same stdio/transport protocol works regardless of where the vault is hosted; agents connect identically.
+
+**New constraint introduced by the three-mode shape:**
+
+- **The pre-cooked summary format produced by the T0.3.x consolidator-driven read pipeline must be portable across LLM providers.** A summary generated by Qwen-7B in Mode 1 must be servable to a Claude-driven read in Mode 2, and vice versa. The format itself must not embed provider-specific tokenization or template conventions. This is a format-lock decision that happens during T0.3.x design, not a separate architecture.
+
+**Out of scope until justified by a Tx.y.z task with explicit acceptance criteria:**
+
+- Mode-specific feature divergence (e.g., "Mode 3 gets fancier UI than Mode 1") — modes share UX; differentiation is on speed / cost / hosting, not features.
+- Migration tools between modes (e.g., "export Mode 1 vault, import to Mode 3"). Re-evaluate at Mode 2/3 launch; until then, users pick a mode at signup and stay there.
+- Pricing experiments / A/B tests on the published prices in this section. Locked-in numbers in this BRD are the contract; changes require an explicit BRD amendment with founder approval, not Claude judgment.
+
+**Cross-references:**
+
+- §1.4 "Out of Scope" — the v1.4 amendment removed the "Self-hosting backend (never)" line; Mode 2 is the supported successor.
+- §6 Version Roadmap — V0.2 (current) is Mode-1-only closed beta. Mode 2 + Mode 3 ship at V1.0+ per the roadmap (specific Tx.y.z task IDs to be drafted when Mode 2/3 work begins).
+- §11 Security & Privacy — zero-knowledge contract (server cryptographically cannot read user vault contents) holds across all three modes; Mode 3 in particular must preserve this — our VPS storing user data does NOT mean we can read it.
 
 ---
 

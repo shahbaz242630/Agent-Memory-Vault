@@ -147,6 +147,12 @@ async fn setup_application() -> TestApp {
         // 32-byte sentinel preserves the smoke-test surface without
         // exercising the at-rest sealing path.
         at_rest_key: zeroize::Zeroizing::new([0u8; 32]),
+        // T0.2.7 Phase 4: integration smoke does not exercise the read
+        // pipeline (no 4.36 GB GGUF on disk in CI). `None` leaves the
+        // read pipeline unwired; memory.read calls return
+        // VaultError::Config("not configured") which is the correct
+        // surface for the absent-model scenario.
+        qwen_model_path: None,
     };
 
     let application = Application::new(&config).await.expect(
@@ -664,7 +670,7 @@ async fn adversarial_oversized_query_rejected_through_composed_adapter() {
 }
 
 /// **Adversarial defense:** `max_results` outside `1..=`[`MAX_RESULTS_CAP`]
-/// (= 100). Both edges (`0` below the floor, `MAX_RESULTS_CAP + 1` above
+/// (= 200). Both edges (`0` below the floor, `MAX_RESULTS_CAP + 1` above
 /// the cap) collapse into one defense at one code path; this single
 /// test exercises both edges via two sub-assertions on the same defense.
 ///
