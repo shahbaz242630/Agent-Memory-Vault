@@ -198,6 +198,24 @@ jobs:
           # Build Tools); choco install line is defensive idempotency.
           choco install ninja -y --no-progress
           Add-Content $env:GITHUB_ENV "CMAKE_GENERATOR=Ninja"
+          # T0.2.3 close commit 12 fix-forward (2026-05-24): shorten
+          # `CARGO_TARGET_DIR` to bypass the Windows MAX_PATH=260 limit hit
+          # by MSVC `cl.exe` on deeply-nested `vulkan-shaders-gen`
+          # TryCompile paths. Commit 10's Ninja switch successfully
+          # bypassed the MSBuild VCEnd bug (configure step started
+          # executing); then `cl.exe` itself failed with `error C1083:
+          # Cannot open compiler generated file: '': Invalid argument`
+          # because the inner TryCompile path was ~252 chars
+          # (`D:\a\Agent-Memory-Vault\Agent-Memory-Vault\target\debug
+          # \build\llama-cpp-sys-2-XXX\out\build\ggml\src\ggml-vulkan
+          # \vulkan-shaders-gen-prefix\src\vulkan-shaders-gen-build
+          # \CMakeFiles\CMakeScratch\TryCompile-XXX\testCCompiler.c`).
+          # The empty `''` filename in the C1083 error is MSVC's path-
+          # overflow signature. Setting `CARGO_TARGET_DIR=C:\t` shaves
+          # 42 chars off the workspace prefix (`D:\a\...target` → `C:\t`)
+          # and clears the limit comfortably. `Swatinem/rust-cache@v2`
+          # reads `CARGO_TARGET_DIR` automatically.
+          Add-Content $env:GITHUB_ENV "CARGO_TARGET_DIR=C:\t"
       - if: runner.os == 'Linux'
         name: Install Vulkan SDK via LunarG apt repo
         run: |
@@ -331,6 +349,24 @@ jobs:
           # Build Tools); choco install line is defensive idempotency.
           choco install ninja -y --no-progress
           Add-Content $env:GITHUB_ENV "CMAKE_GENERATOR=Ninja"
+          # T0.2.3 close commit 12 fix-forward (2026-05-24): shorten
+          # `CARGO_TARGET_DIR` to bypass the Windows MAX_PATH=260 limit hit
+          # by MSVC `cl.exe` on deeply-nested `vulkan-shaders-gen`
+          # TryCompile paths. Commit 10's Ninja switch successfully
+          # bypassed the MSBuild VCEnd bug (configure step started
+          # executing); then `cl.exe` itself failed with `error C1083:
+          # Cannot open compiler generated file: '': Invalid argument`
+          # because the inner TryCompile path was ~252 chars
+          # (`D:\a\Agent-Memory-Vault\Agent-Memory-Vault\target\debug
+          # \build\llama-cpp-sys-2-XXX\out\build\ggml\src\ggml-vulkan
+          # \vulkan-shaders-gen-prefix\src\vulkan-shaders-gen-build
+          # \CMakeFiles\CMakeScratch\TryCompile-XXX\testCCompiler.c`).
+          # The empty `''` filename in the C1083 error is MSVC's path-
+          # overflow signature. Setting `CARGO_TARGET_DIR=C:\t` shaves
+          # 42 chars off the workspace prefix (`D:\a\...target` → `C:\t`)
+          # and clears the limit comfortably. `Swatinem/rust-cache@v2`
+          # reads `CARGO_TARGET_DIR` automatically.
+          Add-Content $env:GITHUB_ENV "CARGO_TARGET_DIR=C:\t"
       - if: runner.os == 'Linux'
         name: Install Vulkan SDK via LunarG apt repo
         run: |
@@ -482,6 +518,24 @@ jobs:
           # Build Tools); choco install line is defensive idempotency.
           choco install ninja -y --no-progress
           Add-Content $env:GITHUB_ENV "CMAKE_GENERATOR=Ninja"
+          # T0.2.3 close commit 12 fix-forward (2026-05-24): shorten
+          # `CARGO_TARGET_DIR` to bypass the Windows MAX_PATH=260 limit hit
+          # by MSVC `cl.exe` on deeply-nested `vulkan-shaders-gen`
+          # TryCompile paths. Commit 10's Ninja switch successfully
+          # bypassed the MSBuild VCEnd bug (configure step started
+          # executing); then `cl.exe` itself failed with `error C1083:
+          # Cannot open compiler generated file: '': Invalid argument`
+          # because the inner TryCompile path was ~252 chars
+          # (`D:\a\Agent-Memory-Vault\Agent-Memory-Vault\target\debug
+          # \build\llama-cpp-sys-2-XXX\out\build\ggml\src\ggml-vulkan
+          # \vulkan-shaders-gen-prefix\src\vulkan-shaders-gen-build
+          # \CMakeFiles\CMakeScratch\TryCompile-XXX\testCCompiler.c`).
+          # The empty `''` filename in the C1083 error is MSVC's path-
+          # overflow signature. Setting `CARGO_TARGET_DIR=C:\t` shaves
+          # 42 chars off the workspace prefix (`D:\a\...target` → `C:\t`)
+          # and clears the limit comfortably. `Swatinem/rust-cache@v2`
+          # reads `CARGO_TARGET_DIR` automatically.
+          Add-Content $env:GITHUB_ENV "CARGO_TARGET_DIR=C:\t"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Run `#[ignore]`'d tests in vault-llm (the real-model smoke suite).
