@@ -216,6 +216,21 @@ jobs:
           # and clears the limit comfortably. `Swatinem/rust-cache@v2`
           # reads `CARGO_TARGET_DIR` automatically.
           Add-Content $env:GITHUB_ENV "CARGO_TARGET_DIR=C:\t"
+          # T0.2.3 close commit 13 fix-forward (2026-05-24): reduce debug
+          # info on Windows to bypass MSVC `LNK1318 LIMIT (12)` and
+          # `LNK1318 FILE_SYSTEM (3)` PDB errors hit at the link stage in
+          # commit 12's CI run 26367831242. With full debuginfo, the test
+          # binaries (`integration_smoke`, `vault_app` lib test) link the
+          # whole workspace — lance + datafusion + llama-cpp-sys + tantivy
+          # — producing .pdb files that exceed MSVC's internal 2 GB cap.
+          # `-C debuginfo=line-tables-only` keeps panic backtraces +
+          # function names + file:line info (the only debug info CI ever
+          # surfaces) while shrinking PDB ~10×. Standard upstream Rust
+          # workaround (rust-lang/rust#101050, #100972). Does NOT change
+          # test semantics — tests still run, fail, and report identically.
+          # Local dev builds on the founder's machine are unaffected;
+          # this only mutates the per-job GITHUB_ENV.
+          Add-Content $env:GITHUB_ENV "RUSTFLAGS=-D warnings -C debuginfo=line-tables-only"
       - if: runner.os == 'Linux'
         name: Install Vulkan SDK via LunarG apt repo
         run: |
@@ -367,6 +382,21 @@ jobs:
           # and clears the limit comfortably. `Swatinem/rust-cache@v2`
           # reads `CARGO_TARGET_DIR` automatically.
           Add-Content $env:GITHUB_ENV "CARGO_TARGET_DIR=C:\t"
+          # T0.2.3 close commit 13 fix-forward (2026-05-24): reduce debug
+          # info on Windows to bypass MSVC `LNK1318 LIMIT (12)` and
+          # `LNK1318 FILE_SYSTEM (3)` PDB errors hit at the link stage in
+          # commit 12's CI run 26367831242. With full debuginfo, the test
+          # binaries (`integration_smoke`, `vault_app` lib test) link the
+          # whole workspace — lance + datafusion + llama-cpp-sys + tantivy
+          # — producing .pdb files that exceed MSVC's internal 2 GB cap.
+          # `-C debuginfo=line-tables-only` keeps panic backtraces +
+          # function names + file:line info (the only debug info CI ever
+          # surfaces) while shrinking PDB ~10×. Standard upstream Rust
+          # workaround (rust-lang/rust#101050, #100972). Does NOT change
+          # test semantics — tests still run, fail, and report identically.
+          # Local dev builds on the founder's machine are unaffected;
+          # this only mutates the per-job GITHUB_ENV.
+          Add-Content $env:GITHUB_ENV "RUSTFLAGS=-D warnings -C debuginfo=line-tables-only"
       - if: runner.os == 'Linux'
         name: Install Vulkan SDK via LunarG apt repo
         run: |
@@ -536,6 +566,21 @@ jobs:
           # and clears the limit comfortably. `Swatinem/rust-cache@v2`
           # reads `CARGO_TARGET_DIR` automatically.
           Add-Content $env:GITHUB_ENV "CARGO_TARGET_DIR=C:\t"
+          # T0.2.3 close commit 13 fix-forward (2026-05-24): reduce debug
+          # info on Windows to bypass MSVC `LNK1318 LIMIT (12)` and
+          # `LNK1318 FILE_SYSTEM (3)` PDB errors hit at the link stage in
+          # commit 12's CI run 26367831242. With full debuginfo, the test
+          # binaries (`integration_smoke`, `vault_app` lib test) link the
+          # whole workspace — lance + datafusion + llama-cpp-sys + tantivy
+          # — producing .pdb files that exceed MSVC's internal 2 GB cap.
+          # `-C debuginfo=line-tables-only` keeps panic backtraces +
+          # function names + file:line info (the only debug info CI ever
+          # surfaces) while shrinking PDB ~10×. Standard upstream Rust
+          # workaround (rust-lang/rust#101050, #100972). Does NOT change
+          # test semantics — tests still run, fail, and report identically.
+          # Local dev builds on the founder's machine are unaffected;
+          # this only mutates the per-job GITHUB_ENV.
+          Add-Content $env:GITHUB_ENV "RUSTFLAGS=-D warnings -C debuginfo=line-tables-only"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Run `#[ignore]`'d tests in vault-llm (the real-model smoke suite).
