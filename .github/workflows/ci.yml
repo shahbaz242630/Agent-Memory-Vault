@@ -230,7 +230,22 @@ jobs:
           # test semantics — tests still run, fail, and report identically.
           # Local dev builds on the founder's machine are unaffected;
           # this only mutates the per-job GITHUB_ENV.
-          Add-Content $env:GITHUB_ENV "RUSTFLAGS=-D warnings -C debuginfo=line-tables-only"
+          # T0.2.3 close commit 14 fix-forward (2026-05-25): switch the
+          # Windows linker from `link.exe` to `lld-link.exe`. Commit 13's
+          # CI run 26369187646 confirmed `-C debuginfo=line-tables-only`
+          # reduced PDB content but the MSVC link.exe PDB writer still
+          # hit `LNK1318 LIMIT (12)` on `read_pipeline_scale_acceptance`
+          # — the per-PDB section/type-index cap is structural to MSVC's
+          # writer, not just about debuginfo volume. LLD's `lld-link.exe`
+          # has a more efficient PDB writer that handles large Rust
+          # workspaces (used in production by Mozilla, Tauri, Rustls).
+          # lld-link.exe is bundled with the LLVM install we already do
+          # via `choco install llvm` (at `C:\Program Files\LLVM\bin\
+          # lld-link.exe`, added to PATH by choco); no new install step
+          # needed. line-tables-only kept as belt-and-braces alongside
+          # the linker switch. Rust passes the same link flags so this
+          # is drop-in compatible with our existing native deps.
+          Add-Content $env:GITHUB_ENV "RUSTFLAGS=-D warnings -C debuginfo=line-tables-only -C linker=lld-link"
       - if: runner.os == 'Linux'
         name: Install Vulkan SDK via LunarG apt repo
         run: |
@@ -396,7 +411,22 @@ jobs:
           # test semantics — tests still run, fail, and report identically.
           # Local dev builds on the founder's machine are unaffected;
           # this only mutates the per-job GITHUB_ENV.
-          Add-Content $env:GITHUB_ENV "RUSTFLAGS=-D warnings -C debuginfo=line-tables-only"
+          # T0.2.3 close commit 14 fix-forward (2026-05-25): switch the
+          # Windows linker from `link.exe` to `lld-link.exe`. Commit 13's
+          # CI run 26369187646 confirmed `-C debuginfo=line-tables-only`
+          # reduced PDB content but the MSVC link.exe PDB writer still
+          # hit `LNK1318 LIMIT (12)` on `read_pipeline_scale_acceptance`
+          # — the per-PDB section/type-index cap is structural to MSVC's
+          # writer, not just about debuginfo volume. LLD's `lld-link.exe`
+          # has a more efficient PDB writer that handles large Rust
+          # workspaces (used in production by Mozilla, Tauri, Rustls).
+          # lld-link.exe is bundled with the LLVM install we already do
+          # via `choco install llvm` (at `C:\Program Files\LLVM\bin\
+          # lld-link.exe`, added to PATH by choco); no new install step
+          # needed. line-tables-only kept as belt-and-braces alongside
+          # the linker switch. Rust passes the same link flags so this
+          # is drop-in compatible with our existing native deps.
+          Add-Content $env:GITHUB_ENV "RUSTFLAGS=-D warnings -C debuginfo=line-tables-only -C linker=lld-link"
       - if: runner.os == 'Linux'
         name: Install Vulkan SDK via LunarG apt repo
         run: |
@@ -580,7 +610,22 @@ jobs:
           # test semantics — tests still run, fail, and report identically.
           # Local dev builds on the founder's machine are unaffected;
           # this only mutates the per-job GITHUB_ENV.
-          Add-Content $env:GITHUB_ENV "RUSTFLAGS=-D warnings -C debuginfo=line-tables-only"
+          # T0.2.3 close commit 14 fix-forward (2026-05-25): switch the
+          # Windows linker from `link.exe` to `lld-link.exe`. Commit 13's
+          # CI run 26369187646 confirmed `-C debuginfo=line-tables-only`
+          # reduced PDB content but the MSVC link.exe PDB writer still
+          # hit `LNK1318 LIMIT (12)` on `read_pipeline_scale_acceptance`
+          # — the per-PDB section/type-index cap is structural to MSVC's
+          # writer, not just about debuginfo volume. LLD's `lld-link.exe`
+          # has a more efficient PDB writer that handles large Rust
+          # workspaces (used in production by Mozilla, Tauri, Rustls).
+          # lld-link.exe is bundled with the LLVM install we already do
+          # via `choco install llvm` (at `C:\Program Files\LLVM\bin\
+          # lld-link.exe`, added to PATH by choco); no new install step
+          # needed. line-tables-only kept as belt-and-braces alongside
+          # the linker switch. Rust passes the same link flags so this
+          # is drop-in compatible with our existing native deps.
+          Add-Content $env:GITHUB_ENV "RUSTFLAGS=-D warnings -C debuginfo=line-tables-only -C linker=lld-link"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Run `#[ignore]`'d tests in vault-llm (the real-model smoke suite).
