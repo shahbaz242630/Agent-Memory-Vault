@@ -42,7 +42,21 @@
 //! Expected wall ~3-5 min: ~30s release relink + ~15-20s Qwen-7B load
 //! + 1 × ~30-90s inference + parse.
 
-#![cfg(target_os = "windows")]
+// File-level `#![cfg(target_os = "windows")]` was struck at T0.2.3 close
+// commit 11 fix-forward (2026-05-24): non-Windows CI hit `error[E0601]:
+// main function not found in crate`. Replaced with per-item cfg + non-
+// Windows stub `main` below; file-level allow suppresses unused/dead-code
+// warnings for the now-unreachable helpers on non-Windows. Per
+// [[cfg-gate-transitively-platform-only-items]].
+#![cfg_attr(not(target_os = "windows"), allow(unused, dead_code))]
+
+#[cfg(not(target_os = "windows"))]
+fn main() {
+    eprintln!(
+        "t031 is a Windows-only spike artifact (Vulkan llama-cpp backend). \
+         Skipped on this platform."
+    );
+}
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -57,6 +71,7 @@ use vault_retrieval::read_pipeline::{
 };
 use vault_retrieval::RetrievedMemory;
 
+#[cfg(target_os = "windows")]
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let started = chrono::Utc::now();

@@ -42,7 +42,24 @@
 //! embedding generation for 1000 memories + ~5s bulk_upsert + ~2 min
 //! Tantivy index + 9 × ~1s retrieval calls.
 
-#![cfg(target_os = "windows")]
+// File-level `#![cfg(target_os = "windows")]` was struck at T0.2.3 close
+// commit 11 fix-forward (2026-05-24): non-Windows CI hit `error[E0601]:
+// main function not found in crate` because file-level cfg skipped the
+// entire crate when target was not Windows, leaving no `main` for Cargo
+// to compile the example binary. Replaced with per-item cfg + non-Windows
+// stub `main` below. All other items (imports, consts, structs, helpers)
+// stay at file level; they're unused on non-Windows because the cfg-gated
+// `tokio::main` is the only caller, so we suppress unused/dead-code
+// warnings on that platform. Per [[cfg-gate-transitively-platform-only-items]].
+#![cfg_attr(not(target_os = "windows"), allow(unused, dead_code))]
+
+#[cfg(not(target_os = "windows"))]
+fn main() {
+    eprintln!(
+        "t029 is a Windows-only spike artifact (Vulkan llama-cpp backend). \
+         Skipped on this platform."
+    );
+}
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -343,6 +360,7 @@ struct QueryEntry {
     notes: String,
 }
 
+#[cfg(target_os = "windows")]
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let started = chrono::Utc::now();
