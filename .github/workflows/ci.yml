@@ -216,11 +216,11 @@ jobs:
           # \vulkan-shaders-gen-prefix\src\vulkan-shaders-gen-build
           # \CMakeFiles\CMakeScratch\TryCompile-XXX\testCCompiler.c`).
           # The empty `''` filename in the C1083 error is MSVC's path-
-          # overflow signature. Setting `CARGO_TARGET_DIR=C:\t` shaves
-          # 42 chars off the workspace prefix (`D:\a\...target` → `C:\t`)
+          # overflow signature. Setting `CARGO_TARGET_DIR=D:\t` shaves
+          # 42 chars off the workspace prefix (`D:\a\...target` → `D:\t`)
           # and clears the limit comfortably. `Swatinem/rust-cache@v2`
           # reads `CARGO_TARGET_DIR` automatically.
-          Add-Content $env:GITHUB_ENV "CARGO_TARGET_DIR=C:\t"
+          Add-Content $env:GITHUB_ENV "CARGO_TARGET_DIR=D:\t"
           # T0.2.3 close commit 13 fix-forward (2026-05-24): reduce debug
           # info on Windows to bypass MSVC `LNK1318 LIMIT (12)` and
           # `LNK1318 FILE_SYSTEM (3)` PDB errors hit at the link stage in
@@ -446,11 +446,25 @@ jobs:
           # \vulkan-shaders-gen-prefix\src\vulkan-shaders-gen-build
           # \CMakeFiles\CMakeScratch\TryCompile-XXX\testCCompiler.c`).
           # The empty `''` filename in the C1083 error is MSVC's path-
-          # overflow signature. Setting `CARGO_TARGET_DIR=C:\t` shaves
-          # 42 chars off the workspace prefix (`D:\a\...target` → `C:\t`)
-          # and clears the limit comfortably. `Swatinem/rust-cache@v2`
-          # reads `CARGO_TARGET_DIR` automatically.
-          Add-Content $env:GITHUB_ENV "CARGO_TARGET_DIR=C:\t"
+          # overflow signature. Setting a short `CARGO_TARGET_DIR`
+          # shaves 42 chars off the workspace prefix and clears the
+          # limit comfortably. `Swatinem/rust-cache@v2` reads
+          # `CARGO_TARGET_DIR` automatically.
+          #
+          # T0.2.3 close commit 16 fix-forward (2026-05-25): point at
+          # the D: drive instead of C:. Commits 12-15 used `C:\t` (short
+          # path on the C: drive). Commit 15 added a disk-cleanup step
+          # that freed ~15.4 GB on C: but the link stage STILL hit
+          # `LLVM ERROR: IO failure on output stream: no space on device`
+          # — the workspace build needs more than 15 GB of headroom for
+          # link artifacts. windows-2025 runners ship a D: drive with
+          # ~150 GB free (vs C:'s ~50 GB), so moving target/ to D:
+          # eliminates the disk pressure structurally rather than
+          # incrementally squeezing more GB out of C:. Path length is
+          # the same as `C:\t` (4 chars) so the MAX_PATH bypass from
+          # commit 12 is preserved. Disk cleanup step in build-and-test
+          # job is kept as defense-in-depth (no per-platform downside).
+          Add-Content $env:GITHUB_ENV "CARGO_TARGET_DIR=D:\t"
           # T0.2.3 close commit 13 fix-forward (2026-05-24): reduce debug
           # info on Windows to bypass MSVC `LNK1318 LIMIT (12)` and
           # `LNK1318 FILE_SYSTEM (3)` PDB errors hit at the link stage in
@@ -645,11 +659,11 @@ jobs:
           # \vulkan-shaders-gen-prefix\src\vulkan-shaders-gen-build
           # \CMakeFiles\CMakeScratch\TryCompile-XXX\testCCompiler.c`).
           # The empty `''` filename in the C1083 error is MSVC's path-
-          # overflow signature. Setting `CARGO_TARGET_DIR=C:\t` shaves
-          # 42 chars off the workspace prefix (`D:\a\...target` → `C:\t`)
+          # overflow signature. Setting `CARGO_TARGET_DIR=D:\t` shaves
+          # 42 chars off the workspace prefix (`D:\a\...target` → `D:\t`)
           # and clears the limit comfortably. `Swatinem/rust-cache@v2`
           # reads `CARGO_TARGET_DIR` automatically.
-          Add-Content $env:GITHUB_ENV "CARGO_TARGET_DIR=C:\t"
+          Add-Content $env:GITHUB_ENV "CARGO_TARGET_DIR=D:\t"
           # T0.2.3 close commit 13 fix-forward (2026-05-24): reduce debug
           # info on Windows to bypass MSVC `LNK1318 LIMIT (12)` and
           # `LNK1318 FILE_SYSTEM (3)` PDB errors hit at the link stage in
