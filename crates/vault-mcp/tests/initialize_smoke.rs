@@ -231,3 +231,129 @@ async fn full_initialize_round_trip_lists_five_tools_with_expected_names() {
         panic!("server task panicked: {join_err}");
     }
 }
+
+// =============================================================================
+// 6. T0.2.7 close — `memory.write` canonical-save contract pin
+// =============================================================================
+
+/// T0.2.7 close (2026-05-25): pin test for the `memory.write` canonical-
+/// save contract. The tool description and per-field input-schema
+/// descriptions are load-bearing for cross-platform consistency — Claude,
+/// GPT, Codex, Kimi all read them via `tools/list` and save memories in
+/// matching shape. Accidental edits that drop the canonical rules must
+/// surface as a CI failure, not silent contract drift.
+///
+/// What this test pins:
+/// - Tool-level description contains each of the six canonical-save rule
+///   keywords + the WHEN-TO-CALL / WHEN-NOT-TO-CALL section headers +
+///   the cross-platform thesis phrase ("ANY AI agent").
+/// - Per-field input-schema descriptions on `content`, `boundary`, and
+///   `confidence` contain their respective load-bearing phrases (third-
+///   person framing for content; authorization for boundary; explicit
+///   value ranges for confidence).
+///
+/// Mirrors the round-trip pattern from test #5 — pin tests against the
+/// actual `tools/list` wire payload, not just an in-process Rust string,
+/// because what agents see IS the wire payload.
+#[tokio::test]
+async fn memory_write_description_contains_canonical_save_contract() {
+    use rmcp::ServiceExt;
+
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server = make_test_server(vec![]);
+
+    let server_handle = tokio::spawn(async move {
+        if let Ok(running) = server.serve(server_io).await {
+            let _ = running.waiting().await;
+        }
+    });
+
+    let client = ().serve(client_io).await.expect("initialize handshake completes");
+
+    let listed = client
+        .peer()
+        .list_tools(Default::default())
+        .await
+        .expect("list_tools succeeds");
+
+    let write_tool = listed
+        .tools
+        .iter()
+        .find(|t| t.name.as_ref() == "memory.write")
+        .expect("memory.write tool present in tools/list");
+
+    // ── Tool-level description pin ───────────────────────────────────
+    let description = write_tool
+        .description
+        .as_ref()
+        .expect("memory.write tool has a description")
+        .as_ref();
+
+    // The six canonical-save rule keywords + the WHEN/CRITICAL section
+    // headers + the cross-platform thesis. Each phrase is a load-bearing
+    // contract element; dropping any one risks silent cross-platform
+    // drift.
+    let required_phrases: &[(&str, &str)] = &[
+        ("Atomic facts", "canonical rule 1"),
+        ("Third-person about the user", "canonical rule 2"),
+        ("Complete sentences", "canonical rule 3"),
+        ("Strip conversation framing", "canonical rule 4"),
+        ("Absolute dates", "canonical rule 5"),
+        ("Never first-person agent reference", "canonical rule 6"),
+        ("ANY AI agent", "cross-platform thesis"),
+        ("WHEN TO CALL", "when-to-call section header"),
+        ("WHEN NOT TO CALL", "when-not-to-call section header"),
+    ];
+    for (phrase, label) in required_phrases {
+        assert!(
+            description.contains(phrase),
+            "memory.write description missing canonical-save phrase {phrase:?} ({label})"
+        );
+    }
+
+    // ── Per-field schema description pin ─────────────────────────────
+    let properties = write_tool
+        .input_schema
+        .get("properties")
+        .and_then(|v| v.as_object())
+        .expect("input_schema has properties object");
+
+    let content_desc = properties
+        .get("content")
+        .and_then(|c| c.get("description"))
+        .and_then(|d| d.as_str())
+        .expect("content field has description");
+    assert!(
+        content_desc.contains("third-person") || content_desc.contains("Third-person"),
+        "content field description must mention third-person framing; got: {content_desc}"
+    );
+    assert!(
+        content_desc.contains("2000"),
+        "content field description must mention the 2000-char length cap; got: {content_desc}"
+    );
+
+    let boundary_desc = properties
+        .get("boundary")
+        .and_then(|b| b.get("description"))
+        .and_then(|d| d.as_str())
+        .expect("boundary field has description");
+    assert!(
+        boundary_desc.contains("authorized"),
+        "boundary field description must mention authorization; got: {boundary_desc}"
+    );
+
+    let confidence_desc = properties
+        .get("confidence")
+        .and_then(|c| c.get("description"))
+        .and_then(|d| d.as_str())
+        .expect("confidence field has description");
+    assert!(
+        confidence_desc.contains("0.95") && confidence_desc.contains("0.75"),
+        "confidence field description must give specific value guidance; got: {confidence_desc}"
+    );
+
+    drop(client);
+    if let Err(join_err) = server_handle.await {
+        panic!("server task panicked: {join_err}");
+    }
+}

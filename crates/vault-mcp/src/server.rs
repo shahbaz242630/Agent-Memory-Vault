@@ -99,14 +99,58 @@ pub struct ReadToolParams {
 /// this field appears in `self.authorized_boundaries` BEFORE calling
 /// the adapter; if not, returns `VaultError::AccessDenied` (mapped to
 /// JSON-RPC `-32602 InvalidParams` with a generic message per ADR-024).
+///
+/// **Field doc-comments are load-bearing** (T0.2.7 close, 2026-05-25):
+/// `schemars::JsonSchema` derive reads `///` lines and publishes them in
+/// the JSON Schema 2020-12 `description` field that calling agents see
+/// via `tools/list`. These per-field descriptions complement the tool-
+/// level description on `tool_write` — the tool description teaches the
+/// overall save contract; the field descriptions teach per-field
+/// specifics. Pinned by the canonical-save-contract test in
+/// `tests/initialize_smoke.rs`.
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct WriteToolParams {
+    /// The memory content. Must be a complete sentence in third-person
+    /// about the user. Apply ALL six canonical-format rules from the
+    /// tool description (atomic fact, third-person, complete sentence,
+    /// strip conversation framing, absolute dates, no agent self-
+    /// reference). Hard limit: 2000 characters (atomic facts should be
+    /// much shorter; this is a sanity cap, not a target). Examples of
+    /// good content: "The user prefers dark mode in their code
+    /// editors." / "As of 2026-05-25 the user is building Memory
+    /// Vault, a cross-agent personal memory layer." / "The user is a
+    /// non-coder product owner who works with an AI partner; they
+    /// prefer plain-English explanations."
     pub content: String,
+    /// Namespace this memory belongs to (e.g., "personal", "work.acme",
+    /// "project.memory-vault"). Must match one of the boundaries the
+    /// host application authorized for this session; requests with
+    /// unauthorized boundaries are rejected with AccessDenied. If you
+    /// don't know which boundary applies, ask the user or default to
+    /// the session's primary boundary as indicated by the host
+    /// application's setup.
     pub boundary: String,
+    /// Type of memory. Defaults to "semantic" — general facts about the
+    /// user (preferences, identity, ongoing context — the most common
+    /// case). Use "episodic" for time-stamped events ("on 2026-05-25
+    /// the user shipped Phase B"). Use "procedural" for how-to
+    /// knowledge ("to run the test suite, use cargo test
+    /// --workspace"). When unsure, omit and default to semantic.
     #[serde(default)]
     pub memory_type: Option<String>,
+    /// Stable identifier of the agent saving this memory (e.g.,
+    /// "claude-3.5-sonnet", "gpt-4-turbo", "codex-cli", "kimi-k2").
+    /// Lowercase kebab-case. Used for cross-platform attribution and
+    /// retrieval filtering. Omit if unknown.
     #[serde(default)]
     pub source_agent: Option<String>,
+    /// Confidence in this fact's accuracy, 0.0 to 1.0. Defaults to 0.9.
+    /// Guidance: 0.95-1.0 for explicit user statements ("I prefer dark
+    /// mode"); 0.75-0.85 for strong inference ("the user keeps using
+    /// dark mode in screenshots"); 0.50-0.70 for tentative inference.
+    /// Below 0.50, consider whether the fact is worth saving at all.
+    /// The consolidator uses confidence in downstream contradiction
+    /// resolution.
     #[serde(default)]
     pub confidence: Option<f32>,
 }
@@ -561,11 +605,68 @@ impl StdioServer {
     /// `None` so the canonical-JSON serialisation OMITS them per Q1
     /// (ABSENT, not `null`). Tracing emits before audit-append so the
     /// operational log fires regardless of audit-store health.
+    ///
+    /// **Canonical-save contract (T0.2.7 close, 2026-05-25 lock):** the
+    /// tool description below tells calling agents how to format memory
+    /// content for cross-platform consistency — atomic facts, third-
+    /// person about the user, complete sentences, no conversation
+    /// framing, absolute dates, no agent self-reference. Server-side
+    /// `vault_app::adapter::normalize_for_canonical_save` is the belt-
+    /// and-braces safety net that auto-fixes common drift (strips
+    /// "When asked," / "I think," prefixes, rewrites "I prefer X" →
+    /// "The user prefers X", appends terminal period). Description pinned
+    /// by `full_initialize_lists_memory_write_with_canonical_save_contract`
+    /// test in `tests/initialize_smoke.rs` — accidental edits that drop
+    /// the canonical rules will fail CI.
     #[tool(
         name = "memory.write",
-        description = "Create a new memory in the user's vault. \
+        description = "Save a fact to the user's persistent memory vault. The vault is \
+                       read by ANY AI agent the user connects later (Claude, GPT, \
+                       Codex, Kimi, custom), so memories must be written in a \
+                       canonical format that's unambiguous across agents and \
+                       platforms. \
+                       \n\n\
+                       WHEN TO CALL: save high-signal user facts — preferences, \
+                       decisions, identity/role information, project context, \
+                       things the user has explicitly stated, recurring patterns \
+                       you've observed. When in doubt, save it — the vault's \
+                       nightly consolidator deduplicates and compresses \
+                       automatically. \
+                       \n\n\
+                       WHEN NOT TO CALL: do NOT save ephemeral chat (current-turn \
+                       scratchwork), conversation history that belongs in your \
+                       own context, anything the user explicitly said not to \
+                       remember, or sensitive content (passwords, keys, \
+                       credentials) without explicit user confirmation. \
+                       \n\n\
+                       CRITICAL — canonical save format (other agents WILL read \
+                       this): \
+                       \n\
+                       1. Atomic facts. One fact per memory. Split compound \
+                       statements into multiple writes. \
+                       \n\
+                       2. Third-person about the user. 'The user prefers Python' \
+                       — NOT 'I prefer Python' (the 'I' is ambiguous across \
+                       agents). \
+                       \n\
+                       3. Complete sentences. Subject + verb + object. Never \
+                       fragments. \
+                       \n\
+                       4. Strip conversation framing. 'The user prefers Python' \
+                       — NOT 'When asked, the user said Python.' \
+                       \n\
+                       5. Absolute dates for time-sensitive facts. 'As of \
+                       2026-05-25 the user is working on Project X' — NOT 'the \
+                       user is currently working on Project X'. \
+                       \n\
+                       6. Never first-person agent reference. NO 'I learned...', \
+                       'I think...', 'I noticed...'. The memory is about the \
+                       user, not about you. \
+                       \n\n\
                        The `boundary` field must name a boundary the host \
-                       application has authorized for this MCP session."
+                       application has authorized for this MCP session. \
+                       Authorization is mediated by the host application, not by \
+                       this tool's parameters."
     )]
     pub async fn tool_write(
         &self,

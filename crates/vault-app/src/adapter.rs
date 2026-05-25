@@ -147,7 +147,22 @@ impl Adapter for VaultAdapter {
         }
     }
 
-    async fn write(&self, new_memory: NewMemory) -> VaultResult<MemoryId> {
+    async fn write(&self, mut new_memory: NewMemory) -> VaultResult<MemoryId> {
+        // Normalize content to canonical-save shape BEFORE validation.
+        // Belt-and-braces companion to the `memory.write` MCP tool
+        // description's canonical-save contract (T0.2.7 close,
+        // 2026-05-25): the description teaches agents the six rules;
+        // this catches the most common drift cases server-side so
+        // smaller / cheaper LLMs that don't follow the description
+        // perfectly still produce canonical-shape memories. See
+        // `crate::normalization` for the applied rules.
+        //
+        // `Adapter::update` is NOT yet normalized — locked plan keeps
+        // update as an explicit/agent-knowing-what-it-does operation
+        // for this commit. Tracked in HANDOFF tech-debt for follow-up.
+        new_memory.content =
+            crate::normalization::normalize_for_canonical_save(&new_memory.content)?;
+
         // Memory::try_new applies validation + generates a fresh
         // MemoryId. Embedding is computed from validated content.
         let memory = Memory::try_new(new_memory)?;
@@ -506,14 +521,18 @@ mod tests {
         // Embedder was called exactly once.
         assert_eq!(f.embedder.call_count(), 1);
 
-        // Row exists in metadata store.
+        // Row exists in metadata store. Content reflects canonical-save
+        // normalization per T0.2.7 close (2026-05-25): the input
+        // "remember the milk" was capitalized + terminated with a period
+        // by `normalize_for_canonical_save` before storage. This
+        // assertion pins that normalization runs on the write path.
         let stored = f
             .metadata_for_assert
             .get_memory(&id)
             .await
             .unwrap()
             .expect("memory written by VaultAdapter::write must be readable");
-        assert_eq!(stored.content, "remember the milk");
+        assert_eq!(stored.content, "Remember the milk.");
         assert_eq!(stored.boundary.as_str(), "work");
         assert_eq!(stored.access_count, 0);
     }

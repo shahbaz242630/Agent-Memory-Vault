@@ -2,6 +2,111 @@
 
 **Current version:** V0.2 Closed Beta (BRD §6.2 — sleep consolidator, boundaries hardening, cross-device sync, 30 beta users)
 
+**Last updated:** 2026-05-25 (T0.2.7 **LOCKED-NEXT-ARC SHIFT — Phase C (write-time decision loop) DEFERRED to V1.0+. New arc: MCP `memory.write` description hardening + consolidator → REPORT pipeline + read-from-REPORT + founder-dogfood. Pre-cooked REPORT is the structural correctness fix at scale per [[correctness-is-the-product]].** First commit of new arc shipping this session: MCP write hardening — canonical-save contract baked into tool description + field-level doc-comments + server-side normalization helper + JSON-RPC wire-level pin test. T0.2.3 close commit 15 (Windows runner disk-cleanup, root-cause was disk exhaustion not MSBuild VCEnd) pushed earlier in session as `64258a9`; both CI runs in flight at session close.) Headline:
+
+---
+
+### 🆕 SESSION SUMMARY (2026-05-25) — Locked-next-arc shift + MCP write hardening + Windows CI disk-cleanup
+
+**The arc.** Session opened with CI status check on the Phase B + Phase 5 bundle commit `c091281`. Discovered the Windows-only CI failure was disk exhaustion ("LLVM ERROR: IO failure on output stream: no space on device"), NOT the MSBuild VCEnd bug commits 6-14 had been chasing. Each commit 10-14 fix-forward had been incrementally shrinking disk footprint (Ninja generator, `CARGO_TARGET_DIR=C:\t`, `debuginfo=line-tables-only`, lld-link) without naming the actual cause. Diagnosed + addressed via commit 15: inline PowerShell disk-cleanup step in the Windows build-and-test job removes ~20-25 GB of preinstalled tooling we don't use (Android SDK, .NET, Java, Go, Ruby, PyPy, miniconda, Selenium, MongoDB) before checkout. Linux already used `jlumbroso/free-disk-space`; this is the Windows equivalent.
+
+**Strategic redirect from Shahbaz mid-session.** Phase C planning surfaced strong product-cost concerns: ~3-5s latency per write visible during agent interaction, ~$9/mo BYOK token cost overrun (3× the $5/mo BYOK fee), ~100× more LLM calls than the nightly consolidator approach for Managed PAYG. Honest reframe: write-time housekeeping doesn't move the differential — the differential is correct OUTPUT at query time, which Phase 5 + the future T0.3.x consolidator-driven read pipeline deliver. Phase C is V1.0+ optional premium feature territory.
+
+**Locked next arc (supersedes the 2026-05-24 next-session opener):**
+
+1. **MCP `memory.write` description hardening** (this commit) — canonical-save contract baked into the tool description + field-level doc-comments + server-side normalization helper + JSON-RPC wire-level pin test.
+2. **Consolidator → REPORT pipeline** — nightly job produces small (~5-10K tokens) curated, deduplicated, contradiction-resolved REPORT per boundary. Vault hygiene happens here, not on the write path.
+3. **Read pipeline reads REPORT first, vault fallback second** — pre-cooked REPORT is the structural correctness fix at scale (removes distractors before Qwen ever sees them). Same input size at 10K and 100K → 9/9 holds as vault grows. Same-day deltas handled via a separate mechanism in the read pipeline.
+4. **Founder-dogfood from Claude Desktop** — wire MCP end-to-end, use daily for real, watch correctness hold.
+
+Locked + saved to project memory: [[locked-next-arc-t03x]], [[mcp-descriptions-cross-platform-lever]], [[managed-mode-per-user-vault]].
+
+**What this commit ships (MCP write hardening):**
+
+1. **`crates/vault-mcp/src/server.rs`** — `tool_write` description rewrite: 6 numbered canonical-save rules (atomic facts, third-person about the user, complete sentences, strip conversation framing, absolute dates, no agent self-reference) + WHEN-TO-CALL / WHEN-NOT-TO-CALL sections + cross-platform thesis ("read by ANY AI agent the user connects later"). Per-field doc-comments on `WriteToolParams` (content, boundary, memory_type, source_agent, confidence) with examples + length cap (2000 chars) + confidence-value guidance.
+
+2. **`crates/vault-app/src/normalization.rs`** (NEW, ~310 lines) — `normalize_for_canonical_save(content)` helper: trim + length cap + strip conversation prefixes ("When asked, …", "The user told me [that] …") + strip agent self-reference ("I think [that] …", "I learned [that] …") + first-person rewrite ("I prefer X" → "The user prefers X") + capitalize first char + append terminal period. Auto-fix silently per 2026-05-25 product decision. 19 unit tests covering each rule + idempotency + Unicode + case-insensitivity + length boundaries.
+
+3. **`crates/vault-app/src/adapter.rs`** — `Adapter::write` calls `normalize_for_canonical_save` before `Memory::try_new`. Update path NOT normalized in this commit (tracked as tech-debt follow-up below).
+
+4. **`crates/vault-app/src/lib.rs`** — `mod normalization;` declaration.
+
+5. **`crates/vault-mcp/tests/initialize_smoke.rs`** — new pin test `memory_write_description_contains_canonical_save_contract` exercises the actual JSON-RPC `tools/list` wire payload, asserts each of the 9 canonical phrases appears in the tool description + the field-level schema descriptions for content / boundary / confidence include their load-bearing phrases. Future edits that drop canonical rules will fail CI.
+
+6. **`.github/workflows/ci.yml`** — Windows runner disk-cleanup step (T0.2.3 close commit 15, shipped earlier in session as `64258a9`).
+
+**Why this is step 1 of the locked arc:** without canonical-save format in the tool description, the cross-platform thesis leaks — different agents save in different shapes, the future consolidator → REPORT pipeline gets noisy input, retrieval suffers. With the contract locked in the tool description verbatim, the bet holds across all LLM clients per [[mcp-descriptions-cross-platform-lever]].
+
+**Tech-debt opened by this commit (track for follow-up):**
+
+- `Adapter::update` content normalization — explicit update is agent-knowing-what-it-does, but for vault canonical-shape consistency, normalize there too. Defer to a follow-up commit alongside `memory.update` tool description hardening.
+- `memory.update` + `memory.delete` MCP tool descriptions — same canonical-save treatment as `memory.write` got here. Smaller scope than write hardening (these are explicit ops), but worth doing for consistency.
+
+### 🎯 NEXT-SESSION OPENER (2026-05-26+) — STEP 1: CHECK BOTH CI RUNS, THEN START CONSOLIDATOR → REPORT DESIGN
+
+**Read this first.** This session shipped MCP write hardening as the first commit of [[locked-next-arc-t03x]]. Branches based on CI:
+
+#### Step 1 — Check CI status (commit 15 disk-cleanup + this commit's MCP hardening)
+
+```bash
+gh run list --workflow=ci.yml -L 2
+```
+
+| Conclusion (both runs) | Diagnosis | Action |
+|---|---|---|
+| Both green | Phase 5 + Phase B + Windows disk-fix + MCP write hardening all clean across the matrix | Proceed to Step 2 (consolidator → REPORT plan iteration 1) |
+| Commit 15 red, MCP commit green | Windows CI still has a disk-related issue we missed | Diagnose Windows job's final error, fix-forward OR ADR the gap |
+| Commit 15 green, MCP commit red | Regression introduced by MCP changes | STOP — investigate before any new work |
+| Linux/macOS red | NEW regression introduced by MCP write hardening | STOP — investigate before any new work |
+| Both red on Windows only, same pattern | Disk pressure persists | Decide: another fix-forward OR accept Windows-CI gap (founder dogfoods Windows locally per HANDOFF fallback option (c)) |
+
+#### Step 2 — Consolidator → REPORT plan iteration 1
+
+**Only after CI is green OR the gap is deliberately accepted.** Per [[locked-next-arc-t03x]] step 2:
+
+- Nightly batch job (cron'd locally for V0.2; managed-mode scheduling TBD in V1.0+)
+- Reads all memories in the vault → groups by boundary
+- For each boundary, produces a `REPORT` artifact: deduplicated, contradiction-resolved curated summary, ~5-10K tokens
+- Uses Qwen-7B locally (BYOK / Managed substitute trait-swapped via `LlmProvider`)
+- Composes with Phase B's `invalidate()` + existing `mark_superseded()` per ADR-051 composition rules
+- REPORT format: file-on-disk vs SQLite table row vs Lance artifact — open design decision
+- Plan-iteration depth: contract-establishing work, warrant 2-3 iterations before code per [[plan-iteration-depth-scales-with-design-surface]]
+- Estimated effort: ~1 week to first usable REPORT, ~2 weeks to integrate with read pipeline (Step 3 of the arc)
+
+#### Step 3 — Tech-debt follow-up (small, can land in any session)
+
+- `Adapter::update` content normalization — extend `normalize_for_canonical_save` call into the update path
+- `memory.update` + `memory.delete` MCP tool description hardening — mirror the canonical-save contract treatment from this commit
+
+#### Frozen vs open going into next session
+
+**Frozen (do not re-litigate):**
+
+- [[locked-next-arc-t03x]] — the four-step sequence
+- Phase C (write-time decision loop) DEFERRED to V1.0+
+- ADR-051 (bi-temporal invalidation; Phase B)
+- MCP `memory.write` canonical-save contract (this commit's tool description + field docs)
+- Server-side normalization rules in `crates/vault-app/src/normalization.rs`
+- Pin test asserting canonical phrases via JSON-RPC `tools/list` wire payload
+
+**Open (for next session):**
+
+- CI status of this session's two pushes
+- Consolidator → REPORT plan iteration 1 (Step 2 above)
+- Tech-debt items in Step 3 above
+
+#### Files to read first in next session
+
+1. This block (the 2026-05-25 opener)
+2. `gh run list --workflow=ci.yml -L 2` output
+3. Project memories: [[locked-next-arc-t03x]] + [[mcp-descriptions-cross-platform-lever]]
+4. `crates/vault-app/src/normalization.rs` (the new module shipped this session)
+5. `crates/vault-mcp/src/server.rs` (the new `WriteToolParams` field docs + `tool_write` canonical-save description)
+
+---
+
+**(Below is the pre-2026-05-25 headline block, preserved for context — locked-next-arc shift skips Phase C in favor of MCP write hardening + consolidator → REPORT + founder-dogfood arc.)**
+
 **Last updated:** 2026-05-24 (T0.2.7 **PHASE B COMPLETE — bi-temporal invalidation contract locked + retrieval-side `valid_until` filter wired + write-time `invalidate()` API shipped + 6/6 DoD gates GREEN. ADR-051 drafted. BRD v1.4 amended (correctness-is-the-product thesis + three-mode deployment + pricing).** Merged consolidator plan iteration 1 locked in chat. **PHASE B + PHASE 5 BUNDLE COMMITTED + PUSHED as `c091281`. T0.2.3 close commit 10 (Ninja CMake generator fix-forward for Windows) PUSHED as a follow-up — second CI run testing the Ninja hypothesis live.**) Headline:
 
 ---
