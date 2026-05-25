@@ -67,9 +67,14 @@ jobs:
         os: [ubuntu-latest, windows-2025, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      # Linux-only: free ~15-20GB by removing unused tooling. Windows runners
-      # ship ~85 GB free, no equivalent pressure; the action itself is
-      # Linux-only by design (uses apt-get / rm -rf /usr/share/dotnet etc.).
+      # Linux-only: free ~15-20GB by removing unused tooling. The jlumbroso
+      # action is Linux-only by design (uses apt-get / rm -rf /usr/share/dotnet
+      # etc.). Windows has its own equivalent inline PowerShell cleanup in the
+      # build-and-test job below (T0.2.3 close commit 15 fix-forward, 2026-05-25,
+      # after commit 14's CI run 26372365294 hit "LLVM ERROR: no space on device"
+      # during lld-link of large workspace test binaries). Clippy Windows is
+      # NOT cleaned because clippy passes without it — only the heavier
+      # build-and-test job hits the disk ceiling.
       # See HANDOFF.md "CI Discipline Recovery — 2026-05-03 finding" for the
       # 22-commit silent-failure context that landed this in Step 2a.
       - if: runner.os == 'Linux'
@@ -294,6 +299,55 @@ jobs:
         with:
           large-packages: true
           docker-images: true
+      # Windows-only: T0.2.3 close commit 15 fix-forward (2026-05-25). The
+      # windows-2025 runner hits "LLVM ERROR: IO failure on output stream:
+      # no space on device" during lld-link of large workspace test binaries
+      # (commit 14 CI run 26372365294). Preinstalled tooling we don't use
+      # (Android SDK, .NET, Java, MongoDB, miniconda, Selenium, etc.) eats
+      # ~25 GB of the 80 GB C: drive. Removing it recovers enough headroom
+      # for the link stage to complete. The jlumbroso action above is apt-
+      # based so doesn't apply to Windows; this is the Windows equivalent.
+      #
+      # NOT deleted: C:\Strawberry (Perl — required by ADR-006's vendored-
+      # openssl for SQLCipher per L466 comment), C:\Program Files\LLVM
+      # (we install it ourselves below), C:\VulkanSDK (we install it below),
+      # C:\Users\* (Cargo cache lives here via rust-cache@v2). Surfaces
+      # before/after free-space delta in CI logs for auditability.
+      - if: runner.os == 'Windows'
+        name: Free disk space on Windows runner
+        shell: pwsh
+        run: |
+          $before = (Get-PSDrive C).Free / 1GB
+          Write-Host "Free space before cleanup: $([math]::Round($before, 1)) GB"
+          $paths = @(
+            "C:\Android",
+            "C:\Program Files\Android",
+            "C:\Program Files (x86)\Android",
+            "C:\hostedtoolcache\windows\AndroidSdk",
+            "C:\Program Files\dotnet",
+            "C:\Program Files\Java",
+            "C:\hostedtoolcache\windows\Java_Temurin-Hotspot_jdk",
+            "C:\hostedtoolcache\windows\Java_Adopt_jdk",
+            "C:\hostedtoolcache\windows\Java_Zulu_jdk",
+            "C:\hostedtoolcache\windows\go",
+            "C:\hostedtoolcache\windows\Ruby",
+            "C:\hostedtoolcache\windows\PyPy",
+            "C:\miniconda",
+            "C:\selenium",
+            "C:\Program Files\MongoDB",
+            "C:\ProgramData\chocolatey\lib\selenium-chrome-driver",
+            "C:\ProgramData\chocolatey\lib\selenium-edge-driver",
+            "C:\ProgramData\chocolatey\lib\selenium-firefox-driver"
+          )
+          foreach ($path in $paths) {
+            if (Test-Path $path) {
+              Remove-Item -Path $path -Recurse -Force -ErrorAction SilentlyContinue
+              Write-Host "Removed: $path"
+            }
+          }
+          $after = (Get-PSDrive C).Free / 1GB
+          Write-Host "Free space after cleanup: $([math]::Round($after, 1)) GB"
+          Write-Host "Freed: $([math]::Round($after - $before, 1)) GB"
       - uses: actions/checkout@v6
       # Tauri 2.x Linux native deps — same as clippy job (see comment there
       # for full rationale). MUST be in BOTH jobs because GitHub Actions
