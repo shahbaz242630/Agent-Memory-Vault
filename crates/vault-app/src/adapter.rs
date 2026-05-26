@@ -63,7 +63,8 @@ use vault_core::{Boundary, Memory, MemoryId, NewMemory, VaultError, VaultResult}
 use vault_embedding::EmbeddingProvider;
 use vault_mcp::{Adapter, ToolInvokeDetails};
 use vault_retrieval::{
-    ReadPipeline, ReadQuery, ReadResponse, RetrievalQuery, RetrievedMemory, Retriever,
+    ReadQuery, RetrievalQuery, RetrievedMemory, Retriever, StructuredReadPipeline,
+    StructuredReadResponse,
 };
 use vault_storage::{
     ActorKind, AuditEventType, AuditResult, MetadataStore, PendingAuditEvent, StorageBackend,
@@ -78,37 +79,32 @@ use vault_storage::{
 /// can hold clones without locking.
 pub struct VaultAdapter {
     retriever: Arc<dyn Retriever>,
-    /// Optional read pipeline for the `memory.read` MCP tool. When
-    /// `None`, `Adapter::read` returns
-    /// `VaultError::Config("read pipeline not configured")`. The field
-    /// is `Option` because:
-    /// - Integration tests don't have the 4.36 GB Qwen GGUF on disk;
-    ///   they wire `qwen_model_path: None` and skip read-pipeline
-    ///   testing.
-    /// - Future deployments may opt out of local LLM inference (cloud
-    ///   tier V0.3+).
-    ///
-    /// Added at T0.2.7 Phase 4 (2026-05-20).
-    read_pipeline: Option<ReadPipeline>,
+    /// Read pipeline for the `memory.read` MCP tool. Commit 6 (locked-
+    /// next-arc, 2026-05-26 — ADR-052) replaced the V0.2-era
+    /// `Option<ReadPipeline>` with a concrete [`StructuredReadPipeline`]
+    /// that has no fallible setup. The field is no longer `Option`:
+    /// the pipeline is always wired by `Application::new` against the
+    /// vault root REPORT directory, and `Adapter::read` dispatches
+    /// directly with no config-error fallback.
+    read_pipeline: StructuredReadPipeline,
     embedding: Arc<dyn EmbeddingProvider>,
     storage: StorageBackend,
     metadata: MetadataStore,
 }
 
 impl VaultAdapter {
-    /// Construct from the four trait deps + an optional read pipeline.
-    /// Caller (T0.1.10 `Application::start`) is responsible for wiring
-    /// concrete implementations and passing a `MetadataStore` handle
-    /// that points at the same encrypted SQLite file used in the
-    /// `StorageBackend` open.
+    /// Construct from the four trait deps + a [`StructuredReadPipeline`].
+    /// Caller (`Application::new`) wires concrete implementations and
+    /// passes a `MetadataStore` handle that points at the same encrypted
+    /// SQLite file used in the `StorageBackend` open.
     ///
-    /// **T0.2.7 Phase 4 addition (2026-05-20):** the `read_pipeline`
-    /// parameter accepts `None` for absent-LLM deployments (tests,
-    /// cloud tier). When `None`, `memory.read` MCP calls return
-    /// `VaultError::Config("read pipeline not configured")`.
+    /// **Commit 6 (2026-05-26) — signature change:** the `read_pipeline`
+    /// parameter is now a concrete [`StructuredReadPipeline`] (not
+    /// `Option<ReadPipeline>`). The new pipeline has no model-load cost
+    /// and no fallible setup, so the `Option` wrapper is unnecessary.
     pub fn new(
         retriever: Arc<dyn Retriever>,
-        read_pipeline: Option<ReadPipeline>,
+        read_pipeline: StructuredReadPipeline,
         embedding: Arc<dyn EmbeddingProvider>,
         storage: StorageBackend,
         metadata: MetadataStore,
@@ -131,20 +127,13 @@ impl Adapter for VaultAdapter {
         self.retriever.retrieve(query).await
     }
 
-    async fn read(&self, query: ReadQuery) -> VaultResult<ReadResponse> {
+    async fn read(&self, query: ReadQuery) -> VaultResult<StructuredReadResponse> {
         // Trust-boundary auth-gating already done at the StdioServer
         // layer per ADR-025 (handle_read populates query.authorized_
         // boundaries from the trusted slice). Pass through to the
-        // wired ReadPipeline; if no pipeline was configured (absent
-        // GGUF in tests / opted-out deployments), return Config error.
-        match &self.read_pipeline {
-            Some(pipeline) => pipeline.read(query).await,
-            None => Err(VaultError::Config(
-                "read pipeline not configured (AppConfig.qwen_model_path was None at \
-                 Application::new)"
-                    .into(),
-            )),
-        }
+        // wired StructuredReadPipeline; Commit 6 (ADR-052) removed the
+        // Option wrapper — pipeline is always present.
+        self.read_pipeline.read(query).await
     }
 
     async fn write(&self, mut new_memory: NewMemory) -> VaultResult<MemoryId> {
@@ -382,6 +371,21 @@ mod tests {
         }
     }
 
+    /// Test-only no-op REPORT loader for constructing a
+    /// [`StructuredReadPipeline`] in fixtures that don't exercise the
+    /// read path. Returns `Ok(None)` for every boundary so the pipeline
+    /// surfaces `REPORT_MISSING` (which these tests don't assert on).
+    /// Mirrors the canned-empty pattern from
+    /// `crates/vault-mcp/tests/common/mock_adapter.rs::MockAdapter::read`.
+    struct NoopReportLoader;
+
+    #[async_trait]
+    impl vault_retrieval::ReportLoader for NoopReportLoader {
+        async fn load(&self, _: &Boundary) -> VaultResult<Option<vault_retrieval::LoadedReport>> {
+            Ok(None)
+        }
+    }
+
     // -----------------------------------------------------------------
     // Test fixture: open fresh tempdir-backed StorageBackend + a
     // SECOND MetadataStore handle for VaultAdapter. The two
@@ -427,13 +431,19 @@ mod tests {
         let retriever = Arc::new(StubRetriever::with_response(retriever_response));
         let embedder = Arc::new(StubEmbedder::new());
 
+        // Commit 6 (ADR-052, 2026-05-26): VaultAdapter::new now takes a
+        // concrete StructuredReadPipeline (not Option<ReadPipeline>). Build
+        // a minimal pipeline backed by a fresh StubRetriever + NoopReportLoader
+        // — these tests don't exercise read(), but the field must hold a
+        // valid pipeline to compile.
+        let pipeline_retriever: Arc<dyn Retriever> =
+            Arc::new(StubRetriever::with_response(Vec::new()));
+        let pipeline_loader: Arc<dyn vault_retrieval::ReportLoader> = Arc::new(NoopReportLoader);
+        let read_pipeline = StructuredReadPipeline::new(pipeline_retriever, pipeline_loader);
+
         let adapter = VaultAdapter::new(
             retriever.clone() as Arc<dyn Retriever>,
-            // T0.2.7 Phase 4: read_pipeline = None for unit tests
-            // (no Qwen GGUF, no need for the read path here). The
-            // VaultAdapter::read tests live elsewhere; these inner
-            // unit tests cover the cascading + audit paths only.
-            None,
+            read_pipeline,
             embedder.clone() as Arc<dyn EmbeddingProvider>,
             storage,
             metadata,

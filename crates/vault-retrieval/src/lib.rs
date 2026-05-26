@@ -24,18 +24,25 @@
 
 #![forbid(unsafe_code)]
 
-pub mod read_pipeline;
+pub mod report_io;
 pub mod retriever;
 pub mod strategies;
+pub mod structured_read_pipeline;
 
-pub use read_pipeline::{
-    ContradictionRef, ReadPipeline, ReadQuery, ReadResponse, DEFAULT_MAX_CANDIDATES,
-    READ_TIME_JSON_SCHEMA, READ_TIME_SYSTEM_PROMPT,
-};
+// The V0.2-era `read_pipeline` module (Qwen-7B single-call synthesis,
+// ADR-048 + ADR-049) was retired by ADR-052 at Commit 6 (locked-next-arc,
+// 2026-05-26). The deterministic [`structured_read_pipeline`] module
+// replaces it with structured `relevant_facts` + `abstain` +
+// `health.warnings` per ADR-054 Contract 2. No LLM in the read path.
+pub use report_io::{FilesystemReportLoader, LoadedReport, LoadedReportFact, ReportLoader};
 pub use retriever::{
     RetrievalOptions, RetrievalQuery, RetrievedMemory, Retriever, MAX_QUERY_BYTES, MAX_RESULTS_CAP,
 };
 pub use strategies::{
     AbstainConfig, AbstainingRetriever, HybridConfig, HybridRetriever, KeywordIndex,
     KeywordRetriever, SemanticRetriever,
+};
+pub use structured_read_pipeline::{
+    HealthInfo, HealthStatus, HealthWarning, ReadQuery, RelevantFact, StructuredReadPipeline,
+    StructuredReadResponse, WarningCode, WarningSeverity,
 };

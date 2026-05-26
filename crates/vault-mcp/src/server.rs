@@ -33,7 +33,7 @@ use rmcp::model::{CallToolResult, Content, ErrorCode, ServerCapabilities, Server
 use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
 use serde::{Deserialize, Serialize};
 use vault_core::{Boundary, MemoryId, MemoryType, NewMemory, VaultError, VaultResult};
-use vault_retrieval::{ReadQuery, ReadResponse, RetrievalOptions, RetrievalQuery};
+use vault_retrieval::{ReadQuery, RetrievalOptions, RetrievalQuery, StructuredReadResponse};
 
 use crate::audit::{ToolInvokeDetails, ToolInvokeError};
 use crate::Adapter;
@@ -76,8 +76,10 @@ pub struct SearchToolParams {
 }
 
 /// JSON-RPC parameters for the `memory.read` tool. Added at T0.2.7
-/// Phase 4 (2026-05-20) to expose the production read pipeline
-/// (`vault_retrieval::ReadPipeline`) over MCP.
+/// Phase 4 (2026-05-20); response shape was rewritten at Commit 6
+/// (locked-next-arc, 2026-05-26 — ADR-052 + ADR-054) when the Qwen-7B
+/// read-time synthesis was retired in favour of a deterministic
+/// structured-fact pipeline.
 ///
 /// **NOTE (ADR-025 trust boundary):** like `SearchToolParams`, this
 /// schema does NOT contain an `authorized_boundaries` field. The
@@ -87,8 +89,8 @@ pub struct SearchToolParams {
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ReadToolParams {
     /// Free-text query — handed to the read pipeline's retrieval stage
-    /// (hybrid BGE + BM25 + abstain gate) and then synthesised by the
-    /// Qwen-7B LLM into a `ReadResponse`.
+    /// (hybrid BGE + BM25 + abstain gate) and then packed into a
+    /// `StructuredReadResponse` by the deterministic filter+pack stage.
     pub query: String,
 }
 
@@ -271,11 +273,13 @@ impl StdioServer {
     /// TRUSTED `self.authorized_boundaries` (NEVER the request body),
     /// then dispatches to `self.adapter.read()`.
     ///
-    /// Added at T0.2.7 Phase 4 (2026-05-20). The read pipeline returns
-    /// a structured [`ReadResponse`] with the load-bearing
-    /// `contradictions_flagged` field — see the `tool_read` tool
-    /// description for the agent-consumption contract.
-    pub async fn handle_read(&self, params: ReadToolParams) -> VaultResult<ReadResponse> {
+    /// Added at T0.2.7 Phase 4 (2026-05-20); response shape rewritten
+    /// at Commit 6 (locked-next-arc, 2026-05-26 — ADR-052 + ADR-054).
+    /// The pipeline returns a [`StructuredReadResponse`] with
+    /// `relevant_facts` + `abstain` + `health.warnings` — no LLM in
+    /// the read path. See `tool_read` for the full agent-consumption
+    /// contract.
+    pub async fn handle_read(&self, params: ReadToolParams) -> VaultResult<StructuredReadResponse> {
         let query = ReadQuery {
             query_text: params.query,
             // Trust boundary (ADR-025): the trusted slice goes here,
@@ -497,46 +501,75 @@ impl StdioServer {
     }
 
     /// `memory.read` MCP tool — the agent-facing surface for the
-    /// production [`vault_retrieval::ReadPipeline`] (hybrid BGE+BM25
-    /// retrieval + Qwen-7B synthesis).
+    /// production [`vault_retrieval::StructuredReadPipeline`]
+    /// (deterministic filter+pack over BGE + Tantivy + RRF + abstain
+    /// retrieval, enriched with per-boundary REPORT topic labels).
     ///
-    /// **Agent consumption contract (T0.2.7 Phase 4 lock,
-    /// 2026-05-20):** the tool description below tells calling agents
-    /// they MUST consume the `contradictions_flagged` structured field
-    /// as the authoritative contradiction signal (the
-    /// `synthesis_markdown` field is a convenience summary). This is
-    /// the lock from the 2026-05-20 HANDOFF Phase 0 amendment #3 ---
-    /// without this language in the tool description, agents that only
-    /// read the synthesis prose would miss contradictions when the LLM
-    /// elides the prior value in evolution-with-reason phrasing
-    /// ([[structured-contract-user-sees-via-agent]]).
+    /// **Agent consumption contract (Commit 6 lock, 2026-05-26 —
+    /// ADR-052 + ADR-054):** the response carries structured `relevant_facts`
+    /// the calling agent composes into its own user-facing voice. The
+    /// vault never speaks to the user directly. `health.warnings`
+    /// surfaces three severity tiers (info / warn / critical); the agent
+    /// decides which to mention based on materiality to the user's query.
+    /// When `abstain=true`, the vault has no relevant content — the
+    /// agent MUST NOT fabricate.
     ///
     /// Audit + tracing wired with the same handler-mediated pattern as
     /// `tool_search`: timer brackets the handler dispatch,
     /// `ToolInvokeDetails` records `boundary_count` from the trusted
     /// slice + `result_count = 1` on success (single
-    /// `ReadResponse`) / `0` on error.
+    /// `StructuredReadResponse`) / `0` on error.
     #[tool(
         name = "memory.read",
-        description = "Read-time pipeline: retrieves relevant memories AND \
-                       synthesises a coherent narrative answer in ONE call. \
-                       Returns a JSON object with three fields: \
-                       `synthesis_markdown` (convenience narrative summary), \
-                       `contradictions_flagged` (structured list of \
-                       contradictions detected across the retrieved set, with \
-                       memory_ids + literal positions), and \
-                       `vault_has_no_relevant_content` (true when the vault \
-                       has no memory matching the query). \
+        description = "Read the user's memory vault as structured facts. \
+                       Returns a JSON object with five fields: \
+                       \n\
+                       - `boundary`: the boundary in scope (null for \
+                       cross-boundary reads) \
+                       \n\
+                       - `query`: echo of your query (post-trim) \
+                       \n\
+                       - `relevant_facts`: array of \
+                       `{fact, topic, memory_id, as_of, confidence, source_agent}` \
+                       \n\
+                       - `abstain`: true when the vault has no relevant \
+                       content for this query \
+                       \n\
+                       - `health`: `{status: ok|degraded|critical, warnings: [...]}` \
                        \n\n\
-                       CRITICAL — agent contract: when \
-                       `contradictions_flagged` is non-empty you MUST \
-                       surface every contradiction in your response to the \
-                       user. The `synthesis_markdown` field is a \
-                       convenience summary; `contradictions_flagged` is the \
-                       authoritative contradiction signal. Treating \
-                       synthesis_markdown alone as ground truth may cause \
-                       you to miss contradictions when the LLM elides a \
-                       prior value in evolution-with-reason phrasing. \
+                       HOW TO USE the structured facts: \
+                       \n\
+                       1. Each `fact` is a user-authored memory verbatim. \
+                       Compose your response from these facts in your own \
+                       voice. Cite via `memory_id` if the user asks. \
+                       \n\
+                       2. The `topic` field tags facts with their \
+                       consolidator-discovered cluster (may be null if the \
+                       fact was written since the last nightly consolidation). \
+                       \n\
+                       3. `as_of` is the fact-time anchor (when the fact \
+                       became true in the world), NOT when it was added. \
+                       Newer `as_of` = more recent truth. \
+                       \n\
+                       4. `confidence` is the user/agent's confidence in this \
+                       fact's accuracy. \
+                       \n\n\
+                       HOW TO USE health.warnings: \
+                       \n\
+                       - `status=ok`: vault state is fresh and complete. Use \
+                       facts directly. \
+                       \n\
+                       - `status=degraded`: at least one info/warn-severity \
+                       issue. Read facts but note any caveats from `warnings` \
+                       to the user if material. \
+                       \n\
+                       - `status=critical`: vault state may be unreliable \
+                       (REPORT very stale or clock skew). Tell the user the \
+                       vault hasn't been consolidated recently and results \
+                       may be incomplete. \
+                       \n\n\
+                       CRITICAL — when `abstain=true`: tell the user the \
+                       vault has nothing matching. Do NOT fabricate. \
                        \n\n\
                        Authorization is mediated by the host application, \
                        not by this tool's parameters."

@@ -191,9 +191,10 @@ async fn full_initialize_round_trip_lists_five_tools_with_expected_names() {
     // the five `#[tool]` decorators in `server.rs`. End-to-end macro
     // chain verification.
     //
-    // T0.2.7 Phase 4 (2026-05-20): `memory.read` joins the contract,
-    // exposing the production `ReadPipeline` (hybrid retrieval +
-    // Qwen-7B synthesis + `contradictions_flagged` structured field).
+    // T0.2.7 Phase 4 (2026-05-20): `memory.read` joins the contract.
+    // Commit 6 (locked-next-arc, 2026-05-26 — ADR-052 + ADR-054):
+    // response shape rewritten to structured `relevant_facts` +
+    // `abstain` + `health.warnings`; Qwen-7B retired from read path.
     let listed = client
         .peer()
         .list_tools(Default::default())

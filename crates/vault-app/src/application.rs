@@ -46,11 +46,11 @@ use uuid::Uuid;
 use vault_consolidator::{ConsolidationReport, Consolidator, ConsolidatorConfig};
 use vault_core::{Boundary, VaultError, VaultResult};
 use vault_embedding::{BgeSmallProvider, EmbeddingProvider, EMBEDDING_DIM};
-use vault_llm::{LlmProvider, Phi4MiniConfig, Phi4MiniProvider, Qwen25_14BProvider, TuningConfig};
+use vault_llm::{LlmProvider, Phi4MiniConfig, Phi4MiniProvider};
 use vault_mcp::{Adapter, StdioServer};
 use vault_retrieval::{
-    AbstainingRetriever, HybridRetriever, KeywordIndex, KeywordRetriever, ReadPipeline, Retriever,
-    SemanticRetriever,
+    AbstainingRetriever, FilesystemReportLoader, HybridRetriever, KeywordIndex, KeywordRetriever,
+    Retriever, SemanticRetriever, StructuredReadPipeline,
 };
 use vault_storage::{MemoryFilter, MetadataStore, RetryWorker, StorageBackend};
 
@@ -173,6 +173,28 @@ impl Application {
         )
         .await?;
 
+        // 1b. Derive vault_root from metadata_path's parent. Moved up
+        //     from former-step-12 at Commit 6 (locked-next-arc, 2026-05-26)
+        //     because the new StructuredReadPipeline (step 9) needs it to
+        //     wire FilesystemReportLoader; the Consolidator lockfile
+        //     (step 11) also consumes it. By this line StorageBackend::open
+        //     above has already used metadata_path, so its parent is
+        //     guaranteed to exist on disk — the parent() check guards
+        //     against the edge case where metadata_path has no parent
+        //     component (e.g., a bare filename without a directory).
+        let vault_root = config
+            .metadata_path
+            .parent()
+            .ok_or_else(|| {
+                VaultError::Config(
+                    "AppConfig.metadata_path must have a parent directory for \
+                     consolidator lockfile placement + structured read pipeline \
+                     REPORT-loader root"
+                        .into(),
+                )
+            })?
+            .to_path_buf();
+
         // 2. Second MetadataStore handle for VaultAdapter's audit appends.
         let adapter_metadata =
             MetadataStore::open(&config.metadata_path, config.key.clone()).await?;
@@ -242,42 +264,32 @@ impl Application {
         //    channel directly for the threshold check.
         let retriever: Arc<dyn Retriever> = Arc::new(AbstainingRetriever::new(hybrid, keyword));
 
-        // 9. Optional ReadPipeline — wires the Qwen-7B LLM if the
-        //    config supplies a model path. `None` is the test /
-        //    cloud-tier path; the corresponding `memory.read` MCP
-        //    call surfaces `VaultError::Config("read pipeline not
-        //    configured")`.
+        // 9. StructuredReadPipeline — deterministic filter+pack for the
+        //    `memory.read` MCP tool per ADR-052 + ADR-054 (Commit 6 of
+        //    the locked-next-arc, 2026-05-26). Replaces the V0.2-era
+        //    Qwen-7B single-call synthesis pipeline (ADR-048 + ADR-049,
+        //    formally retired by ADR-052) with code that:
         //
-        //    Locked tuning config (HANDOFF.md V0.2 backend + tuning):
-        //    `n_threads = 12`, `n_threads_batch = 12`, `n_gpu_layers
-        //    = 99`. Empirically anchored on i7-13620H + Intel UHD +
-        //    Vulkan iGPU offload (mean 86.0s, p99 119.7s per
-        //    t027b_qwen_7b_vulkan_results.md).
-        let read_pipeline = match &config.qwen_model_path {
-            Some(path) => {
-                tracing::info!(
-                    target: "vault_app::startup",
-                    qwen_model_path = %path.display(),
-                    "loading Qwen-7B for read pipeline"
-                );
-                let tuning = TuningConfig {
-                    n_threads: Some(12),
-                    n_threads_batch: Some(12),
-                    n_gpu_layers: Some(99),
-                    ..TuningConfig::default()
-                };
-                let provider = Qwen25_14BProvider::open_with_tuning(path, tuning).await?;
-                let llm: Arc<dyn LlmProvider> = Arc::new(provider);
-                Some(ReadPipeline::new(retriever.clone(), llm))
-            }
-            None => {
-                tracing::info!(
-                    target: "vault_app::startup",
-                    "qwen_model_path is None; memory.read tool will return VaultError::Config"
-                );
-                None
-            }
-        };
+        //    - loads the per-boundary REPORT artifact via
+        //      [`FilesystemReportLoader`] from
+        //      `<vault_root>/reports/<boundary>.report.json`,
+        //    - enriches each retrieved candidate with its
+        //      consolidator-discovered topic label, and
+        //    - emits the seven ADR-054 Contract 2 health-warnings
+        //      (REPORT_MISSING, REPORT_STALE_*, DELTA_LOG_UNAVAILABLE
+        //      [Commit 7], TOPIC_NAMES_UNAVAILABLE, CLOCK_SKEW_DETECTED).
+        //
+        //    No LLM in this stage. The pipeline is always constructed
+        //    (no Option) — no model loading, no fallible setup. The
+        //    `AppConfig.qwen_model_path` field is now dead (kept with
+        //    #[allow(dead_code)] until Commit 8 removes it).
+        let report_loader = Arc::new(FilesystemReportLoader::new(vault_root.clone()));
+        let read_pipeline = StructuredReadPipeline::new(retriever.clone(), report_loader);
+        tracing::info!(
+            target: "vault_app::startup",
+            vault_root = %vault_root.display(),
+            "structured read pipeline wired (deterministic filter+pack, no LLM)"
+        );
 
         // 10. VaultAdapter — composes the trait deps + optional read
         //    pipeline into the MCP Adapter surface. Clone the
@@ -368,24 +380,10 @@ impl Application {
             }
         };
 
-        // 12. Capture vault root for the consolidator lockfile. Derived
-        //    from `metadata_path.parent()` because metadata_path is
-        //    SQLCipher-opened first in `StorageBackend::open` and its
-        //    parent directory is therefore guaranteed to exist by the
-        //    time we reach this line. Lockfile is placed at
-        //    `<vault_root>/.consolidator.lock` per the locked-next-arc
-        //    Step 4 cross-process lockfile contract.
-        let vault_root = config
-            .metadata_path
-            .parent()
-            .ok_or_else(|| {
-                VaultError::Config(
-                    "AppConfig.metadata_path must have a parent directory for \
-                     consolidator lockfile placement"
-                        .into(),
-                )
-            })?
-            .to_path_buf();
+        // vault_root was derived at step 1b (moved up at Commit 6 so
+        // step 9's StructuredReadPipeline could use it). The Consolidator
+        // lockfile in `run_consolidation_with_safety` continues to consume
+        // the same value via `self.vault_root`.
 
         Ok(Self {
             adapter: Arc::new(adapter),

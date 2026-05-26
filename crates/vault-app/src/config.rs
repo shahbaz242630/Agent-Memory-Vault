@@ -133,23 +133,18 @@ pub struct AppConfig {
     #[allow(dead_code)] // Phase 2 migration consumer — see field-doc above
     pub at_rest_key: Zeroizing<[u8; 32]>,
 
-    /// Path to the Qwen2.5-7B-Instruct-Q4_K_M GGUF file (the V0.2
-    /// production read-time LLM per ADR-049). When `Some`,
-    /// [`crate::Application::new`] loads the model at startup and wires
-    /// a `vault_retrieval::ReadPipeline` into [`crate::VaultAdapter`],
-    /// enabling the `memory.read` MCP tool. When `None`, the read
-    /// pipeline is unwired and `memory.read` calls return
-    /// `VaultError::Config("read pipeline not configured")`.
+    /// **DEAD as of Commit 6 (locked-next-arc, 2026-05-26) — see ADR-052.**
+    /// The V0.2-era Qwen-7B read-time synthesis pipeline (ADR-048 + ADR-049)
+    /// was retired by the 2026-05-26 architectural lock; the read path now
+    /// uses a deterministic [`vault_retrieval::StructuredReadPipeline`] that
+    /// needs no LLM. The field is kept with `#[allow(dead_code)]` so
+    /// existing callers (vault-cli, vault-tauri, integration_smoke) keep
+    /// compiling without churn; Commit 8 removes the field entirely after
+    /// founder-dogfood confirms no regression.
     ///
-    /// `Option`-al because:
-    /// - Integration tests don't have the 4.36 GB GGUF on disk and
-    ///   don't exercise the read pipeline at scale — they just verify
-    ///   composition.
-    /// - Future deployments may opt out of local LLM inference
-    ///   (cloud tier V0.3+, smaller-vault appliances, etc.).
-    ///
-    /// **Migration anchor:** new field at T0.2.7 Phase 4 (2026-05-20).
-    /// Not a rename — additive per the rename-prohibition discipline.
+    /// **Migration anchor:** new field at T0.2.7 Phase 4 (2026-05-20),
+    /// retired at Commit 6 (2026-05-26).
+    #[allow(dead_code)]
     pub qwen_model_path: Option<PathBuf>,
 
     /// Path to the Phi-4-mini-instruct Q4_K_M GGUF file (the V0.2

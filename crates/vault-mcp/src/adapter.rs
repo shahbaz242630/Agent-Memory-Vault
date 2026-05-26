@@ -21,7 +21,7 @@
 use async_trait::async_trait;
 
 use vault_core::{Boundary, MemoryId, NewMemory, VaultResult};
-use vault_retrieval::{ReadQuery, ReadResponse, RetrievalQuery, RetrievedMemory};
+use vault_retrieval::{ReadQuery, RetrievalQuery, RetrievedMemory, StructuredReadResponse};
 
 use crate::audit::ToolInvokeDetails;
 
@@ -44,28 +44,29 @@ pub trait Adapter: Send + Sync {
     /// own state, NOT from the JSON-RPC request body.
     async fn search(&self, query: RetrievalQuery) -> VaultResult<Vec<RetrievedMemory>>;
 
-    /// `memory.read` — read-time pipeline returning a structured
-    /// [`ReadResponse`] (LLM-synthesised narrative + the load-bearing
-    /// `contradictions_flagged` structured field + the boundary-of-
-    /// hard-negative `vault_has_no_relevant_content` flag).
+    /// `memory.read` — read-time pipeline returning a
+    /// [`StructuredReadResponse`] (structured `relevant_facts` +
+    /// `abstain` + `health.warnings`).
     ///
-    /// Added at T0.2.7 Phase 4 (2026-05-20). The agent contract per the
-    /// 2026-05-20 lock ([[structured-contract-user-sees-via-agent]]) is
-    /// that callers MUST consume `ReadResponse::contradictions_flagged`
-    /// as the authoritative contradiction signal —
-    /// `ReadResponse::synthesis_markdown` is a convenience summary
-    /// (per the structured-contract policy).
+    /// **Commit 6 retirement of Qwen-7B (locked-next-arc, 2026-05-26 —
+    /// ADR-052):** the V0.2-era `ReadResponse` shape (synthesis_markdown
+    /// + contradictions_flagged + vault_has_no_relevant_content) is
+    /// retired. The new contract returns deterministic structured facts
+    /// that the calling agent (Claude / GPT / Codex / Kimi) composes
+    /// into its own response. The vault never speaks to the user
+    /// directly; it returns facts + health metadata, and the agent
+    /// owns voice / framing.
     ///
     /// The `ReadQuery::authorized_boundaries` field carries the trusted
     /// slice — the caller (`StdioServer`) populates it from its own
     /// state, NOT from the JSON-RPC request body, mirroring `search`.
     ///
-    /// Implementations that do NOT have a wired-up `ReadPipeline`
-    /// (e.g., test stubs, or production binaries built without the
-    /// Qwen GGUF path configured) should return
-    /// `Err(VaultError::Config(...))` with a clear "read pipeline not
-    /// configured" diagnostic.
-    async fn read(&self, query: ReadQuery) -> VaultResult<ReadResponse>;
+    /// Implementations always have a wired `StructuredReadPipeline`
+    /// (no fallible model load), so this method is never a config-
+    /// error surface in practice. Errors propagate from the underlying
+    /// retriever + REPORT-loader (`VaultError::Retrieval` /
+    /// `VaultError::Io` / `VaultError::Serde` / `VaultError::InvalidInput`).
+    async fn read(&self, query: ReadQuery) -> VaultResult<StructuredReadResponse>;
 
     /// `memory.write` — create a new memory in the given boundary.
     /// `new_memory.boundary` MUST appear in the trusted authorization

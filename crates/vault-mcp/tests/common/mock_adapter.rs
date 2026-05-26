@@ -31,7 +31,9 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use vault_core::{Boundary, MemoryId, NewMemory, VaultResult};
 use vault_mcp::{Adapter, ToolInvokeDetails};
-use vault_retrieval::{ReadQuery, ReadResponse, RetrievalQuery, RetrievedMemory};
+use vault_retrieval::{
+    HealthInfo, HealthStatus, ReadQuery, RetrievalQuery, RetrievedMemory, StructuredReadResponse,
+};
 
 /// One captured `Adapter::update` call. Named struct (not tuple) so
 /// Step 8 assertions read `mock.update_calls()[0].new_memory.boundary`
@@ -148,15 +150,24 @@ impl Adapter for MockAdapter {
         Ok(Vec::new())
     }
 
-    async fn read(&self, query: ReadQuery) -> VaultResult<ReadResponse> {
+    async fn read(&self, query: ReadQuery) -> VaultResult<StructuredReadResponse> {
         self.reads
             .lock()
             .expect("MockAdapter reads mutex poisoned")
             .push(query);
-        Ok(ReadResponse {
-            synthesis_markdown: String::new(),
-            contradictions_flagged: Vec::new(),
-            vault_has_no_relevant_content: true,
+        // Commit 6 (locked-next-arc, 2026-05-26): canned response in the
+        // new structured-fact shape per ADR-054. Default = empty +
+        // abstain=true + Ok health (no warnings) so callers that don't
+        // care about read content don't need to manage REPORT state.
+        Ok(StructuredReadResponse {
+            boundary: None,
+            query: String::new(),
+            relevant_facts: Vec::new(),
+            abstain: true,
+            health: HealthInfo {
+                status: HealthStatus::Ok,
+                warnings: Vec::new(),
+            },
         })
     }
 

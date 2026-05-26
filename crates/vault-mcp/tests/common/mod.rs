@@ -47,7 +47,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use vault_core::{Boundary, Memory, MemoryId, MemoryType, NewMemory, VaultError, VaultResult};
 use vault_mcp::{Adapter, StdioServer, ToolInvokeDetails};
-use vault_retrieval::{ReadQuery, ReadResponse, RetrievalQuery, RetrievedMemory};
+use vault_retrieval::{
+    HealthInfo, HealthStatus, ReadQuery, RetrievalQuery, RetrievedMemory, StructuredReadResponse,
+};
 
 /// Phase 1 stub adapter — every CRUD method panics with `unimplemented!()`.
 /// Trust-boundary tests catch the panic via `#[should_panic]`; the
@@ -82,8 +84,8 @@ impl Adapter for StubAdapter {
         unimplemented!("T0.1.9 Phase 2: wire SemanticRetriever via Application")
     }
 
-    async fn read(&self, _query: ReadQuery) -> VaultResult<ReadResponse> {
-        unimplemented!("T0.2.7 Phase 4: wire ReadPipeline via Application")
+    async fn read(&self, _query: ReadQuery) -> VaultResult<StructuredReadResponse> {
+        unimplemented!("Commit 6 (ADR-052): wire StructuredReadPipeline via Application")
     }
 
     async fn write(&self, _new_memory: NewMemory) -> VaultResult<MemoryId> {
@@ -166,7 +168,7 @@ impl Adapter for DimMismatchAdapter {
         })
     }
 
-    async fn read(&self, _query: ReadQuery) -> VaultResult<ReadResponse> {
+    async fn read(&self, _query: ReadQuery) -> VaultResult<StructuredReadResponse> {
         unimplemented!("DimMismatchAdapter: read() is not exercised by any current test")
     }
 
@@ -273,14 +275,21 @@ impl Adapter for SuccessAdapter {
         }])
     }
 
-    async fn read(&self, _query: ReadQuery) -> VaultResult<ReadResponse> {
-        // Deterministic success fixture matching the search() shape:
-        // a single relevant memory's worth of synthesis prose, no
-        // contradictions, vault_has_no_relevant_content=false.
-        Ok(ReadResponse {
-            synthesis_markdown: "deterministic test synthesis".to_string(),
-            contradictions_flagged: Vec::new(),
-            vault_has_no_relevant_content: false,
+    async fn read(&self, _query: ReadQuery) -> VaultResult<StructuredReadResponse> {
+        // Commit 6 (ADR-052/054, 2026-05-26): deterministic success fixture
+        // in the new structured-fact shape. Empty `relevant_facts` +
+        // `abstain=true` + Ok health is the simplest deterministic shape;
+        // tests that exercise the read response shape can construct a
+        // richer fixture inline.
+        Ok(StructuredReadResponse {
+            boundary: None,
+            query: "deterministic test query".to_string(),
+            relevant_facts: Vec::new(),
+            abstain: true,
+            health: HealthInfo {
+                status: HealthStatus::Ok,
+                warnings: Vec::new(),
+            },
         })
     }
 

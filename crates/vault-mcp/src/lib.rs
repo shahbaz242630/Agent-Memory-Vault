@@ -8,11 +8,13 @@
 //! request handling, with four tools: `memory.search` / `memory.write` /
 //! `memory.update` / `memory.delete`.
 //!
-//! T0.2.7 Phase 4 (2026-05-20) added a fifth tool: `memory.read` —
-//! exposes the production [`vault_retrieval::ReadPipeline`]
-//! (hybrid retrieval + Qwen-7B synthesis) over the MCP wire. The
-//! agent-consumption contract on `ReadResponse::contradictions_flagged`
-//! is locked in the `memory.read` tool description (see
+//! T0.2.7 Phase 4 (2026-05-20) added a fifth tool: `memory.read`.
+//! Commit 6 (locked-next-arc, 2026-05-26 — ADR-052 + ADR-054) rewrote
+//! its response shape: the tool now surfaces
+//! [`vault_retrieval::StructuredReadPipeline`] output (deterministic
+//! `relevant_facts` + `abstain` + `health.warnings`) instead of the
+//! V0.2-era Qwen-7B `ReadResponse`. The structured-fact agent
+//! contract is taught in the `memory.read` tool description (see
 //! [`crate::server::StdioServer::tool_read`]).
 //!
 //! ## Trust boundary (ADR-025 — load-bearing)

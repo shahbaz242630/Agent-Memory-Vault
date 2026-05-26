@@ -92,6 +92,12 @@ tokio = { workspace = true }
 tokio-test.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
+# uuid — dev-only at Commit 6 (2026-05-26): tests in
+# `src/structured_read_pipeline.rs::tests` need `Uuid::from_u128` to
+# construct deterministic MemoryId fixtures (the production code paths
+# get UUIDs transitively via `vault_core::MemoryId`, which IS a direct
+# dep, but the constructor helper is not re-exported there).
+uuid = { workspace = true }
 # serde_json — production dep above carries through to dev-builds, so
 # the prior dev-dep line was redundant after T0.2.3 close. Test helpers
 # (`make_memory` building empty metadata JSON) consume the production

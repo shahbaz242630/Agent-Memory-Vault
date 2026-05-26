@@ -79,6 +79,22 @@ pub struct Report {
     /// Topic label → ordered facts. `BTreeMap` for deterministic JSON
     /// output (consecutive nightly REPORTs diff cleanly).
     pub facts_by_topic: BTreeMap<String, Vec<ReportFact>>,
+    /// `true` when Phi-4 was unavailable or each call failed at topic-
+    /// naming time, so cluster `label`s in `facts_by_topic` are the
+    /// placeholder form `"topic_<id>"`. Mirrors
+    /// [`crate::topics::TopicMap::topic_names_unavailable`]; the Commit 6
+    /// structured read pipeline surfaces this as the
+    /// `TOPIC_NAMES_UNAVAILABLE` health-warning so the calling agent
+    /// knows topic labels are not trustworthy and should be presented
+    /// to the user as opaque cluster identifiers, not semantic groupings.
+    ///
+    /// Additive at ADR-053 Amendment 1 (Commit 6, 2026-05-26). `#[serde(default)]`
+    /// makes pre-amendment REPORTs (none exist in practice — Batch A
+    /// shipped 2026-05-26 and no nightly run has executed) deserialize
+    /// as `false`, preserving backward-compat without a schema_version
+    /// bump.
+    #[serde(default)]
+    pub topic_names_unavailable: bool,
 }
 
 /// One structured fact inside a topic. The fields are exactly what the
@@ -135,6 +151,7 @@ pub fn generate_report(
         generated_at,
         consolidator_run_id,
         facts_by_topic,
+        topic_names_unavailable: topic_map.topic_names_unavailable,
     }
 }
 
@@ -465,6 +482,80 @@ mod tests {
         assert!(
             reports_dir.exists(),
             "write_report_atomic MUST create reports dir if missing"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // ADR-053 Amendment 1 (Commit 6, 2026-05-26) — `topic_names_unavailable`
+    // additive field. The Commit 6 structured read pipeline reads this flag to
+    // surface the `TOPIC_NAMES_UNAVAILABLE` health-warning; without the
+    // producer-side population below + the deserialize-default, the signal
+    // would silently disappear at the disk boundary.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn generate_report_propagates_topic_names_unavailable_true_from_topic_map() {
+        let m1 = make_memory(1, "fact", 0.9);
+        let topics = vec![Topic {
+            topic_id: 0,
+            label: "topic_0".into(), // placeholder label, signalling Phi-4 unavailable
+            member_ids: vec![m1.id],
+        }];
+        let topic_map = TopicMap {
+            boundary: boundary("personal"),
+            topics,
+            topic_names_unavailable: true,
+        };
+        let report = generate_report(&topic_map, &[m1], Uuid::nil(), Utc::now());
+        assert!(
+            report.topic_names_unavailable,
+            "generate_report MUST propagate topic_names_unavailable=true from TopicMap; \
+             otherwise the Commit 6 read pipeline cannot surface TOPIC_NAMES_UNAVAILABLE"
+        );
+    }
+
+    #[test]
+    fn generate_report_propagates_topic_names_unavailable_false_from_topic_map() {
+        let m1 = make_memory(1, "fact", 0.9);
+        let topics = vec![Topic {
+            topic_id: 0,
+            label: "blood_pressure".into(),
+            member_ids: vec![m1.id],
+        }];
+        let topic_map = TopicMap {
+            boundary: boundary("personal"),
+            topics,
+            topic_names_unavailable: false,
+        };
+        let report = generate_report(&topic_map, &[m1], Uuid::nil(), Utc::now());
+        assert!(
+            !report.topic_names_unavailable,
+            "happy-path topic_names_unavailable=false MUST propagate too \
+             (pins the populate direction, not just the truthy case)"
+        );
+    }
+
+    #[test]
+    fn report_deserializes_pre_amendment_json_without_topic_names_unavailable_field() {
+        // Pre-ADR-053-Amendment-1 REPORTs (none exist in practice — Batch A
+        // shipped 2026-05-26 and no nightly run has executed yet) omit the
+        // field. #[serde(default)] makes deserialize succeed with the field
+        // set to `false`. This pin protects the backward-compat path so a
+        // future "tighten serde" change can't silently break old REPORTs.
+        let pre_amendment_json = serde_json::json!({
+            "schema_version": 1,
+            "boundary": "personal",
+            "generated_at": "2026-05-26T03:00:00Z",
+            "consolidator_run_id": "00000000-0000-0000-0000-000000000000",
+            "facts_by_topic": {}
+        })
+        .to_string();
+        let parsed: Report = serde_json::from_str(&pre_amendment_json).unwrap_or_else(|e| {
+            panic!("Pre-amendment Report JSON MUST deserialize via #[serde(default)]; got: {e}")
+        });
+        assert!(
+            !parsed.topic_names_unavailable,
+            "missing field MUST default to false (the safe value — no warning surfaced)"
         );
     }
 }
