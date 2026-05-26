@@ -740,10 +740,46 @@ impl StdioServer {
     /// errors from tool-dispatch events cleanly.
     #[tool(
         name = "memory.update",
-        description = "Replace an existing memory's content. \
-                       The `id` field selects the target; the remaining \
-                       fields are the full replacement payload (same \
-                       shape as `memory.write`)."
+        description = "Replace an existing memory's content. The `id` field \
+                       selects the target; the remaining fields are the \
+                       full replacement payload (same shape as \
+                       `memory.write`). The vault is read by ANY AI agent \
+                       the user connects later, so updated content must \
+                       still follow the canonical save format. \
+                       \n\n\
+                       WHEN TO CALL: when the agent has explicit evidence \
+                       that an existing memory needs correction — a fact \
+                       changed, the original wording was wrong, or new \
+                       context refines an earlier save. When in doubt, \
+                       save a NEW memory via `memory.write` and let the \
+                       nightly consolidator deduplicate or supersede. \
+                       \n\n\
+                       WHEN NOT TO CALL: do NOT update to extend or \
+                       augment a still-partially-true memory — save a new \
+                       one. Do NOT silently mutate facts the user did not \
+                       ask to change. Do NOT use update to mark a fact as \
+                       no longer true — that's a future `memory.invalidate` \
+                       surface. \
+                       \n\n\
+                       CRITICAL — canonical save format (same six rules \
+                       as `memory.write`). The vault normalizes content \
+                       server-side regardless, but agents that follow the \
+                       rules produce higher-quality memories: \
+                       \n\
+                       1. Atomic facts. One fact per memory. \
+                       \n\
+                       2. Third-person about the user. \
+                       \n\
+                       3. Complete sentences. \
+                       \n\
+                       4. Strip conversation framing. \
+                       \n\
+                       5. Absolute dates for time-sensitive facts. \
+                       \n\
+                       6. Never first-person agent reference. \
+                       \n\n\
+                       The vault verifies the memory's stored boundary \
+                       against the authorized set before update."
     )]
     pub async fn tool_update(
         &self,
@@ -813,7 +849,31 @@ impl StdioServer {
         name = "memory.delete",
         description = "Delete a memory by id. The vault verifies the \
                        memory's stored boundary against the authorized \
-                       set before deletion."
+                       set before deletion. \
+                       \n\n\
+                       WHEN TO CALL: when the user has explicitly asked \
+                       the agent to forget something, OR the agent has \
+                       high confidence a memory is wrong AND there is no \
+                       useful provenance to retain. Typically rare — the \
+                       nightly consolidator handles deduplication and \
+                       supersession, so most \"this should go away\" cases \
+                       resolve themselves without explicit deletion. \
+                       \n\n\
+                       WHEN NOT TO CALL: do NOT delete to clean up \
+                       duplicates or merged facts — that's the \
+                       consolidator's job. Do NOT delete to mark a fact \
+                       as no longer true — use `memory.update` with \
+                       corrected content, or wait for the future \
+                       `memory.invalidate` surface. Do NOT delete based \
+                       on agent inference alone; require explicit user \
+                       direction. \
+                       \n\n\
+                       IRREVERSIBILITY: delete removes the memory + its \
+                       embedding + its cascade rows; provenance is lost. \
+                       Prefer update or supersession when in doubt. \
+                       \n\n\
+                       Idempotent: deleting a non-existent id returns \
+                       success."
     )]
     pub async fn tool_delete(
         &self,
@@ -982,7 +1042,15 @@ fn vault_error_to_mcp(err: VaultError) -> McpError {
         // Per ADR-040 + ADR-040 amendment.
         | VaultError::WorkerSpawnFailed(_)
         | VaultError::McpBindFailed(_)
-        | VaultError::KeychainProvenance(_) => McpError::internal_error("internal error", None),
+        | VaultError::KeychainProvenance(_)
+        // T0.3.x Batch A (2026-05-26): consolidator safety-wrapper errors.
+        // Surface only via the vault-cli `consolidate run` subcommand, never
+        // through MCP tool dispatch in V0.2 — the consolidator runs out-of-band
+        // from MCP. Defensive mapping preserves the same generic
+        // "internal error" privacy posture if they ever do leak to the MCP
+        // wire (which would itself be a regression worth investigating).
+        | VaultError::ConsolidatorBusy(_)
+        | VaultError::ConsolidatorTimeout(_) => McpError::internal_error("internal error", None),
     }
 }
 

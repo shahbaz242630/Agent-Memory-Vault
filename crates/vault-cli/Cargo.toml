@@ -16,7 +16,16 @@ path = "src/main.rs"
 vault-core = { path = "../vault-core" }
 vault-storage = { path = "../vault-storage" }
 vault-app = { path = "../vault-app" }
-clap = { workspace = true }
+# Consolidator report types — `consolidate run` subcommand prints
+# ConsolidationReport fields (memories_processed / memories_merged /
+# contradictions_resolved / summary_markdown). Added at T0.3.x Batch A
+# (2026-05-26) per the locked-next-arc Step 4 wiring.
+vault-consolidator = { path = "../vault-consolidator" }
+# `env` feature added at T0.3.x Batch A for `consolidate run`'s
+# `VAULT_*_PATH` env-var fallbacks (`#[arg(long, env = "...")]`).
+# Workspace declaration carries `["derive"]`; this per-crate override
+# merges in `"env"` so vault-cli has both features available.
+clap = { workspace = true, features = ["env"] }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }

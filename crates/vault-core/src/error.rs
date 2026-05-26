@@ -147,6 +147,26 @@ pub enum VaultError {
     #[error("mcp server bind failed: {0}")]
     McpBindFailed(String),
 
+    /// A consolidation run was requested but another run is already in
+    /// progress for this vault (the on-disk lockfile is held by another
+    /// process or this process). Carried as a structured variant so
+    /// vault-cli / vault-tauri can surface a "consolidator busy" exit code
+    /// or UI message distinct from a generic configuration / I/O failure.
+    /// See [[locked-next-arc-t03x]] Step 4 wiring + ADR-051 invalidate
+    /// semantics for the V0.2 cross-process lockfile contract.
+    #[error("consolidator busy: {0}")]
+    ConsolidatorBusy(String),
+
+    /// A consolidation run exceeded its hard time budget (30 min by
+    /// default per the locked-next-arc Step 4 operational-safety contract)
+    /// and was cancelled. Distinct from [`Self::Consolidation`] so callers
+    /// can decide whether to retry next nightly cycle (timeout — likely
+    /// transient resource pressure) or alert the operator
+    /// (Consolidation — a real correctness or storage fault). Payload
+    /// carries the elapsed-at-cancellation duration in seconds.
+    #[error("consolidator timeout: hard budget exceeded after {0}s")]
+    ConsolidatorTimeout(u64),
+
     /// At-rest-key provenance failed: the OS keychain could not be read,
     /// the entry could not be created on first run, or the platform is
     /// not supported by the V0.2 Phase 1 keychain wiring.
@@ -223,6 +243,38 @@ mod tests {
                 actual: 256
             }
         ));
+    }
+
+    #[test]
+    fn consolidator_busy_displays_category_prefix_and_carries_context() {
+        let err = VaultError::ConsolidatorBusy(
+            "lockfile held by pid=1234 since 2026-05-26T03:00:01Z".into(),
+        );
+        let s = err.to_string();
+        assert!(
+            s.starts_with("consolidator busy:"),
+            "display should start with 'consolidator busy:' prefix; got: {s}"
+        );
+        assert!(
+            s.contains("pid=1234"),
+            "display should carry the supplied context; got: {s}"
+        );
+        assert!(matches!(err, VaultError::ConsolidatorBusy(_)));
+    }
+
+    #[test]
+    fn consolidator_timeout_carries_elapsed_seconds_in_message() {
+        let err = VaultError::ConsolidatorTimeout(1800);
+        let s = err.to_string();
+        assert!(
+            s.starts_with("consolidator timeout:"),
+            "display should start with 'consolidator timeout:' prefix; got: {s}"
+        );
+        assert!(
+            s.contains("1800"),
+            "display should mention the elapsed seconds; got: {s}"
+        );
+        assert!(matches!(err, VaultError::ConsolidatorTimeout(1800)));
     }
 
     #[test]

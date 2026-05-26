@@ -157,9 +157,9 @@ impl Adapter for VaultAdapter {
         // perfectly still produce canonical-shape memories. See
         // `crate::normalization` for the applied rules.
         //
-        // `Adapter::update` is NOT yet normalized — locked plan keeps
-        // update as an explicit/agent-knowing-what-it-does operation
-        // for this commit. Tracked in HANDOFF tech-debt for follow-up.
+        // `Adapter::update` is also normalized — same rationale as the
+        // write path. Closed as the small tech-debt follow-up shipping
+        // alongside this admin-cleanup ride-along.
         new_memory.content =
             crate::normalization::normalize_for_canonical_save(&new_memory.content)?;
 
@@ -171,9 +171,18 @@ impl Adapter for VaultAdapter {
         Ok(memory.id)
     }
 
-    async fn update(&self, id: MemoryId, new_memory: NewMemory) -> VaultResult<()> {
+    async fn update(&self, id: MemoryId, mut new_memory: NewMemory) -> VaultResult<()> {
         // ADR-028 read-before-write contract: read existing → patch
         // preserved fields → re-compute embedding → cascade update.
+
+        // Normalize content to canonical-save shape BEFORE validation.
+        // Mirrors the write path so all stored memories — regardless of
+        // entry route — land in canonical shape (per the cross-platform
+        // thesis in [[mcp-descriptions-cross-platform-lever]]). The
+        // earlier T0.2.7 close commit deferred this; the admin
+        // ride-along of 2026-05-26 closes it.
+        new_memory.content =
+            crate::normalization::normalize_for_canonical_save(&new_memory.content)?;
 
         // Read existing. NotFound surfaces as VaultError::NotFound,
         // which maps to `-32602 "not found"` at the MCP wire layer
@@ -629,8 +638,14 @@ mod tests {
             .unwrap()
             .expect("memory still exists after update");
 
-        // OVERWRITTEN.
-        assert_eq!(after.content, "updated content", "content overwritten");
+        // OVERWRITTEN. Content arrives normalized per the canonical-save
+        // contract — first-char capitalized + terminal period appended —
+        // mirroring the write path's normalization (2026-05-26 admin
+        // ride-along).
+        assert_eq!(
+            after.content, "Updated content.",
+            "content overwritten and normalized"
+        );
         assert_eq!(
             after.memory_type,
             MemoryType::Procedural,
@@ -679,6 +694,57 @@ mod tests {
             f.embedder.call_count(),
             pre_update_embed_calls + 1,
             "ADR-028: embedding re-computed exactly once during update"
+        );
+    }
+
+    // ==================================================================
+    // 3b. update — content normalization mirrors the write path
+    // ==================================================================
+
+    /// **Pinning test for the 2026-05-26 admin ride-along.** The
+    /// canonical-save normalization that the write path runs through
+    /// `vault_app::normalization::normalize_for_canonical_save` MUST
+    /// also run on the update path. Calls `Adapter::update` with raw
+    /// agent-style content (lowercase first char, no terminal period,
+    /// first-person framing) and asserts the stored row carries the
+    /// normalized form. Mirrors `write_embeds_then_cascades`'s
+    /// content-shape assertion.
+    #[tokio::test]
+    async fn update_normalizes_content_like_write() {
+        let f = make_fixture(vec![]).await;
+
+        // Seed a memory we can update.
+        let id = f
+            .adapter
+            .write(sample_new_memory("seed content", "work"))
+            .await
+            .unwrap();
+
+        // Update with raw agent-style content. The write path normalizes
+        // "i prefer dark mode" → "The user prefers dark mode." — assert
+        // the update path matches.
+        let update_payload = NewMemory {
+            content: "i prefer dark mode".to_string(),
+            memory_type: MemoryType::Semantic,
+            boundary: Boundary::new("work").unwrap(),
+            source_agent: Some("update-agent".to_string()),
+            confidence: 0.8,
+            valid_from: None,
+            valid_until: None,
+            metadata: serde_json::json!({}),
+        };
+        f.adapter.update(id, update_payload).await.unwrap();
+
+        let after = f
+            .metadata_for_assert
+            .get_memory(&id)
+            .await
+            .unwrap()
+            .expect("updated memory exists");
+        assert_eq!(
+            after.content, "The user prefers dark mode.",
+            "update path MUST run normalize_for_canonical_save (first-person → third-person, \
+             capitalize, terminal period); see crate::normalization"
         );
     }
 

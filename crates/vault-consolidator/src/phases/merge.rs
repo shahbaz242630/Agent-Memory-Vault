@@ -55,9 +55,26 @@ pub enum MergeOutcome {
     KeepSeparate { reasoning: String },
     /// LLM decided the cluster's memories conflict (e.g., "Mom's birthday
     /// is June 15" vs "Mom's birthday is July 15"). Per BRD §5.6 line 944,
-    /// **do not auto-resolve** — the orchestrator emits a `ConflictReview`
-    /// row in `ConsolidationReport.conflicts_for_user_review` instead.
-    Contradiction { reasoning: String },
+    /// the **default** behaviour is to queue a `ConflictReview` row for
+    /// user review — the LLM does not auto-resolve.
+    ///
+    /// **Exception (T0.3.x Batch A, locked-next-arc Step 4):** when the LLM
+    /// can identify a clear winner (one fact is unambiguously newer,
+    /// more specific, or explicitly supersedes the other), it MAY populate
+    /// `clear_winner` with the winning memory's id. The orchestrator
+    /// calls [`vault_storage::StorageBackend::invalidate`] on each loser
+    /// (`cluster.member_row_ids - clear_winner`) per ADR-051's bi-temporal
+    /// `valid_until` semantics; retrieval thereafter skips the invalidated
+    /// rows by default. The reasoning text is recorded in the invalidate
+    /// audit event.
+    ///
+    /// When `clear_winner` is `None`, the legacy ConflictReview path
+    /// remains in effect — no auto-resolution.
+    Contradiction {
+        reasoning: String,
+        #[serde(default)]
+        clear_winner: Option<MemoryId>,
+    },
 }
 
 /// JSON schema (string form) the LLM is constrained to emit. GBNF-compiled
@@ -71,7 +88,11 @@ const MERGE_DECISION_SCHEMA: &str = r#"{
             "enum": ["merge", "keep_separate", "contradiction"]
         },
         "merged_text": { "type": "string" },
-        "reasoning": { "type": "string" }
+        "reasoning": { "type": "string" },
+        "clear_winner": {
+            "type": ["string", "null"],
+            "description": "For contradiction decisions ONLY: the memory_id of the unambiguously-correct fact if one exists. Null otherwise."
+        }
     },
     "required": ["decision", "reasoning"],
     "additionalProperties": false
@@ -86,10 +107,13 @@ const MERGE_DECISION_SYSTEM_PROMPT: &str =
      that a vector-similarity pass flagged as potential duplicates. Decide whether \
      to (a) merge them into one consolidated memory, (b) keep them separate \
      (vector similarity was a false positive), or (c) flag a contradiction (the \
-     memories describe the same entity with conflicting facts — do NOT \
-     auto-resolve, the user reviews). Respond with strict JSON matching the \
-     schema. For merge decisions, set merged_text to the consolidated content; \
-     for keep_separate and contradiction, omit merged_text.";
+     memories describe the same entity with conflicting facts). For contradictions, \
+     if one memory is unambiguously newer / more specific / explicitly supersedes \
+     the others (e.g., 'we moved to $109' explicitly replaces an older '$89'), set \
+     clear_winner to that memory's id and the others will be auto-invalidated. \
+     Otherwise leave clear_winner null and the user reviews. Respond with strict \
+     JSON matching the schema. For merge decisions, set merged_text to the \
+     consolidated content; for keep_separate and contradiction, omit merged_text.";
 
 /// Phase 2 primitive — ask the LLM to classify a cluster.
 ///
@@ -540,6 +564,79 @@ mod tests {
             matches!(err, VaultError::Llm(_)),
             "expected VaultError::Llm, got {err:?}"
         );
+    }
+
+    // ─── T0.3.x Batch A: MergeOutcome::Contradiction::clear_winner pins ──
+    //
+    // Backwards-compat + present-path serde behaviour. The orchestrator's
+    // dispatch on `clear_winner.is_some()` (auto-invalidate via ADR-051) vs
+    // `None` (queue ConflictReview) is exercised end-to-end via the
+    // integration tests at Batch B; these unit tests pin only the JSON
+    // deserialisation contract.
+
+    #[test]
+    fn merge_outcome_contradiction_clear_winner_defaults_to_none_when_field_absent() {
+        // Pre-T0.3.x JSON: no `clear_winner` field. With `#[serde(default)]`
+        // on the field, deserialisation MUST default to None — keeps every
+        // existing fixture + canned LLM response working unchanged.
+        let json = r#"{"decision":"contradiction","reasoning":"same person, conflicting dates"}"#;
+        let outcome: MergeOutcome =
+            serde_json::from_str(json).expect("legacy contradiction JSON MUST still parse");
+        match outcome {
+            MergeOutcome::Contradiction {
+                reasoning,
+                clear_winner,
+            } => {
+                assert_eq!(reasoning, "same person, conflicting dates");
+                assert_eq!(
+                    clear_winner, None,
+                    "missing clear_winner MUST default to None for backwards-compat"
+                );
+            }
+            other => panic!("expected Contradiction, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_outcome_contradiction_deserializes_clear_winner_when_field_present() {
+        // T0.3.x Batch A path: LLM populated clear_winner with the
+        // winning memory's UUID. Orchestrator at consolidator.rs branches
+        // on this being Some to invoke `storage.invalidate(loser, now, ...)`.
+        let winner_uuid = "00000000-0000-0000-0000-000000000042";
+        let json = format!(
+            r#"{{"decision":"contradiction","reasoning":"newer bill supersedes older","clear_winner":"{winner_uuid}"}}"#
+        );
+        let outcome: MergeOutcome =
+            serde_json::from_str(&json).expect("clear_winner-present JSON MUST parse");
+        match outcome {
+            MergeOutcome::Contradiction {
+                reasoning,
+                clear_winner,
+            } => {
+                assert_eq!(reasoning, "newer bill supersedes older");
+                assert_eq!(
+                    clear_winner,
+                    Some(MemoryId(uuid::Uuid::parse_str(winner_uuid).unwrap())),
+                    "clear_winner MUST round-trip as the supplied MemoryId"
+                );
+            }
+            other => panic!("expected Contradiction, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_outcome_contradiction_clear_winner_explicit_null_is_equivalent_to_absent() {
+        // Phi-4's GBNF grammar may emit `"clear_winner": null` rather than
+        // omitting the field. Both shapes MUST deserialise to None.
+        let json = r#"{"decision":"contradiction","reasoning":"r","clear_winner":null}"#;
+        let outcome: MergeOutcome =
+            serde_json::from_str(json).expect("explicit-null clear_winner MUST parse");
+        match outcome {
+            MergeOutcome::Contradiction { clear_winner, .. } => {
+                assert_eq!(clear_winner, None, "explicit null MUST deserialise to None");
+            }
+            other => panic!("expected Contradiction, got: {other:?}"),
+        }
     }
 
     // ─── floor 5: N-boundary cases (N=2 / N=5 / N=10) dispatch one call ──

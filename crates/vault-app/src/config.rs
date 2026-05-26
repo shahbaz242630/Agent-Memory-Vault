@@ -151,6 +151,29 @@ pub struct AppConfig {
     /// **Migration anchor:** new field at T0.2.7 Phase 4 (2026-05-20).
     /// Not a rename — additive per the rename-prohibition discipline.
     pub qwen_model_path: Option<PathBuf>,
+
+    /// Path to the Phi-4-mini-instruct Q4_K_M GGUF file (the V0.2
+    /// consolidation-time merge classifier per ADR-042 + ADR-044). When
+    /// `Some`, [`crate::Application::new`] loads the model at startup and
+    /// constructs a `vault_consolidator::Consolidator` that wires
+    /// Phi-4 into the nightly merge phase (T0.3.x Step 4 locked-next-arc).
+    /// When `None`, the consolidator is unwired and
+    /// [`crate::Application::run_consolidation_with_safety`] returns
+    /// `VaultError::Config("consolidator not configured")` — graceful
+    /// degradation per the locked-next-arc Thread 3 enterprise practice
+    /// (fail-open on quality-degrading dependencies, signal it to the
+    /// consumer, do not block startup).
+    ///
+    /// `Option`-al because:
+    /// - Integration tests don't have the 2.49 GB GGUF on disk and don't
+    ///   exercise consolidation at scale — they just verify wiring.
+    /// - V0.2 founder-dogfood deployments may opt out of nightly
+    ///   consolidation if they're using the vault as pure write-through
+    ///   storage (no merge / contradiction-resolution needs).
+    ///
+    /// **Migration anchor:** new field at T0.3.x Batch A (2026-05-26).
+    /// Not a rename — additive per the rename-prohibition discipline.
+    pub phi4_model_path: Option<PathBuf>,
 }
 
 impl fmt::Debug for AppConfig {
@@ -169,6 +192,7 @@ impl fmt::Debug for AppConfig {
             .field("ort_lib_path", &self.ort_lib_path)
             .field("at_rest_key", &"<redacted>")
             .field("qwen_model_path", &self.qwen_model_path)
+            .field("phi4_model_path", &self.phi4_model_path)
             .finish()
     }
 }
@@ -204,6 +228,7 @@ mod tests {
             ort_lib_path: PathBuf::new(),
             at_rest_key: Zeroizing::new([0u8; 32]),
             qwen_model_path: None,
+            phi4_model_path: None,
         };
     }
 
@@ -225,6 +250,7 @@ mod tests {
             ort_lib_path: PathBuf::from("/tmp/libonnxruntime.so"),
             at_rest_key: at_rest_bytes,
             qwen_model_path: Some(PathBuf::from("/tmp/qwen-7b.gguf")),
+            phi4_model_path: Some(PathBuf::from("/tmp/phi-4-mini.gguf")),
         };
         let dbg_str = format!("{config:?}");
         assert!(

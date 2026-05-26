@@ -229,14 +229,64 @@ impl Consolidator {
                         // Vector similarity was a false positive per Phase 2's
                         // judgement. Originals stay; no state change.
                     }
-                    MergeOutcome::Contradiction { reasoning } => {
-                        boundary_summary.contradictions.push(ConflictReview {
-                            conflict_id: Uuid::new_v4(),
-                            boundary: boundary.clone(),
-                            conflicting_memory_ids: cluster.member_row_ids.clone(),
-                            reasoning,
-                            flagged_at: Utc::now(),
-                        });
+                    MergeOutcome::Contradiction {
+                        reasoning,
+                        clear_winner,
+                    } => {
+                        match clear_winner {
+                            Some(winner_id) => {
+                                // Auto-resolve via ADR-051 invalidate(): mark
+                                // every non-winner cluster member's
+                                // `valid_until = now`. Retrieval thereafter
+                                // skips invalidated rows by default. Per the
+                                // locked-next-arc Step 4 contract, failure to
+                                // invalidate is logged-and-continued, NOT a
+                                // run abort — the next nightly cycle will
+                                // re-detect the contradiction and try again.
+                                let now = Utc::now();
+                                let losers: Vec<MemoryId> = cluster
+                                    .member_row_ids
+                                    .iter()
+                                    .copied()
+                                    .filter(|id| *id != winner_id)
+                                    .collect();
+                                tracing::info!(
+                                    target: "vault_consolidator::contradiction",
+                                    cluster_id = cluster.id,
+                                    winner = %winner_id,
+                                    loser_count = losers.len(),
+                                    "Phi-4 surfaced contradiction with clear winner; \
+                                     invalidating losers per ADR-051"
+                                );
+                                for loser in losers {
+                                    let invalidate_reason = format!(
+                                        "auto-invalidated by consolidator (cluster {}): {reasoning}",
+                                        cluster.id
+                                    );
+                                    if let Err(e) =
+                                        self.storage.invalidate(loser, now, invalidate_reason).await
+                                    {
+                                        tracing::warn!(
+                                            target: "vault_consolidator::contradiction",
+                                            loser = %loser,
+                                            error = %e,
+                                            "invalidate failed; next consolidation cycle will retry"
+                                        );
+                                    }
+                                }
+                            }
+                            None => {
+                                // Legacy path — queue ConflictReview for the
+                                // user to resolve. BRD §5.6 line 944.
+                                boundary_summary.contradictions.push(ConflictReview {
+                                    conflict_id: Uuid::new_v4(),
+                                    boundary: boundary.clone(),
+                                    conflicting_memory_ids: cluster.member_row_ids.clone(),
+                                    reasoning,
+                                    flagged_at: Utc::now(),
+                                });
+                            }
+                        }
                     }
                 }
             }

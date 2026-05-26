@@ -37,7 +37,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{anyhow, Context, Result};
@@ -48,6 +48,8 @@ use vault_app::keychain::{
     derive_at_rest_key, derive_sqlcipher_passphrase, read_or_init_master_key, PRODUCTION_NAMESPACE,
     VAULT_ID,
 };
+use vault_app::{AppConfig, Application};
+use vault_consolidator::ConsolidationReport;
 use vault_core::{Boundary, MemoryId};
 use vault_storage::{
     CascadeOperation, DeadLetterEntry, DivergenceDetector, DivergenceReport, Resolution,
@@ -94,6 +96,41 @@ enum Command {
     /// vector store. Reports tier-1 count comparison + tier-2 sampled
     /// existence findings. Per Phase A Q3 / ADR-018.
     DivergenceCheck,
+    /// Sleep-cycle consolidation per BRD §5.6 — merge near-duplicates,
+    /// surface contradictions, emit a run summary. Locked-next-arc Step 4
+    /// (T0.3.x Batch A, 2026-05-26): Phi-4-mini drives the merge
+    /// classifier; Qwen-7B is NOT used in this path. Requires the BGE
+    /// embedder model + tokenizer + ONNX Runtime library + Phi-4-mini
+    /// GGUF on disk; arguments accept `VAULT_*` env-var fallbacks for
+    /// shell-profile convenience.
+    Consolidate {
+        /// Path to the BGE-small-en-v1.5 ONNX model file.
+        #[arg(long, env = "VAULT_BGE_MODEL_PATH", value_name = "PATH")]
+        bge_model: PathBuf,
+        /// Path to the BGE-small-en-v1.5 tokenizer.json file.
+        #[arg(long, env = "VAULT_BGE_TOKENIZER_PATH", value_name = "PATH")]
+        bge_tokenizer: PathBuf,
+        /// Path to the ONNX Runtime dynamic library
+        /// (libonnxruntime.{dll,dylib,so}).
+        #[arg(long, env = "VAULT_ORT_LIB_PATH", value_name = "PATH")]
+        ort_lib: PathBuf,
+        /// Path to the Phi-4-mini-instruct Q4_K_M GGUF file.
+        #[arg(long, env = "VAULT_PHI4_MODEL_PATH", value_name = "PATH")]
+        phi4_model: PathBuf,
+
+        #[command(subcommand)]
+        action: ConsolidateAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ConsolidateAction {
+    /// Run one consolidation cycle immediately, print the summary, then exit.
+    /// Refuses with `consolidator busy` if another run is in progress
+    /// (cross-process lockfile at `<vault_root>/.consolidator.lock`). Hard
+    /// timeout 30 min — past this, the run is cancelled and the previous
+    /// nightly summary remains the latest artifact on disk.
+    Run,
 }
 
 #[derive(Subcommand, Debug)]
@@ -152,19 +189,78 @@ fn init_tracing() {
 
 async fn real_main() -> Result<()> {
     let cli = Cli::parse();
-    let backend = open_backend(&cli).await?;
 
+    // Destructure command out of cli so the match arms can move action /
+    // ConsolidateAction by value while we still borrow the storage-path
+    // fields by reference for dispatch helpers. Pre-T0.3.x this function
+    // opened the backend upfront and matched on `cli.command` directly;
+    // the Consolidate arm needs to NOT open the redundant backend (it
+    // builds its own Application internally), so we split the open into
+    // a per-arm helper that takes individual fields.
+    let Cli {
+        vault_db,
+        vector_dir,
+        graph_db,
+        dimension,
+        command,
+    } = cli;
+
+    match command {
+        Command::DeadLetter { action } => {
+            let backend = open_and_warn(&vault_db, &vector_dir, &graph_db, dimension).await?;
+            dispatch_dead_letter(&backend, action).await
+        }
+        Command::DivergenceCheck => {
+            let backend = open_and_warn(&vault_db, &vector_dir, &graph_db, dimension).await?;
+            run_divergence_check(&backend).await
+        }
+        Command::Consolidate {
+            bge_model,
+            bge_tokenizer,
+            ort_lib,
+            phi4_model,
+            action,
+        } => {
+            // `dimension` is intentionally not threaded into
+            // `dispatch_consolidate` — `Application::new` uses the locked
+            // `EMBEDDING_DIM` constant from `vault_embedding` internally,
+            // not a caller-supplied value. The CLI flag stays for backward
+            // compatibility with the dead-letter / divergence-check arms.
+            let _ = dimension;
+            dispatch_consolidate(
+                &vault_db,
+                &vector_dir,
+                &graph_db,
+                bge_model,
+                bge_tokenizer,
+                ort_lib,
+                phi4_model,
+                action,
+            )
+            .await
+        }
+    }
+}
+
+/// Open the storage backend via [`open_backend_fields`] and emit a degraded-mode
+/// warning to stderr if any downstream store is unreadable. Takes
+/// individual storage-path + dimension fields rather than `&Cli` so it
+/// can be called inside `real_main`'s match arms (cli.command has been
+/// moved by the destructuring — `&cli` no longer borrows cleanly).
+async fn open_and_warn(
+    vault_db: &Path,
+    vector_dir: &Path,
+    graph_db: &Path,
+    dimension: usize,
+) -> Result<StorageBackend> {
+    let backend = open_backend_fields(vault_db, vector_dir, graph_db, dimension).await?;
     if backend.degraded().is_degraded() {
         eprintln!(
             "warning: vault opened in degraded mode ({:?}) — some downstream stores are unreadable",
             backend.degraded()
         );
     }
-
-    match cli.command {
-        Command::DeadLetter { action } => dispatch_dead_letter(&backend, action).await,
-        Command::DivergenceCheck => run_divergence_check(&backend).await,
-    }
+    Ok(backend)
 }
 
 async fn run_divergence_check(backend: &StorageBackend) -> Result<()> {
@@ -212,23 +308,176 @@ fn print_divergence_report(r: &DivergenceReport) {
     }
 }
 
-/// Open the storage backend, reading master_key from the OS keychain and
-/// deriving the SqlCipher passphrase + at-rest key per ADR-040 amendment
-/// v2 option β derivation tree. Generic `authentication failed` on any
-/// error — no info leak per BRD §11.7.2 / §11.4.4. Detailed diagnostics
-/// go to the local `tracing` subscriber for dev debugging only.
-async fn open_backend(cli: &Cli) -> Result<StorageBackend> {
-    open_backend_inner(cli, PRODUCTION_NAMESPACE, VAULT_ID).await
+/// Dispatch the `consolidate` subcommand. Constructs a full [`Application`]
+/// (which loads BGE embedder + Phi-4-mini at startup) and routes to the
+/// chosen [`ConsolidateAction`]. T0.3.x Batch A.
+///
+/// Takes the storage-path + model-path fields by value/ref rather than
+/// `&Cli` so it can be called from `real_main`'s match arm after
+/// `cli.command` has been moved by the destructuring. `dimension` is
+/// intentionally omitted — `Application::new` reads the embedding
+/// dimension from the locked `vault_embedding::EMBEDDING_DIM` constant.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_consolidate(
+    vault_db: &Path,
+    vector_dir: &Path,
+    graph_db: &Path,
+    bge_model: PathBuf,
+    bge_tokenizer: PathBuf,
+    ort_lib: PathBuf,
+    phi4_model: PathBuf,
+    action: ConsolidateAction,
+) -> Result<()> {
+    let app = build_application(
+        vault_db,
+        vector_dir,
+        graph_db,
+        bge_model,
+        bge_tokenizer,
+        ort_lib,
+        phi4_model,
+    )
+    .await?;
+    match action {
+        ConsolidateAction::Run => run_one_consolidation(&app).await,
+    }
 }
 
-/// Inner helper taking keychain `namespace` + `vault_id` as parameters so
-/// tests can inject unique-per-test ids via [`vault_app::keychain::test_helpers::unique_test_namespace`]
-/// and avoid colliding with the production keychain entry.
+/// Build an [`Application`] for the consolidate path. Reads master_key
+/// from the OS keychain (same pattern as [`open_backend_inner`]),
+/// derives the SqlCipher passphrase + at-rest key, then calls
+/// [`Application::new`] which constructs the full V0.2 dependency graph
+/// including Phi-4-mini + a [`vault_consolidator::Consolidator`].
 ///
-/// Production callers use [`open_backend`] which passes
-/// [`PRODUCTION_NAMESPACE`] + [`VAULT_ID`].
+/// Generic `authentication failed` on keychain / open failure — no info
+/// leak per BRD §11.7.2 / §11.4.4. Phi-4 load failures surface a more
+/// specific "model load failed" message because the user is the one who
+/// just supplied a `--phi4-model` path; obscuring that error would only
+/// confuse them, and the path is not a secret.
+#[allow(clippy::too_many_arguments)]
+async fn build_application(
+    vault_db: &Path,
+    vector_dir: &Path,
+    graph_db: &Path,
+    bge_model: PathBuf,
+    bge_tokenizer: PathBuf,
+    ort_lib: PathBuf,
+    phi4_model: PathBuf,
+) -> Result<Application> {
+    let master_key = read_or_init_master_key(PRODUCTION_NAMESPACE, VAULT_ID).map_err(|e| {
+        tracing::warn!(error = %e, "keychain read failed");
+        anyhow!("authentication failed")
+    })?;
+    let sqlcipher_passphrase = derive_sqlcipher_passphrase(&master_key);
+    let at_rest_key = derive_at_rest_key(&master_key);
+
+    let config = AppConfig {
+        metadata_path: vault_db.to_path_buf(),
+        vector_dir: vector_dir.to_path_buf(),
+        graph_path: graph_db.to_path_buf(),
+        key: sqlcipher_passphrase,
+        model_path: bge_model,
+        tokenizer_path: bge_tokenizer,
+        ort_lib_path: ort_lib,
+        at_rest_key,
+        // Consolidate path does NOT use the read pipeline. Qwen stays
+        // unloaded (saves ~4.36 GB of resident memory + ~30s startup).
+        qwen_model_path: None,
+        phi4_model_path: Some(phi4_model),
+    };
+
+    Application::new(&config).await.map_err(|e| {
+        // Surface the underlying VaultError class so the user can act on
+        // it: a `Llm(...)` error names "Phi-4-mini load failed at startup"
+        // which is the most common case for first-time setup (wrong path,
+        // wrong file, missing GGUF). Any other class falls through to
+        // "authentication failed" to avoid leaking storage-layer detail.
+        tracing::warn!(error = %e, "Application::new failed in consolidate path");
+        match e {
+            vault_core::VaultError::Llm(msg) => anyhow!("model load failed: {msg}"),
+            vault_core::VaultError::Config(msg) => anyhow!("configuration error: {msg}"),
+            _ => anyhow!("authentication failed"),
+        }
+    })
+}
+
+async fn run_one_consolidation(app: &Application) -> Result<()> {
+    println!("starting consolidation run...");
+    let report = app
+        .run_consolidation_with_safety()
+        .await
+        .context("consolidation run failed")?;
+    print_consolidation_report(&report);
+    Ok(())
+}
+
+fn print_consolidation_report(r: &ConsolidationReport) {
+    println!();
+    println!("consolidation run complete.");
+    println!("  memories processed   : {}", r.memories_processed);
+    println!("  merges applied       : {}", r.memories_merged);
+    println!("  contradictions queued: {}", r.contradictions_resolved);
+    println!("  memories archived    : {}", r.memories_archived);
+    println!("  duration             : {:.2}s", r.duration.as_secs_f64());
+    if !r.conflicts_for_user_review.is_empty() {
+        println!();
+        println!("contradictions surfaced for user review:");
+        for c in &r.conflicts_for_user_review {
+            println!("  - conflict {} (boundary: {})", c.conflict_id, c.boundary);
+            println!("    {}", c.reasoning);
+        }
+    }
+    if !r.summary_markdown.is_empty() {
+        println!();
+        println!("--- summary markdown ---");
+        println!("{}", r.summary_markdown);
+    }
+}
+
+/// Open the storage backend from individual path + dimension fields,
+/// reading master_key from the OS keychain and deriving the SqlCipher
+/// passphrase + at-rest key per ADR-040 amendment v2 option β derivation
+/// tree. Generic `authentication failed` on any error — no info leak per
+/// BRD §11.7.2 / §11.4.4. Detailed diagnostics go to the local `tracing`
+/// subscriber for dev debugging only.
+///
+/// Production callers (`real_main`'s match arms) invoke this directly;
+/// [`open_backend_inner`] is the per-test sibling that accepts a custom
+/// `namespace` + `vault_id` for keychain isolation. T0.3.x Batch A
+/// replaced the prior `&Cli`-based entrypoint with this fields-based
+/// shape so the match arms can borrow individual fields after
+/// `cli.command` has been moved by destructuring.
+async fn open_backend_fields(
+    vault_db: &Path,
+    vector_dir: &Path,
+    graph_db: &Path,
+    dimension: usize,
+) -> Result<StorageBackend> {
+    open_backend_inner(
+        vault_db,
+        vector_dir,
+        graph_db,
+        dimension,
+        PRODUCTION_NAMESPACE,
+        VAULT_ID,
+    )
+    .await
+}
+
+/// Inner helper taking individual storage fields + keychain `namespace` +
+/// `vault_id` as parameters so tests can inject unique-per-test ids via
+/// [`vault_app::keychain::test_helpers::unique_test_namespace`] and avoid
+/// colliding with the production keychain entry.
+///
+/// Production callers use [`open_backend_fields`] which passes
+/// [`PRODUCTION_NAMESPACE`] + [`VAULT_ID`]. T0.3.x Batch A migrated this
+/// fn from a `&Cli` parameter to individual fields so it composes
+/// cleanly with the cli-destructured `real_main` dispatch.
 pub(crate) async fn open_backend_inner(
-    cli: &Cli,
+    vault_db: &Path,
+    vector_dir: &Path,
+    graph_db: &Path,
+    dimension: usize,
     namespace: &str,
     vault_id: &str,
 ) -> Result<StorageBackend> {
@@ -239,11 +488,11 @@ pub(crate) async fn open_backend_inner(
     let sqlcipher_passphrase = derive_sqlcipher_passphrase(&master_key);
     let at_rest_key = derive_at_rest_key(&master_key);
     StorageBackend::open_with_at_rest_key(
-        &cli.vault_db,
-        &cli.vector_dir,
-        &cli.graph_db,
+        vault_db,
+        vector_dir,
+        graph_db,
         sqlcipher_passphrase,
-        cli.dimension,
+        dimension,
         &at_rest_key,
     )
     .await
@@ -616,6 +865,81 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_consolidate_run_with_all_paths_supplied() {
+        let cli = Cli::try_parse_from([
+            "vault-cli",
+            "--vault-db",
+            "/tmp/v.db",
+            "--vector-dir",
+            "/tmp/lance",
+            "--graph-db",
+            "/tmp/g.duckdb",
+            "consolidate",
+            "--bge-model",
+            "/tmp/bge.onnx",
+            "--bge-tokenizer",
+            "/tmp/tokenizer.json",
+            "--ort-lib",
+            "/tmp/libonnxruntime.so",
+            "--phi4-model",
+            "/tmp/phi-4-mini.gguf",
+            "run",
+        ])
+        .expect("consolidate-run flat path should parse");
+        match cli.command {
+            Command::Consolidate {
+                bge_model,
+                bge_tokenizer,
+                ort_lib,
+                phi4_model,
+                action,
+            } => {
+                assert_eq!(bge_model, PathBuf::from("/tmp/bge.onnx"));
+                assert_eq!(bge_tokenizer, PathBuf::from("/tmp/tokenizer.json"));
+                assert_eq!(ort_lib, PathBuf::from("/tmp/libonnxruntime.so"));
+                assert_eq!(phi4_model, PathBuf::from("/tmp/phi-4-mini.gguf"));
+                assert!(
+                    matches!(action, ConsolidateAction::Run),
+                    "expected ConsolidateAction::Run; got {action:?}"
+                );
+            }
+            other => panic!("expected Command::Consolidate, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_consolidate_run_with_missing_phi4_model_path() {
+        let result = Cli::try_parse_from([
+            "vault-cli",
+            "--vault-db",
+            "/tmp/v.db",
+            "--vector-dir",
+            "/tmp/lance",
+            "--graph-db",
+            "/tmp/g.duckdb",
+            "consolidate",
+            "--bge-model",
+            "/tmp/bge.onnx",
+            "--bge-tokenizer",
+            "/tmp/tokenizer.json",
+            "--ort-lib",
+            "/tmp/libonnxruntime.so",
+            // --phi4-model deliberately omitted; env-var also unset for this test
+            "run",
+        ]);
+        // clap will reject missing required-or-env arg unless env var supplies it.
+        // The CI matrix does not set VAULT_PHI4_MODEL_PATH; under `cargo test` the
+        // env var is also unset. clap surfaces a parse error before our code runs.
+        // If a future CI layer DOES set the env var, this test will start passing
+        // unexpectedly — that's a signal to harden test isolation rather than
+        // silently weaken the contract.
+        assert!(
+            result.is_err() || std::env::var("VAULT_PHI4_MODEL_PATH").is_ok(),
+            "consolidate-run MUST refuse missing --phi4-model unless env var supplies it"
+        );
+    }
+
+    #[test]
     fn cli_rejects_missing_required_flag() {
         let result = Cli::try_parse_from([
             "vault-cli",
@@ -931,7 +1255,15 @@ mod tests {
             .expect("initial open_with_at_rest_key should succeed");
         }
 
-        let result = open_backend_inner(&cli, &namespace, vault_id).await;
+        let result = open_backend_inner(
+            &cli.vault_db,
+            &cli.vector_dir,
+            &cli.graph_db,
+            cli.dimension,
+            &namespace,
+            vault_id,
+        )
+        .await;
         assert!(
             result.is_ok(),
             "open_backend_inner should succeed with valid keychain entry + sealed vault; got: {:?}",
@@ -974,7 +1306,15 @@ mod tests {
         ])
         .expect("Cli::try_parse_from for fail-closed test");
 
-        let result = open_backend_inner(&cli, &namespace, vault_id).await;
+        let result = open_backend_inner(
+            &cli.vault_db,
+            &cli.vector_dir,
+            &cli.graph_db,
+            cli.dimension,
+            &namespace,
+            vault_id,
+        )
+        .await;
         // Cannot use `Result::expect_err` here because `StorageBackend` does
         // not implement `Debug` by design (BRD §11 secrets-in-logs / ADR-007
         // redaction posture). Explicit match yields the `anyhow::Error` for

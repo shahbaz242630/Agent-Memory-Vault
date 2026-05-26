@@ -38,11 +38,15 @@
 //! `trigger_b_audit_chain_consistent_across_composition` in
 //! `tests/integration_smoke.rs`).
 
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
+use uuid::Uuid;
+use vault_consolidator::{ConsolidationReport, Consolidator, ConsolidatorConfig};
 use vault_core::{Boundary, VaultError, VaultResult};
 use vault_embedding::{BgeSmallProvider, EmbeddingProvider, EMBEDDING_DIM};
-use vault_llm::{LlmProvider, Qwen25_14BProvider, TuningConfig};
+use vault_llm::{LlmProvider, Phi4MiniConfig, Phi4MiniProvider, Qwen25_14BProvider, TuningConfig};
 use vault_mcp::{Adapter, StdioServer};
 use vault_retrieval::{
     AbstainingRetriever, HybridRetriever, KeywordIndex, KeywordRetriever, ReadPipeline, Retriever,
@@ -50,9 +54,38 @@ use vault_retrieval::{
 };
 use vault_storage::{MemoryFilter, MetadataStore, RetryWorker, StorageBackend};
 
+use crate::consolidator_lock::ConsolidatorLock;
 use crate::process_exit::{LiveProcessExit, ProcessExit};
 use crate::signal_source::{LiveSignalSource, SignalSource};
 use crate::{AppConfig, VaultAdapter};
+
+/// Hard upper bound on a single consolidation run per the locked-next-arc
+/// Step 4 operational-safety contract (2026-05-26): 30 minutes. Past this,
+/// the run is cancelled and [`VaultError::ConsolidatorTimeout`] returned.
+/// Per-merge transactions already committed remain committed (ADR-046
+/// atomic supersession); uncommitted work rolls back via storage primitives'
+/// transaction wrappers; atomic REPORT artifact writes (`.tmp + rename` at
+/// Commit 4) preserve the previous artifact intact under cancellation.
+pub(crate) const CONSOLIDATOR_HARD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Wrap an inner consolidation future in a hard timeout. If the inner
+/// future completes before `timeout_dur`, returns its [`VaultResult`]
+/// verbatim. If the timeout fires first, drops the inner future and
+/// returns [`VaultError::ConsolidatorTimeout`] with the elapsed-budget
+/// seconds.
+///
+/// Factored out from [`Application::run_consolidation_with_safety`] so
+/// the timeout semantics are independently testable with sub-second
+/// budgets (the production const is 30 min — untestable end-to-end).
+async fn timeout_or_consolidator_timeout<F, T>(timeout_dur: Duration, inner: F) -> VaultResult<T>
+where
+    F: std::future::Future<Output = VaultResult<T>>,
+{
+    match tokio::time::timeout(timeout_dur, inner).await {
+        Ok(inner_result) => inner_result,
+        Err(_elapsed) => Err(VaultError::ConsolidatorTimeout(timeout_dur.as_secs())),
+    }
+}
 
 /// Composition root. Phase 1 wires the dep graph; Phase 1b adds the
 /// minimum lifecycle (retry-worker spawn) needed for write→search
@@ -65,6 +98,23 @@ pub struct Application {
     /// (per `cascading.rs:149`), so this clone is cheap and shares state
     /// with the [`VaultAdapter`]'s clone — both see the same retry_queue.
     storage: StorageBackend,
+    /// Consolidator wired when [`AppConfig::phi4_model_path`] is `Some` at
+    /// construction. Cloned out by [`Self::run_consolidation_with_safety`]
+    /// for each invocation. `None` at integration-test time (no Phi-4
+    /// GGUF on disk); in that case the safety wrapper returns
+    /// [`VaultError::Config`] — graceful degradation per the locked-next-arc
+    /// Thread 3 enterprise practice (fail-open on quality-degrading
+    /// dependencies, signal it loudly, do not block startup).
+    ///
+    /// Added at T0.3.x Batch A (2026-05-26) per the architectural lock
+    /// (Phi-4-mini stays at consolidation, Qwen-7B exits the read path).
+    consolidator: Option<Arc<Consolidator>>,
+    /// Vault root directory — derived from `AppConfig::metadata_path.parent()`
+    /// at construction. Used by [`Self::run_consolidation_with_safety`] to
+    /// place the cross-process [`ConsolidatorLock`] file. Captured here so
+    /// the safety wrapper doesn't require `AppConfig` to be threaded
+    /// through the lifecycle.
+    vault_root: PathBuf,
 }
 
 impl Application {
@@ -241,14 +291,107 @@ impl Application {
         let adapter = VaultAdapter::new(
             retriever,
             read_pipeline,
-            embedder,
+            embedder.clone(),
             adapter_storage,
             adapter_metadata,
         );
 
+        // 11. Optional Consolidator (T0.3.x Batch A, 2026-05-26).
+        //
+        //    When `phi4_model_path` is `Some`, load Phi-4-mini-instruct
+        //    at startup so the nightly consolidation workload doesn't
+        //    pay model-load cost per run, then construct a
+        //    `vault_consolidator::Consolidator` with the shared storage
+        //    + embedder + a default `ConsolidatorConfig` (BRD §5.6
+        //    defaults: 3 AM, 0.92 similarity, 180-day decay, 365-day
+        //    archive, 1000 memories/run).
+        //
+        //    When `None`, the consolidator is unwired and
+        //    `run_consolidation_with_safety` surfaces `VaultError::Config`
+        //    — graceful degradation per the locked-next-arc Thread 3
+        //    enterprise practice. Write + read paths remain fully
+        //    functional; only nightly consolidation is unavailable.
+        //
+        //    Per the architectural lock (2026-05-26): Phi-4-mini stays
+        //    at consolidation (cheap, offline, real quality contribution
+        //    on the binary merge-classifier role); Qwen-7B exits the
+        //    read path entirely. Read still uses Qwen via the existing
+        //    `ReadPipeline` wiring above at step 9; Commit 6 of the
+        //    locked-next-arc removes that and replaces it with a
+        //    deterministic structured-fact pipeline.
+        let consolidator = match &config.phi4_model_path {
+            Some(path) => {
+                tracing::info!(
+                    target: "vault_app::startup",
+                    phi4_model_path = %path.display(),
+                    "loading Phi-4-mini for consolidator"
+                );
+                let model_dir = path
+                    .parent()
+                    .ok_or_else(|| {
+                        VaultError::Config(
+                            "AppConfig.phi4_model_path must have a parent directory".into(),
+                        )
+                    })?
+                    .to_path_buf();
+                let model_filename = path
+                    .file_name()
+                    .ok_or_else(|| {
+                        VaultError::Config(
+                            "AppConfig.phi4_model_path must have a filename component".into(),
+                        )
+                    })?
+                    .to_string_lossy()
+                    .into_owned();
+                let mut phi4_config = Phi4MiniConfig::v0_2_default(model_dir);
+                phi4_config.model_filename = model_filename;
+                let phi4_provider = Phi4MiniProvider::new(phi4_config).await.map_err(|e| {
+                    VaultError::Llm(format!("Phi-4-mini load failed at startup: {e}"))
+                })?;
+                let llm: Arc<dyn LlmProvider> = Arc::new(phi4_provider);
+                let cons = Consolidator::new(
+                    Arc::new(storage.clone()),
+                    llm,
+                    embedder,
+                    ConsolidatorConfig::default(),
+                );
+                Some(Arc::new(cons))
+            }
+            None => {
+                tracing::info!(
+                    target: "vault_app::startup",
+                    "phi4_model_path is None; consolidator not wired (graceful degradation \
+                     per locked-next-arc Thread 3 — write/read remain functional, \
+                     `vault-cli consolidate run` returns VaultError::Config)"
+                );
+                None
+            }
+        };
+
+        // 12. Capture vault root for the consolidator lockfile. Derived
+        //    from `metadata_path.parent()` because metadata_path is
+        //    SQLCipher-opened first in `StorageBackend::open` and its
+        //    parent directory is therefore guaranteed to exist by the
+        //    time we reach this line. Lockfile is placed at
+        //    `<vault_root>/.consolidator.lock` per the locked-next-arc
+        //    Step 4 cross-process lockfile contract.
+        let vault_root = config
+            .metadata_path
+            .parent()
+            .ok_or_else(|| {
+                VaultError::Config(
+                    "AppConfig.metadata_path must have a parent directory for \
+                     consolidator lockfile placement"
+                        .into(),
+                )
+            })?
+            .to_path_buf();
+
         Ok(Self {
             adapter: Arc::new(adapter),
             storage,
+            consolidator,
+            vault_root,
         })
     }
 
@@ -364,6 +507,75 @@ impl Application {
             server_handle,
             signal_handle,
         })
+    }
+
+    /// Run one consolidation cycle under cross-process lockfile +
+    /// [`CONSOLIDATOR_HARD_TIMEOUT`] (30 min). Returns the underlying
+    /// [`vault_consolidator::ConsolidationReport`] on success.
+    ///
+    /// # Operational safety (locked-next-arc Step 4, 2026-05-26)
+    ///
+    /// - **Cross-process lockfile** at `<vault_root>/.consolidator.lock` —
+    ///   refuses with [`VaultError::ConsolidatorBusy`] if held. Released
+    ///   on drop (RAII guard via [`ConsolidatorLock`]) including under
+    ///   panic unwind. Stale lockfiles (holder crashed without cleanup)
+    ///   require manual removal — explicit operator action per the
+    ///   `consolidator_lock` module docs.
+    /// - **30-min hard timeout** — past this, the run is cancelled and
+    ///   [`VaultError::ConsolidatorTimeout`] returned. Per-merge
+    ///   transactions already committed remain committed (ADR-046);
+    ///   uncommitted work rolls back via storage primitives' tx wrappers.
+    /// - **Tracing span** tagged with `run_id = Uuid::new_v4()` propagates
+    ///   to every consolidator phase log line for end-to-end correlation.
+    ///
+    /// # Errors
+    ///
+    /// - [`VaultError::Config`] — consolidator not wired
+    ///   ([`AppConfig::phi4_model_path`] was `None` at construction).
+    /// - [`VaultError::ConsolidatorBusy`] — another run holds the lockfile.
+    /// - [`VaultError::ConsolidatorTimeout`] — exceeded the 30-min budget.
+    /// - Any [`VaultError`] propagated by
+    ///   [`vault_consolidator::Consolidator::run_consolidation`].
+    #[tracing::instrument(skip_all)]
+    pub async fn run_consolidation_with_safety(&self) -> VaultResult<ConsolidationReport> {
+        let consolidator = self.consolidator.as_ref().ok_or_else(|| {
+            VaultError::Config(
+                "consolidator not configured (AppConfig.phi4_model_path was None at \
+                 Application::new); set phi4_model_path to enable nightly consolidation"
+                    .into(),
+            )
+        })?;
+
+        let run_id = Uuid::new_v4();
+        tracing::info!(
+            target: "vault_app::consolidator",
+            run_id = %run_id,
+            "consolidation run starting under safety wrapper"
+        );
+
+        // Acquire the cross-process lockfile. The guard is held for the
+        // entire run; dropped on function exit (success / error / panic
+        // unwind) which removes the lockfile.
+        let _lock = ConsolidatorLock::try_acquire(&self.vault_root)?;
+
+        // Wrap the consolidator's run_consolidation in the hard timeout.
+        // We .clone() the Arc<Consolidator> so the future is 'static-
+        // friendly (no borrow on self threaded through tokio::timeout's
+        // internal future polling).
+        let consolidator = consolidator.clone();
+        let inner = async move { consolidator.run_consolidation().await };
+        let report = timeout_or_consolidator_timeout(CONSOLIDATOR_HARD_TIMEOUT, inner).await?;
+
+        tracing::info!(
+            target: "vault_app::consolidator",
+            run_id = %run_id,
+            memories_processed = report.memories_processed,
+            memories_merged = report.memories_merged,
+            contradictions_resolved = report.contradictions_resolved,
+            "consolidation run completed under safety wrapper"
+        );
+
+        Ok(report)
     }
 }
 
@@ -536,6 +748,63 @@ mod tests {
     use super::*;
     use crate::process_exit::CapturingProcessExit;
     use crate::signal_source::MockSignalSource;
+
+    // =========================================================================
+    // Consolidator safety wrapper — timeout helper unit tests (T0.3.x Batch A)
+    //
+    // These tests pin `timeout_or_consolidator_timeout`'s contract independently
+    // of the full `Application::run_consolidation_with_safety` path so we can
+    // exercise the timeout behaviour with sub-second budgets (the production
+    // const is 30 min — untestable end-to-end). The lockfile contract is pinned
+    // in `consolidator_lock::tests`. End-to-end wiring is exercised at Batch A
+    // Commit 2 (vault-cli consolidate run subcommand) where a real Application
+    // is constructed against a tempdir backend.
+    // =========================================================================
+
+    #[tokio::test]
+    async fn timeout_or_returns_inner_value_when_inner_completes_before_budget() {
+        let fast_inner = async { Ok::<u32, VaultError>(42) };
+        let result = timeout_or_consolidator_timeout(Duration::from_secs(60), fast_inner).await;
+        assert_eq!(
+            result.unwrap(),
+            42,
+            "inner future completing within budget MUST return its value verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_or_returns_consolidator_timeout_when_inner_exceeds_budget() {
+        let slow_inner = async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok::<(), VaultError>(())
+        };
+        let result = timeout_or_consolidator_timeout(Duration::from_millis(50), slow_inner).await;
+        match result {
+            Err(VaultError::ConsolidatorTimeout(secs)) => {
+                // 50ms rounds to 0 seconds under `as_secs()`. The point of the
+                // assertion is the variant + that the value is what we passed
+                // in, not the exact ms-vs-secs precision.
+                assert_eq!(
+                    secs, 0,
+                    "ConsolidatorTimeout payload MUST be the budget's as_secs() value"
+                );
+            }
+            other => panic!("expected VaultError::ConsolidatorTimeout, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_or_propagates_inner_error_verbatim_when_inner_errs_before_timeout() {
+        let inner = async { Err::<u32, _>(VaultError::Storage("simulated".into())) };
+        let result = timeout_or_consolidator_timeout(Duration::from_secs(60), inner).await;
+        match result {
+            Err(VaultError::Storage(msg)) => assert_eq!(
+                msg, "simulated",
+                "inner error MUST propagate verbatim when it fires before timeout"
+            ),
+            other => panic!("expected VaultError::Storage, got: {other:?}"),
+        }
+    }
 
     // =========================================================================
     // Lifecycle test 1 (v2 test 10) — `start_with_mcp` McpBindFailed path

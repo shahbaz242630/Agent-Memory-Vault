@@ -64,6 +64,20 @@ vault-storage = { path = "../vault-storage" }
 # update_memory (StorageBackend takes a pre-computed embedding).
 vault-embedding = { path = "../vault-embedding" }
 
+# Consolidator + ConsolidatorConfig + ConsolidationReport — added at
+# T0.3.x Batch A (2026-05-26) per the architectural lock. Application
+# constructs Consolidator when AppConfig.phi4_model_path is Some, and
+# exposes `Application::run_consolidation_with_safety` wrapping the
+# inner run with a cross-process lockfile + 30-min hard timeout
+# (locked-next-arc Step 4 operational-safety contract). Phi-4-mini
+# stays at consolidation per the 2026-05-26 lock; Qwen-7B exits the
+# read path at Commit 6.
+vault-consolidator = { path = "../vault-consolidator" }
+
+# uuid — `run_id = Uuid::new_v4()` correlation ID for the consolidator
+# safety-wrapper tracing span. Added at T0.3.x Batch A.
+uuid = { workspace = true }
+
 # Keychain helper — `vault_app::keychain` reads the master_key from the
 # OS keychain at vault-tauri startup (per ADR-040 + ADR-040 amendment).
 # `keyring-core` is the library API crate (April 2026 v1.0.0 release;

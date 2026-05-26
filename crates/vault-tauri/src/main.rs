@@ -250,6 +250,12 @@ fn main() {
             // server bound per ADR-034). A future Tauri wiring task
             // will read the resolved model path and pass `Some(...)`
             // when the UI surfaces a read-tool affordance.
+            //
+            // T0.3.x Batch A (2026-05-26): phi4_model_path is also None
+            // here — V0.1 Tauri shell does not host the consolidator.
+            // The vault-cli `consolidate run` subcommand is the V0.2
+            // entry point for nightly merge work; T0.2.6 will land
+            // in-process scheduling that may re-evaluate this default.
             let config = AppConfig {
                 metadata_path,
                 vector_dir,
@@ -260,6 +266,7 @@ fn main() {
                 ort_lib_path,
                 at_rest_key,
                 qwen_model_path: None,
+                phi4_model_path: None,
             };
 
             // 6. Construct Application and spawn the cascading retry

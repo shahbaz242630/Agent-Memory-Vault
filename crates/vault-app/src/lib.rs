@@ -27,6 +27,7 @@
 mod adapter;
 mod application;
 mod config;
+mod consolidator_lock;
 pub mod keychain;
 mod normalization;
 pub mod process_exit;
@@ -35,6 +36,7 @@ pub mod signal_source;
 pub use adapter::VaultAdapter;
 pub use application::{Application, ApplicationHandle};
 pub use config::AppConfig;
+pub use consolidator_lock::ConsolidatorLock;
 pub use process_exit::{LiveProcessExit, ProcessExit};
 pub use signal_source::{LiveSignalSource, SignalSource};
 /// Re-export `EMBEDDING_DIM` from `vault_embedding` so vault-tauri (which

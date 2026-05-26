@@ -153,6 +153,13 @@ async fn setup_application() -> TestApp {
         // VaultError::Config("not configured") which is the correct
         // surface for the absent-model scenario.
         qwen_model_path: None,
+        // T0.3.x Batch A: same rationale as `qwen_model_path` above —
+        // integration smoke does not load Phi-4-mini (no 2.49 GB GGUF
+        // on disk in CI). `None` leaves the consolidator unwired;
+        // `Application::run_consolidation_with_safety` returns
+        // `VaultError::Config("consolidator not configured")` which is
+        // the graceful absent-model surface per locked-next-arc Thread 3.
+        phi4_model_path: None,
     };
 
     let application = Application::new(&config).await.expect(

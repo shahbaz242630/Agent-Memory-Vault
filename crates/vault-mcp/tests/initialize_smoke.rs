@@ -357,3 +357,138 @@ async fn memory_write_description_contains_canonical_save_contract() {
         panic!("server task panicked: {join_err}");
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Test 7: memory.update tool description carries the canonical-save
+// contract (admin ride-along, 2026-05-26)
+// ─────────────────────────────────────────────────────────────────────────
+//
+// Mirrors test 6's pattern. `memory.update` replaces existing memory
+// content, so the same six canonical-save rules apply — agents that
+// follow them produce higher-quality memories regardless of server-side
+// normalization. Description pinned by this test so accidental edits
+// that drop the canonical rules fail CI.
+#[tokio::test]
+async fn memory_update_description_contains_canonical_save_contract() {
+    use rmcp::ServiceExt;
+
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server = make_test_server(vec![]);
+
+    let server_handle = tokio::spawn(async move {
+        if let Ok(running) = server.serve(server_io).await {
+            let _ = running.waiting().await;
+        }
+    });
+
+    let client = ().serve(client_io).await.expect("initialize handshake completes");
+
+    let listed = client
+        .peer()
+        .list_tools(Default::default())
+        .await
+        .expect("list_tools succeeds");
+
+    let update_tool = listed
+        .tools
+        .iter()
+        .find(|t| t.name.as_ref() == "memory.update")
+        .expect("memory.update tool present in tools/list");
+
+    let description = update_tool
+        .description
+        .as_ref()
+        .expect("memory.update tool has a description")
+        .as_ref();
+
+    // Canonical-save rule keywords + when-to-call sections + cross-platform
+    // thesis phrase. Each phrase is load-bearing; dropping any one risks
+    // silent cross-platform drift.
+    let required_phrases: &[(&str, &str)] = &[
+        ("Atomic facts", "canonical rule 1"),
+        ("Third-person about the user", "canonical rule 2"),
+        ("Complete sentences", "canonical rule 3"),
+        ("Strip conversation framing", "canonical rule 4"),
+        ("Absolute dates", "canonical rule 5"),
+        ("Never first-person agent reference", "canonical rule 6"),
+        ("ANY AI agent", "cross-platform thesis"),
+        ("WHEN TO CALL", "when-to-call section header"),
+        ("WHEN NOT TO CALL", "when-not-to-call section header"),
+        ("memory.write", "cross-reference to write tool"),
+    ];
+    for (phrase, label) in required_phrases {
+        assert!(
+            description.contains(phrase),
+            "memory.update description missing canonical-save phrase {phrase:?} ({label})"
+        );
+    }
+
+    drop(client);
+    if let Err(join_err) = server_handle.await {
+        panic!("server task panicked: {join_err}");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Test 8: memory.delete tool description carries WHEN-TO-CALL /
+// IRREVERSIBILITY / idempotency guidance (admin ride-along, 2026-05-26)
+// ─────────────────────────────────────────────────────────────────────────
+//
+// Delete is rare and high-blast-radius — the description must teach
+// agents when NOT to call it (consolidator handles dedupe; update
+// handles correction; future invalidate handles stale-but-historical),
+// the irreversibility note, and the idempotency contract.
+#[tokio::test]
+async fn memory_delete_description_contains_when_to_call_guidance() {
+    use rmcp::ServiceExt;
+
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let server = make_test_server(vec![]);
+
+    let server_handle = tokio::spawn(async move {
+        if let Ok(running) = server.serve(server_io).await {
+            let _ = running.waiting().await;
+        }
+    });
+
+    let client = ().serve(client_io).await.expect("initialize handshake completes");
+
+    let listed = client
+        .peer()
+        .list_tools(Default::default())
+        .await
+        .expect("list_tools succeeds");
+
+    let delete_tool = listed
+        .tools
+        .iter()
+        .find(|t| t.name.as_ref() == "memory.delete")
+        .expect("memory.delete tool present in tools/list");
+
+    let description = delete_tool
+        .description
+        .as_ref()
+        .expect("memory.delete tool has a description")
+        .as_ref();
+
+    let required_phrases: &[(&str, &str)] = &[
+        ("WHEN TO CALL", "when-to-call section header"),
+        ("WHEN NOT TO CALL", "when-not-to-call section header"),
+        ("IRREVERSIBILITY", "irreversibility section header"),
+        ("Idempotent", "idempotency contract"),
+        ("consolidator", "delete-vs-consolidator boundary guidance"),
+        ("memory.update", "delete-vs-update guidance"),
+        ("authorized", "boundary auth note"),
+    ];
+    for (phrase, label) in required_phrases {
+        assert!(
+            description.contains(phrase),
+            "memory.delete description missing guidance phrase {phrase:?} ({label})"
+        );
+    }
+
+    drop(client);
+    if let Err(join_err) = server_handle.await {
+        panic!("server task panicked: {join_err}");
+    }
+}

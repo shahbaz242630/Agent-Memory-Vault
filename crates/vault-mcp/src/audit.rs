@@ -268,6 +268,20 @@ impl ToolInvokeError {
                 category: "KeychainProvenance".to_string(),
                 message: message.clone(),
             },
+            // T0.3.x Batch A (2026-05-26): consolidator safety-wrapper
+            // errors. Surface via `Application::run_consolidation_with_safety`
+            // (vault-cli `consolidate run` subcommand) — never via MCP tool
+            // dispatch in V0.2. Audit-coverage exhaustive via Internal with
+            // explicit category names matching `Application::run_consolidation_with_safety`'s
+            // error contract (locked-next-arc Step 4).
+            VaultError::ConsolidatorBusy(message) => Self::Internal {
+                category: "ConsolidatorBusy".to_string(),
+                message: message.clone(),
+            },
+            VaultError::ConsolidatorTimeout(elapsed_secs) => Self::Internal {
+                category: "ConsolidatorTimeout".to_string(),
+                message: format!("hard budget exceeded after {elapsed_secs}s"),
+            },
         }
     }
 }

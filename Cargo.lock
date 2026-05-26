@@ -9856,6 +9856,8 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "uuid",
+ "vault-consolidator",
  "vault-core",
  "vault-embedding",
  "vault-llm",
@@ -9880,6 +9882,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "vault-app",
+ "vault-consolidator",
  "vault-core",
  "vault-storage",
 ]
