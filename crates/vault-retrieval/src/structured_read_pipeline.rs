@@ -197,8 +197,10 @@ pub struct HealthWarning {
     pub recovery_hint: String,
 }
 
-/// The seven warning codes locked by ADR-054 Contract 2 (2026-05-26).
-/// Adding an eighth requires a Contract amendment.
+/// The six warning codes locked by ADR-054 Contract 2 (2026-05-26),
+/// amended by ADR-054 Amendment 2 (2026-05-27) which retired
+/// `DELTA_LOG_UNAVAILABLE` together with Plan Iteration 3 Contract 4.
+/// Adding a seventh requires a Contract amendment.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum WarningCode {
@@ -213,10 +215,6 @@ pub enum WarningCode {
     /// REPORT age ≥ 7d. Vault state has drifted; consolidator hasn't
     /// run in a week.
     ReportStaleCritical,
-    /// Same-day delta log unavailable. Reserved for Commit 7;
-    /// **never emitted by the Commit 6 pipeline.** A future code path
-    /// must trip this when delta-log reads fail.
-    DeltaLogUnavailable,
     /// REPORT's topic labels are placeholder `"topic_<id>"` strings.
     /// Driven by the `topic_names_unavailable: true` flag in the loaded
     /// REPORT (Phi-4-mini was unavailable at consolidation time).
@@ -1189,36 +1187,6 @@ mod tests {
             .find(|w| w.code == WarningCode::ClockSkewDetected)
             .expect("CLOCK_SKEW_DETECTED MUST fire when REPORT.generated_at > now()");
         assert_eq!(w.severity, WarningSeverity::Critical);
-    }
-
-    #[tokio::test]
-    async fn commit_6_never_emits_delta_log_unavailable_warning() {
-        // Sanity pin: DELTA_LOG_UNAVAILABLE is reserved for Commit 7.
-        // The Commit 6 pipeline has no code path that emits it; any
-        // emission here means a future commit is bleeding into Commit 6
-        // scope.
-        let now = read_clock_now();
-        let m = fake_memory(1, "f", "personal", now, 0.9, None);
-        let pipeline = StructuredReadPipeline::new(
-            MockRetriever::new(vec![retrieved(m, 0.9)]),
-            MockReportLoader::empty(),
-        )
-        .with_clock(FixedClock::arc(now));
-        let resp = pipeline
-            .read(ReadQuery {
-                query_text: "q".into(),
-                authorized_boundaries: vec![boundary("personal")],
-            })
-            .await
-            .unwrap();
-        assert!(
-            !resp
-                .health
-                .warnings
-                .iter()
-                .any(|w| w.code == WarningCode::DeltaLogUnavailable),
-            "Commit 6 MUST NOT emit DELTA_LOG_UNAVAILABLE; it lands at Commit 7"
-        );
     }
 
     // ---------------------------------------------------------------------

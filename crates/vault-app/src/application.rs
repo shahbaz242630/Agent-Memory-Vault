@@ -275,9 +275,11 @@ impl Application {
         //      `<vault_root>/reports/<boundary>.report.json`,
         //    - enriches each retrieved candidate with its
         //      consolidator-discovered topic label, and
-        //    - emits the seven ADR-054 Contract 2 health-warnings
-        //      (REPORT_MISSING, REPORT_STALE_*, DELTA_LOG_UNAVAILABLE
-        //      [Commit 7], TOPIC_NAMES_UNAVAILABLE, CLOCK_SKEW_DETECTED).
+        //    - emits the six ADR-054 Contract 2 health-warnings
+        //      (REPORT_MISSING, REPORT_STALE_*, TOPIC_NAMES_UNAVAILABLE,
+        //      CLOCK_SKEW_DETECTED). DELTA_LOG_UNAVAILABLE was retired by
+        //      ADR-054 Amendment 2 (Commit 7) when Plan Iteration 3
+        //      Contract 4 was falsified by the shipped Commit 6 shape.
         //
         //    No LLM in this stage. The pipeline is always constructed
         //    (no Option) — no model loading, no fallible setup. The

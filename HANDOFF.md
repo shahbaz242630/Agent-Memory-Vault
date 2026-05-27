@@ -2,7 +2,7 @@
 
 **Current version:** V0.2 Closed Beta (BRD §6.2 — sleep consolidator, boundaries hardening, cross-device sync, 30 beta users)
 
-**Last updated:** 2026-05-26 (T0.3.x **Batch A** pushed at `f0cc158` — Consolidator wired into runtime + `vault-cli consolidate run` subcommand + K-means topic discovery + per-boundary REPORT artifact + `invalidate()` auto-resolution wired into the merge phase. ADR-053 (REPORT shape + storage + lifecycle) shipped with this commit; ADR-052 + ADR-054 ride with Batch B Commit 6. Full local DoD green pre-push: ~610 tests pass workspace-wide / 0 failures / clippy `-D warnings` clean / fmt clean. **CI run #26449167018 `in_progress` for `f0cc158`** — next session opens by confirming CI `success` per [[ci-green-per-commit-vault-code]]. HANDOFF next-session opener rewritten for **Batch B** kick-off (Commits 6-7-8: structured-fact read pipeline + same-day delta log + founder dogfood); the rewrite is uncommitted and rides with the first Batch B code commit per [[admin-changes-ride-with-code]]. Last CI run before `f0cc158`: `08901bf` GREEN matrix-wide. Batch B picks up at Commit 6 (`read_pipeline.rs` Qwen→deterministic surgery) once CI on `f0cc158` confirms green.)
+**Last updated:** 2026-05-26 (T0.3.x **Batch B Commit 6** pushed at `99052f2` — Qwen-7B retired from read path per the 2026-05-26 architectural lock. New `StructuredReadPipeline` (`crates/vault-retrieval/src/structured_read_pipeline.rs`, ~870 lines incl. 21 unit tests covering 7 warning codes + aggregate-status rules) + new `report_io.rs` (`LoadedReport` + `FilesystemReportLoader` + `ReportLoader` trait, ~280 lines incl. 5 tests); `read_pipeline.rs` deleted; 13 Qwen-anchored spike examples deleted (research preserved in `.md` results files). ADR-052 + ADR-054 + ADR-053 Amendment 1 all shipped here. Net result across deployment modes: Local 86s → ~500ms (~170×), BYOK $0.02-0.05 → ~$0 (~50× cut), Managed PAYG ~$0.001 → ~$0.0001 (~10×). Full local DoD green pre-push: 193 tests pass workspace-wide (vault-consolidator 49, vault-retrieval 52, vault-app 56+1ign, vault-mcp 36) / 0 failures / clippy `-D warnings` clean / fmt clean. **CI run on `99052f2` GREEN matrix-wide** (ubuntu / macos / windows × build+test + clippy + fmt). Next: **Commit 7** (retire Contract 4 + ADR-054 Amendment 2) — Contract 4 (same-day delta log) was falsified 2026-05-27 by Commit 6's shipped architecture: the retriever queries SQLite/Lance directly, so today's writes are visible without a delta-log layer. Contract 4 retired; `WarningCode::DeltaLogUnavailable` removed; 7 locked codes → 6. Then **Commit 8** (founder dogfood) closes Batch B. This HANDOFF rewrite is the admin ride-along bundled with the Commit 7 code commit per [[admin-changes-ride-with-code]] (closes the "Commit 6 shipped without a HANDOFF rewrite" gap surfaced 2026-05-27).)
 
 ---
 
@@ -12,8 +12,8 @@
 
 1. ✅ **MCP `memory.write` description hardening** — shipped at `93d1410` (2026-05-25). Canonical-save contract in tool description + `vault-app::normalization` server-side helper + JSON-RPC wire-level pin test.
 2. ✅ **Consolidator → REPORT (structured per-boundary state)** — shipped at **T0.3.x Batch A** (2026-05-26). K-means topic discovery (`crates/vault-consolidator/src/topics.rs`) + per-boundary REPORT artifact with atomic write (`crates/vault-consolidator/src/report.rs`) + `invalidate()` auto-resolution in the Phase 2 contradiction branch when the LLM surfaces a `clear_winner`. Phi-4-mini placeholder fallback when LLM unavailable → `TOPIC_NAMES_UNAVAILABLE` health-warning surfaces at read time (Batch B). ADR-053 rides here.
-3. ⏳ **Read returns structured facts — NO LLM at read** — replaces Qwen-7B's 86s synthesis with cheap code: retrieve top-K (existing BGE + Tantivy + RRF + abstain) → filter by relevance threshold → structure into JSON facts → return via MCP. The calling agent (Claude / GPT / Codex / Kimi) composes its own response from the structured facts. Read latency: ~500ms total. **Batch B (Commit 6) — ADR-052 + ADR-054 ride here.**
-4. ✅ **Wire consolidator into runtime + manual trigger** — shipped at **T0.3.x Batch A**. `Application::run_consolidation_with_safety` wraps `Consolidator::run_consolidation` in a cross-process lockfile (RAII guard at `crates/vault-app/src/consolidator_lock.rs`) + 30-min hard timeout + tracing span with `run_id`. CLI entrypoint: `vault-cli consolidate run --bge-model ... --bge-tokenizer ... --ort-lib ... --phi4-model ...` with `VAULT_*_PATH` env-var fallbacks. Founder-dogfood via Claude Desktop's MCP lands at **Batch B (Commit 8)** after the structured-fact read pipeline replaces Qwen.
+3. ✅ **Read returns structured facts — NO LLM at read** — shipped at **T0.3.x Batch B Commit 6** (`99052f2`, 2026-05-26). Qwen-7B's 86s synthesis replaced with `StructuredReadPipeline`: retrieve top-K (existing BGE + Tantivy + RRF + abstain) → filter by relevance + relevance-threshold abstain → structure into JSON facts → return via MCP. The calling agent (Claude / GPT / Codex / Kimi) composes its own response from the structured facts. Read latency: ~500ms total. ADR-052 + ADR-054 + ADR-053 Amendment 1 all shipped here.
+4. ✅ **Wire consolidator into runtime + manual trigger** — runtime wiring shipped at **T0.3.x Batch A** (`f0cc158`). `Application::run_consolidation_with_safety` wraps `Consolidator::run_consolidation` in a cross-process lockfile (RAII guard at `crates/vault-app/src/consolidator_lock.rs`) + 30-min hard timeout + tracing span with `run_id`. CLI entrypoint: `vault-cli consolidate run --bge-model ... --bge-tokenizer ... --ort-lib ... --phi4-model ...` with `VAULT_*_PATH` env-var fallbacks. ⏳ Founder-dogfood via Claude Desktop's MCP lands at **Commit 8** (final Batch B commit) after Commit 7's Contract-4-retirement cleanup ships.
 
 ### 🔒 Architectural lock (2026-05-26)
 
@@ -47,9 +47,9 @@
 
 **The learning from t023-t027 spikes IS preserved** (we know what 7B does, what tuning knobs matter, what contradictions Qwen surfaces). The IMPLEMENTATION (the synthesis stage in `read_pipeline.rs`) becomes deprecated; the LEARNING informs how the structured-fact filter is designed.
 
-**Last CI run:** `08901bf` (T0.2.3 close commit 16 — `CARGO_TARGET_DIR` at D: drive) — **GREEN matrix-wide** (ubuntu / macos / windows × build+test + clippy + fmt; weekly real-model smoke correctly skipped). Windows-CI disk-exhaustion saga closed; T0.2.3 close commits 14-16 fix-forward chain shipped clean.
+**Last CI run:** `99052f2` (T0.3.x Batch B Commit 6 — structured-fact read pipeline) — **GREEN matrix-wide** (ubuntu / macos / windows × build+test + clippy + fmt; weekly real-model smoke correctly skipped). Previous run: `f0cc158` (Batch A) also GREEN. The 3-commit CI-green chain since `08901bf` (T0.2.3 close) holds: 08901bf → f0cc158 → 99052f2 all matrix-clean.
 
-**Working tree at this update:** uncommitted HANDOFF cleanup + architectural-lock section + technique map + `crates/vault-app/src/adapter.rs` update-path normalization + `crates/vault-mcp/src/server.rs` update + delete tool description hardening + `crates/vault-mcp/tests/initialize_smoke.rs` pin-test extension. Will ride with the next code commit per [[admin-changes-ride-with-code]].
+**Working tree at this update:** clean post-`99052f2` push. The "Commit 6 shipped, opening Commit 7" rewrite below (this HANDOFF.md edit) is the only admin ride-along expected to accompany the Commit 7 code commit per [[admin-changes-ride-with-code]]. The full "Commit 6 shipped" rewrite did not bundle with `99052f2` itself; rolling it forward with Commit 7 closes that gap.
 
 ---
 
@@ -133,7 +133,7 @@ Mapped against the vault's six core behaviours: **A** Write · **B** Read · **C
 |---|---|---|---|
 | **K-means clustering on BGE embeddings** | C | At consolidation: cluster each boundary's memories into ~8-15 natural topic groups; LLM (Phi-4) labels each cluster | REPORT structure IS the agent-facing output — no internal LLM smooths over messy topic grouping. Clean clusters at consolidation time are what makes the structured JSON navigable for the agent |
 | **Token/count-budgeted structured packing** | B | At read: pack top-K retrieved candidates + relevance filter into JSON response payload under a sane size cap | The load-bearing read primitive that replaces Qwen-7B. Just smart engineering — no exotic structure |
-| **Append-only delta log** | A → C | Track writes that landed since last consolidation run; read pipeline merges with REPORT at query time | Solves the "stale vault between nightly runs" gap. Plain SQLite table or append-only file |
+| ~~**Append-only delta log**~~ | ~~A → C~~ | ~~Track writes that landed since last consolidation run; read pipeline merges with REPORT at query time~~ | **RETIRED 2026-05-27** — falsified by Commit 6's retriever-primary architecture. Retriever queries SQLite/Lance directly; today's writes are visible the moment SQLite commits. See ADR-054 Amendment 2. |
 | **Generational hygiene (concept, not library)** | C | Phase 4 decay: active → decayed → archived as memories age past thresholds | T0.2.4 work. No library to add; just the policy applied to existing fields |
 | **Application startup wiring + CLI subcommand** | A, B, C | `vault-app::Application::start` constructs the Consolidator; `vault-cli consolidate run` triggers manually | The consolidator is a working library that nothing currently calls. Wiring it in is prerequisite to dogfood |
 
@@ -171,7 +171,7 @@ Mapped against the vault's six core behaviours: **A** Write · **B** Read · **C
 
 ### Specialist's pick — direction summary
 
-- **Adopt now**: K-means topic discovery + structured filter/pack code + append-only delta log
+- **Adopt now**: K-means topic discovery + structured filter/pack code (delta log RETIRED 2026-05-27 — see ADR-054 Amendment 2)
 - **Keep using**: HNSW + cascading writes + hashing + CoW-via-SQLite/Lance + Phi-4-mini at night + BGE embedder + Tantivy/RRF/abstain
 - **Park for sync (V0.2.9-13)**: Cuckoo filters
 - **Park for V1.0+ Managed**: per-tenant sharding (we get it naturally), the consensus/replication stack (likely use managed DB, don't roll our own)
@@ -181,9 +181,9 @@ The architectural lock **simplified** the menu rather than complicated it. The v
 
 ---
 
-## 🎯 Next-session opener — Batch B (Commits 6 + 7 + 8)
+## 🎯 Next-session opener — Commits 7 + 8 (closing locked-next-arc Batch B)
 
-Read this whole block before any new work. **Batch A shipped at commit `f0cc158` (2026-05-26)** — the consolidator write-side of the locked-next-arc is done. Batch B picks up the read-side + same-day deltas + founder dogfood.
+Read this whole block before any new work. **Commit 6 shipped at `99052f2` (2026-05-26)** — Qwen-7B retired from read path; `StructuredReadPipeline` + REPORT-enrichment + 7 health-warning codes all live. **Commit 7 retires Plan Iteration 3 Contract 4** (same-day delta log) — falsified 2026-05-27 by Commit 6's shipped architecture; cleanup is `WarningCode::DeltaLogUnavailable` removal + obsolete pin test removal + MCP tool-description update + ADR-054 Amendment 2 in HANDOFF (~30 LoC + admin). **Commit 8** closes Batch B with founder dogfood + optional Qwen-7B Rust code removal.
 
 ### Step 1 — Sanity check working tree + CI
 
@@ -192,54 +192,45 @@ git status --short
 gh run list --workflow=ci.yml -L 1
 ```
 
-**Expected working tree:** only this HANDOFF.md (the Batch-B opener rewrite — admin ride-along that bundles with Commit 6 per [[admin-changes-ride-with-code]]). If anything else is uncommitted, investigate before proceeding.
+**Expected working tree:** only this HANDOFF.md (the Commits-7+8 opener rewrite — admin ride-along that bundles with Commit 7 per [[admin-changes-ride-with-code]]). If anything else is uncommitted, investigate before proceeding.
 
-**Expected CI:** the latest run is for `f0cc158` (T0.3.x Batch A). If it shows `success`: proceed. If `in_progress`: wait. If `failure`: STOP — read `gh run view <run-id> --log-failed` and triage before any Batch B code per [[ci-green-per-commit-vault-code]].
+**Expected CI:** the latest run is for `99052f2` (T0.3.x Batch B Commit 6) and should show `success`. If it shows `failure` or anything unexpected, STOP — read `gh run view <run-id> --log-failed` and triage before any Commit 7 code per [[ci-green-per-commit-vault-code]].
 
 Per [[gh-run-watch-exit-not-equal-run-status]] — if `gh run watch` errors, that's network/rate-limit transient, NOT a CI failure. Verify actual run status via `gh run list` before alarming.
 
-### Step 2 — Confirm Batch B scope, no plan re-litigation
+### Step 2 — Confirm Commit 7 scope, no plan re-litigation
 
-**Plan iteration 3 is locked** (this chat session, 2026-05-26). All 5 Contracts + failure semantics are signed off:
-- Contract 1: REPORT artifact shape + storage (ADR-053, **shipped at Batch A**)
-- Contract 2: MCP `memory.read` response with `health` object (ADR-054, **ships at Commit 6**)
-- Contract 3: Consolidator behavior — K-means + Phi-4 labels + contradiction `clear_winner` (**shipped at Batch A**)
-- Contract 4: Same-day delta log (**ships at Commit 7**)
-- Contract 5: Read pipeline (deterministic filter+pack, no LLM) (**ships at Commit 6**)
+**Plan iteration 3 is locked** (2026-05-26). 4 of 5 Contracts shipped; Contract 4 retired 2026-05-27:
+- Contract 1: REPORT artifact shape + storage (ADR-053, ✅ shipped at Batch A `f0cc158`)
+- Contract 2: MCP `memory.read` response with `health` object (ADR-054, ✅ shipped at Commit 6 `99052f2`; **amended by ADR-054 Amendment 2 at Commit 7** to drop `DELTA_LOG_UNAVAILABLE` → 6 codes)
+- Contract 3: Consolidator behavior — K-means + Phi-4 labels + contradiction `clear_winner` (✅ shipped at Batch A `f0cc158`)
+- Contract 4: Same-day delta log (❌ **retired 2026-05-27** — falsified by Commit 6's shipped architecture; see ADR-054 Amendment 2 below)
+- Contract 5: Read pipeline (deterministic filter+pack, no LLM) (✅ shipped at Commit 6 `99052f2`)
 
-**Re-confirm briefly with Shahbaz:** "Plan iteration 3 still holds; we're picking up at Commit 6 (structured-fact read pipeline + ADR-052 + ADR-054). Confirm before code." This prevents silent drift back to LLM-at-read framing.
+**Re-confirm briefly with Shahbaz:** "Contract 4 retirement still holds; Commit 7 is the ~30-line cleanup commit (drop `WarningCode::DeltaLogUnavailable` + obsolete pin test + tool-description update + ADR-054 Amendment 2 in HANDOFF). Then Commit 8 dogfood closes Batch B." This prevents silent drift back to "we should still build delta log".
 
-**Do NOT re-litigate the locked contracts.** If a recon surfaces a falsifying finding, surface it as a plan amendment with falsified-by evidence per [[retract-with-falsified-by-when-prior-iteration-wrong]] — not a quiet redesign.
+**Why Contract 4 retired (one-line summary):** Contract 4 assumed REPORT was the read pipeline's candidate pool, so a delta layer was needed to keep today's writes visible. Commit 6 shipped a retriever-primary architecture where REPORT is enrichment only (`crates/vault-retrieval/src/structured_read_pipeline.rs:470` retrieves from the whole vault directly). Today's writes are visible to the retriever the moment SQLite commits them. The "make new memories visible" job has no body.
 
-### Step 3 — Batch B code sequence (3 commits per Shahbaz's batched-DoD direction)
+**Do NOT re-litigate further.** If a future recon surfaces another falsifying finding, surface as a plan amendment with falsified-by evidence per [[retract-with-falsified-by-when-prior-iteration-wrong]].
 
-Within Batch B, write all of Commit 6 + 7 + 8 in one stretch, then run gates once. Commit + push happens once at the end. Mirrors the Batch A cadence.
+### Step 3 — Code sequence (2 commits closing Batch B)
 
-**Commit 6 — Structured-fact read pipeline** (~3-4 days):
-- New `StructuredReadPipeline` in `crates/vault-retrieval/src/read_pipeline.rs` (or sibling module) — deterministic filter + pack, no LLM call.
-- Inputs: retriever (existing BGE+Tantivy+RRF+abstain wired in `vault-app::Application::new`), per-boundary REPORT loader, optional same-day delta source.
-- Output shape (locked, Contract 2): `{ boundary, query, relevant_facts: [{fact, topic, memory_id, as_of, confidence, source_agent}], abstain, health: { status, warnings: [{code, severity, detail, recovery_hint}] } }`.
-- 7 locked warning codes (Contract 2): `REPORT_MISSING` / `REPORT_STALE_INFO` (24-72h) / `REPORT_STALE_WARN` (72h-7d) / `REPORT_STALE_CRITICAL` (7d+) / `DELTA_LOG_UNAVAILABLE` / `TOPIC_NAMES_UNAVAILABLE` / `CLOCK_SKEW_DETECTED`.
-- Rip Qwen-7B out of `Application::new` step 9 (the existing `ReadPipeline` wiring with `Qwen25_14BProvider`). `AppConfig.qwen_model_path` becomes effectively dead — flag for removal at Commit 8 or leave with `#[allow(dead_code)]` and a comment pointing at the supersession.
-- `vault-mcp::server.rs::tool_read` updates to surface the new shape.
-- **ADR-052** rides here (supersedes ADR-048 + ADR-049: Qwen retired from read path).
-- **ADR-054** rides here (MCP read response health contract + locked warning codes).
-
-**Commit 7 — Same-day delta log** (~1-2 days):
-- Schema migration 0004 (or whatever the next migration number is — check `crates/vault-storage/src/migrations/`): `CREATE TABLE delta_log (memory_id TEXT PRIMARY KEY, boundary TEXT NOT NULL, appended_at TIMESTAMP NOT NULL)`.
-- Write path append in `vault-storage::cascading::write_memory` (or wherever the canonical write entrypoint lives) after the cascade commits.
-- Read path UNIONs delta_log memory IDs with REPORT-bound candidate pool BEFORE the filter step (so today's writes are visible even though they're not in last night's REPORT).
-- Consolidator clears delta_log rows older than `generated_at` at end of each successful run.
-- Failure to read delta_log → surface `DELTA_LOG_UNAVAILABLE` warning at read time (Contract 2).
+**Commit 7 — Retire Contract 4 + ADR-054 Amendment 2** (~half a day):
+- **Drop `WarningCode::DeltaLogUnavailable`** from the `WarningCode` enum in `crates/vault-retrieval/src/structured_read_pipeline.rs`. Compiler will surface any remaining references (none expected — Commit 6's emission path never lit up).
+- **Remove the obsolete pin test** `commit_6_never_emits_delta_log_unavailable_warning` (`structured_read_pipeline.rs::tests`). No replacement test needed; the warning no longer exists.
+- **Update the MCP tool description** at `crates/vault-mcp/src/server.rs::tool_read` IF it enumerates the 7 warning codes (verify via grep at kickoff). Either drop `DELTA_LOG_UNAVAILABLE` from the list or rewrite the count from 7 to 6.
+- **Update HANDOFF cross-refs** that say "7 warning codes" → "6 warning codes" (ADR-054 body + cross-link summary + opener metadata).
+- **ADR-054 Amendment 2** lands in HANDOFF (rides with this commit, no separate doc): drops `DELTA_LOG_UNAVAILABLE` from the locked-codes set, cites the falsified-by evidence (Commit 6 architecture), retires Plan Iteration 3 Contract 4. Already drafted below ADR-054 base text.
+- **Local DoD gates** before commit: fmt → check → clippy → test → fmt --check → `git status --short`. Per [[run-cargo-gates-in-background]] all in background; per [[no-parallel-cargo-invocations]] strictly serial.
 
 **Commit 8 — Founder dogfood + polish** (~1.5 days):
 - End-to-end check from Claude Desktop via MCP stdio: write a few memories, run `vault-cli consolidate run`, read them back, verify the structured-fact shape arrives in Claude Desktop and Claude composes a coherent answer from it.
 - Tighten any rough edges surfaced during dogfood. Possible items: error-message clarity, REPORT staleness threshold tuning, MCP tool description final polish.
-- If Qwen-7B Rust code (`Qwen25_14BProvider` in `vault-llm`) is now fully unused after Commit 6, remove it here. Or defer to a V0.2 cleanup commit.
+- If Qwen-7B Rust code (`Qwen25_14BProvider` in `vault-llm`) is fully unused, remove it here. `AppConfig.qwen_model_path` (currently `#[allow(dead_code)]` per ADR-052) also removed.
 
-**Note on cadence:** per Shahbaz's batched-DoD direction at Batch A kickoff (2026-05-26), inside Batch B we write all three commits in one stretch, then run local DoD once (fmt → check → test → clippy → fmt --check → git status), then ask for combined commit+push approval, then wait for CI green. Same shape as Batch A.
+**Note on cadence:** Commit 7 (retirement) is deterministic ~30-LoC + HANDOFF — ships cleanly on its own CI cycle. Commit 8 (dogfood) is exploratory and may surface fix-forward needs. Two separate commit+push cycles, per [[ci-green-per-commit-vault-code]].
 
-### Step 4 — Remaining tech-debt (still not in Batch B scope)
+### Step 4 — Remaining tech-debt (still not in Commits 7 + 8 scope)
 
 The four open items in the Tech-debt section below are NOT small:
 - Entity-extraction-at-consolidation + GraphStore relationship-rewrite — multi-week scope
@@ -247,47 +238,46 @@ The four open items in the Tech-debt section below are NOT small:
 - `pending_sync` sweep + migration 0003 — ~80 LoC + schema migration + tests (ship-gated with V0.2 sync, not the consolidator arc)
 - Lance Cosine NaN community filing — LOW priority
 
-### Frozen vs open going into Batch B
+### Frozen vs open going into Commits 7 + 8
 
 **Frozen (do not re-litigate):**
 - 🔒 **Architectural lock 2026-05-26**: LLM out of read; agent composes; vault returns structured facts. Phi-4 stays at consolidation; Qwen-7B fired from read path. See [[architectural-lock-llm-out-of-read-path]] memory.
-- [[locked-next-arc-t03x]] — four-step sequence; Steps 2 + 4 shipped at Batch A; Step 3 + final Step 4 dogfood ship at Batch B.
+- [[locked-next-arc-t03x]] — four-step sequence; Steps 1-3 + runtime-wiring of Step 4 shipped; Step 4 founder dogfood lands at Commit 8.
 - Phase C (write-time decision loop) DEFERRED to V1.0+
-- **Plan iteration 3** (this chat session, 2026-05-26): all 5 Contracts + failure semantics locked.
+- **Plan iteration 3** (2026-05-26): 5 Contracts + failure semantics locked. 4 of 5 shipped; **Contract 4 (same-day delta log) retired 2026-05-27** — falsified by Commit 6's retriever-primary architecture; see ADR-054 Amendment 2.
 - **Batch A deliverables** (commit `f0cc158`): `consolidator_lock.rs` RAII guard + 30-min hard timeout + `run_id` tracing span + `Application::run_consolidation_with_safety` + `vault-cli consolidate run` subcommand + K-means topic discovery (`topics.rs`) + per-boundary REPORT artifact (`report.rs`) + `MergeOutcome::Contradiction.clear_winner` auto-invalidate wiring.
-- **ADR-053** (REPORT shape + storage + lifecycle) — shipped at Batch A.
+- **Batch B Commit 6 deliverables** (commit `99052f2`): `structured_read_pipeline.rs` (~870 lines, 21 tests) + `report_io.rs` (~280 lines, 5 tests) + `read_pipeline.rs` deleted + 13 Qwen spike examples deleted + `Application::new` step 9 rewired + VaultAdapter + Adapter trait return type updated + `tool_read` description rewrite. 193 tests pass workspace-wide.
+- **ADR-052** (Qwen retirement from read path) — shipped at Commit 6.
+- **ADR-053** (REPORT shape + storage + lifecycle) — shipped at Batch A. **Amendment 1** (additive `topic_names_unavailable: bool` with `#[serde(default)]`) shipped at Commit 6.
+- **ADR-054** (MCP read response health-warning contract — staleness thresholds + aggregate-status rule) — shipped at Commit 6 with 7 codes; **Amendment 2 at Commit 7 (2026-05-27) drops `DELTA_LOG_UNAVAILABLE` → 6 locked codes**.
 - ADR-051 (bi-temporal `invalidate()` API contract) — still load-bearing, consumed by Batch A merge orchestrator.
 - MCP `memory.write` + `memory.update` + `memory.delete` canonical-save contract (tool descriptions + field docs + server-side `normalize_for_canonical_save`)
 - ADR-044 / 045 / 046 / 047 (consolidator surface) — still load-bearing
-- ADR-048 / 049 — formally locked but **superseded by the architectural lock**; **ADR-052** rides with Commit 6 to formalize the supersession.
+- ADR-048 / 049 — formally **superseded-in-effect by ADR-052** as of Commit 6 ship; kept in archive for the t023-t027b empirical anchors that informed the supersession.
 - Consolidator inventory above (canonical — do NOT re-discover; update in lockstep if new code lands)
 - Technique map above (do NOT re-debate Bloom vs Cuckoo, Z-order, quad-tree, etc. — settled)
 - BRD v1.4 (correctness-is-the-product thesis + three-mode deployment)
 
-**Open (Batch B):**
-- Commit 6: structured-fact read pipeline + ADR-052 + ADR-054
-- Commit 7: same-day delta log + migration 0004
-- Commit 8: founder dogfood + polish + (optional) Qwen-7B Rust code removal
+**Open (Commits 7 + 8 + tech-debt):**
+- Commit 7: retire Contract 4 (drop `WarningCode::DeltaLogUnavailable` + obsolete pin test + MCP tool-description update + HANDOFF cross-ref count updates) + ADR-054 Amendment 2 in HANDOFF
+- Commit 8: founder dogfood + polish + (optional) Qwen-7B Rust code removal + (optional) `AppConfig.qwen_model_path` field removal
 - The four multi-session tech-debt items in the Tech-debt section
-- Eventual: scheduling (T0.2.6), Phase 4 decay (T0.2.4), checkpoint+rollback (T0.2.5) — sequenced after Batch B
+- Eventual: scheduling (T0.2.6), Phase 4 decay (T0.2.4), checkpoint+rollback (T0.2.5) — sequenced after Batch B closes
 
 ### Files to read first in next session
 
 1. **This block** — current state + architectural lock + consolidator inventory + technique map + this opener
 2. **Project memories** — [[architectural-lock-llm-out-of-read-path]] + [[locked-next-arc-t03x]] + [[correctness-is-the-product]] + [[mcp-descriptions-cross-platform-lever]] + [[managed-mode-per-user-vault]]
-3. **CI status** — `gh run list --workflow=ci.yml -L 1` (confirm `f0cc158` shows `success`)
-4. **Batch A outputs (consumed by Batch B)**:
-   - `crates/vault-consolidator/src/report.rs` — REPORT artifact producer + shape; Commit 6's read pipeline consumes this.
-   - `crates/vault-consolidator/src/topics.rs` — K-means producer; provides the topic labels surfaced in REPORT facts.
-   - `crates/vault-app/src/consolidator_lock.rs` — RAII lockfile primitive (reference pattern; not load-bearing for Batch B but useful context).
-   - `crates/vault-app/src/application.rs::run_consolidation_with_safety` — shows the safety-wrapper pattern (lockfile + timeout + tracing) for any future runtime hook.
-5. **To-be-replaced code (Commit 6 surgery target)** — `crates/vault-retrieval/src/read_pipeline.rs::ReadPipeline`. Current Qwen-7B synthesis stage. Read for context; Commit 6 replaces with deterministic filter+pack.
-6. **MCP wiring target** — `crates/vault-mcp/src/server.rs::tool_read`. Where the new structured-fact response shape gets surfaced.
-7. **Existing health-degradation pattern in MCP** — `crates/vault-mcp/src/audit.rs::ToolInvokeError::from_vault_error` (for Internal-category mapping reference if Commit 6 adds new error surfaces).
+3. **CI status** — `gh run list --workflow=ci.yml -L 1` (confirm `99052f2` shows `success`)
+4. **Commit 7 surgery target — the warning enum** — `crates/vault-retrieval/src/structured_read_pipeline.rs::WarningCode`. Drop the `DeltaLogUnavailable` variant; recompile to surface any callers.
+5. **Commit 7 surgery target — the obsolete pin test** — `crates/vault-retrieval/src/structured_read_pipeline.rs::tests::commit_6_never_emits_delta_log_unavailable_warning`. Remove it entirely.
+6. **Commit 7 cross-ref site** — `crates/vault-mcp/src/server.rs::tool_read`. Grep for `DELTA_LOG_UNAVAILABLE` or "7 warning codes" or similar; update if found.
+7. **Commit 7 falsification anchor (read for grounding only, do NOT modify)** — `crates/vault-retrieval/src/structured_read_pipeline.rs::read` lines 460-490. This is the retriever-primary read path that falsified Contract 4's "REPORT-bound candidate pool" assumption. Cited verbatim in ADR-054 Amendment 2.
+8. **Commit 8 dogfood entry points** — `crates/vault-cli/src/main.rs` (`vault-cli consolidate run` subcommand) + `crates/vault-mcp/src/server.rs` (MCP stdio surface for Claude Desktop).
 
 ### Three sentences to open next session with
 
-If you're me opening cold: confirm CI green on `f0cc158` first, then re-anchor with Shahbaz "Plan iteration 3 still holds; we're at Commit 6 (structured-fact read pipeline + ADR-052 + ADR-054)." Read `crates/vault-consolidator/src/report.rs` + `crates/vault-retrieval/src/read_pipeline.rs` + `crates/vault-mcp/src/server.rs::tool_read` to ground the surgery before any code. Then proceed with Commit 6 → 7 → 8 as one stretch per Shahbaz's batched-DoD cadence, gates at the end of Batch B.
+If you're me opening cold: confirm CI green on `99052f2` first, then re-anchor with Shahbaz "Contract 4 retirement still holds; Commit 7 is the ~30-line cleanup (drop `WarningCode::DeltaLogUnavailable` + obsolete pin test + MCP description update + ADR-054 Amendment 2). Then Commit 8 dogfood closes Batch B." Read `crates/vault-retrieval/src/structured_read_pipeline.rs` to confirm the `DeltaLogUnavailable` variant + obsolete test are still the only delta-log surface to remove. Then proceed with Commit 7 (deterministic, CI-cycles cleanly) → Commit 8 (founder dogfood, may surface fix-forward) as two separate commit+push cycles per [[ci-green-per-commit-vault-code]].
 
 ---
 
@@ -496,7 +486,7 @@ Stale `.tmp` files (process killed between `fsync` and `rename`) persist until t
 
 ### ADR-053 Amendment 1 — additive `topic_names_unavailable` field (Commit 6, 2026-05-26)
 
-**Status:** Accepted, Commit 6 of locked-next-arc (2026-05-26). Rides with the Commit 6 code commit.
+**Status:** Accepted, shipped at Commit 6 (`99052f2`, 2026-05-26).
 
 **Context.** During Commit 6 implementation source-read it surfaced that `vault_consolidator::topics::TopicMap` carries a `topic_names_unavailable: bool` signal (set when Phi-4-mini is unavailable and clusters fall back to placeholder `"topic_<id>"` labels) but the persisted `Report` shape locked at Batch A did NOT propagate the field. ADR-054 Contract 2 (Batch B Commit 6) requires surfacing this as the `TOPIC_NAMES_UNAVAILABLE` health-warning — without the producer-side field, the signal silently dies at the disk boundary.
 
@@ -518,7 +508,7 @@ Stale `.tmp` files (process killed between `fsync` and `rename`) persist until t
 
 ## ADR-052 — Qwen-7B retirement from read path (Commit 6 of locked-next-arc)
 
-**Status:** Accepted, Commit 6 (2026-05-26). **Supersedes ADR-048 + ADR-049 in effect** (the LLM read-time pipeline they ship is retired; the model lock they document becomes archival).
+**Status:** Accepted, shipped at Commit 6 (`99052f2`, 2026-05-26). **Supersedes ADR-048 + ADR-049 in effect** (the LLM read-time pipeline they ship is retired; the model lock they document becomes archival).
 
 **Context.** BRD v1.4 architectural lock (2026-05-26, captured in [[architectural-lock-llm-out-of-read-path]]) reframed the read path: the vault's consumer is itself an LLM (Claude / GPT / Codex / Kimi via MCP). Pre-composing prose for it was redundant work the agent re-does anyway in its own voice. Empirical anchors that drove the rethink:
 
@@ -581,7 +571,7 @@ Stale `.tmp` files (process killed between `fsync` and `rename`) persist until t
 
 ## ADR-054 — MCP `memory.read` response health-warning contract (Commit 6 of locked-next-arc)
 
-**Status:** Accepted, Commit 6 (2026-05-26). Locks the locked-next-arc Plan Iteration 3 Contract 2 surface.
+**Status:** Accepted, shipped at Commit 6 (`99052f2`, 2026-05-26). Locks the locked-next-arc Plan Iteration 3 Contract 2 surface.
 
 **Context.** With Qwen-7B retired from the read path (ADR-052), the MCP `memory.read` tool now returns structured facts the agent composes from. But the agent needs to know when the vault state behind those facts is stale, missing, or otherwise compromised — otherwise it'll cheerfully compose answers from a REPORT that hasn't been refreshed in a month. The agent contract needs a structured health surface.
 
@@ -668,6 +658,55 @@ Boundary-order × per-boundary sequence makes consecutive identical reads byte-i
 - Tool-description sanity pin: the Commit 6 changes the MCP `tool_read` description; pinned indirectly by `initialize_smoke.rs` `tools/list` contract.
 
 **Cross-refs.** ADR-052 (Qwen retirement, ships at same commit) · ADR-053 + Amendment 1 (REPORT shape consumed) · `crates/vault-retrieval/src/structured_read_pipeline.rs` (production impl + 21 unit tests) · `crates/vault-mcp/src/server.rs::tool_read` (agent-facing description) · [[locked-next-arc-t03x]] Plan Iteration 3 Contract 2.
+
+### ADR-054 Amendment 2 — drop `DELTA_LOG_UNAVAILABLE`, retire Plan Iteration 3 Contract 4 (Commit 7, 2026-05-27)
+
+**Status:** Drafted 2026-05-27, lands at Commit 7. Rides with the Commit 7 code commit (cleanup of `WarningCode::DeltaLogUnavailable` + obsolete pin test).
+
+**Context.** ADR-054's base text (above) locks 7 warning codes including `DELTA_LOG_UNAVAILABLE`, which is reserved for a same-day delta-log layer scoped under Plan Iteration 3 Contract 4. The Commit 6 pin test `commit_6_never_emits_delta_log_unavailable_warning` is the forward-looking pin: Commit 6 ships the code as a reserved variant; Commit 7 was meant to light up its real emission path when delta-log reads fail.
+
+**Falsifying recon (2026-05-27 session-open).** Source-read of the as-shipped `crates/vault-retrieval/src/structured_read_pipeline.rs::read` (Commit 6, `99052f2`) shows:
+
+- **Line 470** — `let candidates = self.retriever.retrieve(retrieval_query).await?` — retrieval runs against the **whole vault** via the existing `Retriever` (BGE + Tantivy + RRF + abstain). It queries SQLite + Lance directly. No REPORT-based candidate filter.
+- **Lines 449-458** — REPORT is loaded only to build a `topic_lookup: HashMap<MemoryId, String>`. REPORT is **enrichment-only**, not a candidate pool.
+- **Lines 477-487** — memories not in REPORT still get returned to the agent — just with `topic: None`.
+
+Combined with the cascading-write path (`crates/vault-storage/src/cascading.rs::write_memory` at line 343 → `cascading_write` at line 728): SQLite + Lance commits happen synchronously before `Ack` returns. The retriever sees newly-written memories immediately. **Today's writes are visible without a delta-log layer.**
+
+Contract 4 was conceived under an architecture where REPORT was the candidate pool. Commit 6 shipped a retriever-primary architecture where REPORT is enrichment only. The architecture changed during the locked-next-arc work; Contract 4's mechanism wasn't re-litigated against the actual shipped shape. Per [[fix-one-break-another-signals-structural]] + [[retract-with-falsified-by-when-prior-iteration-wrong]] the right move is honest retirement, not building infrastructure with no job.
+
+**Decision.**
+
+1. **Drop `WarningCode::DeltaLogUnavailable`** from the `WarningCode` enum in `structured_read_pipeline.rs`. The locked-codes set drops from 7 → 6: `REPORT_MISSING` / `REPORT_STALE_INFO` / `REPORT_STALE_WARN` / `REPORT_STALE_CRITICAL` / `TOPIC_NAMES_UNAVAILABLE` / `CLOCK_SKEW_DETECTED`.
+2. **Remove the obsolete pin test** `commit_6_never_emits_delta_log_unavailable_warning` from `structured_read_pipeline.rs::tests`. No replacement test; the variant no longer exists.
+3. **Update the MCP tool description** at `vault-mcp/src/server.rs::tool_read` IF it enumerates the 7 codes (verify via grep at kickoff).
+4. **Retire Plan Iteration 3 Contract 4** entirely. No delta-log table. No schema migration 0003 for delta log (migration 0003 stays reserved for the `pending_sync` payload tech-debt entry).
+5. **The ADR-054 base text above stays unchanged for archival** — Amendment 2 is the locked surface from Commit 7 forward. Future readers see "Status: Accepted, shipped at Commit 6" + this Amendment 2's "Status: Drafted 2026-05-27" together and understand the supersession chain.
+
+**What stays load-bearing in ADR-054 base.**
+
+- Six of seven warning codes (all except `DELTA_LOG_UNAVAILABLE`)
+- Staleness threshold constants (`STALE_INFO_THRESHOLD` = 24h, `STALE_WARN_THRESHOLD` = 72h, `STALE_CRITICAL_THRESHOLD` = 7d)
+- Aggregate-status rule (Critical / Degraded / Ok three-tier)
+- Emission ordering (schema-guard → clock-skew → staleness tier → topic-names-unavailable, per-boundary in input order)
+- Response shape (`boundary` / `query` / `relevant_facts` / `abstain` / `health` with `status` + `warnings`)
+
+**Rejected alternatives.**
+
+- **Keep `DeltaLogUnavailable` as a Reserved variant with `#[allow(dead_code)]`** — bleeds a never-emitted enum variant into the public API surface. The CLAUDE.md no-backwards-compat principle applies: delete the code.
+- **Repurpose `DELTA_LOG_UNAVAILABLE` for a different signal** (e.g., "post-REPORT memories present, topic clustering pending") — different semantics under the same name is worse than a clean rename. Future ADR can add a new code with a precise name if the use case surfaces.
+- **Build delta_log anyway as forward-compat for V0.2 cross-device sync (V0.2.9-13)** — violates CLAUDE.md "Don't design for hypothetical future requirements." When the sync arc lands, its data-shape needs may differ from what Contract 4 envisioned anyway. Build at sync time with sync-anchored evidence.
+
+**Pin tests (after the obsolete one is removed).**
+
+- 6 warning-code tests in `structured_read_pipeline.rs::tests` (one per remaining code's trigger + severity)
+- 4 aggregate-status tests (one per branch of the three-tier rule)
+- 4 boundary-field semantics tests
+- 15 → 14 total covering ADR-054 surface
+
+**Pin-test count update.** ADR-054 base text said "Pinned by 15 unit tests in `crates/vault-retrieval/src/structured_read_pipeline.rs`." Post-Amendment-2 the count is **14** (one test removed, no replacement added). The base-text count stays as-written for archival fidelity; this Amendment is the authoritative current count.
+
+**Cross-refs.** ADR-054 base text above · `crates/vault-retrieval/src/structured_read_pipeline.rs::read` lines 460-490 (falsifying anchor) · `crates/vault-storage/src/cascading.rs::cascading_write` line 728 (commit-before-Ack proof) · [[architectural-lock-llm-out-of-read-path]] (the architecture lock that drove Commit 6's retriever-primary shape) · [[retract-with-falsified-by-when-prior-iteration-wrong]] (the discipline this Amendment honors).
 
 ---
 
@@ -954,9 +993,9 @@ The following ADRs are LIVE for current V0.2 work. **Full text in `HANDOFF_V0.2_
 - **ADR-048** — Read-time pipeline architecture (T0.2.3 close). Two-stage pipeline (BGE retrieve top-20 → single Qwen-7B synthesis call). **SUPERSEDED-IN-EFFECT by ADR-052 at Commit 6 (2026-05-26)** — read path no longer runs the LLM; kept here as archival reference for the t023-t027b empirical anchors that informed the supersession decision. Full ADR text above this section.
 - **ADR-049** — Qwen2.5-7B-Instruct Q4_K_M model lock (T0.2.3 close). Apache 2.0, 128K context, ~4.36 GB. **SUPERSEDED-IN-EFFECT-FOR-READ-PATH by ADR-052 at Commit 6 (2026-05-26)** — `Qwen25_14BProvider` is no longer wired in `Application::new` step 9; the Rust code remains in `vault-llm` until Commit 8 confirms full disuse and removes it. Full ADR text above this section.
 - **ADR-051** — Bi-temporal storage semantics + invalidation API contract (T0.2.7 Phase B, 2026-05-24). Locks `valid_until` semantics + retrieval filter + `invalidate()` API surface + orthogonality with `mark_superseded`. No schema migration (fields already exist since T0.1.3). Full ADR text above this section.
-- **ADR-052** — Qwen-7B retirement from read path (Commit 6 of locked-next-arc, 2026-05-26). Formally supersedes ADR-048 + ADR-049 in effect: replaces the V0.2-era Qwen-7B single-call synthesis pipeline (mean 86s, p99 119.7s on Vulkan iGPU) with the deterministic `StructuredReadPipeline` (~500ms total). Delivers ~170× local-mode speedup, ~50× BYOK cost cut, ~10× Managed PAYG margin. Phi-4-mini stays at nightly consolidation. ADR-051 + ADR-053 + ADR-044/045/046/047 unchanged. Full ADR text above this section.
-- **ADR-053** — Per-boundary REPORT artifact shape + storage + lifecycle (T0.3.x Batch A, 2026-05-26). Locks the structured JSON shape (`schema_version` + `boundary` + `generated_at` + `consolidator_run_id` + `facts_by_topic` keyed by topic label), storage path `<vault_root>/reports/<boundary>.report.json`, atomic `.tmp + fsync + rename` write protocol, and latest-only versioning. Consumed by the Batch B Commit 6 structured-fact read pipeline. **Amendment 1 at Commit 6 (2026-05-26)** adds `topic_names_unavailable: bool` (additive, `#[serde(default)]`) so the read pipeline can surface ADR-054's `TOPIC_NAMES_UNAVAILABLE` warning. Full ADR text + Amendment 1 above this section.
-- **ADR-054** — MCP `memory.read` response health-warning contract (Commit 6 of locked-next-arc, 2026-05-26). Locks the structured-fact response shape (`boundary` / `query` / `relevant_facts` / `abstain` / `health`) and the seven warning codes (`REPORT_MISSING` / `REPORT_STALE_INFO` / `REPORT_STALE_WARN` / `REPORT_STALE_CRITICAL` / `DELTA_LOG_UNAVAILABLE` / `TOPIC_NAMES_UNAVAILABLE` / `CLOCK_SKEW_DETECTED`) with their severity assignments + staleness threshold constants + aggregate-status rule. Pinned by 15 unit tests in `crates/vault-retrieval/src/structured_read_pipeline.rs`. Full ADR text above this section.
+- **ADR-052** — Qwen-7B retirement from read path (shipped at Commit 6, `99052f2`, 2026-05-26). Formally supersedes ADR-048 + ADR-049 in effect: replaces the V0.2-era Qwen-7B single-call synthesis pipeline (mean 86s, p99 119.7s on Vulkan iGPU) with the deterministic `StructuredReadPipeline` (~500ms total). Delivers ~170× local-mode speedup, ~50× BYOK cost cut, ~10× Managed PAYG margin. Phi-4-mini stays at nightly consolidation. ADR-051 + ADR-053 + ADR-044/045/046/047 unchanged. Full ADR text above this section.
+- **ADR-053** — Per-boundary REPORT artifact shape + storage + lifecycle (shipped at T0.3.x Batch A, `f0cc158`, 2026-05-26). Locks the structured JSON shape (`schema_version` + `boundary` + `generated_at` + `consolidator_run_id` + `facts_by_topic` keyed by topic label), storage path `<vault_root>/reports/<boundary>.report.json`, atomic `.tmp + fsync + rename` write protocol, and latest-only versioning. Consumed by the Batch B Commit 6 structured-fact read pipeline. **Amendment 1 shipped at Commit 6 (`99052f2`, 2026-05-26)** adds `topic_names_unavailable: bool` (additive, `#[serde(default)]`) so the read pipeline can surface ADR-054's `TOPIC_NAMES_UNAVAILABLE` warning. Full ADR text + Amendment 1 above this section.
+- **ADR-054** — MCP `memory.read` response health-warning contract (shipped at Commit 6, `99052f2`, 2026-05-26). Locks the structured-fact response shape (`boundary` / `query` / `relevant_facts` / `abstain` / `health`) with staleness threshold constants + aggregate-status rule + per-boundary deterministic emission ordering. **Amendment 2 at Commit 7 (drafted 2026-05-27) drops `DELTA_LOG_UNAVAILABLE`** → 6 locked codes (`REPORT_MISSING` / `REPORT_STALE_INFO` / `REPORT_STALE_WARN` / `REPORT_STALE_CRITICAL` / `TOPIC_NAMES_UNAVAILABLE` / `CLOCK_SKEW_DETECTED`); retires Plan Iteration 3 Contract 4 (same-day delta log) as falsified by Commit 6's retriever-primary architecture. Pinned by 14 unit tests in `crates/vault-retrieval/src/structured_read_pipeline.rs` (was 15; one obsolete pin removed at Commit 7). Full ADR text + Amendment 2 above this section.
 
 **V0.1-era ADRs (ADR-001 → ADR-030 + ADR-008 amendments)** — full text in `HANDOFF_V0.1_ARCHIVE.md`.
 
