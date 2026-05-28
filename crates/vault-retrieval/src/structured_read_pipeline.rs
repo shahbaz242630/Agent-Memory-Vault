@@ -69,7 +69,7 @@ use serde::Serialize;
 use vault_core::{Boundary, MemoryId, VaultError, VaultResult};
 
 use crate::report_io::{LoadedReport, ReportLoader};
-use crate::retriever::{RetrievalOptions, RetrievalQuery, Retriever};
+use crate::retriever::{RetrievalOptions, RetrievalQuery, RetrievedMemory, Retriever};
 
 // =============================================================================
 // Constants — locked by ADR-054 (Commit 6)
@@ -79,6 +79,26 @@ use crate::retriever::{RetrievalOptions, RetrievalQuery, Retriever};
 /// Matches the V0.2-era `read_pipeline::DEFAULT_MAX_CANDIDATES` for
 /// continuity with the t026 8-query gauntlet anchoring.
 pub const DEFAULT_MAX_CANDIDATES: usize = 20;
+
+/// Number of top semantic hits the relevance gate averages (ADR-057,
+/// 2026-05-28). **Top-1** (K=1): the single best semantic match. We started at
+/// top-3 mean (wider gap on the 100-memory fixture: 0.070 vs 0.054), but live
+/// dogfood proved top-3 mean DILUTES a single strong match with weak fillers on
+/// a sparse vault — it over-abstained on a real query whose answer was present
+/// (the "zafflang" case: search found it, the read hid it). top-1 cannot be
+/// diluted; for a memory vault, recall > precision (hiding a real memory is the
+/// worst failure). See ADR-057 over-abstain amendment.
+const RELEVANCE_GATE_TOP_K: usize = 1;
+
+/// Minimum top-1 BGE cosine for a query to count as having relevant content.
+/// Below this the read abstains (no-signal). Calibrated 2026-05-28
+/// (`abstain_channel_diagnostic` top-1 column, n=5 no-signal probes): no-signal
+/// top-1 ≤ 0.642, the four must-proceed contradictions ≥ 0.696 → 0.66 sits in
+/// that gap (slight recall bias toward proceeding). ADR-057. V0.2 closes
+/// no-signal abstention ONLY; topical-noise (the Q21 class, top-1 0.717 — above
+/// two contradictions) is structurally unseparable by a cosine floor and is
+/// deferred to a non-LLM cross-encoder reranker at V1.0+.
+const RELEVANCE_COSINE_FLOOR: f32 = 0.66;
 
 /// Staleness tier thresholds. Age = `now() - generated_at`.
 ///
@@ -271,6 +291,12 @@ impl Clock for SystemClock {
 #[derive(Clone)]
 pub struct StructuredReadPipeline {
     retriever: Arc<dyn Retriever>,
+    /// Optional semantic-only probe channel for the relevance gate
+    /// (ADR-057). When `Some`, `read` abstains if the top-K-mean BGE cosine
+    /// is below [`RELEVANCE_COSINE_FLOOR`]. Wired in production via
+    /// [`Self::with_relevance_gate`]; `None` (the `new` default) disables the
+    /// gate so unit tests exercising other contracts are unaffected.
+    semantic: Option<Arc<dyn Retriever>>,
     report_loader: Arc<dyn ReportLoader>,
     clock: Arc<dyn Clock>,
     max_candidates: usize,
@@ -283,10 +309,23 @@ impl StructuredReadPipeline {
     pub fn new(retriever: Arc<dyn Retriever>, report_loader: Arc<dyn ReportLoader>) -> Self {
         Self {
             retriever,
+            semantic: None,
             report_loader,
             clock: Arc::new(SystemClock),
             max_candidates: DEFAULT_MAX_CANDIDATES,
         }
+    }
+
+    /// Enable the relevance gate (ADR-057) with a semantic-only probe channel
+    /// (production: the `SemanticRetriever` backing the hybrid's dense leg).
+    /// When wired, [`Self::read`] abstains on a query whose top-K-mean BGE
+    /// cosine is below [`RELEVANCE_COSINE_FLOOR`] — closing the no-signal
+    /// ship-gate. Mirrors the [`Self::with_clock`] /
+    /// [`Self::with_max_candidates`] builder style.
+    #[must_use]
+    pub fn with_relevance_gate(mut self, semantic: Arc<dyn Retriever>) -> Self {
+        self.semantic = Some(semantic);
+        self
     }
 
     /// Override the wall-clock provider. Tests inject a fixed-point
@@ -455,17 +494,48 @@ impl StructuredReadPipeline {
             }
         }
 
-        // Stage 1 — retrieval. Hands `authorized_boundaries` to the
-        // retriever; the abstain gate (production: AbstainingRetriever)
-        // returns empty when the top-1 BM25 score is below the cliff,
-        // which we surface as abstain=true below.
+        // Stage 1 — retrieval, gated on semantic relevance (ADR-057).
         let retrieval_query = RetrievalQuery {
             query_text: query_echo.clone(),
             authorized_boundaries: query.authorized_boundaries.clone(),
             max_results: self.max_candidates,
             options: RetrievalOptions::default(),
         };
-        let candidates = self.retriever.retrieve(retrieval_query).await?;
+
+        // Relevance gate (Approach P, ADR-057). When a semantic probe channel
+        // is wired, abstain if the top-K-mean BGE cosine is below the floor:
+        // a query with no semantically relevant content must NOT return the
+        // whole boundary (the no-signal A6 ship-gate). Cosine is the one
+        // signal immune to the canonical-format shared-subject-token
+        // degeneracy that defeats a keyword gate. The BM25 top-1 gate in
+        // `AbstainingRetriever` is left in place but is now vestigial for the
+        // read path — superseded in effect by this gate; its formal
+        // retirement + per-candidate relevance filtering are deferred to the
+        // carry-cosine-through-fusion follow-up (tracked tech-debt).
+        let candidates = if let Some(semantic) = &self.semantic {
+            let gate_query = RetrievalQuery {
+                query_text: query_echo.clone(),
+                authorized_boundaries: query.authorized_boundaries.clone(),
+                max_results: RELEVANCE_GATE_TOP_K,
+                options: RetrievalOptions::default(),
+            };
+            let probe = semantic.retrieve(gate_query).await?;
+            let relevance = mean_top_k_cosine(&probe, RELEVANCE_GATE_TOP_K);
+            if relevance < RELEVANCE_COSINE_FLOOR {
+                tracing::info!(
+                    target: "vault_retrieval::relevance_gate",
+                    relevance_top_k_mean = relevance,
+                    floor = RELEVANCE_COSINE_FLOOR,
+                    top_k = RELEVANCE_GATE_TOP_K,
+                    "abstain: top-K mean semantic cosine below relevance floor"
+                );
+                Vec::new()
+            } else {
+                self.retriever.retrieve(retrieval_query).await?
+            }
+        } else {
+            self.retriever.retrieve(retrieval_query).await?
+        };
 
         // Stage 2 — pack into RelevantFacts. Empty retrieval is the only
         // abstain trigger after the zero-boundary short-circuit above.
@@ -564,6 +634,20 @@ fn aggregate_status(warnings: &[HealthWarning]) -> HealthStatus {
     } else {
         HealthStatus::Degraded
     }
+}
+
+/// Mean of the top-`k` semantic cosine scores in `hits` (fewer if the slice
+/// is shorter; 0.0 if empty). The relevance gate's signal — see
+/// [`RELEVANCE_GATE_TOP_K`] / [`RELEVANCE_COSINE_FLOOR`] (ADR-057). Assumes
+/// `hits` is sorted by score DESC (the `Retriever` trait invariant), so the
+/// first `k` are the highest-cosine hits.
+fn mean_top_k_cosine(hits: &[RetrievedMemory], k: usize) -> f32 {
+    if hits.is_empty() || k == 0 {
+        return 0.0;
+    }
+    let n = k.min(hits.len());
+    let sum: f32 = hits.iter().take(n).map(|h| h.score).sum();
+    sum / n as f32
 }
 
 impl std::fmt::Debug for StructuredReadPipeline {
@@ -1002,6 +1086,201 @@ mod tests {
             resp.relevant_facts[0].topic.is_none(),
             "REPORT_MISSING case MUST set topic=None on all facts"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Group C.5 — relevance gate (ADR-057): no-signal abstention via the
+    // semantic top-1 cosine floor. Both directions pinned + anti-dilution.
+    // ---------------------------------------------------------------------
+
+    /// Mock semantic probe channel returning `RELEVANCE_GATE_TOP_K` hit(s) all
+    /// at `cosine`, so the gate's top-1 equals `cosine` exactly.
+    fn semantic_probe_at(cosine: f32) -> Arc<MockRetriever> {
+        let now = read_clock_now();
+        let hits: Vec<RetrievedMemory> = (0..RELEVANCE_GATE_TOP_K)
+            .map(|i| {
+                let m = fake_memory(900 + i as u128, "probe", "personal", now, 0.9, None);
+                retrieved(m, cosine)
+            })
+            .collect();
+        MockRetriever::new(hits)
+    }
+
+    #[test]
+    fn relevance_floor_and_top_k_are_pinned() {
+        // ADR-057 calibration pins (n=5 no-signal probes, 2026-05-28). A future
+        // embedder swap that shifts the cosine distribution MUST re-break these
+        // consciously, not drift silently.
+        assert!(
+            (RELEVANCE_COSINE_FLOOR - 0.66).abs() < f32::EPSILON,
+            "relevance floor pinned at 0.66 (top-1 calibration: in the 0.642-0.696 gap)"
+        );
+        assert_eq!(
+            RELEVANCE_GATE_TOP_K, 1,
+            "top-1 (NOT top-K mean — avoids sparse-vault dilution; see over-abstain finding)"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_signal_query_abstains_when_top_k_mean_below_floor() {
+        // The A6 ship-gate. The main retriever WOULD return a candidate (so the
+        // abstain is the GATE firing, not empty retrieval), but the semantic
+        // probe's top-1 (0.61) is below the 0.66 floor → abstain, no facts.
+        let now = read_clock_now();
+        let candidate = fake_memory(1, "an unrelated fact", "personal", now, 0.9, None);
+        let pipeline = StructuredReadPipeline::new(
+            MockRetriever::new(vec![retrieved(candidate, 0.0145)]),
+            MockReportLoader::empty(),
+        )
+        .with_clock(FixedClock::arc(now))
+        .with_relevance_gate(semantic_probe_at(0.61));
+        let resp = pipeline
+            .read(ReadQuery {
+                query_text: "what is the user's blood type".into(),
+                authorized_boundaries: vec![boundary("personal")],
+            })
+            .await
+            .expect("gate abstain MUST succeed, not error");
+        assert!(
+            resp.abstain,
+            "top-1 0.61 < floor 0.66 MUST abstain (no-signal ship-gate)"
+        );
+        assert!(
+            resp.relevant_facts.is_empty(),
+            "abstain MUST return empty facts even though the retriever had a candidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn genuine_content_proceeds_when_top_k_mean_above_floor() {
+        // No over-abstain: a real query (semantic top-1 0.72) clears the
+        // floor → candidates returned, abstain=false.
+        let now = read_clock_now();
+        let m = fake_memory(
+            1,
+            "the user prefers dark roast",
+            "personal",
+            now,
+            0.95,
+            None,
+        );
+        let pipeline = StructuredReadPipeline::new(
+            MockRetriever::new(vec![retrieved(m, 0.0328)]),
+            MockReportLoader::empty(),
+        )
+        .with_clock(FixedClock::arc(now))
+        .with_relevance_gate(semantic_probe_at(0.72));
+        let resp = pipeline
+            .read(ReadQuery {
+                query_text: "what coffee does the user like".into(),
+                authorized_boundaries: vec![boundary("personal")],
+            })
+            .await
+            .unwrap();
+        assert!(
+            !resp.abstain,
+            "top-1 0.72 >= floor 0.66 MUST proceed (no over-abstain)"
+        );
+        assert_eq!(resp.relevant_facts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn contradiction_band_proceeds_at_lowest_measured_cosine() {
+        // The lowest must-proceed contradiction measured at top-1 cosine 0.696
+        // (Q26) MUST clear the 0.66 floor — contradiction detection is not
+        // silently gated off.
+        let now = read_clock_now();
+        let m = fake_memory(1, "GA launch is Q1 2027", "work", now, 0.95, None);
+        let pipeline = StructuredReadPipeline::new(
+            MockRetriever::new(vec![retrieved(m, 0.0300)]),
+            MockReportLoader::empty(),
+        )
+        .with_clock(FixedClock::arc(now))
+        .with_relevance_gate(semantic_probe_at(0.696));
+        let resp = pipeline
+            .read(ReadQuery {
+                query_text: "when did we decide GA launch".into(),
+                authorized_boundaries: vec![boundary("work")],
+            })
+            .await
+            .unwrap();
+        assert!(
+            !resp.abstain,
+            "lowest contradiction cosine 0.696 >= 0.66 MUST proceed"
+        );
+    }
+
+    #[tokio::test]
+    async fn top1_proceeds_on_single_strong_match_amid_weak_fillers() {
+        // The over-abstain regression (live dogfood 2026-05-28): on a sparse
+        // vault a real query has ONE strong match (e.g. zafflang ~0.72) plus
+        // weak unrelated fillers (~0.45). top-3 mean would be ~0.54 → wrongly
+        // abstain; top-1 (0.72) clears the 0.66 floor → proceeds. This is WHY
+        // the gate uses top-1 (RELEVANCE_GATE_TOP_K=1), not top-K mean.
+        let now = read_clock_now();
+        let m = fake_memory(
+            1,
+            "the user prefers the zafflang language",
+            "personal",
+            now,
+            0.95,
+            None,
+        );
+        // Probe with one strong hit + two weak fillers, in score-DESC order
+        // (mirrors the SemanticRetriever's sorted output).
+        let strong = fake_memory(901, "strong match", "personal", now, 0.9, None);
+        let filler1 = fake_memory(902, "filler one", "personal", now, 0.9, None);
+        let filler2 = fake_memory(903, "filler two", "personal", now, 0.9, None);
+        let probe: Arc<dyn Retriever> = MockRetriever::new(vec![
+            retrieved(strong, 0.72),
+            retrieved(filler1, 0.45),
+            retrieved(filler2, 0.45),
+        ]);
+        let pipeline = StructuredReadPipeline::new(
+            MockRetriever::new(vec![retrieved(m, 0.0328)]),
+            MockReportLoader::empty(),
+        )
+        .with_clock(FixedClock::arc(now))
+        .with_relevance_gate(probe);
+        let resp = pipeline
+            .read(ReadQuery {
+                query_text: "what language do I prefer".into(),
+                authorized_boundaries: vec![boundary("personal")],
+            })
+            .await
+            .unwrap();
+        assert!(
+            !resp.abstain,
+            "top-1 (0.72) MUST proceed despite weak fillers — top-3 mean (0.54) would over-abstain"
+        );
+        assert_eq!(resp.relevant_facts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn gate_disabled_by_default_does_not_abstain_on_low_cosine() {
+        // Opt-in semantics: a pipeline built WITHOUT `with_relevance_gate`
+        // never runs the probe, so it returns candidates regardless of cosine
+        // (the existing pipeline contract the other tests rely on).
+        let now = read_clock_now();
+        let m = fake_memory(1, "fact", "personal", now, 0.9, None);
+        let pipeline = StructuredReadPipeline::new(
+            MockRetriever::new(vec![retrieved(m, 0.0145)]),
+            MockReportLoader::empty(),
+        )
+        .with_clock(FixedClock::arc(now));
+        // NOTE: no .with_relevance_gate(...)
+        let resp = pipeline
+            .read(ReadQuery {
+                query_text: "anything".into(),
+                authorized_boundaries: vec![boundary("personal")],
+            })
+            .await
+            .unwrap();
+        assert!(
+            !resp.abstain,
+            "gate-off pipeline MUST NOT abstain on a returned candidate"
+        );
+        assert_eq!(resp.relevant_facts.len(), 1);
     }
 
     // ---------------------------------------------------------------------

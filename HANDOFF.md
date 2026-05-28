@@ -2,7 +2,7 @@
 
 **Current version:** V0.2 Closed Beta (BRD §6.2 — sleep consolidator, boundaries hardening, cross-device sync, 30 beta users)
 
-**Last updated:** 2026-05-28 (T0.3.x **Batch B Commit 8** in working tree — `vault-cli mcp serve` entrypoint + tool-name rename `memory.X`→`memory_X` + stderr tracing + 3 dogfood fixes per **ADR-056** (keyword-index-on-write / delete idempotency / content-cap store-whole). **Memory Vault connected LIVE to Claude Desktop on 2026-05-28** — full MCP handshake, all 5 tools, real write→read round-trips. Local DoD gates all green; `vault-cli` binary rebuilt; **live re-verification of the 3 fixes is the next step**. Commit 7 shipped at `f6293c6` (CI green). **Commit 8 NOT yet committed.** See the 🎯 Next-session opener below for the full state, file list, testing stage, and ADR-056.)
+**Last updated:** 2026-05-28 (T0.3.x **Batch B Commit 9** — *read-relevance cosine-floor gate* — in working tree, local DoD gates ALL GREEN (fmt/clippy/build/test), awaiting commit. Closes the dogfood-found **A6 no-signal ship-gate**: `memory_read` now abstains when a query's top-1 BGE cosine < 0.66 (**ADR-057**, Approach P — gate lives in `StructuredReadPipeline`; `memory_search` + the `abstain_tests` BM25 suite untouched). Floor (top-1, 0.66) measured via the n=5 `abstain_channel_diagnostic`; an initial top-3-mean choice over-abstained on a real query in live dogfood → switched to top-1, re-validated live (blood-type abstains, zafflang proceeds). Bundles the **JoinHandle clean-disconnect panic fix** Codex found (`is_finished()` guard in `ApplicationHandle::shutdown` + regression test). **Commit 8 shipped at `b772d9d`** (MCP serve entrypoint + `memory.X`→`memory_X` rename + ADR-056 dogfood fixes); **Commit 7 at `f6293c6`** (CI green). **Cross-agent dogfood:** Claude Desktop + Codex (GPT-5.5, full write→search→update→read→delete CRUD) both verified live; Cursor is the next connection. See **ADR-057** below + [[cross-agent-mcp-connection]]. The 🎯 opener block further down is now HISTORICAL (Commit 8 close).)
 
 ---
 
@@ -248,6 +248,28 @@ Read this whole block before any new work. **The detailed Step 1–4 plan furthe
 **(b) Delete is idempotent on missing ids.** `handle_delete` previously returned `VaultError::NotFound` (`-32602`) when `lookup_boundary` found no memory — contradicting the `memory_delete` tool description's documented idempotency contract. Decision: return `Ok(())` for a missing memory. Nothing exists to auth-gate and returning success leaks nothing an attacker couldn't already infer from the prior not-found-vs-access-denied split. Pinned by `tool_delete_missing_id_is_idempotent_success`.
 
 **(c) Content-length cap is store-whole / embed-truncate.** The canonical-save normalizer rejected content > 2000 chars — a "sanity cap" contradicting both vault-core's real `MAX_MEMORY_CONTENT_BYTES` (100 KB) and the consolidator's fixtures (paragraph-scale memories up to ~2.4 KB designed to exercise embedding truncation). Decision: removed the normalizer's 2000-char reject. vault-core's 100 KB cap is the single length gate; the embedder truncates at its 512-token window. Long memories are stored whole; only the embedding is truncated. Pinned by `accepts_long_content_above_former_2000_cap`. Confirmed with Shahbaz 2026-05-28.
+
+---
+
+### ADR-057 — Deterministic cosine relevance gate for `memory_read` (Commit 9, 2026-05-28)
+
+**Status:** Accepted, T0.3.x Batch B Commit 9 (2026-05-28). Surfaced by the §7 dogfood **A6 failure** (`memory_read` returned the whole boundary, never abstained on no-signal); mechanism chosen by the parallel agent pair (4/4 convergence) + measured calibration.
+
+**Context.** `memory_read` only abstained on literally-empty retrieval, so a no-signal query (e.g. "what is the user's blood type") returned the entire boundary — a confident answer from nothing. Root cause: **ADR-052 removed the LLM from the read path but never reassigned its relevance-judgment job.** `abstain.rs`'s BM25-top-1 gate was deliberately built to catch only gibberish (its own module doc: "the LLM is the only correct gate"). The canonical "The user…" format makes the subject token corpus-wide, so no keyword/RRF-derived floor can separate signal from noise — the agent pair rejected an RRF-floor and elbow/gap detection on exactly these grounds; **cosine is the only channel that's an absolute semantic-relatedness measure, immune to the shared-subject-token degeneracy.**
+
+**Decision.** A deterministic **raw-BGE-cosine relevance gate** in `StructuredReadPipeline` (**Approach P** — placed in the read path that has the bug; `memory_search` stays a raw-retrieval primitive and the `AbstainingRetriever` / `abstain_tests` suite is left untouched). Signal = **semantic top-1 cosine**; floor = **0.66**; abstain when below. Wired via `with_relevance_gate()` (mirrors the existing `with_clock` builder, gate opt-in so the other pipeline tests are unaffected); `score_threshold` stays an agent override, never the gate.
+
+**Calibration** (`abstain_channel_diagnostic`, n=5 no-signal probes — 1 clean-distant + 4 near-topic adversarial). On the **top-1** column: no-signal ≤ 0.642, the four must-proceed contradictions ≥ 0.696 → **0.66** sits in that gap (slight recall bias toward proceeding).
+
+**Over-abstain amendment (2026-05-28, live dogfood — supersedes the original top-3-mean choice).** The agent pair + fixture measurement first chose **top-3 mean** (wider fixture gap: 0.070 vs top-1's 0.054). Live dogfood on the sparse personal vault **falsified that for the real-world case**: a real query whose answer was present (the zafflang memory) **over-abstained**, because top-3 mean diluted the single strong match (~0.72) with two unrelated fillers (~0.45) below the floor — while raw `memory_search` found the memory instantly. Switched to **top-1** (cannot be diluted by fillers). Principle, per Claude Desktop: for a memory vault, **recall > precision — hiding a real memory is the worst failure**, worse than occasionally returning a marginal one. Re-validated live + server-log confirmed: blood-type abstains (`abstain=true`), zafflang proceeds (`abstain=false`, memory returned). Pinned by `top1_proceeds_on_single_strong_match_amid_weak_fillers`.
+
+**Scope (load-bearing — what V0.2 fixes and what it knowingly does NOT):** V0.2 = deterministic raw-cosine floor for **no-signal abstention only**. Topical-noise discrimination (the Q21 class — top-1 **0.717**, above two must-proceed contradictions) is **structurally impossible for a cosine-top-1 floor — measurement-confirmed, not hedged** — and is deferred to a **non-LLM cross-encoder reranker at V1.0+**. This ADR fixes *confident-answer-from-nothing*; it does NOT fix *confident-answer-from-topically-adjacent-but-wrong*. (This is Shahbaz's verbatim scope line — the pivot back to top-1 made it literally accurate again.)
+
+**Vestigial BM25 gate:** the BM25 abstain gate in `AbstainingRetriever` is left vestigial; superseded in effect by the pipeline cosine gate; formal retirement deferred to the per-candidate-precision / carry-cosine-through work (see Tech-debt — read-relevance follow-up).
+
+**Pinned by** (`structured_read_pipeline.rs::tests`): `relevance_floor_and_top_k_are_pinned` (floor 0.66 + K=1), `no_signal_query_abstains_when_top_k_mean_below_floor` (A6), `genuine_content_proceeds_when_top_k_mean_above_floor` (no over-abstain), `contradiction_band_proceeds_at_lowest_measured_cosine` (0.696 proceeds), `top1_proceeds_on_single_strong_match_amid_weak_fillers` (anti-dilution — the over-abstain regression), `gate_disabled_by_default_does_not_abstain_on_low_cosine` (opt-in semantics).
+
+**Also in Commit 9 — JoinHandle clean-disconnect fix (Codex dogfood, not its own ADR):** `vault-cli mcp serve` panicked "JoinHandle polled after completion" on clean stdin close — `wait()`'s `select!` drove `&mut server_handle` to completion on EOF, then `shutdown()` re-awaited it. Fixed with an `is_finished()` guard before the re-awaits in `ApplicationHandle::shutdown`; pinned by `wait_does_not_panic_when_server_handle_completes_first`.
 
 ---
 
@@ -991,6 +1013,19 @@ Per-knob evidence: `crates/vault-retrieval/examples/t027a_qwen_tuning_results.md
 ---
 
 ## Tech debt — open items
+
+### T0.3.x — read-relevance: per-candidate cosine filter + carry-cosine-through-fusion + retire vestigial BM25 gate
+
+**Surfaced + logged:** ADR-057 (Commit 9, 2026-05-28).
+
+**The gap.** ADR-057's cosine gate closes no-signal abstention but leaves three coupled items for one follow-up:
+1. **Vestigial BM25 gate** — `AbstainingRetriever`'s BM25-top-1 gate is superseded in effect for the read path by the pipeline cosine gate but still runs. Harmless (near-no-op) but should be formally retired so a future reader isn't confused by two gates.
+2. **No per-candidate relevance filtering** — the gate is all-or-nothing abstain on the top-3-mean; it does NOT drop individual off-topic candidates below the floor from a non-abstaining response (the "real query still returns lots" precision side of the A6 finding).
+3. **Double-embed on the proceed path** — the pipeline runs its own semantic probe AND the inner hybrid re-embeds the same query (~+50-150ms). Accepted under correctness-before-latency for V0.2.
+
+**The fix (one follow-up).** Carry the raw semantic cosine through `HybridRetriever` fusion onto `RetrievedMemory` (today `hybrid.rs:221-247` discards it for the RRF score). Then the pipeline filters per-candidate on the carried cosine (abstain = filtered-empty), which (a) removes the separate probe + double-embed, (b) enables per-candidate precision filtering, and (c) lets the BM25 gate be formally retired. Sequenced after the cosine-floor ship + live A6 validation. **Distinct from** the V1.0+ cross-encoder reranker (ADR-057 scope), which addresses topical-noise discrimination, not no-signal.
+
+**Affected files (forward-pointer):** `crates/vault-retrieval/src/strategies/hybrid.rs:221-247` (RRF discards cosine), `crates/vault-retrieval/src/structured_read_pipeline.rs` (gate + future carry-cosine consumer), `crates/vault-retrieval/src/strategies/abstain.rs` (BM25 gate to retire).
 
 ### T0.2.x — entity-extraction-at-consolidation + GraphStore relationship-rewrite primitive on merge
 

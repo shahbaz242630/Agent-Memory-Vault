@@ -48,8 +48,8 @@ use serde::Deserialize;
 use vault_core::{Boundary, Memory, MemoryType, NewMemory};
 use vault_embedding::{BgeSmallProvider, EmbeddingProvider, EMBEDDING_DIM};
 use vault_retrieval::{
-    AbstainConfig, KeywordIndex, KeywordRetriever, RetrievalOptions, RetrievalQuery, Retriever,
-    SemanticRetriever, MAX_RESULTS_CAP,
+    AbstainConfig, KeywordIndex, KeywordRetriever, RetrievalOptions, RetrievalQuery,
+    RetrievedMemory, Retriever, SemanticRetriever, MAX_RESULTS_CAP,
 };
 use vault_storage::{LanceVectorStore, MetadataStore, SqlCipherKey, VectorStore};
 
@@ -117,7 +117,42 @@ async fn abstain_channel_diagnostic_top_scores_per_query() -> Result<()> {
     let query_fixture_path = vault_retrieval_root()
         .join("test-fixtures")
         .join("merge_acceptance_100_queries.json");
-    let query_set: QuerySet = serde_json::from_slice(&std::fs::read(&query_fixture_path)?)?;
+    let mut query_set: QuerySet = serde_json::from_slice(&std::fs::read(&query_fixture_path)?)?;
+
+    // Calibration add (2026-05-28, cosine-floor design / n=4 go-no-go):
+    // inject synthetic ZERO-SIGNAL queries (the A6 ship-gate case). Q21/Q22
+    // are topical-noise hard-negs; these are the genuine no-signal cases the
+    // cosine floor must catch. One clean-distant probe (zero corpus overlap)
+    // plus four near-topic probes (an adjacent cluster exists but the
+    // specific fact does not) — the near-topic ones are the adversarial worst
+    // case for a cosine floor. Authorize every fixture boundary so each
+    // searches the whole corpus.
+    {
+        let mut boundaries = std::collections::BTreeSet::new();
+        for e in &memory_fixture {
+            boundaries.insert(e.boundary.clone());
+        }
+        let nosig_boundaries: Vec<String> = boundaries.into_iter().collect();
+        let nosig_probes: &[(&str, &str)] = &[
+            // near-topic: blood-PRESSURE cluster exists, blood TYPE does not
+            ("NOSIG-blood", "what is the user's blood type"),
+            // clean-distant: no corpus overlap at all
+            ("NOSIG-mercury", "what is the boiling point of mercury"),
+            // near-topic: household/rent/bills exist, no address
+            ("NOSIG-address", "what is the user's home street address"),
+            // near-topic: health/dental/physical exist, no gym
+            ("NOSIG-gym", "what is the user's gym membership number"),
+            // near-topic: family-reunion travel exists, no airline fact
+            ("NOSIG-airline", "what airline does the user usually fly"),
+        ];
+        for (id, text) in nosig_probes {
+            query_set.queries.push(QueryEntry {
+                id: (*id).to_string(),
+                query_text: (*text).to_string(),
+                authorized_boundaries: nosig_boundaries.clone(),
+            });
+        }
+    }
 
     // Insert memories into BOTH stores.
     let mut all_memories: Vec<Memory> = Vec::with_capacity(memory_fixture.len());
@@ -167,9 +202,24 @@ async fn abstain_channel_diagnostic_top_scores_per_query() -> Result<()> {
     println!("Current AbstainConfig default threshold: {threshold} (BM25 top-1)");
     println!();
 
-    let mut summary: Vec<(String, String, f32, f32, &'static str)> = Vec::new();
+    // Tuple: (query id, kind, BM25 top-1, sem top-1 cosine, sem top-3 mean,
+    // sem top-5 mean). The three semantic signals let iteration 2 pick the
+    // most-separated one (top-1 vs top-k aggregate).
+    let mut summary: Vec<(String, String, f32, f32, f32, f32)> = Vec::new();
 
-    for qid in DIAGNOSTIC_QUERY_IDS {
+    const NOSIG_IDS: &[&str] = &[
+        "NOSIG-blood",
+        "NOSIG-mercury",
+        "NOSIG-address",
+        "NOSIG-gym",
+        "NOSIG-airline",
+    ];
+    let diagnostic_query_ids: Vec<&str> = DIAGNOSTIC_QUERY_IDS
+        .iter()
+        .copied()
+        .chain(NOSIG_IDS.iter().copied())
+        .collect();
+    for qid in &diagnostic_query_ids {
         let q = query_set
             .queries
             .iter()
@@ -191,9 +241,13 @@ async fn abstain_channel_diagnostic_top_scores_per_query() -> Result<()> {
 
         let bm25_top1 = bm25_hits.first().map(|h| h.score).unwrap_or(0.0);
         let sem_top1 = sem_hits.first().map(|h| h.score).unwrap_or(0.0);
+        let sem_top3_mean = mean_top_k(&sem_hits, 3);
+        let sem_top5_mean = mean_top_k(&sem_hits, 5);
 
         let kind = if ["Q11", "Q13", "Q25", "Q26"].contains(qid) {
             "contradiction"
+        } else if qid.starts_with("NOSIG") {
+            "no-signal"
         } else {
             "hard-negative"
         };
@@ -219,40 +273,90 @@ async fn abstain_channel_diagnostic_top_scores_per_query() -> Result<()> {
         }
         println!();
 
-        summary.push((qid.to_string(), kind.to_string(), bm25_top1, sem_top1, kind));
+        summary.push((
+            qid.to_string(),
+            kind.to_string(),
+            bm25_top1,
+            sem_top1,
+            sem_top3_mean,
+            sem_top5_mean,
+        ));
     }
 
-    println!("{:=^140}", " SUMMARY ");
+    println!("{:=^140}", " SUMMARY (cosine-floor calibration, ADR-057) ");
     println!(
-        "{:<5} {:<14} {:>14} {:>14} {:>14}    Gate decision",
-        "Query",
-        "Kind",
-        "BM25 top-1",
-        "Sem top-1 cos",
-        format!("BM25 vs {threshold}"),
+        "{:<14} {:<14} {:>12} {:>14} {:>14} {:>14}",
+        "Query", "Kind", "BM25 top-1", "Sem top-1", "Sem top-3 mean", "Sem top-5 mean",
     );
-    for (qid, kind, bm25, sem, _) in &summary {
-        let gate = if *bm25 < threshold {
-            "ABSTAIN (BM25 below threshold → no LLM call)"
-        } else {
-            "PROCEED (LLM judges relevance)"
-        };
+    for (qid, kind, bm25, sem1, sem3, sem5) in &summary {
         println!(
-            "{:<5} {:<14} {:>14.4} {:>14.4} {:>14}    {gate}",
-            qid,
-            kind,
-            bm25,
-            sem,
-            if *bm25 < threshold { "<" } else { ">=" }
+            "{:<14} {:<14} {:>12.4} {:>14.4} {:>14.4} {:>14.4}",
+            qid, kind, bm25, sem1, sem3, sem5,
         );
     }
-    println!(
-        "\nV0.2 architectural note: at threshold {threshold} the abstain gate catches only \
-         genuine-zero-signal queries (gibberish). All non-trivial queries proceed to the \
-         LLM, which judges relevance per the read-time system prompt's explicit rules."
-    );
+
+    // ── Pre-declared go/no-go decision rule (cosine-floor calibration) ──
+    // The floor must sit in a gap: STRICTLY BELOW the lowest must-proceed
+    // contradiction AND STRICTLY ABOVE every no-signal probe. If any
+    // no-signal probe lands at/above the lowest contradiction, the signal
+    // cannot carry no-signal abstention and we STOP (rethink: top-k aggregate
+    // vs top-1, or move the cross-encoder up). Evaluated for each candidate
+    // signal so iteration 2 can pick the most-separated one.
+    for (label, sel) in [
+        ("top-1", 3usize),
+        ("top-3 mean", 4usize),
+        ("top-5 mean", 5usize),
+    ] {
+        let pick = |s: &(String, String, f32, f32, f32, f32)| -> f32 {
+            match sel {
+                3 => s.3,
+                4 => s.4,
+                _ => s.5,
+            }
+        };
+        let mut lowest_contradiction = f32::INFINITY;
+        let mut highest_nosignal = f32::NEG_INFINITY;
+        for s in &summary {
+            let v = pick(s);
+            if s.1 == "contradiction" && v < lowest_contradiction {
+                lowest_contradiction = v;
+            }
+            if s.1 == "no-signal" && v > highest_nosignal {
+                highest_nosignal = v;
+            }
+        }
+        let gap = lowest_contradiction - highest_nosignal;
+        let verdict = if gap > 0.0 {
+            "GO — separable; lock floor in the gap"
+        } else {
+            "NO-GO — a no-signal probe sits in the proceed band; rethink the signal"
+        };
+        println!(
+            "\n[{label}] lowest must-proceed contradiction = {lowest_contradiction:.4} · \
+             highest no-signal = {highest_nosignal:.4} · gap = {gap:.4}  → {verdict}"
+        );
+        if gap > 0.0 {
+            println!(
+                "        suggested floor (gap midpoint) = {:.4}",
+                highest_nosignal + gap / 2.0
+            );
+        }
+    }
 
     Ok(())
+}
+
+/// Mean of the top-`k` semantic cosine scores (fewer if the result set is
+/// smaller). Returns 0.0 for an empty set. Lets the diagnostic compare a
+/// fragile top-1 gate signal against a top-k aggregate in the compressed
+/// BGE-small cosine band (iteration-2 mechanism question).
+fn mean_top_k(hits: &[RetrievedMemory], k: usize) -> f32 {
+    if hits.is_empty() || k == 0 {
+        return 0.0;
+    }
+    let n = k.min(hits.len());
+    let sum: f32 = hits.iter().take(n).map(|h| h.score).sum();
+    sum / n as f32
 }
 
 fn open_bge_provider() -> Result<Arc<dyn EmbeddingProvider>> {

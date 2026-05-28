@@ -255,7 +255,8 @@ impl Application {
 
         // 7. HybridRetriever — fuses semantic + keyword via Reciprocal
         //    Rank Fusion (k=60, top_n_each=200) per T0.2.7 Phase 2.
-        let hybrid: Arc<dyn Retriever> = Arc::new(HybridRetriever::new(semantic, keyword.clone()));
+        let hybrid: Arc<dyn Retriever> =
+            Arc::new(HybridRetriever::new(semantic.clone(), keyword.clone()));
 
         // 8. AbstainingRetriever — gates on top-1 BM25 score; below
         //    threshold (default 6.0) returns empty result so the LLM
@@ -286,7 +287,12 @@ impl Application {
         //    `AppConfig.qwen_model_path` field is now dead (kept with
         //    #[allow(dead_code)] until Commit 8 removes it).
         let report_loader = Arc::new(FilesystemReportLoader::new(vault_root.clone()));
-        let read_pipeline = StructuredReadPipeline::new(retriever.clone(), report_loader);
+        // Wire the relevance gate (ADR-057): the same `semantic` retriever
+        // that backs the hybrid's dense leg is the probe channel. The pipeline
+        // abstains when a query's top-K-mean BGE cosine is below the floor —
+        // closing the no-signal ship-gate. `semantic` is moved here (last use).
+        let read_pipeline = StructuredReadPipeline::new(retriever.clone(), report_loader)
+            .with_relevance_gate(semantic);
         tracing::info!(
             target: "vault_app::startup",
             vault_root = %vault_root.display(),
@@ -726,8 +732,21 @@ impl ApplicationHandle {
 
         // 5. Await the aborted handles to confirm cleanup. JoinError on
         //    aborted tasks is expected (cancellation), so swallow.
-        let _ = self.server_handle.await;
-        let _ = self.signal_handle.await;
+        //
+        //    `is_finished()` guard (2026-05-28, Codex dogfood): when reached
+        //    via `wait()`, the `select!` already polled one of these handles
+        //    to completion by `&mut` (stdio EOF completes `server_handle`).
+        //    Re-awaiting an already-finished `JoinHandle` panics ("JoinHandle
+        //    polled after completion"). Skip the await when the task is already
+        //    finished; on the direct-`shutdown()` path the freshly-aborted
+        //    handles are not yet finished, so they're awaited to confirm
+        //    cancellation exactly as before.
+        if !self.server_handle.is_finished() {
+            let _ = self.server_handle.await;
+        }
+        if !self.signal_handle.is_finished() {
+            let _ = self.signal_handle.await;
+        }
 
         Ok(())
     }
@@ -961,6 +980,47 @@ mod tests {
             "ApplicationHandle::shutdown MUST have sent `true` over \
              shutdown_signal so the worker observed the drain request; \
              post-shutdown channel state is `false` (regression)."
+        );
+    }
+
+    /// Regression (Codex dogfood 2026-05-28): `wait()`'s `select!` drives
+    /// `server_handle` to completion on stdio EOF; the subsequent
+    /// `shutdown()` MUST NOT re-await that already-completed handle — doing so
+    /// panics with "JoinHandle polled after completion". Pins the
+    /// `is_finished()` guard in `shutdown()`. Pre-fix this test panics.
+    #[tokio::test]
+    async fn wait_does_not_panic_when_server_handle_completes_first() {
+        // `_rx` kept alive so `shutdown_signal.send` has a live receiver.
+        let (shutdown_signal, _rx) = tokio::sync::watch::channel(false);
+
+        // worker exits immediately (drain trivially complete).
+        let worker_handle = tokio::spawn(async {});
+        // server_handle completes immediately == stdio EOF: wait()'s select!
+        // drives it to completion via `&mut`.
+        let server_handle = tokio::spawn(async {});
+        // signal_handle stays pending (the SIGINT path never fires here).
+        let signal_handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+
+        let handle = ApplicationHandle::for_test(
+            shutdown_signal,
+            worker_handle,
+            server_handle,
+            signal_handle,
+        );
+
+        // wait() → select! fires on the completed server_handle → shutdown().
+        // MUST return Ok within the bound, never panic on a re-awaited handle.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handle.wait()).await;
+        assert!(
+            result.is_ok(),
+            "wait() MUST complete (not hang) after server_handle EOF"
+        );
+        assert!(
+            result.unwrap().is_ok(),
+            "wait() MUST return Ok after graceful shutdown, not panic re-awaiting \
+             the already-completed server_handle"
         );
     }
 
