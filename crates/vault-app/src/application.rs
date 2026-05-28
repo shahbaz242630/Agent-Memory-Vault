@@ -265,7 +265,7 @@ impl Application {
         let retriever: Arc<dyn Retriever> = Arc::new(AbstainingRetriever::new(hybrid, keyword));
 
         // 9. StructuredReadPipeline — deterministic filter+pack for the
-        //    `memory.read` MCP tool per ADR-052 + ADR-054 (Commit 6 of
+        //    `memory_read` MCP tool per ADR-052 + ADR-054 (Commit 6 of
         //    the locked-next-arc, 2026-05-26). Replaces the V0.2-era
         //    Qwen-7B single-call synthesis pipeline (ADR-048 + ADR-049,
         //    formally retired by ADR-052) with code that:
@@ -308,6 +308,10 @@ impl Application {
             embedder.clone(),
             adapter_storage,
             adapter_metadata,
+            // Same Arc the retriever's keyword channel holds — inline
+            // upsert/delete here keeps a fresh write searchable in the
+            // same process (read-after-write fix, 2026-05-28).
+            keyword_index.clone(),
         );
 
         // 11. Optional Consolidator (T0.3.x Batch A, 2026-05-26).
@@ -639,6 +643,48 @@ impl ApplicationHandle {
     /// resources).
     pub fn shutdown_signal(&self) -> &tokio::sync::watch::Sender<bool> {
         &self.shutdown_signal
+    }
+
+    /// Block until one of the spawned tasks naturally exits, then perform
+    /// graceful shutdown. The typical "main loop" entry-point for a CLI
+    /// subcommand that runs the vault as a long-lived MCP stdio server
+    /// (`vault-cli mcp serve`).
+    ///
+    /// Selects across:
+    /// - **`server_handle`** — completes on stdio EOF (the MCP client,
+    ///   typically Claude Desktop, disconnected) or on rmcp-internal task
+    ///   panic.
+    /// - **`signal_handle`** — completes when the SIGINT handler's future
+    ///   resolves (the signal source closed, OR the second-Ctrl-C path
+    ///   already called `process_exit` and we never reach here).
+    ///
+    /// The retry worker is intentionally *not* selected on — under normal
+    /// operation it polls indefinitely until [`Self::shutdown_signal`]
+    /// flips, which this method does after the select completes. A worker
+    /// task exiting on its own is anomalous (panic), surfaced via
+    /// [`Self::shutdown`]'s join-error logging.
+    ///
+    /// Consumes `self` by value to enforce single-call semantics at compile
+    /// time (same rationale as [`Self::shutdown`]).
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Self::shutdown`]'s error surface. Currently
+    /// [`Self::shutdown`] always returns `Ok(())`, so this is reserved for
+    /// future shutdown-fallibility surfacing.
+    pub async fn wait(mut self) -> VaultResult<()> {
+        tokio::select! {
+            _ = &mut self.server_handle => {
+                // stdio EOF — client disconnected, or rmcp server task
+                // returned. Graceful shutdown of remaining tasks below.
+            }
+            _ = &mut self.signal_handle => {
+                // Signal handler resolved — typically the signal stream
+                // broke (rare) or the second-Ctrl-C path called
+                // `process_exit` and we never observed the resolution.
+            }
+        }
+        self.shutdown().await
     }
 
     /// Graceful shutdown. Signals the worker to drain, aborts the server

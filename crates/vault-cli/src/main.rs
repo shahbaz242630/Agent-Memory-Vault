@@ -121,6 +121,46 @@ enum Command {
         #[command(subcommand)]
         action: ConsolidateAction,
     },
+    /// MCP (Model Context Protocol) server — exposes the vault to an MCP
+    /// client (Claude Desktop, Cursor, etc.) over a stdio JSON-RPC
+    /// transport. Locked-next-arc Commit 8 (T0.3.x Batch B, 2026-05-27):
+    /// the entrypoint binary that ADR-034 forward-pointed to as part of
+    /// "V0.2 alpha-distribution / subcommand-split design". Constructs a
+    /// full Application (BGE embedder + read pipeline + cascading worker)
+    /// and binds rmcp's stdio transport via Application::start_with_mcp.
+    /// Phi-4 model OPTIONAL — only needed if this same process should
+    /// also be runnable as a consolidator host; the typical alpha
+    /// deployment runs consolidation via `vault-cli consolidate run` in
+    /// a separate process.
+    Mcp {
+        /// Path to the BGE-small-en-v1.5 ONNX model file.
+        #[arg(long, env = "VAULT_BGE_MODEL_PATH", value_name = "PATH")]
+        bge_model: PathBuf,
+        /// Path to the BGE-small-en-v1.5 tokenizer.json file.
+        #[arg(long, env = "VAULT_BGE_TOKENIZER_PATH", value_name = "PATH")]
+        bge_tokenizer: PathBuf,
+        /// Path to the ONNX Runtime dynamic library
+        /// (libonnxruntime.{dll,dylib,so}).
+        #[arg(long, env = "VAULT_ORT_LIB_PATH", value_name = "PATH")]
+        ort_lib: PathBuf,
+        /// Path to the Phi-4-mini-instruct Q4_K_M GGUF file. Optional for
+        /// this subcommand — the MCP server itself does not require Phi-4
+        /// (the read path is fully deterministic per ADR-052). Supply only
+        /// if you want this process to also be able to run consolidation
+        /// jobs (uncommon for the MCP-server role).
+        #[arg(long, env = "VAULT_PHI4_MODEL_PATH", value_name = "PATH")]
+        phi4_model: Option<PathBuf>,
+        /// Authorized boundary to expose to the MCP client. Repeatable;
+        /// defaults to ["personal"] when not supplied. Each boundary the
+        /// client can read/write/update/delete must be listed here at
+        /// launch time — the server refuses tool calls that touch other
+        /// boundaries (BRD §11.4.3).
+        #[arg(long, value_name = "NAME", default_values_t = vec!["personal".to_string()])]
+        boundary: Vec<String>,
+
+        #[command(subcommand)]
+        action: McpAction,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -131,6 +171,16 @@ enum ConsolidateAction {
     /// timeout 30 min — past this, the run is cancelled and the previous
     /// nightly summary remains the latest artifact on disk.
     Run,
+}
+
+#[derive(Subcommand, Debug)]
+enum McpAction {
+    /// Start the MCP server. Blocks on stdio until the client disconnects
+    /// (stdio EOF) or the process receives SIGINT (Ctrl-C); on first
+    /// SIGINT the cascading retry worker is asked to drain gracefully, on
+    /// second SIGINT the process exits with code 130 per the locked
+    /// `handle_signals` semantics in `vault-app`.
+    Serve,
 }
 
 #[derive(Subcommand, Debug)]
@@ -180,9 +230,19 @@ fn init_tracing() {
     use tracing_subscriber::EnvFilter;
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn,vault_cli=info"));
+    // Write to STDERR, not STDOUT. The `mcp serve` subcommand reserves
+    // STDOUT for the MCP JSON-RPC protocol stream — any byte written
+    // there that isn't a valid JSON-RPC message corrupts the channel
+    // and the MCP client (Claude Desktop / Cursor / Codex) disconnects.
+    // Other subcommands (consolidate / dead-letter / divergence-check)
+    // emit their human-facing output via `println!` to STDOUT;
+    // diagnostic + lifecycle logs belong on STDERR by convention regardless.
+    // ANSI colour codes auto-disable when the writer isn't a terminal
+    // (subscriber default) — leave colouring on for interactive runs.
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        .with_writer(std::io::stderr)
         .compact()
         .init();
 }
@@ -235,6 +295,30 @@ async fn real_main() -> Result<()> {
                 bge_tokenizer,
                 ort_lib,
                 phi4_model,
+                action,
+            )
+            .await
+        }
+        Command::Mcp {
+            bge_model,
+            bge_tokenizer,
+            ort_lib,
+            phi4_model,
+            boundary,
+            action,
+        } => {
+            // Same rationale as Consolidate above — `Application::new`
+            // owns the embedding dimension.
+            let _ = dimension;
+            dispatch_mcp(
+                &vault_db,
+                &vector_dir,
+                &graph_db,
+                bge_model,
+                bge_tokenizer,
+                ort_lib,
+                phi4_model,
+                boundary,
                 action,
             )
             .await
@@ -335,12 +419,87 @@ async fn dispatch_consolidate(
         bge_model,
         bge_tokenizer,
         ort_lib,
-        phi4_model,
+        Some(phi4_model),
     )
     .await?;
     match action {
         ConsolidateAction::Run => run_one_consolidation(&app).await,
     }
+}
+
+/// Dispatch the `mcp` subcommand. Constructs a full [`Application`] and
+/// hands it to [`Application::start_with_mcp`] which binds rmcp's stdio
+/// transport. Blocks until the client (e.g. Claude Desktop) disconnects
+/// (stdio EOF) or the user Ctrl-Cs. Locked-next-arc Commit 8.
+///
+/// `phi4_model` is `Option<PathBuf>` here because the MCP server's read
+/// path is fully deterministic per ADR-052 (no LLM in the read path) —
+/// Phi-4 is only required if this same process should also be able to
+/// host consolidation runs. The typical alpha deployment runs the MCP
+/// server and the consolidator in separate processes, so omitting
+/// `--phi4-model` is the common case.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_mcp(
+    vault_db: &Path,
+    vector_dir: &Path,
+    graph_db: &Path,
+    bge_model: PathBuf,
+    bge_tokenizer: PathBuf,
+    ort_lib: PathBuf,
+    phi4_model: Option<PathBuf>,
+    boundary: Vec<String>,
+    action: McpAction,
+) -> Result<()> {
+    // Map raw boundary strings to typed Boundary values up front so any
+    // parse failure surfaces before we touch the keychain / open the
+    // backend / load models (all expensive).
+    let authorized_boundaries: Vec<Boundary> = boundary
+        .into_iter()
+        .map(|raw| {
+            // `as_str()` so `raw` stays usable for the error message;
+            // `Boundary::new` takes `impl Into<String>` and `&str` is the
+            // simplest type that satisfies it without an early move.
+            Boundary::new(raw.as_str())
+                .map_err(|e| anyhow!("invalid --boundary value {raw:?}: {e}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let app = build_application(
+        vault_db,
+        vector_dir,
+        graph_db,
+        bge_model,
+        bge_tokenizer,
+        ort_lib,
+        phi4_model,
+    )
+    .await?;
+
+    match action {
+        McpAction::Serve => run_mcp_serve(app, authorized_boundaries).await,
+    }
+}
+
+async fn run_mcp_serve(app: Application, authorized_boundaries: Vec<Boundary>) -> Result<()> {
+    eprintln!(
+        "vault-cli mcp serve: ready ({} authorized boundary{})",
+        authorized_boundaries.len(),
+        if authorized_boundaries.len() == 1 {
+            ""
+        } else {
+            "ies"
+        },
+    );
+    let handle = app
+        .start_with_mcp(authorized_boundaries)
+        .await
+        .context("MCP transport bind failed")?;
+    handle
+        .wait()
+        .await
+        .context("MCP serve task exited with an error")?;
+    eprintln!("vault-cli mcp serve: clean shutdown");
+    Ok(())
 }
 
 /// Build an [`Application`] for the consolidate path. Reads master_key
@@ -362,7 +521,7 @@ async fn build_application(
     bge_model: PathBuf,
     bge_tokenizer: PathBuf,
     ort_lib: PathBuf,
-    phi4_model: PathBuf,
+    phi4_model: Option<PathBuf>,
 ) -> Result<Application> {
     let master_key = read_or_init_master_key(PRODUCTION_NAMESPACE, VAULT_ID).map_err(|e| {
         tracing::warn!(error = %e, "keychain read failed");
@@ -371,6 +530,12 @@ async fn build_application(
     let sqlcipher_passphrase = derive_sqlcipher_passphrase(&master_key);
     let at_rest_key = derive_at_rest_key(&master_key);
 
+    // `phi4_model` is required by the consolidate path (the consolidator
+    // calls Phi-4-mini for merge classification) and optional for the
+    // mcp-serve path (read pipeline is fully deterministic per ADR-052).
+    // When `None`, `Application::new` logs a WARN and leaves the
+    // Consolidator unwired (`run_consolidation_with_safety` will return
+    // `ConsolidatorUnconfigured` if invoked) — graceful degradation.
     let config = AppConfig {
         metadata_path: vault_db.to_path_buf(),
         vector_dir: vector_dir.to_path_buf(),
@@ -380,10 +545,10 @@ async fn build_application(
         tokenizer_path: bge_tokenizer,
         ort_lib_path: ort_lib,
         at_rest_key,
-        // Consolidate path does NOT use the read pipeline. Qwen stays
-        // unloaded (saves ~4.36 GB of resident memory + ~30s startup).
+        // Both subcommands skip the V0.2-era Qwen read pipeline — ADR-052
+        // retired Qwen-7B from the read path entirely.
         qwen_model_path: None,
-        phi4_model_path: Some(phi4_model),
+        phi4_model_path: phi4_model,
     };
 
     Application::new(&config).await.map_err(|e| {
@@ -952,6 +1117,137 @@ mod tests {
             "list",
         ]);
         assert!(result.is_err(), "should reject missing --vector-dir");
+    }
+
+    // --------------------------------------------------------------
+    // T0.3.x Batch B Commit 8 — `mcp serve` subcommand parsing
+    // --------------------------------------------------------------
+
+    #[test]
+    fn cli_parses_mcp_serve_with_default_boundary() {
+        let cli = Cli::try_parse_from([
+            "vault-cli",
+            "--vault-db",
+            "/tmp/v.db",
+            "--vector-dir",
+            "/tmp/lance",
+            "--graph-db",
+            "/tmp/g.duckdb",
+            "mcp",
+            "--bge-model",
+            "/tmp/bge.onnx",
+            "--bge-tokenizer",
+            "/tmp/tokenizer.json",
+            "--ort-lib",
+            "/tmp/libonnxruntime.so",
+            // --phi4-model deliberately omitted (Option<PathBuf>; mcp does not require it)
+            // --boundary deliberately omitted (defaults to ["personal"])
+            "serve",
+        ])
+        .expect("mcp-serve flat path should parse without phi4 / boundary");
+        match cli.command {
+            Command::Mcp {
+                bge_model,
+                bge_tokenizer,
+                ort_lib,
+                phi4_model,
+                boundary,
+                action,
+            } => {
+                assert_eq!(bge_model, PathBuf::from("/tmp/bge.onnx"));
+                assert_eq!(bge_tokenizer, PathBuf::from("/tmp/tokenizer.json"));
+                assert_eq!(ort_lib, PathBuf::from("/tmp/libonnxruntime.so"));
+                assert!(
+                    phi4_model.is_none() || std::env::var("VAULT_PHI4_MODEL_PATH").is_ok(),
+                    "mcp-serve without --phi4-model MUST yield None unless env var supplies it"
+                );
+                assert_eq!(
+                    boundary,
+                    vec!["personal".to_string()],
+                    "default --boundary list MUST be exactly ['personal']"
+                );
+                assert!(
+                    matches!(action, McpAction::Serve),
+                    "expected McpAction::Serve; got {action:?}"
+                );
+            }
+            other => panic!("expected Command::Mcp, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_mcp_serve_with_multiple_boundaries_and_phi4() {
+        let cli = Cli::try_parse_from([
+            "vault-cli",
+            "--vault-db",
+            "/tmp/v.db",
+            "--vector-dir",
+            "/tmp/lance",
+            "--graph-db",
+            "/tmp/g.duckdb",
+            "mcp",
+            "--bge-model",
+            "/tmp/bge.onnx",
+            "--bge-tokenizer",
+            "/tmp/tokenizer.json",
+            "--ort-lib",
+            "/tmp/libonnxruntime.so",
+            "--phi4-model",
+            "/tmp/phi-4-mini.gguf",
+            "--boundary",
+            "personal",
+            "--boundary",
+            "work",
+            "--boundary",
+            "family",
+            "serve",
+        ])
+        .expect("mcp-serve flat path should parse with all opts supplied");
+        match cli.command {
+            Command::Mcp {
+                phi4_model,
+                boundary,
+                action,
+                ..
+            } => {
+                assert_eq!(phi4_model, Some(PathBuf::from("/tmp/phi-4-mini.gguf")));
+                assert_eq!(
+                    boundary,
+                    vec![
+                        "personal".to_string(),
+                        "work".to_string(),
+                        "family".to_string(),
+                    ],
+                    "--boundary MUST be repeatable preserving caller order"
+                );
+                assert!(matches!(action, McpAction::Serve));
+            }
+            other => panic!("expected Command::Mcp, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_mcp_serve_with_missing_bge_model() {
+        let result = Cli::try_parse_from([
+            "vault-cli",
+            "--vault-db",
+            "/tmp/v.db",
+            "--vector-dir",
+            "/tmp/lance",
+            "--graph-db",
+            "/tmp/g.duckdb",
+            "mcp",
+            // --bge-model deliberately omitted; env-var also unset for this test
+            "--bge-tokenizer",
+            "/tmp/tokenizer.json",
+            "--ort-lib",
+            "/tmp/libonnxruntime.so",
+            "serve",
+        ]);
+        assert!(
+            result.is_err() || std::env::var("VAULT_BGE_MODEL_PATH").is_ok(),
+            "mcp-serve MUST refuse missing --bge-model unless env var supplies it"
+        );
     }
 
     // --------------------------------------------------------------

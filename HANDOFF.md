@@ -2,7 +2,7 @@
 
 **Current version:** V0.2 Closed Beta (BRD §6.2 — sleep consolidator, boundaries hardening, cross-device sync, 30 beta users)
 
-**Last updated:** 2026-05-26 (T0.3.x **Batch B Commit 6** pushed at `99052f2` — Qwen-7B retired from read path per the 2026-05-26 architectural lock. New `StructuredReadPipeline` (`crates/vault-retrieval/src/structured_read_pipeline.rs`, ~870 lines incl. 21 unit tests covering 7 warning codes + aggregate-status rules) + new `report_io.rs` (`LoadedReport` + `FilesystemReportLoader` + `ReportLoader` trait, ~280 lines incl. 5 tests); `read_pipeline.rs` deleted; 13 Qwen-anchored spike examples deleted (research preserved in `.md` results files). ADR-052 + ADR-054 + ADR-053 Amendment 1 all shipped here. Net result across deployment modes: Local 86s → ~500ms (~170×), BYOK $0.02-0.05 → ~$0 (~50× cut), Managed PAYG ~$0.001 → ~$0.0001 (~10×). Full local DoD green pre-push: 193 tests pass workspace-wide (vault-consolidator 49, vault-retrieval 52, vault-app 56+1ign, vault-mcp 36) / 0 failures / clippy `-D warnings` clean / fmt clean. **CI run on `99052f2` GREEN matrix-wide** (ubuntu / macos / windows × build+test + clippy + fmt). Next: **Commit 7** (retire Contract 4 + ADR-054 Amendment 2) — Contract 4 (same-day delta log) was falsified 2026-05-27 by Commit 6's shipped architecture: the retriever queries SQLite/Lance directly, so today's writes are visible without a delta-log layer. Contract 4 retired; `WarningCode::DeltaLogUnavailable` removed; 7 locked codes → 6. Then **Commit 8** (founder dogfood) closes Batch B. This HANDOFF rewrite is the admin ride-along bundled with the Commit 7 code commit per [[admin-changes-ride-with-code]] (closes the "Commit 6 shipped without a HANDOFF rewrite" gap surfaced 2026-05-27).)
+**Last updated:** 2026-05-28 (T0.3.x **Batch B Commit 8** in working tree — `vault-cli mcp serve` entrypoint + tool-name rename `memory.X`→`memory_X` + stderr tracing + 3 dogfood fixes per **ADR-056** (keyword-index-on-write / delete idempotency / content-cap store-whole). **Memory Vault connected LIVE to Claude Desktop on 2026-05-28** — full MCP handshake, all 5 tools, real write→read round-trips. Local DoD gates all green; `vault-cli` binary rebuilt; **live re-verification of the 3 fixes is the next step**. Commit 7 shipped at `f6293c6` (CI green). **Commit 8 NOT yet committed.** See the 🎯 Next-session opener below for the full state, file list, testing stage, and ADR-056.)
 
 ---
 
@@ -181,9 +181,77 @@ The architectural lock **simplified** the menu rather than complicated it. The v
 
 ---
 
-## 🎯 Next-session opener — Commits 7 + 8 (closing locked-next-arc Batch B)
+## 🎯 Next-session opener — Commit 8 close: live MCP connection + dogfood fixes (2026-05-28)
 
-Read this whole block before any new work. **Commit 6 shipped at `99052f2` (2026-05-26)** — Qwen-7B retired from read path; `StructuredReadPipeline` + REPORT-enrichment + 7 health-warning codes all live. **Commit 7 retires Plan Iteration 3 Contract 4** (same-day delta log) — falsified 2026-05-27 by Commit 6's shipped architecture; cleanup is `WarningCode::DeltaLogUnavailable` removal + obsolete pin test removal + MCP tool-description update + ADR-054 Amendment 2 in HANDOFF (~30 LoC + admin). **Commit 8** closes Batch B with founder dogfood + optional Qwen-7B Rust code removal.
+Read this whole block before any new work. **The detailed Step 1–4 plan further down (Commits 7 + 8) is now HISTORICAL** — Commit 7 shipped and Commit 8 grew during live dogfood. This block is the current truth.
+
+### Where we are (2026-05-28)
+
+- **Commit 7 shipped** at `f6293c6` (2026-05-27, CI green) — Contract 4 retirement + ADR-054 Amendment 2.
+- **🎉 Memory Vault connected LIVE to Claude Desktop** via `vault-cli mcp serve` over MCP stdio. Full handshake, all 5 tools enumerated, real write→read round-trips. First time the product ran end-to-end against a real external agent.
+- **Commit 8 is in the working tree, NOT yet committed.** Local DoD gates ALL GREEN (fmt / check --all-targets / clippy -D warnings / test). `vault-cli` binary rebuilt. **Live re-verification of the 3 dogfood fixes was the next step when the session ended.**
+
+### What Commit 8 contains (working tree, uncommitted)
+
+**(a) MCP entrypoint** (drafted before this session): `vault-cli mcp serve` subcommand binds rmcp stdio via `Application::start_with_mcp`; new public `ApplicationHandle::wait()`; `phi4_model: Option<PathBuf>`; `--boundary` repeatable (default `["personal"]`). **ADR-055.** Files: `vault-cli/src/main.rs`, `vault-app/src/application.rs`.
+
+**(b) Two correctness fixes from connecting** (this session):
+- **Tool-name rename `memory.X` → `memory_X`** (dots → underscores). Claude Desktop's MCP client rejects tool names containing dots (regex `^[a-zA-Z0-9_-]{1,64}$`); the server connected but no tool was usable until renamed. Touched all 5 `#[tool]` decorators + every doc/test/audit reference in `vault-mcp` + cross-crate doc comments. **vault-storage audit event-type taxonomy (`memory.create`/`memory.read`/… in `vault-storage/src/audit.rs` + migration 0001) deliberately LEFT dotted** — separate persisted-string concept, not an MCP tool name; renaming would break audit-log parsing of existing rows.
+- **Tracing → stderr** (`vault-cli/src/main.rs::init_tracing` now `.with_writer(std::io::stderr)`). MCP stdio reserves stdout for JSON-RPC; tracing on stdout corrupted the channel (the original symptom: Claude Desktop "Unexpected token" parse errors).
+
+**(c) Three dogfood-surfaced fixes** (this session — **ADR-056** below):
+- **#0 Keyword-index maintenance on write** — a fresh write was invisible to search/read until the next server restart (in-RAM BM25 index bulk-loaded at boot, never updated on write — documented Phase-1 gap at `application.rs:234`). Fix: `VaultAdapter` holds the shared `Arc<KeywordIndex>` and upserts on write/update, deletes on delete (best-effort + WARN; SQLite is source of truth).
+- **#3 Delete idempotency** — deleting a missing id returned `-32602 not found`, contradicting the tool's documented "idempotent" contract. Fix: `handle_delete` returns `Ok(())` when `lookup_boundary` finds nothing.
+- **#7 Content cap** — canonical-save normalizer rejected content > 2000 chars, contradicting both vault-core's real 100 KB cap and the consolidator's paragraph-scale fixtures. Fix: removed the redundant 2000-char reject; vault-core's `MAX_MEMORY_CONTENT_BYTES` (100 KB) is the sole length gate, embedder truncates at 512 tokens (store-whole / embed-truncate).
+
+### Files modified in the Commit 8 working tree
+
+- **vault-app:** `src/adapter.rs` (keyword-index field + `maintain_keyword_index_upsert`/`_delete` helpers + 3 call sites + 2 regression tests + fixture wiring), `src/application.rs` (`ApplicationHandle::wait` + passes `keyword_index.clone()`), `src/normalization.rs` (#7 cap removal), `tests/integration_smoke.rs` (rename)
+- **vault-cli:** `src/main.rs` (mcp serve subcommand + stderr tracing)
+- **vault-mcp:** `Cargo.toml`, `examples/macro_spike.rs`, `src/adapter.rs`, `src/audit.rs`, `src/lib.rs`, `src/server.rs` (rename + #3 handle_delete + #7 description), `tests/{common/mock_adapter.rs, common/mod.rs, error_mapping.rs, initialize_smoke.rs, tool_invoke.rs, trust_boundary.rs}`
+- **doc-only (rename ripple):** `vault-core/src/memory.rs`, `vault-consolidator/src/report.rs`, `vault-retrieval/Cargo.toml` + `src/retriever.rs` + `src/structured_read_pipeline.rs`, `vault-storage/src/audit.rs` (taxonomy strings unchanged — only the MCP-tool-name doc line)
+- **HANDOFF.md** (this update)
+
+### Testing stage — DONE: all 3 fixes live-verified (2026-05-28)
+
+- ✅ Local DoD gates all green on the full working tree. 4 new tests pass: `write_makes_memory_searchable_in_keyword_index_without_restart`, `delete_removes_memory_from_keyword_index`, `tool_delete_missing_id_is_idempotent_success`, `accepts_long_content_above_former_2000_cap`.
+- ✅ `vault-cli` binary rebuilt with all fixes (`target/debug/vault-cli.exe`).
+- ✅ **Live-verified in Claude Desktop, confirmed against the server log (ground truth):**
+  - **#0** wrote `019e6e01…` then `memory_read` 6s later in the SAME chat (no restart) → returned it, `abstain:false`. Read-after-write works.
+  - **#7** ~2000+ char write accepted + read back intact (was rejected before).
+  - **#3** missing-id delete → `{"deleted":…}` success, `isError:false`.
+- **Ground-truth note for future sessions:** the MCP log at `%APPDATA%\Claude\logs\mcp-server-memory-vault.log` shows actual `tools/call` requests + server responses. Trust it over Claude Desktop's prose — its UI collapses JSON-RPC errors to a generic "Tool execution failed", and it can echo stale tool descriptions from earlier in a conversation / its loaded project context.
+- **Rebuild gotcha:** Claude Desktop holds the `.exe` lock as a running MCP child. To rebuild `vault-cli` you must fully quit Claude Desktop first; `Get-Process vault-cli` then `Stop-Process -Force` if it lingers. Clear the MCP log (`> $LOG`) before each fresh live test.
+
+### Next steps — pick up here (verification PASSED, nothing blocking)
+
+1. **Commit + push Commit 8** (NOT yet done — needs Shahbaz's explicit per-action approval per [[confirm-before-commit-push]]). Admin (ADR-056 + this HANDOFF) rides with the code commit per [[admin-changes-ride-with-code]]. Suggested message: `T0.3.x Batch B Commit 8: MCP serve entrypoint + tool-name rename + dogfood fixes (ADR-055, ADR-056)`. Then CI green check before anything else per [[ci-green-per-commit-vault-code]].
+2. **Consolidation dogfood (highest-value next test).** Run `vault-cli consolidate run` on the `personal` boundary, then re-read. This is the single move that unlocks the entire untested surface: K-means topic discovery, Phi-4 topic labels, the REPORT-present read path (`topic` is `null` on every fact today because consolidation has never run), and it clears the `degraded`/`REPORT_MISSING` health so we can see the `ok` path. Needs Phi-4 GGUF (already on disk per pre-dogfood gating).
+3. **Read-precision characterization (the agent-read differentiator — own session).** Live reads on the tiny ~5-memory `personal` vault return ALL memories regardless of query relevance — expected small-N behavior, NOT a regression (retriever core is validated at SCALE=10K, 9/9 quality, Phase 5). But the `StructuredReadPipeline` relevance filter has never been characterized on a realistic vault. Load the ~100-memory fixture, run varied queries, measure signal-vs-noise. Note: `memory_read` exposes no caller-side score threshold (only `memory_search` does) — the read pipeline's internal filter is the only relevance gate. Ties to [[correctness-is-the-product]].
+
+### Deferred (NOT in Commit 8 — decide later)
+
+- **#1 Opaque errors in Claude Desktop** — NOT our bug. The server emits correct structured JSON-RPC errors (verified in the log: `-32001`/`-32602` + messages); Claude Desktop's UI collapses them to "Tool execution failed." Optional future enhancement: surface actionable errors as `isError` results so agents can react — trades against ADR-024 no-info-leak. ADR-level.
+- **#4 Boundary names with dots** — `project.memory-vault` / `work.acme` are rejected by `Boundary::new`, yet the `memory_write` boundary-field description still lists them as examples. Decide: allow dots, or fix the examples + error message.
+- **#2 REPORT_MISSING severity** — young vault with no REPORT surfaces `health.status: degraded`, which is noisy/cry-wolf. Consider info-level instead.
+- **#6 Write-success echoes only `{id}`** — no content/byte echo, limits client-side round-trip verification. Minor.
+- **#8 Delete no-op indistinguishable from real delete** (dogfood 2026-05-28, consequence of the ADR-056 #3 idempotency fix) — `memory_delete` returns `{"deleted": id}` whether a memory existed or not, so an agent narrating its actions could tell the user "done, forgotten that" when nothing was there. The cascade already computes a `deleted: bool` (`cascading.rs`); surface it as an `existed: false` flag or outcome enum. Pre-beta polish (delete is irreversible + agents narrate), not ship-blocking.
+- **Content-limit contract: already fixed in Commit 8.** The `memory_write` content-field description now says "no hard length cap (~100 KB), only the first ~2000 chars feed the embedding" — vault-core's `MAX_MEMORY_CONTENT_BYTES` (100 KB) is the real ceiling and rejects past it with a clean `InvalidInput` (already unit-tested). If Claude Desktop still shows a "hard 2000" limit, it's reading a stale cached schema, not the live binary.
+- Optional: remove dead Qwen-7B Rust code (`Qwen25_14BProvider`) + `AppConfig.qwen_model_path` (Commit 8's original optional scope).
+
+### ADR-056 — Dogfood-surfaced correctness fixes (Commit 8, 2026-05-28)
+
+**Status:** Accepted, T0.3.x Batch B Commit 8 (2026-05-28). Surfaced by the first live Claude Desktop MCP connection + founder dogfood.
+
+**(a) Keyword-index maintained inline on write/update/delete.** The in-RAM Tantivy BM25 index (`vault-retrieval::KeywordIndex`) is bulk-loaded from SQLite at `Application::new` but was never updated on subsequent writes — a documented Phase-1 gap. Because the `AbstainingRetriever` gates on the BM25 channel, a memory written after boot was invisible to both `memory_read` and `memory_search` until the next restart re-ran the bulk-load. Decision: `VaultAdapter` holds the same `Arc<KeywordIndex>` the retriever's keyword channel queries and maintains it inline — `upsert` after `write`/`update`, `delete` after `delete`. Best-effort with a loud WARN: the durable SQLite write is the commit point; the in-RAM index rebuilds from SQLite on every restart, so an index hiccup self-heals. Read-after-write contract is now **a write is searchable the instant the call returns** (BM25 inline; the async Lance vector leg lags <1s but RRF fusion carries the result). Pinned by `write_makes_memory_searchable_in_keyword_index_without_restart` + `delete_removes_memory_from_keyword_index`.
+
+**(b) Delete is idempotent on missing ids.** `handle_delete` previously returned `VaultError::NotFound` (`-32602`) when `lookup_boundary` found no memory — contradicting the `memory_delete` tool description's documented idempotency contract. Decision: return `Ok(())` for a missing memory. Nothing exists to auth-gate and returning success leaks nothing an attacker couldn't already infer from the prior not-found-vs-access-denied split. Pinned by `tool_delete_missing_id_is_idempotent_success`.
+
+**(c) Content-length cap is store-whole / embed-truncate.** The canonical-save normalizer rejected content > 2000 chars — a "sanity cap" contradicting both vault-core's real `MAX_MEMORY_CONTENT_BYTES` (100 KB) and the consolidator's fixtures (paragraph-scale memories up to ~2.4 KB designed to exercise embedding truncation). Decision: removed the normalizer's 2000-char reject. vault-core's 100 KB cap is the single length gate; the embedder truncates at its 512-token window. Long memories are stored whole; only the embedding is truncated. Pinned by `accepts_long_content_above_former_2000_cap`. Confirmed with Shahbaz 2026-05-28.
+
+---
+
+> **⚠️ The Step 1–4 plan below (Commits 7 + 8) is HISTORICAL** — superseded by the block above. Kept for the design-reasoning trail only.
 
 ### Step 1 — Sanity check working tree + CI
 
@@ -223,10 +291,22 @@ Per [[gh-run-watch-exit-not-equal-run-status]] — if `gh run watch` errors, tha
 - **ADR-054 Amendment 2** lands in HANDOFF (rides with this commit, no separate doc): drops `DELTA_LOG_UNAVAILABLE` from the locked-codes set, cites the falsified-by evidence (Commit 6 architecture), retires Plan Iteration 3 Contract 4. Already drafted below ADR-054 base text.
 - **Local DoD gates** before commit: fmt → check → clippy → test → fmt --check → `git status --short`. Per [[run-cargo-gates-in-background]] all in background; per [[no-parallel-cargo-invocations]] strictly serial.
 
-**Commit 8 — Founder dogfood + polish** (~1.5 days):
-- End-to-end check from Claude Desktop via MCP stdio: write a few memories, run `vault-cli consolidate run`, read them back, verify the structured-fact shape arrives in Claude Desktop and Claude composes a coherent answer from it.
+**Commit 8 — MCP entrypoint + founder dogfood** (~2-2.5 days):
+
+**Scope expanded 2026-05-27** after dogfood-prep recon surfaced that no MCP stdio entrypoint binary existed: `crates/vault-mcp` was library-only, `crates/vault-tauri` deliberately omits MCP per ADR-034 ("V0.1 vault-tauri is UI-only — no MCP server bound inside the Tauri process"), and `crates/vault-cli` had no `mcp` subcommand. ADR-034 forward-pointed to a "V0.2 alpha-distribution subcommand-split design"; this commit lands it.
+
+Code shape (already drafted 2026-05-27, sitting in the working tree):
+- `crates/vault-app/src/application.rs` — new public `ApplicationHandle::wait()` method: selects on `server_handle` (stdio EOF) and `signal_handle` (SIGINT path), then calls `shutdown()` for graceful cleanup. ~40 LoC including doc.
+- `crates/vault-cli/src/main.rs` — new `Command::Mcp { ..., command: McpAction }` variant + `McpAction::Serve` + `dispatch_mcp` + `run_mcp_serve` + 3 CLI parser tests. `phi4_model` refactored to `Option<PathBuf>` on `build_application` (Phi-4 is needed only for the consolidate path; MCP read path is fully deterministic per ADR-052). `--boundary` flag repeatable, defaults to `["personal"]`.
+- **ADR-055** (`vault-cli mcp` subcommand-split design) rides with this commit. Documents the rejected alternatives (standalone `vault-mcp` binary, modifying `vault-tauri`).
+- ~329 net LoC across the two files (vault-app +42, vault-cli +287). Close to the 250-LoC pre-write estimate.
+
+Dogfood phase (after CI green):
+- End-to-end check from Claude Desktop via MCP stdio: register `vault-cli mcp serve …` in `%APPDATA%\Claude\claude_desktop_config.json`'s `mcpServers` block, write a few memories from Claude Desktop, run `vault-cli consolidate run` in a separate terminal, read memories back, verify the structured-fact shape arrives cleanly and Claude composes a coherent answer.
 - Tighten any rough edges surfaced during dogfood. Possible items: error-message clarity, REPORT staleness threshold tuning, MCP tool description final polish.
 - If Qwen-7B Rust code (`Qwen25_14BProvider` in `vault-llm`) is fully unused, remove it here. `AppConfig.qwen_model_path` (currently `#[allow(dead_code)]` per ADR-052) also removed.
+
+Pre-dogfood gating: BGE model + tokenizer + ONNX Runtime DLL need to live on disk first — run `scripts/setup-dev-env.ps1` (Windows) which downloads them into `crates/vault-embedding/test-fixtures/bge-small-en-v1.5/` (~150 MB, idempotent, SHA-256-verified per `MODEL_PROVENANCE.md`). Phi-4-mini GGUF already present at `%APPDATA%\com.shahbaz242630.memory-vault\models\Phi-4-mini-instruct-Q4_K_M.gguf`.
 
 **Note on cadence:** Commit 7 (retirement) is deterministic ~30-LoC + HANDOFF — ships cleanly on its own CI cycle. Commit 8 (dogfood) is exploratory and may surface fix-forward needs. Two separate commit+push cycles, per [[ci-green-per-commit-vault-code]].
 
@@ -260,7 +340,7 @@ The four open items in the Tech-debt section below are NOT small:
 
 **Open (Commits 7 + 8 + tech-debt):**
 - Commit 7: retire Contract 4 (drop `WarningCode::DeltaLogUnavailable` + obsolete pin test + MCP tool-description update + HANDOFF cross-ref count updates) + ADR-054 Amendment 2 in HANDOFF
-- Commit 8: founder dogfood + polish + (optional) Qwen-7B Rust code removal + (optional) `AppConfig.qwen_model_path` field removal
+- Commit 8: **MCP entrypoint** (new `vault-cli mcp serve` subcommand per ADR-055 — closes ADR-034's forward-pointer) + founder dogfood + polish + (optional) Qwen-7B Rust code removal + (optional) `AppConfig.qwen_model_path` field removal
 - The four multi-session tech-debt items in the Tech-debt section
 - Eventual: scheduling (T0.2.6), Phase 4 decay (T0.2.4), checkpoint+rollback (T0.2.5) — sequenced after Batch B closes
 
@@ -710,6 +790,78 @@ Contract 4 was conceived under an architecture where REPORT was the candidate po
 
 ---
 
+## ADR-055 — `vault-cli mcp serve` subcommand-split design (Commit 8 of locked-next-arc, 2026-05-27)
+
+**Status:** Drafted 2026-05-27, lands at Commit 8 of locked-next-arc Batch B (this commit). Closes ADR-034's forward-pointer to "V0.2 alpha-distribution / subcommand-split design".
+
+**Context.** ADR-034 (T0.1.11 Phase 5b) deliberately kept the V0.1 `vault-tauri` UI-only — *"V0.1 vault-tauri is UI-only — no MCP server bound inside the Tauri process. `start_with_mcp` would call rmcp's `ServiceExt::serve(server, stdio()).await` which blocks on JSON-RPC `initialize` from a peer that doesn't exist when launched as a Tauri UI app, hanging Tauri's setup() hook indefinitely."* The pointer-forward said *"AI-client MCP integration deferred to V0.2 alpha-distribution task (subcommand-split design per ADR-034 cross-link)."*
+
+Commit 8 dogfood-prep recon (2026-05-27) confirmed the gap was still open: `crates/vault-mcp` is a library crate (no `main.rs`), `crates/vault-tauri/src/main.rs:272-283` still reflects ADR-034's deferral, `crates/vault-cli/src/main.rs` (1,336 lines pre-Commit-8) had subcommands for dead-letter / divergence-check / consolidate but no `mcp` subcommand. So before Claude Desktop could stdio-talk to the vault, the MCP entrypoint binary had to be built. ADR-055 documents that build.
+
+**Decision.** New `vault-cli mcp serve` subcommand (Subcommand-split path α), NOT a standalone `vault-mcp` binary (path β) and NOT modifying `vault-tauri` (path γ).
+
+Concrete shape (locked at this commit):
+
+```text
+vault-cli mcp serve
+  --bge-model <path>           # required (or VAULT_BGE_MODEL_PATH env)
+  --bge-tokenizer <path>       # required (or VAULT_BGE_TOKENIZER_PATH env)
+  --ort-lib <path>             # required (or VAULT_ORT_LIB_PATH env)
+  [--phi4-model <path>]        # optional (Option<PathBuf>) — read pipeline is
+                               #   fully deterministic per ADR-052; Phi-4 only
+                               #   needed if this process is ALSO to host
+                               #   consolidation runs (uncommon)
+  [--boundary <name>]...       # repeatable; defaults to ["personal"]
+  --vault-db <path>            # inherited from the top-level Cli struct
+  --vector-dir <path>
+  --graph-db <path>
+```
+
+**Rejected alternatives.**
+
+- **Path β — Standalone `vault-mcp` binary** (give `crates/vault-mcp/` a `src/main.rs`). Rejected because: (1) duplicates the keychain-bootstrap + `AppConfig` construction logic already in `vault-cli::build_application`; (2) ships a second Rust binary that has to be packaged in alpha distribution + registered for the user; (3) `vault-cli` is the existing operator-tools entrypoint — `mcp serve` fits its surface naturally. Path α reuses the entire vault-cli skeleton.
+- **Path γ — Modify `vault-tauri` to optionally host MCP** (config flag, runtime branch). Rejected because: (1) reintroduces the rmcp-blocking issue ADR-034 explicitly designed around; (2) couples UI lifecycle to MCP transport lifecycle; (3) for V0.2 alpha the UI app and the MCP daemon should be separable — a user running Claude Desktop's MCP integration may not want the Tauri UI open at all.
+- **Single-binary monolith with auto-detect mode (UI / MCP / CLI)** (e.g. argv[0]-based dispatching). Rejected as over-engineering for V0.2 alpha. The subcommand split is mechanical, discoverable (`vault-cli --help` lists `mcp` alongside `consolidate`), and trivially extensible (e.g. a future `vault-cli mcp status` subcommand for diagnostics).
+
+**Implementation surface (rides with this commit).**
+
+| Surface | Change |
+|---|---|
+| `crates/vault-app/src/application.rs::ApplicationHandle` | **NEW** `pub async fn wait(self) -> VaultResult<()>` — selects on `server_handle` + `signal_handle`, then calls `shutdown()` for graceful cleanup. Doc-pinned: worker is NOT in the select (worker exits only when the shutdown signal flips, which happens AFTER one of the other two tasks resolves). |
+| `crates/vault-cli/src/main.rs::Command` | **NEW** `Mcp { bge_model, bge_tokenizer, ort_lib, phi4_model: Option<PathBuf>, boundary: Vec<String>, action: McpAction }` variant. |
+| `crates/vault-cli/src/main.rs::McpAction` | **NEW** enum with single `Serve` variant. (Forward-compat: future subcommands like `vault-cli mcp status` can land as sibling variants without breaking the parser surface.) |
+| `crates/vault-cli/src/main.rs::dispatch_mcp` | **NEW** async fn. Parses `--boundary` strings into typed `Boundary` values BEFORE touching keychain / opening backend (cheap failure surface). |
+| `crates/vault-cli/src/main.rs::run_mcp_serve` | **NEW** async fn. Calls `Application::start_with_mcp` → `handle.wait()`. Eprintln-stderr announces "ready" + "clean shutdown" for operator visibility (stdout is reserved for the MCP JSON-RPC traffic). |
+| `crates/vault-cli/src/main.rs::build_application` | **REFACTORED** `phi4_model: PathBuf` → `phi4_model: Option<PathBuf>`. Backward-compatible for the consolidate caller which now passes `Some(phi4_model)`. `Application::new` already handles `phi4_model_path: None` gracefully (logs WARN, leaves consolidator unwired; `run_consolidation_with_safety` returns `ConsolidatorUnconfigured` if called). |
+| `crates/vault-cli/src/main.rs::tests` | **NEW** 3 CLI parser tests: defaults case (no phi4, no boundary), full case (phi4 supplied + 3 boundaries), rejection case (missing --bge-model). |
+
+**Boundary auth gating.**
+
+The MCP server's tool-call layer (already in `crates/vault-mcp/src/server.rs`) refuses calls that touch boundaries outside the `authorized_boundaries: Vec<Boundary>` passed to `Application::start_with_mcp` per BRD §11.4.3. The CLI's `--boundary` flag is the operator's "what does Claude Desktop see today" gate. Default `["personal"]` matches the single-default convention; supplying multiple boundaries (`--boundary personal --boundary work`) is an explicit operator action.
+
+**Why `phi4_model` is `Option`.**
+
+The MCP read path is fully deterministic per ADR-052 (LLM out of read; `StructuredReadPipeline` filter-and-pack). Loading Phi-4-mini at MCP-server startup would waste ~30s of cold-start time + ~4 GB resident memory for zero functional benefit. The consolidation path (`vault-cli consolidate run`) does require Phi-4 — and runs as a separate process in the typical alpha deployment. If the operator wants the MCP-server process to ALSO be able to invoke consolidation (e.g. via a future MCP `vault.consolidate` tool), they can supply `--phi4-model`; today that path is unused but the type plumbing already accommodates it.
+
+**Pin tests.**
+
+3 CLI parser tests in `crates/vault-cli/src/main.rs::tests`:
+- `cli_parses_mcp_serve_with_default_boundary` — defaults case
+- `cli_parses_mcp_serve_with_multiple_boundaries_and_phi4` — full-opt case + repeatable-flag ordering
+- `cli_rejects_mcp_serve_with_missing_bge_model` — required-arg enforcement
+
+Protocol-level coverage (rmcp JSON-RPC handshake, tools/list, tool dispatch) is already pinned by `crates/vault-mcp/tests/initialize_smoke.rs` — no new integration test needed at the vault-cli layer because the dispatcher is a thin shim over `Application::start_with_mcp` which is already covered.
+
+**Forward-compat.**
+
+- A future `vault-cli mcp status` subcommand (diagnostics — show wired boundaries, REPORT staleness, recent retry-queue depth) drops in as a sibling `McpAction` variant.
+- If V1.0 Managed PAYG needs a non-stdio transport (HTTP/SSE for cloud deployment), a future `McpAction::Serve` flag like `--transport http --listen 0.0.0.0:8443` can extend without breaking the stdio default. rmcp already supports HTTP per its crate docs; the swap point is the `transport::stdio()` call inside `Application::start_with_mcp`.
+- If a future commit needs a dedicated `vault-mcp` binary (e.g. minimized distribution surface for embedded deployments), the same `Application::start_with_mcp` + `handle.wait()` pattern works — no API redesign needed.
+
+**Cross-refs.** ADR-034 (T0.1.11 Phase 5b — V0.1 UI-only vault-tauri; this ADR closes the forward-pointer) · ADR-052 (Qwen out of read path → MCP server doesn't need Phi-4) · `crates/vault-app/src/application.rs::Application::start_with_mcp` (the underlying API consumed) · `crates/vault-app/src/application.rs::ApplicationHandle::wait` (the new public method this commit adds) · `crates/vault-mcp/src/server.rs` (the StdioServer construction site) · `crates/vault-mcp/tests/initialize_smoke.rs` (protocol-level pin) · BRD §11.4.3 (authorized_boundaries surface) · [[locked-next-arc-t03x]] Commit 8.
+
+---
+
 ## ADR-051 — Bi-temporal storage semantics + invalidation API contract (T0.2.7 Phase B, merged-consolidator arc)
 
 **Status:** Drafted before code, 2026-05-24, T0.2.7 close. Pre-locks the semantics consumed by Phase B retrieval-filter wiring and the Phase C write-time `ADD/UPDATE/DELETE/NOOP` loop. ADR-050 (V0.2 read-time architecture lock) is the unrelated sibling tracked separately; numbering skips ADR-050 here.
@@ -996,6 +1148,7 @@ The following ADRs are LIVE for current V0.2 work. **Full text in `HANDOFF_V0.2_
 - **ADR-052** — Qwen-7B retirement from read path (shipped at Commit 6, `99052f2`, 2026-05-26). Formally supersedes ADR-048 + ADR-049 in effect: replaces the V0.2-era Qwen-7B single-call synthesis pipeline (mean 86s, p99 119.7s on Vulkan iGPU) with the deterministic `StructuredReadPipeline` (~500ms total). Delivers ~170× local-mode speedup, ~50× BYOK cost cut, ~10× Managed PAYG margin. Phi-4-mini stays at nightly consolidation. ADR-051 + ADR-053 + ADR-044/045/046/047 unchanged. Full ADR text above this section.
 - **ADR-053** — Per-boundary REPORT artifact shape + storage + lifecycle (shipped at T0.3.x Batch A, `f0cc158`, 2026-05-26). Locks the structured JSON shape (`schema_version` + `boundary` + `generated_at` + `consolidator_run_id` + `facts_by_topic` keyed by topic label), storage path `<vault_root>/reports/<boundary>.report.json`, atomic `.tmp + fsync + rename` write protocol, and latest-only versioning. Consumed by the Batch B Commit 6 structured-fact read pipeline. **Amendment 1 shipped at Commit 6 (`99052f2`, 2026-05-26)** adds `topic_names_unavailable: bool` (additive, `#[serde(default)]`) so the read pipeline can surface ADR-054's `TOPIC_NAMES_UNAVAILABLE` warning. Full ADR text + Amendment 1 above this section.
 - **ADR-054** — MCP `memory.read` response health-warning contract (shipped at Commit 6, `99052f2`, 2026-05-26). Locks the structured-fact response shape (`boundary` / `query` / `relevant_facts` / `abstain` / `health`) with staleness threshold constants + aggregate-status rule + per-boundary deterministic emission ordering. **Amendment 2 at Commit 7 (drafted 2026-05-27) drops `DELTA_LOG_UNAVAILABLE`** → 6 locked codes (`REPORT_MISSING` / `REPORT_STALE_INFO` / `REPORT_STALE_WARN` / `REPORT_STALE_CRITICAL` / `TOPIC_NAMES_UNAVAILABLE` / `CLOCK_SKEW_DETECTED`); retires Plan Iteration 3 Contract 4 (same-day delta log) as falsified by Commit 6's retriever-primary architecture. Pinned by 14 unit tests in `crates/vault-retrieval/src/structured_read_pipeline.rs` (was 15; one obsolete pin removed at Commit 7). Full ADR text + Amendment 2 above this section.
+- **ADR-055** — `vault-cli mcp serve` subcommand-split design (Commit 8 of locked-next-arc, 2026-05-27). Closes ADR-034's V0.1 forward-pointer to "V0.2 alpha-distribution subcommand-split design". New `Mcp { ..., action: McpAction::Serve }` variant in `vault-cli`; `phi4_model: Option<PathBuf>` (read path is fully deterministic per ADR-052); repeatable `--boundary` flag defaulting to `["personal"]`; new public `ApplicationHandle::wait()` method in `vault-app` for graceful select-then-shutdown lifecycle. Rejected: standalone `vault-mcp` binary (duplicates keychain bootstrap), modifying `vault-tauri` (reintroduces ADR-034's rmcp-blocking issue), argv[0]-based monolith (over-engineering). Pinned by 3 CLI parser tests in `crates/vault-cli/src/main.rs`; protocol-level coverage already in `crates/vault-mcp/tests/initialize_smoke.rs`. Full ADR text above this section.
 
 **V0.1-era ADRs (ADR-001 → ADR-030 + ADR-008 amendments)** — full text in `HANDOFF_V0.1_ARCHIVE.md`.
 

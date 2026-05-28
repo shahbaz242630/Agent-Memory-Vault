@@ -191,7 +191,7 @@ async fn full_initialize_round_trip_lists_five_tools_with_expected_names() {
     // the five `#[tool]` decorators in `server.rs`. End-to-end macro
     // chain verification.
     //
-    // T0.2.7 Phase 4 (2026-05-20): `memory.read` joins the contract.
+    // T0.2.7 Phase 4 (2026-05-20): `memory_read` joins the contract.
     // Commit 6 (locked-next-arc, 2026-05-26 — ADR-052 + ADR-054):
     // response shape rewritten to structured `relevant_facts` +
     // `abstain` + `health.warnings`; Qwen-7B retired from read path.
@@ -205,11 +205,11 @@ async fn full_initialize_round_trip_lists_five_tools_with_expected_names() {
 
     let names: BTreeSet<&str> = listed.tools.iter().map(|t| t.name.as_ref()).collect();
     let expected: BTreeSet<&str> = [
-        "memory.search",
-        "memory.read",
-        "memory.write",
-        "memory.update",
-        "memory.delete",
+        "memory_search",
+        "memory_read",
+        "memory_write",
+        "memory_update",
+        "memory_delete",
     ]
     .into_iter()
     .collect();
@@ -234,10 +234,10 @@ async fn full_initialize_round_trip_lists_five_tools_with_expected_names() {
 }
 
 // =============================================================================
-// 6. T0.2.7 close — `memory.write` canonical-save contract pin
+// 6. T0.2.7 close — `memory_write` canonical-save contract pin
 // =============================================================================
 
-/// T0.2.7 close (2026-05-25): pin test for the `memory.write` canonical-
+/// T0.2.7 close (2026-05-25): pin test for the `memory_write` canonical-
 /// save contract. The tool description and per-field input-schema
 /// descriptions are load-bearing for cross-platform consistency — Claude,
 /// GPT, Codex, Kimi all read them via `tools/list` and save memories in
@@ -280,14 +280,14 @@ async fn memory_write_description_contains_canonical_save_contract() {
     let write_tool = listed
         .tools
         .iter()
-        .find(|t| t.name.as_ref() == "memory.write")
-        .expect("memory.write tool present in tools/list");
+        .find(|t| t.name.as_ref() == "memory_write")
+        .expect("memory_write tool present in tools/list");
 
     // ── Tool-level description pin ───────────────────────────────────
     let description = write_tool
         .description
         .as_ref()
-        .expect("memory.write tool has a description")
+        .expect("memory_write tool has a description")
         .as_ref();
 
     // The six canonical-save rule keywords + the WHEN/CRITICAL section
@@ -308,7 +308,7 @@ async fn memory_write_description_contains_canonical_save_contract() {
     for (phrase, label) in required_phrases {
         assert!(
             description.contains(phrase),
-            "memory.write description missing canonical-save phrase {phrase:?} ({label})"
+            "memory_write description missing canonical-save phrase {phrase:?} ({label})"
         );
     }
 
@@ -330,7 +330,8 @@ async fn memory_write_description_contains_canonical_save_contract() {
     );
     assert!(
         content_desc.contains("2000"),
-        "content field description must mention the 2000-char length cap; got: {content_desc}"
+        "content field description must mention the ~2000-char embedding window \
+         (store-whole / embed-truncate, 2026-05-28); got: {content_desc}"
     );
 
     let boundary_desc = properties
@@ -360,11 +361,11 @@ async fn memory_write_description_contains_canonical_save_contract() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Test 7: memory.update tool description carries the canonical-save
+// Test 7: memory_update tool description carries the canonical-save
 // contract (admin ride-along, 2026-05-26)
 // ─────────────────────────────────────────────────────────────────────────
 //
-// Mirrors test 6's pattern. `memory.update` replaces existing memory
+// Mirrors test 6's pattern. `memory_update` replaces existing memory
 // content, so the same six canonical-save rules apply — agents that
 // follow them produce higher-quality memories regardless of server-side
 // normalization. Description pinned by this test so accidental edits
@@ -393,13 +394,13 @@ async fn memory_update_description_contains_canonical_save_contract() {
     let update_tool = listed
         .tools
         .iter()
-        .find(|t| t.name.as_ref() == "memory.update")
-        .expect("memory.update tool present in tools/list");
+        .find(|t| t.name.as_ref() == "memory_update")
+        .expect("memory_update tool present in tools/list");
 
     let description = update_tool
         .description
         .as_ref()
-        .expect("memory.update tool has a description")
+        .expect("memory_update tool has a description")
         .as_ref();
 
     // Canonical-save rule keywords + when-to-call sections + cross-platform
@@ -415,12 +416,12 @@ async fn memory_update_description_contains_canonical_save_contract() {
         ("ANY AI agent", "cross-platform thesis"),
         ("WHEN TO CALL", "when-to-call section header"),
         ("WHEN NOT TO CALL", "when-not-to-call section header"),
-        ("memory.write", "cross-reference to write tool"),
+        ("memory_write", "cross-reference to write tool"),
     ];
     for (phrase, label) in required_phrases {
         assert!(
             description.contains(phrase),
-            "memory.update description missing canonical-save phrase {phrase:?} ({label})"
+            "memory_update description missing canonical-save phrase {phrase:?} ({label})"
         );
     }
 
@@ -431,7 +432,7 @@ async fn memory_update_description_contains_canonical_save_contract() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Test 8: memory.delete tool description carries WHEN-TO-CALL /
+// Test 8: memory_delete tool description carries WHEN-TO-CALL /
 // IRREVERSIBILITY / idempotency guidance (admin ride-along, 2026-05-26)
 // ─────────────────────────────────────────────────────────────────────────
 //
@@ -463,13 +464,13 @@ async fn memory_delete_description_contains_when_to_call_guidance() {
     let delete_tool = listed
         .tools
         .iter()
-        .find(|t| t.name.as_ref() == "memory.delete")
-        .expect("memory.delete tool present in tools/list");
+        .find(|t| t.name.as_ref() == "memory_delete")
+        .expect("memory_delete tool present in tools/list");
 
     let description = delete_tool
         .description
         .as_ref()
-        .expect("memory.delete tool has a description")
+        .expect("memory_delete tool has a description")
         .as_ref();
 
     let required_phrases: &[(&str, &str)] = &[
@@ -478,13 +479,13 @@ async fn memory_delete_description_contains_when_to_call_guidance() {
         ("IRREVERSIBILITY", "irreversibility section header"),
         ("Idempotent", "idempotency contract"),
         ("consolidator", "delete-vs-consolidator boundary guidance"),
-        ("memory.update", "delete-vs-update guidance"),
+        ("memory_update", "delete-vs-update guidance"),
         ("authorized", "boundary auth note"),
     ];
     for (phrase, label) in required_phrases {
         assert!(
             description.contains(phrase),
-            "memory.delete description missing guidance phrase {phrase:?} ({label})"
+            "memory_delete description missing guidance phrase {phrase:?} ({label})"
         );
     }
 

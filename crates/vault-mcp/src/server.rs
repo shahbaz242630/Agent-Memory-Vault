@@ -42,7 +42,7 @@ use crate::Adapter;
 // JSON-RPC parameter schemas — typed, schemars-derived for #[tool] macros
 // =============================================================================
 
-/// JSON-RPC parameters for the `memory.search` tool.
+/// JSON-RPC parameters for the `memory_search` tool.
 ///
 /// **NOTE (ADR-025 trust boundary):** this schema deliberately does NOT
 /// contain an `authorized_boundaries` field. Any such key in the
@@ -75,7 +75,7 @@ pub struct SearchToolParams {
     pub include_archived: Option<bool>,
 }
 
-/// JSON-RPC parameters for the `memory.read` tool. Added at T0.2.7
+/// JSON-RPC parameters for the `memory_read` tool. Added at T0.2.7
 /// Phase 4 (2026-05-20); response shape was rewritten at Commit 6
 /// (locked-next-arc, 2026-05-26 — ADR-052 + ADR-054) when the Qwen-7B
 /// read-time synthesis was retired in favour of a deterministic
@@ -94,7 +94,7 @@ pub struct ReadToolParams {
     pub query: String,
 }
 
-/// JSON-RPC parameters for the `memory.write` tool.
+/// JSON-RPC parameters for the `memory_write` tool.
 ///
 /// **NOTE (ADR-025):** the `boundary` field IS user-controlled — the
 /// agent specifies which boundary to write to. The handler validates
@@ -116,9 +116,10 @@ pub struct WriteToolParams {
     /// about the user. Apply ALL six canonical-format rules from the
     /// tool description (atomic fact, third-person, complete sentence,
     /// strip conversation framing, absolute dates, no agent self-
-    /// reference). Hard limit: 2000 characters (atomic facts should be
-    /// much shorter; this is a sanity cap, not a target). Examples of
-    /// good content: "The user prefers dark mode in their code
+    /// reference). Aim for concise atomic facts. There is no hard length
+    /// cap (storage accepts up to ~100 KB), but only the first ~2000
+    /// characters feed the retrieval embedding, so front-load the key
+    /// fact. Examples of good content: "The user prefers dark mode in their code
     /// editors." / "As of 2026-05-25 the user is building Memory
     /// Vault, a cross-agent personal memory layer." / "The user is a
     /// non-coder product owner who works with an AI partner; they
@@ -157,7 +158,7 @@ pub struct WriteToolParams {
     pub confidence: Option<f32>,
 }
 
-/// JSON-RPC parameters for the `memory.update` tool — combines the target
+/// JSON-RPC parameters for the `memory_update` tool — combines the target
 /// memory id with the full replacement payload (mirrors `WriteToolParams`).
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct UpdateToolParams {
@@ -173,7 +174,7 @@ pub struct UpdateToolParams {
     pub confidence: Option<f32>,
 }
 
-/// JSON-RPC parameters for the `memory.delete` tool — id-only.
+/// JSON-RPC parameters for the `memory_delete` tool — id-only.
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct DeleteToolParams {
     /// UUID v7 of the memory to delete.
@@ -244,7 +245,7 @@ impl StdioServer {
     // Phase 2 will wrap with the macro layer.
     // -------------------------------------------------------------------------
 
-    /// `memory.search` Phase 1 stub. Constructs the `RetrievalQuery`
+    /// `memory_search` Phase 1 stub. Constructs the `RetrievalQuery`
     /// using the TRUSTED `self.authorized_boundaries` (NEVER the request
     /// body), then calls `self.adapter.search()`. Phase 1's stub adapter
     /// panics with `unimplemented!()` — the trust-boundary tests assert
@@ -269,7 +270,7 @@ impl StdioServer {
         self.adapter.search(query).await
     }
 
-    /// `memory.read` handler. Constructs the [`ReadQuery`] using the
+    /// `memory_read` handler. Constructs the [`ReadQuery`] using the
     /// TRUSTED `self.authorized_boundaries` (NEVER the request body),
     /// then dispatches to `self.adapter.read()`.
     ///
@@ -289,7 +290,7 @@ impl StdioServer {
         self.adapter.read(query).await
     }
 
-    /// `memory.write` Phase 1 stub. Validates that `params.boundary` is
+    /// `memory_write` Phase 1 stub. Validates that `params.boundary` is
     /// in the trusted slice — request data is ALLOWED to specify which
     /// boundary the memory goes to (it's a write target, not an auth
     /// override), but only for boundaries the application has already
@@ -331,7 +332,7 @@ impl StdioServer {
         self.adapter.write(new_memory).await
     }
 
-    /// `memory.update` Phase 1 stub.
+    /// `memory_update` Phase 1 stub.
     pub async fn handle_update(&self, id: MemoryId, params: WriteToolParams) -> VaultResult<()> {
         // Same boundary-validation as write: the boundary the agent
         // names MUST be one we've authorized.
@@ -366,7 +367,7 @@ impl StdioServer {
         self.adapter.update(id, new_memory).await
     }
 
-    /// `memory.delete` handler. ADR-025 amendment 2026-05-05 (T0.1.11
+    /// `memory_delete` handler. ADR-025 amendment 2026-05-05 (T0.1.11
     /// Phase 4a): handler auth-gates against the trusted
     /// `authorized_boundaries` slice using the memory's stored boundary
     /// looked up via [`Adapter::lookup_boundary`]. The original
@@ -378,18 +379,24 @@ impl StdioServer {
     /// the delete path.
     ///
     /// Surfacing semantics:
-    /// - lookup returns `Ok(None)` → memory does not exist → `NotFound`
-    ///   (maps to `-32602 "not found"` per ADR-024)
+    /// - lookup returns `Ok(None)` → memory does not exist → **idempotent
+    ///   success** (`Ok(())`). Deleting something already gone is success,
+    ///   not an error — this honours the tool description's documented
+    ///   idempotency contract. A missing memory has no stored boundary to
+    ///   auth-gate, and returning success leaks nothing an attacker
+    ///   couldn't already infer from the not-found-vs-access-denied split.
+    ///   (Changed at Commit 8, 2026-05-28 — ADR-056. Was `NotFound`, which
+    ///   contradicted the tool contract; surfaced by founder dogfood.)
     /// - lookup returns `Ok(Some(b))` and `b ∉ authorized_boundaries`
     ///   → `AccessDenied` (maps to `-32001 "access denied"` per ADR-024)
     /// - lookup returns `Ok(Some(b))` and `b ∈ authorized_boundaries`
     ///   → dispatch through to `Adapter::delete`
     pub async fn handle_delete(&self, id: MemoryId) -> VaultResult<()> {
-        let stored_boundary = self
-            .adapter
-            .lookup_boundary(id)
-            .await?
-            .ok_or_else(|| VaultError::NotFound(format!("memory {id} not found")))?;
+        let Some(stored_boundary) = self.adapter.lookup_boundary(id).await? else {
+            // Idempotent delete: nothing exists, so nothing to auth-gate
+            // and nothing to remove. Return success per ADR-056.
+            return Ok(());
+        };
 
         if !self.authorized_boundaries.contains(&stored_boundary) {
             return Err(VaultError::AccessDenied(format!(
@@ -416,7 +423,7 @@ impl StdioServer {
     // test to assert the audit row shape once the audit append is wired.
     // -------------------------------------------------------------------------
 
-    /// `memory.search` MCP tool — the agent-facing surface for the
+    /// `memory_search` MCP tool — the agent-facing surface for the
     /// `SemanticRetriever`-backed search pipeline.
     ///
     /// **Step 4 (Phase 2): audit + tracing wired.** Both success and
@@ -427,7 +434,7 @@ impl StdioServer {
     /// audit-storage failure still leaves the operational log; the
     /// audit chain is the authoritative record, tracing is operational.
     #[tool(
-        name = "memory.search",
+        name = "memory_search",
         description = "Search the user's memory vault by free-text query. \
                        Returns relevant memories ranked by cosine similarity. \
                        Authorization is mediated by the host application, \
@@ -457,7 +464,7 @@ impl StdioServer {
         };
 
         let details = ToolInvokeDetails {
-            tool: "memory.search",
+            tool: "memory_search",
             duration_ms,
             result_count,
             boundary_count: boundary_count_recorded,
@@ -483,7 +490,7 @@ impl StdioServer {
             include_archived = ?details.include_archived,
             query_length = ?details.query_length,
             error = ?details.error,
-            "memory.search tool invocation completed"
+            "memory_search tool invocation completed"
         );
 
         // Audit append — authoritative record, propagates failures
@@ -500,7 +507,7 @@ impl StdioServer {
         success_json_result(&memories)
     }
 
-    /// `memory.read` MCP tool — the agent-facing surface for the
+    /// `memory_read` MCP tool — the agent-facing surface for the
     /// production [`vault_retrieval::StructuredReadPipeline`]
     /// (deterministic filter+pack over BGE + Tantivy + RRF + abstain
     /// retrieval, enriched with per-boundary REPORT topic labels).
@@ -520,7 +527,7 @@ impl StdioServer {
     /// slice + `result_count = 1` on success (single
     /// `StructuredReadResponse`) / `0` on error.
     #[tool(
-        name = "memory.read",
+        name = "memory_read",
         description = "Read the user's memory vault as structured facts. \
                        Returns a JSON object with five fields: \
                        \n\
@@ -592,7 +599,7 @@ impl StdioServer {
         };
 
         let details = ToolInvokeDetails {
-            tool: "memory.read",
+            tool: "memory_read",
             duration_ms,
             result_count,
             boundary_count: boundary_count_recorded,
@@ -614,7 +621,7 @@ impl StdioServer {
             boundary_count = details.boundary_count,
             query_length = ?details.query_length,
             error = ?details.error,
-            "memory.read tool invocation completed"
+            "memory_read tool invocation completed"
         );
 
         self.adapter
@@ -626,7 +633,7 @@ impl StdioServer {
         success_json_result(&response)
     }
 
-    /// `memory.write` MCP tool — create a new memory in a boundary the
+    /// `memory_write` MCP tool — create a new memory in a boundary the
     /// host application has authorized.
     ///
     /// **Step 5 (Phase 2): audit + tracing wired** per Q7(a)
@@ -652,7 +659,7 @@ impl StdioServer {
     /// test in `tests/initialize_smoke.rs` — accidental edits that drop
     /// the canonical rules will fail CI.
     #[tool(
-        name = "memory.write",
+        name = "memory_write",
         description = "Save a fact to the user's persistent memory vault. The vault is \
                        read by ANY AI agent the user connects later (Claude, GPT, \
                        Codex, Kimi, custom), so memories must be written in a \
@@ -718,7 +725,7 @@ impl StdioServer {
         };
 
         let details = ToolInvokeDetails {
-            tool: "memory.write",
+            tool: "memory_write",
             duration_ms,
             result_count,
             boundary_count: boundary_count_recorded,
@@ -742,7 +749,7 @@ impl StdioServer {
             result_count = details.result_count,
             boundary_count = details.boundary_count,
             error = ?details.error,
-            "memory.write tool invocation completed"
+            "memory_write tool invocation completed"
         );
 
         self.adapter
@@ -754,7 +761,7 @@ impl StdioServer {
         success_json_result(&serde_json::json!({ "id": id.to_string() }))
     }
 
-    /// `memory.update` MCP tool — replace an existing memory's content.
+    /// `memory_update` MCP tool — replace an existing memory's content.
     ///
     /// **Step 5 (Phase 2): audit + tracing wired** with the same
     /// handler-mediated pattern as `tool_write` / `tool_search`.
@@ -772,11 +779,11 @@ impl StdioServer {
     /// `vault_mcp::tool_invoke`) so operators can filter parse-level
     /// errors from tool-dispatch events cleanly.
     #[tool(
-        name = "memory.update",
+        name = "memory_update",
         description = "Replace an existing memory's content. The `id` field \
                        selects the target; the remaining fields are the \
                        full replacement payload (same shape as \
-                       `memory.write`). The vault is read by ANY AI agent \
+                       `memory_write`). The vault is read by ANY AI agent \
                        the user connects later, so updated content must \
                        still follow the canonical save format. \
                        \n\n\
@@ -784,7 +791,7 @@ impl StdioServer {
                        that an existing memory needs correction — a fact \
                        changed, the original wording was wrong, or new \
                        context refines an earlier save. When in doubt, \
-                       save a NEW memory via `memory.write` and let the \
+                       save a NEW memory via `memory_write` and let the \
                        nightly consolidator deduplicate or supersede. \
                        \n\n\
                        WHEN NOT TO CALL: do NOT update to extend or \
@@ -795,7 +802,7 @@ impl StdioServer {
                        surface. \
                        \n\n\
                        CRITICAL — canonical save format (same six rules \
-                       as `memory.write`). The vault normalizes content \
+                       as `memory_write`). The vault normalizes content \
                        server-side regardless, but agents that follow the \
                        rules produce higher-quality memories: \
                        \n\
@@ -821,7 +828,7 @@ impl StdioServer {
         let Parameters(p) = params;
         // Pre-dispatch parse: not audited (handler-mediated audit
         // contract per Q7 a). Tracing-level visibility only.
-        let id = parse_memory_id_traced(&p.id, "memory.update")?;
+        let id = parse_memory_id_traced(&p.id, "memory_update")?;
 
         let write_params = WriteToolParams {
             content: p.content,
@@ -842,7 +849,7 @@ impl StdioServer {
         };
 
         let details = ToolInvokeDetails {
-            tool: "memory.update",
+            tool: "memory_update",
             duration_ms,
             result_count,
             boundary_count: boundary_count_recorded,
@@ -861,7 +868,7 @@ impl StdioServer {
             result_count = details.result_count,
             boundary_count = details.boundary_count,
             error = ?details.error,
-            "memory.update tool invocation completed"
+            "memory_update tool invocation completed"
         );
 
         self.adapter
@@ -873,13 +880,13 @@ impl StdioServer {
         success_json_result(&serde_json::json!({ "updated": p.id }))
     }
 
-    /// `memory.delete` MCP tool — remove a memory by id.
+    /// `memory_delete` MCP tool — remove a memory by id.
     ///
     /// **Step 5 (Phase 2): audit + tracing wired** with the same
     /// handler-mediated pattern. `parse_memory_id` early-return
     /// contract is identical to `tool_update` (see that doc comment).
     #[tool(
-        name = "memory.delete",
+        name = "memory_delete",
         description = "Delete a memory by id. The vault verifies the \
                        memory's stored boundary against the authorized \
                        set before deletion. \
@@ -895,7 +902,7 @@ impl StdioServer {
                        WHEN NOT TO CALL: do NOT delete to clean up \
                        duplicates or merged facts — that's the \
                        consolidator's job. Do NOT delete to mark a fact \
-                       as no longer true — use `memory.update` with \
+                       as no longer true — use `memory_update` with \
                        corrected content, or wait for the future \
                        `memory.invalidate` surface. Do NOT delete based \
                        on agent inference alone; require explicit user \
@@ -913,7 +920,7 @@ impl StdioServer {
         params: Parameters<DeleteToolParams>,
     ) -> Result<CallToolResult, McpError> {
         let Parameters(p) = params;
-        let id = parse_memory_id_traced(&p.id, "memory.delete")?;
+        let id = parse_memory_id_traced(&p.id, "memory_delete")?;
 
         let boundary_count_recorded: u32 = self.authorized_boundaries.len() as u32;
         let start = Instant::now();
@@ -926,7 +933,7 @@ impl StdioServer {
         };
 
         let details = ToolInvokeDetails {
-            tool: "memory.delete",
+            tool: "memory_delete",
             duration_ms,
             result_count,
             boundary_count: boundary_count_recorded,
@@ -945,7 +952,7 @@ impl StdioServer {
             result_count = details.result_count,
             boundary_count = details.boundary_count,
             error = ?details.error,
-            "memory.delete tool invocation completed"
+            "memory_delete tool invocation completed"
         );
 
         self.adapter
@@ -972,7 +979,7 @@ impl ServerHandler for StdioServer {
             ))
             .with_instructions(
                 "Memory Vault — a user-owned, cross-agent persistent memory layer. \
-                 Tools: memory.search, memory.write, memory.update, memory.delete. \
+                 Tools: memory_search, memory_write, memory_update, memory_delete. \
                  Authorization is host-mediated; tool args never override boundaries.",
             )
     }
@@ -1041,7 +1048,7 @@ fn vault_error_to_mcp(err: VaultError) -> McpError {
         // (`-32602 invalid_params, "not found"`). MCP spec offers
         // `RESOURCE_NOT_FOUND = -32002` which may be a better fit;
         // out of Step 4 scope (no shipped test pins this), tracked
-        // for ADR-024 amendment when memory.update / memory.delete
+        // for ADR-024 amendment when memory_update / memory_delete
         // grow their own pin tests in Step 5.
         VaultError::NotFound(_) => McpError::invalid_params("not found", None),
         // ADR-024 silent on the remaining variants — preserves prior
@@ -1115,8 +1122,8 @@ fn success_json_result<T: Serialize>(value: &T) -> Result<CallToolResult, McpErr
 /// for malformed-request rejections.
 ///
 /// `tool_name` is included in the warn event so operators can tell
-/// which tool received the malformed id (`memory.update` vs
-/// `memory.delete`).
+/// which tool received the malformed id (`memory_update` vs
+/// `memory_delete`).
 fn parse_memory_id_traced(id: &str, tool_name: &'static str) -> Result<MemoryId, McpError> {
     match id.parse::<uuid::Uuid>() {
         Ok(uuid) => Ok(MemoryId(uuid)),

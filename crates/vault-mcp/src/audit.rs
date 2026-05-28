@@ -6,7 +6,7 @@
 //!
 //! ```json
 //! {
-//!   "tool": "memory.search" | "memory.write" | "memory.update" | "memory.delete",
+//!   "tool": "memory_search" | "memory_write" | "memory_update" | "memory_delete",
 //!   "duration_ms": <u64>,
 //!   "result_count": <u32>,        // search only; 0 / 1 for write/update/delete
 //!   "boundary_count": <u32>,
@@ -73,8 +73,8 @@ use vault_core::{VaultError, VaultResult};
 /// the keys entirely.
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolInvokeDetails {
-    /// MCP tool name — `"memory.search"`, `"memory.write"`,
-    /// `"memory.update"`, or `"memory.delete"`.
+    /// MCP tool name — `"memory_search"`, `"memory_write"`,
+    /// `"memory_update"`, or `"memory_delete"`.
     pub tool: &'static str,
     /// Wall-clock duration of the handler dispatch, in milliseconds.
     pub duration_ms: u64,
@@ -392,7 +392,7 @@ mod tests {
     #[test]
     fn search_details_serialise_with_all_fields_present() {
         let details = ToolInvokeDetails {
-            tool: "memory.search",
+            tool: "memory_search",
             duration_ms: 12,
             result_count: 3,
             boundary_count: 1,
@@ -404,7 +404,7 @@ mod tests {
         };
         let json: serde_json::Value =
             serde_json::from_str(&details.to_canonical_json().unwrap()).unwrap();
-        assert_eq!(json["tool"], "memory.search");
+        assert_eq!(json["tool"], "memory_search");
         assert_eq!(json["duration_ms"], 12);
         assert_eq!(json["result_count"], 3);
         assert_eq!(json["boundary_count"], 1);
@@ -424,7 +424,7 @@ mod tests {
         // write/update/delete. Pin both the absence + that no `null`
         // sentinel appears.
         let details = ToolInvokeDetails {
-            tool: "memory.write",
+            tool: "memory_write",
             duration_ms: 4,
             result_count: 1,
             boundary_count: 1,
@@ -463,7 +463,7 @@ mod tests {
         // `{"expected": <u32>, "actual": <u32>}`. Outer shape is
         // `{"type": "DimensionMismatch", "detail": {...}}`.
         let details = ToolInvokeDetails {
-            tool: "memory.search",
+            tool: "memory_search",
             duration_ms: 2,
             result_count: 0,
             boundary_count: 1,
@@ -489,7 +489,7 @@ mod tests {
         // ordering at every nesting level is load-bearing for hash
         // determinism (BRD §11.9.2).
         let details = ToolInvokeDetails {
-            tool: "memory.search",
+            tool: "memory_search",
             duration_ms: 12,
             result_count: 3,
             boundary_count: 1,

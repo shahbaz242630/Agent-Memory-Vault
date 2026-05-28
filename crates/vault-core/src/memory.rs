@@ -146,7 +146,7 @@ impl Memory {
 
     /// Construct a memory with a caller-supplied id, sharing the
     /// validation and default behaviour of [`Self::try_new`]. Used
-    /// by the MCP `memory.update` path in vault-app: the existing
+    /// by the MCP `memory_update` path in vault-app: the existing
     /// memory's id must be preserved across the update per ADR-028,
     /// but `try_new` always generates a fresh id. This is the
     /// canonical entry point — vault-app does NOT manually

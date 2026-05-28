@@ -9,7 +9,7 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
-# Async traits for the Adapter abstraction (memory.search / write / update / delete).
+# Async traits for the Adapter abstraction (memory_search / write / update / delete).
 async-trait.workspace = true
 
 # Tokio — rmcp's stdio transport runs on tokio I/O. Server lifecycle uses
@@ -20,7 +20,7 @@ tokio = { workspace = true }
 # with `{tool, duration_ms, result, boundary_count}` per ADR-024 + plan §3.5.
 tracing.workspace = true
 
-# UUID parsing for `memory.update` / `memory.delete` tool params
+# UUID parsing for `memory_update` / `memory_delete` tool params
 # (the agent supplies the memory id as a string; we parse → MemoryId).
 uuid = { workspace = true }
 

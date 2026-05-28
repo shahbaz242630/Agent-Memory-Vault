@@ -35,7 +35,7 @@ use crate::audit::ToolInvokeDetails;
 /// production implementation at vault-app (T0.1.10).
 #[async_trait]
 pub trait Adapter: Send + Sync {
-    /// `memory.search` — semantic retrieval over the boundary-filtered
+    /// `memory_search` — semantic retrieval over the boundary-filtered
     /// vector store. Returns up to `query.max_results` `RetrievedMemory`
     /// items, sorted score-DESC then created_at-DESC (per T0.1.8 Q9).
     ///
@@ -44,7 +44,7 @@ pub trait Adapter: Send + Sync {
     /// own state, NOT from the JSON-RPC request body.
     async fn search(&self, query: RetrievalQuery) -> VaultResult<Vec<RetrievedMemory>>;
 
-    /// `memory.read` — read-time pipeline returning a
+    /// `memory_read` — read-time pipeline returning a
     /// [`StructuredReadResponse`] (structured `relevant_facts` +
     /// `abstain` + `health.warnings`).
     ///
@@ -68,18 +68,18 @@ pub trait Adapter: Send + Sync {
     /// `VaultError::Io` / `VaultError::Serde` / `VaultError::InvalidInput`).
     async fn read(&self, query: ReadQuery) -> VaultResult<StructuredReadResponse>;
 
-    /// `memory.write` — create a new memory in the given boundary.
+    /// `memory_write` — create a new memory in the given boundary.
     /// `new_memory.boundary` MUST appear in the trusted authorization
     /// slice that `StdioServer` checks before calling.
     async fn write(&self, new_memory: NewMemory) -> VaultResult<MemoryId>;
 
-    /// `memory.update` — update an existing memory's content / metadata.
+    /// `memory_update` — update an existing memory's content / metadata.
     /// Phase 1 stub takes a full `NewMemory` as the patch payload;
     /// Phase 2 may introduce a `MemoryUpdates` partial-update struct
     /// once the Tauri UI's update-flow design is firmer (T0.1.11).
     async fn update(&self, id: MemoryId, new_memory: NewMemory) -> VaultResult<()>;
 
-    /// `memory.delete` — delete a memory by id. The caller (`StdioServer`)
+    /// `memory_delete` — delete a memory by id. The caller (`StdioServer`)
     /// has already verified the memory's boundary against the trusted
     /// authorization slice before this is called.
     async fn delete(&self, id: MemoryId) -> VaultResult<()>;
@@ -88,7 +88,7 @@ pub trait Adapter: Send + Sync {
     /// if no memory with that id exists.
     ///
     /// Added at T0.1.11 Phase 4a per ADR-025 amendment 2026-05-05 to
-    /// enable handler-mediated auth-gating on `memory.delete` (see
+    /// enable handler-mediated auth-gating on `memory_delete` (see
     /// HANDOFF.md ADR-025 amendment + multi-agent code review CRITICAL
     /// finding 2026-05-05). The handler MUST verify the returned
     /// boundary against `self.authorized_boundaries` before dispatching

@@ -3,7 +3,7 @@
 //! ## What this file pins
 //!
 //! End-to-end success-path + error-path coverage for all four tools
-//! (`memory.search` / `memory.write` / `memory.update` / `memory.delete`)
+//! (`memory_search` / `memory_write` / `memory_update` / `memory_delete`)
 //! through the audit + tracing wiring landed in Step 4 (`tool_search`)
 //! and Step 5 (`tool_write` / `tool_update` / `tool_delete`).
 //!
@@ -31,12 +31,12 @@
 //!   `-32001` + message `"access denied"` + audit row records
 //!   `error.type = "AccessDenied"` with the rejected boundary in
 //!   `error.detail.boundary_attempted`.
-//! - `tool_delete` NotFound via `DimMismatchAdapter::delete` (Step 5
-//!   extension). Asserts wire code `-32602` + message `"not found"`
-//!   + audit row records `error.type = "Internal"` with
-//!     `error.detail.category = "NotFound"` (ADR-024-silent
-//!     Internal-collapse default — documented behaviour, not a bug to
-//!     fix; pinning it here so future-Claude sees the design).
+//! - `tool_delete` missing-id is **idempotent success** (ADR-056,
+//!   2026-05-28). `DimMismatchAdapter::lookup_boundary` returns `None`,
+//!   so `handle_delete` short-circuits to `Ok(())` before dispatch.
+//!   Asserts the success wire shape + a no-error audit row. Founder
+//!   dogfood surfaced the prior `NotFound` behaviour contradicting the
+//!   tool's documented idempotency contract.
 
 mod common;
 
@@ -125,7 +125,7 @@ async fn tool_search_success_records_audit_and_returns_results() {
     let body = extract_success_json(result);
     let arr = body
         .as_array()
-        .unwrap_or_else(|| panic!("memory.search success body must be a JSON array; got {body}"));
+        .unwrap_or_else(|| panic!("memory_search success body must be a JSON array; got {body}"));
     assert_eq!(arr.len(), 1, "SuccessAdapter returns exactly one hit");
     assert!(
         arr[0].get("memory").is_some(),
@@ -140,7 +140,7 @@ async fn tool_search_success_records_audit_and_returns_results() {
     let audits = adapter.recorded_audits();
     assert_eq!(audits.len(), 1, "exactly one audit row per tool invocation");
     let details = &audits[0];
-    assert_eq!(details.tool, "memory.search");
+    assert_eq!(details.tool, "memory_search");
     assert_eq!(details.result_count, 1);
     assert_eq!(details.boundary_count, 1);
     assert!(details.duration_ms < 60_000, "duration_ms must be sane");
@@ -169,14 +169,14 @@ async fn tool_write_success_records_audit_returns_id_and_omits_search_only_keys(
     let body = extract_success_json(result);
     let id_str = body["id"]
         .as_str()
-        .unwrap_or_else(|| panic!("memory.write success body must have `id` string; got {body}"));
+        .unwrap_or_else(|| panic!("memory_write success body must have `id` string; got {body}"));
     uuid::Uuid::parse_str(id_str).expect("id must parse as UUID");
 
     // (2) Audit-row pin.
     let audits = adapter.recorded_audits();
     assert_eq!(audits.len(), 1);
     let details = &audits[0];
-    assert_eq!(details.tool, "memory.write");
+    assert_eq!(details.tool, "memory_write");
     assert_eq!(details.result_count, 1);
     assert_eq!(details.boundary_count, 1);
     assert!(details.duration_ms < 60_000);
@@ -212,14 +212,14 @@ async fn tool_update_success_records_audit_returns_id_and_omits_search_only_keys
     assert_eq!(
         body["updated"].as_str(),
         Some(target_id),
-        "memory.update success body must echo the input id; got {body}"
+        "memory_update success body must echo the input id; got {body}"
     );
 
     // (2) Audit-row pin.
     let audits = adapter.recorded_audits();
     assert_eq!(audits.len(), 1);
     let details = &audits[0];
-    assert_eq!(details.tool, "memory.update");
+    assert_eq!(details.tool, "memory_update");
     assert_eq!(details.result_count, 1);
     assert_eq!(details.boundary_count, 1);
     assert!(details.error.is_none());
@@ -244,14 +244,14 @@ async fn tool_delete_success_records_audit_and_omits_search_only_keys() {
     assert_eq!(
         body["deleted"].as_str(),
         Some(target_id),
-        "memory.delete success body must echo the input id; got {body}"
+        "memory_delete success body must echo the input id; got {body}"
     );
 
     // (2) Audit-row pin.
     let audits = adapter.recorded_audits();
     assert_eq!(audits.len(), 1);
     let details = &audits[0];
-    assert_eq!(details.tool, "memory.delete");
+    assert_eq!(details.tool, "memory_delete");
     assert_eq!(details.result_count, 1);
     assert_eq!(details.boundary_count, 1);
     assert!(details.error.is_none());
@@ -307,7 +307,7 @@ async fn tool_write_access_denied_pins_wire_code_and_audit_shape() {
     let audits = adapter.recorded_audits();
     assert_eq!(audits.len(), 1, "one audit row even on error path");
     let details = &audits[0];
-    assert_eq!(details.tool, "memory.write");
+    assert_eq!(details.tool, "memory_write");
     assert_eq!(details.result_count, 0, "error path: no result");
     assert_eq!(details.boundary_count, 1);
     match &details.error {
@@ -349,7 +349,7 @@ async fn tool_update_access_denied_pins_wire_code_and_audit_shape() {
     let audits = adapter.recorded_audits();
     assert_eq!(audits.len(), 1);
     let details = &audits[0];
-    assert_eq!(details.tool, "memory.update");
+    assert_eq!(details.tool, "memory_update");
     assert_eq!(details.result_count, 0);
     match &details.error {
         Some(ToolInvokeError::AccessDenied { boundary_attempted }) => {
@@ -359,53 +359,46 @@ async fn tool_update_access_denied_pins_wire_code_and_audit_shape() {
     }
 }
 
-/// `tool_delete` against `DimMismatchAdapter::delete` which returns
-/// `NotFound`. Pins the ADR-024-silent Internal-collapse default:
-/// the wire code stays the prior `-32602 "not found"` (preserved by
-/// Step 4's exhaustive match), but the audit-row error.type collapses
-/// to `"Internal"` with `error.detail.category = "NotFound"`.
+/// ADR-056 (2026-05-28): deleting an id that does not exist is
+/// **idempotent success**, not `NotFound`. `lookup_boundary` returns
+/// `None` for a missing memory, and `handle_delete` short-circuits to
+/// `Ok(())` before any auth-gate or dispatch. Founder dogfood (Claude
+/// Desktop) surfaced the prior `NotFound` behaviour contradicting the
+/// tool description's documented "idempotent on missing ids" contract.
 ///
-/// The asymmetry between wire shape (NotFound-specific) and audit
-/// shape (Internal-collapsed) is documented behaviour from Step 4 —
-/// wire codes follow ADR-024 mapping table (preserved per-variant);
-/// audit error.type uses the variant ident only for ADR-024-listed
-/// variants and Internal-collapse for the rest. This test pins the
-/// asymmetry so future-Claude sees the design.
+/// `DimMismatchAdapter::lookup_boundary` returns `Ok(None)`, so this
+/// exercises the missing-memory path. The adapter's `delete()` (which
+/// would return `NotFound`) is never reached — the short-circuit fires
+/// first — so the call succeeds.
 #[tokio::test]
-async fn tool_delete_not_found_pins_wire_message_and_internal_collapse_audit() {
+async fn tool_delete_missing_id_is_idempotent_success() {
     let (server, adapter) = make_dim_mismatch_server_with_adapter(vec!["work"]);
-    let valid_id = "01910000-0000-7000-8000-000000000004";
+    let missing_id = "01910000-0000-7000-8000-000000000004";
     let result = server
         .tool_delete(Parameters(DeleteToolParams {
-            id: valid_id.to_string(),
+            id: missing_id.to_string(),
         }))
-        .await;
-    let err = result.expect_err("DimMismatchAdapter::delete returns NotFound");
+        .await
+        .expect("deleting a missing id must be idempotent success per ADR-056");
 
-    // Wire: NotFound preserved as -32602 "not found" per Step 4
-    // exhaustive match.
-    assert_eq!(err.code.0, -32602);
-    assert_eq!(err.message, "not found");
-    assert!(err.data.is_none());
+    // Success wire shape — { "deleted": "<uuid>" } echo, even though
+    // nothing existed to delete.
+    let body = extract_success_json(result);
+    assert_eq!(
+        body["deleted"].as_str(),
+        Some(missing_id),
+        "idempotent delete still echoes the id; got {body}"
+    );
 
+    // Exactly one audit row, recorded as a clean success (no error).
     let audits = adapter.recorded_audits();
-    assert_eq!(audits.len(), 1);
+    assert_eq!(audits.len(), 1, "one audit row even on idempotent no-op");
     let details = &audits[0];
-    assert_eq!(details.tool, "memory.delete");
-    assert_eq!(details.result_count, 0);
-    match &details.error {
-        Some(ToolInvokeError::Internal { category, message }) => {
-            assert_eq!(
-                category, "NotFound",
-                "ADR-024-silent variant collapses to Internal with variant ident as category"
-            );
-            assert!(
-                !message.is_empty(),
-                "Internal detail.message carries the verbatim VaultError payload"
-            );
-        }
-        other => panic!("expected Internal {{ category: NotFound, ... }}, got {other:?}"),
-    }
+    assert_eq!(details.tool, "memory_delete");
+    assert!(
+        details.error.is_none(),
+        "idempotent delete records no error"
+    );
 }
 
 // =============================================================================
@@ -418,7 +411,7 @@ async fn tool_delete_not_found_pins_wire_message_and_internal_collapse_audit() {
 /// ADR-024 mapping for `VaultError::InvalidInput` (-32602
 /// `"invalid params"`); only the audit-append is skipped.
 ///
-/// The test exercises `memory.delete` with a malformed UUID because
+/// The test exercises `memory_delete` with a malformed UUID because
 /// `tool_delete` is the simplest of the three tools that go through
 /// `parse_memory_id_traced` (id-only request body). The contract is
 /// equivalent for `tool_update`'s id-parse path.
@@ -427,7 +420,7 @@ async fn tool_delete_not_found_pins_wire_message_and_internal_collapse_audit() {
 /// 1. Tracing event captured at `vault_mcp::request_validation` (not
 ///    `vault_mcp::tool_invoke`) — different target keeps ops-tooling
 ///    filtering clean per ADR-027 reasoning (iv).
-/// 2. Event carries the tool name `memory.delete` so operators can
+/// 2. Event carries the tool name `memory_delete` so operators can
 ///    correlate parse-rejections to which tool was probed.
 /// 3. Recording adapter's `recorded_audits().len()` stays at 0 — the
 ///    audit chain is reserved for handler-dispatched vault operations
@@ -480,8 +473,8 @@ async fn parse_failure_emits_tracing_does_not_append_audit() {
     // (2) Tool-name field present so operators can correlate
     // parse-rejections to the probed tool.
     assert!(
-        tracing_test::internal::logs_with_scope_contain("vault_mcp", "memory.delete"),
-        "ADR-027: tool field must be `memory.delete` for delete-path parse failures"
+        tracing_test::internal::logs_with_scope_contain("vault_mcp", "memory_delete"),
+        "ADR-027: tool field must be `memory_delete` for delete-path parse failures"
     );
 
     // (3) **Load-bearing assertion** — the audit chain is reserved

@@ -98,7 +98,7 @@ pub struct Report {
 }
 
 /// One structured fact inside a topic. The fields are exactly what the
-/// agent-facing `memory.read` response shape carries at Commit 6 — no
+/// agent-facing `memory_read` response shape carries at Commit 6 — no
 /// translation step needed between Report and the MCP read response.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReportFact {

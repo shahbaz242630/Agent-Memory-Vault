@@ -51,8 +51,8 @@ pub enum AuditEventType {
     /// overflow (one event per wave), not per overflowing write —
     /// debouncing keeps the audit log readable. Per Phase C plan Q2.
     CascadeQueueOverflow,
-    /// An MCP tool invocation (`memory.search` / `memory.write` /
-    /// `memory.update` / `memory.delete`) completed (success or error).
+    /// An MCP tool invocation (`memory_search` / `memory_write` /
+    /// `memory_update` / `memory_delete`) completed (success or error).
     /// Records the call shape — tool name, duration, boundary count,
     /// result count, optional structured error — but **never** raw
     /// argument text or any hash of it. Per `T0.1.9_PLAN.md` §6 v1.3:

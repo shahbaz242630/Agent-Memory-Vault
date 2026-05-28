@@ -19,7 +19,7 @@ async-trait.workspace = true
 tracing.workspace = true
 
 # serde — `RetrievedMemory` derives `Serialize` so vault-mcp's
-# `memory.search` tool (T0.1.9 Phase 2) can serialise the wire response
+# `memory_search` tool (T0.1.9 Phase 2) can serialise the wire response
 # directly. Memory (vault-core) is already Serialize; this carries the
 # wire-friendliness through to the retrieval result type.
 serde = { workspace = true }

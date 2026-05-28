@@ -12,11 +12,11 @@
 //! ## Phase 2 Step 3 — `DimMismatchAdapter`
 //!
 //! Returns `Err(VaultError::DimensionMismatch { expected: 384, actual: 256 })`
-//! from `search()`. Step 5 extends `delete()` to return `NotFound` so
-//! `tool_delete`'s adapter-error path has a fixture (the boundary check
-//! for write/update happens at the handler layer, but delete has no
-//! handler-level check — adapter-level error is the only path). Used by
-//! `tests/error_mapping.rs` (Step 3 + Step 4 + Step 5).
+//! from `search()`. Its `delete()` returns `NotFound`, but per ADR-056
+//! (2026-05-28, idempotent delete) that path is no longer reached — its
+//! `lookup_boundary()` returns `None`, so `handle_delete` short-circuits
+//! to idempotent success first. Used by `tests/error_mapping.rs` (search
+//! dimension-mismatch) and `tool_delete_missing_id_is_idempotent_success`.
 //!
 //! ## Phase 2 Step 4 — `append_tool_invoke_audit` recording
 //!
@@ -101,7 +101,8 @@ impl Adapter for StubAdapter {
     }
 
     /// ADR-025 amendment 2026-05-05: StubAdapter returns Ok(None) — no
-    /// memories exist in the stub. handle_delete will surface as NotFound
+    /// memories exist in the stub. Per ADR-056 (2026-05-28) handle_delete
+    /// treats a missing memory as idempotent success, short-circuiting
     /// before reaching delete(); StubAdapter's delete() panic stays
     /// unreachable.
     async fn lookup_boundary(&self, _id: MemoryId) -> VaultResult<Option<Boundary>> {
@@ -180,23 +181,18 @@ impl Adapter for DimMismatchAdapter {
         unimplemented!("DimMismatchAdapter: update() is not exercised by any current test")
     }
 
-    /// Step 5 extension: returns `NotFound` so `tool_delete`'s error
-    /// path has an adapter-level error fixture. NotFound is the
-    /// natural delete-by-id error and exercises the ADR-024-silent
-    /// Internal-collapse default in `ToolInvokeError::from_vault_error`
-    /// (audit row records `error.type = "Internal"`,
-    /// `error.detail.category = "NotFound"`).
+    /// Returns `NotFound`. Retained as the trait impl, but since ADR-056
+    /// (2026-05-28) made delete idempotent, this is no longer reached via
+    /// the `lookup_boundary` → `None` path (handle_delete short-circuits
+    /// to `Ok(())` first). Kept so the fixture stays a complete `Adapter`.
     async fn delete(&self, id: MemoryId) -> VaultResult<()> {
         Err(VaultError::NotFound(format!("memory {id} not found")))
     }
 
-    /// ADR-025 amendment 2026-05-05: DimMismatchAdapter returns
-    /// Ok(None) — handle_delete surfaces NotFound at the lookup layer
-    /// before reaching delete(). Existing
-    /// `tool_delete_not_found_pins_wire_message_and_internal_collapse_audit`
-    /// test still passes because the wire shape (NotFound + Internal-
-    /// collapse audit row) is identical whether NotFound originates at
-    /// lookup or at delete.
+    /// Returns `Ok(None)` — the memory does not exist. Per ADR-056
+    /// (2026-05-28) `handle_delete` treats a missing memory as idempotent
+    /// success, so `tool_delete_missing_id_is_idempotent_success`
+    /// exercises this path and asserts success (not the former NotFound).
     async fn lookup_boundary(&self, _id: MemoryId) -> VaultResult<Option<Boundary>> {
         Ok(None)
     }

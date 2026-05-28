@@ -3,7 +3,7 @@
 //! ## Purpose
 //!
 //! T0.1.9 Phase 2 (per `T0.1.9_PLAN.md` v1.1) wires the four vault tools
-//! (`memory.search` / `memory.write` / `memory.update` / `memory.delete`) on
+//! (`memory_search` / `memory_write` / `memory_update` / `memory_delete`) on
 //! `StdioServer` using rmcp's `#[tool_router]` + `#[tool]` + `#[tool_handler]`
 //! attribute macros. This spike verifies — at compile + runtime — every
 //! contract Phase 2 will rely on, against an actual rmcp 1.5.0 build:
@@ -31,8 +31,8 @@
 //!    `server_info.name = "vault-mcp"` + pin protocol version).
 //! 6. **`tool_attr()` helper.** The macro generates `Server::tool_name_tool_attr()`
 //!    returning a `Tool` with `name` + `description` + `input_schema`. This
-//!    is what Step 9's "tool list is exactly {memory.search, memory.write,
-//!    memory.update, memory.delete}" pin will read.
+//!    is what Step 9's "tool list is exactly {memory_search, memory_write,
+//!    memory_update, memory_delete}" pin will read.
 //!
 //! ## Re-run trigger
 //!
@@ -73,7 +73,7 @@ struct SpikeSearchParams {
     max_results: Option<u32>,
 }
 
-/// Used to prove a no-arg tool also works (Phase 2's `memory.delete` takes
+/// Used to prove a no-arg tool also works (Phase 2's `memory_delete` takes
 /// just an id; we'll see if the no-arg pattern fits or if we need a
 /// trivial wrapper struct).
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -105,9 +105,9 @@ impl SpikeServer {
         }
     }
 
-    /// Mirrors `memory.search` — typed params + `Result<CallToolResult, McpError>`
+    /// Mirrors `memory_search` — typed params + `Result<CallToolResult, McpError>`
     /// return + simulated error path.
-    #[tool(description = "Spike search tool — mirrors memory.search shape.")]
+    #[tool(description = "Spike search tool — mirrors memory_search shape.")]
     async fn search(
         &self,
         params: Parameters<SpikeSearchParams>,
@@ -128,10 +128,10 @@ impl SpikeServer {
         Ok(CallToolResult::success(vec![Content::json(payload)?]))
     }
 
-    /// Mirrors `memory.delete` — no-frills arg shape proves the macro handles
+    /// Mirrors `memory_delete` — no-frills arg shape proves the macro handles
     /// the simpler tools too. Returns `()` (the macro adapts unit to a
     /// successful empty `CallToolResult`).
-    #[tool(description = "Spike delete tool — mirrors memory.delete shape.")]
+    #[tool(description = "Spike delete tool — mirrors memory_delete shape.")]
     async fn delete(
         &self,
         params: Parameters<SpikeDeleteParams>,

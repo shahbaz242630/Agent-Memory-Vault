@@ -181,7 +181,7 @@ async fn handler_reaches_adapter_with_malicious_query_text_boundary_syntax() {
 // 3. Auth-gate: write to non-authorized boundary returns AccessDenied
 // =============================================================================
 
-/// `memory.write` with a `boundary` field NOT in the trusted slice
+/// `memory_write` with a `boundary` field NOT in the trusted slice
 /// returns `AccessDenied` BEFORE reaching the adapter. This pins the
 /// auth-gate-at-write-time discipline (ADR-025 extension): the agent
 /// CAN specify which boundary to write to, but only for boundaries
@@ -231,7 +231,7 @@ fn trusted_boundaries_preserved_through_clone() {
 }
 
 // =============================================================================
-// 5. ADR-025 amendment 2026-05-05 — `memory.delete` boundary auth gate
+// 5. ADR-025 amendment 2026-05-05 — `memory_delete` boundary auth gate
 // =============================================================================
 
 /// **ADR-025 amendment pinning test (T0.1.11 Phase 4a).**

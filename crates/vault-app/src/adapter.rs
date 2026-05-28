@@ -63,7 +63,7 @@ use vault_core::{Boundary, Memory, MemoryId, NewMemory, VaultError, VaultResult}
 use vault_embedding::EmbeddingProvider;
 use vault_mcp::{Adapter, ToolInvokeDetails};
 use vault_retrieval::{
-    ReadQuery, RetrievalQuery, RetrievedMemory, Retriever, StructuredReadPipeline,
+    KeywordIndex, ReadQuery, RetrievalQuery, RetrievedMemory, Retriever, StructuredReadPipeline,
     StructuredReadResponse,
 };
 use vault_storage::{
@@ -79,7 +79,7 @@ use vault_storage::{
 /// can hold clones without locking.
 pub struct VaultAdapter {
     retriever: Arc<dyn Retriever>,
-    /// Read pipeline for the `memory.read` MCP tool. Commit 6 (locked-
+    /// Read pipeline for the `memory_read` MCP tool. Commit 6 (locked-
     /// next-arc, 2026-05-26 — ADR-052) replaced the V0.2-era
     /// `Option<ReadPipeline>` with a concrete [`StructuredReadPipeline`]
     /// that has no fallible setup. The field is no longer `Option`:
@@ -90,24 +90,38 @@ pub struct VaultAdapter {
     embedding: Arc<dyn EmbeddingProvider>,
     storage: StorageBackend,
     metadata: MetadataStore,
+    /// In-RAM BM25 keyword index, shared (`Arc`) with the retriever's
+    /// keyword channel. Maintained inline on write/update/delete so a
+    /// freshly written memory is searchable immediately, not only after
+    /// the next server restart's bulk-load. Read-after-write fix
+    /// (2026-05-28): the retriever queries this same `Arc<KeywordIndex>`,
+    /// so an inline upsert here makes the new memory visible to the very
+    /// next search/read in the same process.
+    keyword_index: Arc<KeywordIndex>,
 }
 
 impl VaultAdapter {
-    /// Construct from the four trait deps + a [`StructuredReadPipeline`].
-    /// Caller (`Application::new`) wires concrete implementations and
-    /// passes a `MetadataStore` handle that points at the same encrypted
-    /// SQLite file used in the `StorageBackend` open.
+    /// Construct from the trait deps + a [`StructuredReadPipeline`] + the
+    /// shared [`KeywordIndex`]. Caller (`Application::new`) wires concrete
+    /// implementations and passes a `MetadataStore` handle that points at
+    /// the same encrypted SQLite file used in the `StorageBackend` open.
     ///
     /// **Commit 6 (2026-05-26) — signature change:** the `read_pipeline`
     /// parameter is now a concrete [`StructuredReadPipeline`] (not
     /// `Option<ReadPipeline>`). The new pipeline has no model-load cost
     /// and no fallible setup, so the `Option` wrapper is unnecessary.
+    ///
+    /// **Commit 8 (2026-05-28) — signature change:** the `keyword_index`
+    /// parameter was added so write/update/delete maintain the BM25 index
+    /// inline (read-after-write fix). Pass the same `Arc<KeywordIndex>`
+    /// that the retriever's keyword channel holds.
     pub fn new(
         retriever: Arc<dyn Retriever>,
         read_pipeline: StructuredReadPipeline,
         embedding: Arc<dyn EmbeddingProvider>,
         storage: StorageBackend,
         metadata: MetadataStore,
+        keyword_index: Arc<KeywordIndex>,
     ) -> Self {
         Self {
             retriever,
@@ -115,6 +129,39 @@ impl VaultAdapter {
             embedding,
             storage,
             metadata,
+            keyword_index,
+        }
+    }
+
+    /// Maintain the in-RAM BM25 keyword index after a durable write/update.
+    /// Best-effort: the SQLite write already committed and the index is
+    /// rebuilt from SQLite on every restart, so a transient index failure
+    /// is self-healing — log loudly, never fail the operation (the memory
+    /// IS saved). Read-after-write fix (2026-05-28): without this, a fresh
+    /// write was invisible to search/read until the next restart's bulk-load.
+    async fn maintain_keyword_index_upsert(&self, id: MemoryId, content: &str) {
+        if let Err(e) = self.keyword_index.upsert(id, content).await {
+            tracing::warn!(
+                target: "vault_app::keyword_index",
+                memory_id = %id,
+                error = %e,
+                "keyword-index upsert failed after durable write; the memory is saved \
+                 and will be indexed on the next server restart"
+            );
+        }
+    }
+
+    /// Mirror of [`Self::maintain_keyword_index_upsert`] for the delete
+    /// path. Best-effort with the same self-healing rationale.
+    async fn maintain_keyword_index_delete(&self, id: MemoryId) {
+        if let Err(e) = self.keyword_index.delete(id).await {
+            tracing::warn!(
+                target: "vault_app::keyword_index",
+                memory_id = %id,
+                error = %e,
+                "keyword-index delete failed after durable delete; the index will be \
+                 reconciled on the next server restart"
+            );
         }
     }
 }
@@ -138,7 +185,7 @@ impl Adapter for VaultAdapter {
 
     async fn write(&self, mut new_memory: NewMemory) -> VaultResult<MemoryId> {
         // Normalize content to canonical-save shape BEFORE validation.
-        // Belt-and-braces companion to the `memory.write` MCP tool
+        // Belt-and-braces companion to the `memory_write` MCP tool
         // description's canonical-save contract (T0.2.7 close,
         // 2026-05-25): the description teaches agents the six rules;
         // this catches the most common drift cases server-side so
@@ -157,6 +204,8 @@ impl Adapter for VaultAdapter {
         let memory = Memory::try_new(new_memory)?;
         let embedding = self.embedding.embed(&memory.content).await?;
         self.storage.write_memory(&memory, &embedding).await?;
+        self.maintain_keyword_index_upsert(memory.id, &memory.content)
+            .await;
         Ok(memory.id)
     }
 
@@ -214,6 +263,8 @@ impl Adapter for VaultAdapter {
         let embedding = self.embedding.embed(&updated.content).await?;
 
         self.storage.update_memory(&updated, &embedding).await?;
+        self.maintain_keyword_index_upsert(id, &updated.content)
+            .await;
         Ok(())
     }
 
@@ -223,11 +274,12 @@ impl Adapter for VaultAdapter {
         // non-existent id still returns Ok with details.deleted =
         // false. Pass through.
         self.storage.delete_memory(&id).await?;
+        self.maintain_keyword_index_delete(id).await;
         Ok(())
     }
 
     /// ADR-025 amendment 2026-05-05: returns the memory's stored
-    /// boundary so the StdioServer handler can auth-gate `memory.delete`
+    /// boundary so the StdioServer handler can auth-gate `memory_delete`
     /// before dispatching to `delete`. Reads through the same
     /// `MetadataStore` handle used by `update`'s read-before-write path.
     async fn lookup_boundary(&self, id: MemoryId) -> VaultResult<Option<Boundary>> {
@@ -401,6 +453,9 @@ mod tests {
         embedder: Arc<StubEmbedder>,
         // Held for direct read-back assertions in tests.
         metadata_for_assert: MetadataStore,
+        // Same Arc the adapter holds — lets tests assert the keyword
+        // index was maintained inline on write/update/delete (#0).
+        keyword_index: Arc<KeywordIndex>,
     }
 
     async fn make_fixture(retriever_response: Vec<RetrievedMemory>) -> Fixture {
@@ -441,12 +496,20 @@ mod tests {
         let pipeline_loader: Arc<dyn vault_retrieval::ReportLoader> = Arc::new(NoopReportLoader);
         let read_pipeline = StructuredReadPipeline::new(pipeline_retriever, pipeline_loader);
 
+        // Commit 8 (2026-05-28): VaultAdapter::new now takes the shared
+        // KeywordIndex for inline write/update/delete maintenance. These
+        // tests don't exercise keyword search, so a fresh empty index is
+        // fine — the maintenance calls upsert/delete into it harmlessly.
+        let keyword_index =
+            Arc::new(vault_retrieval::KeywordIndex::new().expect("KeywordIndex::new in test"));
+
         let adapter = VaultAdapter::new(
             retriever.clone() as Arc<dyn Retriever>,
             read_pipeline,
             embedder.clone() as Arc<dyn EmbeddingProvider>,
             storage,
             metadata,
+            keyword_index.clone(),
         );
 
         Fixture {
@@ -455,6 +518,7 @@ mod tests {
             retriever,
             embedder,
             metadata_for_assert,
+            keyword_index,
         }
     }
 
@@ -485,7 +549,7 @@ mod tests {
 
     fn sample_search_audit_details(error: bool) -> ToolInvokeDetails {
         ToolInvokeDetails {
-            tool: "memory.search",
+            tool: "memory_search",
             duration_ms: 12,
             result_count: if error { 0 } else { 3 },
             boundary_count: 1,
@@ -502,6 +566,74 @@ mod tests {
                 None
             },
         }
+    }
+
+    // ==================================================================
+    // 0. keyword-index maintenance on write/update/delete (#0)
+    // ==================================================================
+
+    #[tokio::test]
+    async fn write_makes_memory_searchable_in_keyword_index_without_restart() {
+        // #0 regression (2026-05-28): before this fix a fresh write went
+        // to SQLite + Lance but NOT the in-RAM BM25 index, so it was
+        // invisible to search/read until the next server restart's
+        // bulk-load. The adapter now upserts into the shared keyword
+        // index inline on write — so the memory is findable in the SAME
+        // process, no restart.
+        let fx = make_fixture(Vec::new()).await;
+        let id = fx
+            .adapter
+            .write(sample_new_memory(
+                "The user prefers dark mode in their code editors.",
+                "personal",
+            ))
+            .await
+            .expect("write succeeds");
+
+        let hits = fx
+            .keyword_index
+            .search("dark mode editors", 10)
+            .await
+            .expect("keyword search succeeds");
+        assert!(
+            hits.iter().any(|(hit_id, _score)| *hit_id == id),
+            "freshly written memory must be searchable in the keyword index \
+             without a restart; got {hits:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_removes_memory_from_keyword_index() {
+        // Companion to the write test: delete must also maintain the
+        // index inline so a removed memory stops surfacing immediately.
+        let fx = make_fixture(Vec::new()).await;
+        let id = fx
+            .adapter
+            .write(sample_new_memory(
+                "The user enjoys hiking on weekends.",
+                "personal",
+            ))
+            .await
+            .expect("write succeeds");
+        // Present after write.
+        let before = fx
+            .keyword_index
+            .search("hiking weekends", 10)
+            .await
+            .unwrap();
+        assert!(before.iter().any(|(h, _)| *h == id), "present after write");
+
+        fx.adapter.delete(id).await.expect("delete succeeds");
+
+        let after = fx
+            .keyword_index
+            .search("hiking weekends", 10)
+            .await
+            .unwrap();
+        assert!(
+            !after.iter().any(|(h, _)| *h == id),
+            "deleted memory must be gone from the keyword index; got {after:?}"
+        );
     }
 
     // ==================================================================

@@ -149,7 +149,7 @@ async fn setup_application() -> TestApp {
         at_rest_key: zeroize::Zeroizing::new([0u8; 32]),
         // T0.2.7 Phase 4: integration smoke does not exercise the read
         // pipeline (no 4.36 GB GGUF on disk in CI). `None` leaves the
-        // read pipeline unwired; memory.read calls return
+        // read pipeline unwired; memory_read calls return
         // VaultError::Config("not configured") which is the correct
         // surface for the absent-model scenario.
         qwen_model_path: None,
@@ -321,7 +321,7 @@ async fn trigger_b_audit_chain_consistent_across_composition() {
     // Append a tool-invoke audit row via the adapter - exercises the
     // SECOND MetadataStore handle.
     let details = ToolInvokeDetails {
-        tool: "memory.search",
+        tool: "memory_search",
         duration_ms: 5,
         result_count: 0,
         boundary_count: 1,

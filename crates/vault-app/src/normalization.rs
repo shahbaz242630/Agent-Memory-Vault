@@ -1,6 +1,6 @@
-//! Canonical-save normalization for incoming `memory.write` content.
+//! Canonical-save normalization for incoming `memory_write` content.
 //!
-//! Belt-and-braces companion to the `memory.write` MCP tool description's
+//! Belt-and-braces companion to the `memory_write` MCP tool description's
 //! canonical-save contract (T0.2.7 close, 2026-05-25 lock at
 //! `vault_mcp::server::tool_write`). The tool description teaches calling
 //! agents the six canonical rules; this module catches the most common
@@ -20,20 +20,24 @@
 //!
 //! 1. **Trim** leading/trailing whitespace.
 //! 2. **Reject empty** content after trim → `VaultError::InvalidInput`.
-//! 3. **Reject over-length** content (>2000 chars) → `VaultError::InvalidInput`.
-//!    2000 is a sanity cap; atomic facts should be much shorter.
-//! 4. **Strip conversation framing** prefixes:
+//! 3. **Strip conversation framing** prefixes:
 //!    - "When [the user was] asked, " / "When asked, " → ""
 //!    - "The user told me [that] " / "The user said [that] " / etc. → "The user "
-//! 5. **Strip agent self-reference** prefixes (drops the "I think/learned/..."
+//! 4. **Strip agent self-reference** prefixes (drops the "I think/learned/..."
 //!    framing, keeps the underlying fact):
 //!    - "I think [that] " / "I believe [that] " / "I learned [that] " /
 //!      "I noticed [that] " / "I observed [that] " → ""
-//! 6. **Rewrite first-person about-the-user** to third-person:
+//! 5. **Rewrite first-person about-the-user** to third-person:
 //!    - "I prefer X" → "The user prefers X" (+s on the verb)
 //!    - Same for like / love / hate / use / want / need.
-//! 7. **Capitalize** the first character if it's now lowercase (post-strip).
-//! 8. **Append terminal period** if missing.
+//! 6. **Capitalize** the first character if it's now lowercase (post-strip).
+//! 7. **Append terminal period** if missing.
+//!
+//! Content length is NOT capped here. `vault_core::Memory::validate`
+//! enforces the only storage cap (`MAX_MEMORY_CONTENT_BYTES` = 100 KB);
+//! the embedder truncates at its 512-token window. Long memories
+//! (paragraph-scale session summaries) are stored whole — only the
+//! embedding is truncated (store-whole / embed-truncate, 2026-05-28).
 //!
 //! Auto-fix is silent (per 2026-05-25 product decision) — agents don't
 //! see "your content was normalized" feedback. Reasoning: smoother UX,
@@ -54,21 +58,16 @@
 
 use vault_core::{VaultError, VaultResult};
 
-/// Hard cap on memory content length, in characters. Atomic facts
-/// should be much shorter; this exists to catch the worst LLM-drift
-/// case where the model dumps a paragraph instead of a fact. Picked
-/// from the iteration 2 lock (2026-05-25) — large enough that legitimate
-/// long-form sentences fit, small enough to enforce "atomic" semantically.
-const MAX_CONTENT_CHARS: usize = 2000;
-
 /// Normalize `content` to canonical-save shape before storage. Returns
-/// `VaultError::InvalidInput` only for length / emptiness violations;
-/// shape-fixes (prefix strip, first-person rewrite, period append) are
-/// applied silently.
+/// `VaultError::InvalidInput` only for emptiness violations; shape-fixes
+/// (prefix strip, first-person rewrite, period append) are applied
+/// silently. Length is not capped here — `vault_core::Memory::validate`
+/// enforces the only storage cap (100 KB) and the embedder truncates at
+/// its token window (store-whole / embed-truncate, 2026-05-28).
 ///
 /// Idempotent: `normalize(normalize(x)) == normalize(x)` for all `x`
-/// that pass the length + empty checks. Pinned by the
-/// `normalize_is_idempotent` test below.
+/// that pass the empty check. Pinned by the `normalize_is_idempotent`
+/// test below.
 pub(crate) fn normalize_for_canonical_save(content: &str) -> VaultResult<String> {
     let trimmed = content.trim();
 
@@ -76,12 +75,6 @@ pub(crate) fn normalize_for_canonical_save(content: &str) -> VaultResult<String>
         return Err(VaultError::InvalidInput(
             "memory content cannot be empty".into(),
         ));
-    }
-
-    if trimmed.chars().count() > MAX_CONTENT_CHARS {
-        return Err(VaultError::InvalidInput(format!(
-            "memory content exceeds {MAX_CONTENT_CHARS} chars; split into atomic facts"
-        )));
     }
 
     let mut s = trimmed.to_string();
@@ -240,18 +233,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_over_length_content() {
-        let too_long = "a".repeat(MAX_CONTENT_CHARS + 1);
-        let result = normalize_for_canonical_save(&too_long);
-        assert!(matches!(result, Err(VaultError::InvalidInput(_))));
-    }
-
-    #[test]
-    fn accepts_at_max_length_content() {
-        // At the cap exactly — should succeed.
-        let at_cap = "a".repeat(MAX_CONTENT_CHARS);
-        let result = normalize_for_canonical_save(&at_cap);
-        assert!(result.is_ok(), "content at exact cap should be accepted");
+    fn accepts_long_content_above_former_2000_cap() {
+        // Store-whole / embed-truncate (2026-05-28): normalization no
+        // longer caps length. A paragraph-scale memory well past the old
+        // 2000-char sanity cap must pass — `vault_core::Memory::validate`
+        // enforces the only storage cap (100 KB) and the embedder
+        // truncates at its token window.
+        let long = "a".repeat(5000);
+        let result = normalize_for_canonical_save(&long).expect("long content must be accepted");
+        // Content preserved: first char capitalized + terminal period
+        // appended, so 5000 → 5001 chars.
+        assert_eq!(result.chars().count(), 5001);
+        assert!(result.ends_with('.'));
     }
 
     #[test]

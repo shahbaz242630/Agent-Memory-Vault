@@ -119,7 +119,7 @@ pub struct RetrievalOptions {
 /// human-readable explanation.
 ///
 /// **Wire format — load-bearing:** this struct is serialised into MCP
-/// `memory.search` tool responses (T0.1.9 Phase 2 — see
+/// `memory_search` tool responses (T0.1.9 Phase 2 — see
 /// `crates/vault-mcp/src/server.rs::tool_search`). Field renames are
 /// **breaking changes** to the MCP API contract; downstream agents
 /// (Claude Desktop, ChatGPT, Cursor, custom MCP clients) parse JSON

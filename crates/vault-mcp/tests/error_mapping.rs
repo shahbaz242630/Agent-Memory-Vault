@@ -9,7 +9,7 @@
 //! `crates/vault-mcp/src/server.rs`). If the mapping leaks internal
 //! shape (dimensions, internal type names, fields populated under
 //! `error.data`), every tool leaks the same way. Pinning this contract
-//! at one tool (`memory.search`) before the others land in Step 5 means
+//! at one tool (`memory_search`) before the others land in Step 5 means
 //! catching the class is cheap.
 //!
 //! ## Step 3 + Step 4 — both tests now active
@@ -37,7 +37,7 @@ use vault_mcp::{SearchToolParams, ToolInvokeError};
 // =============================================================================
 
 /// Pin the `VaultError::DimensionMismatch → InvalidParams` mapping for
-/// `memory.search`, asserting the no-info-leak invariant on every
+/// `memory_search`, asserting the no-info-leak invariant on every
 /// channel a future "helpful" change could leak through:
 ///
 /// - **(a)** JSON-RPC `error.code` is `-32602` (InvalidParams).
@@ -118,14 +118,14 @@ async fn dimension_mismatch_returns_generic_invalid_params_no_data_leak() {
 // =============================================================================
 
 /// Pin the `mcp.tool_invoke` audit-row shape for an error-path
-/// `memory.search` call, asserting BOTH the typed Rust representation
+/// `memory_search` call, asserting BOTH the typed Rust representation
 /// and the canonical-JSON wire format land per ADR-024 (HANDOFF.md
 /// lines 770–790 + plan §5 line 161 + §6.2 rule 2 line 189).
 ///
 /// ## Typed-Rust assertions (struct-level invariants)
 ///
 /// - exactly one audit row recorded (audit append fired exactly once)
-/// - `details.tool == "memory.search"`
+/// - `details.tool == "memory_search"`
 /// - `details.duration_ms > 0` (timer captured something — even a
 ///   zero-cost stub returns at least one millisecond on contended
 ///   Windows + cold cache; if this ever fails as flake, swap to
@@ -171,7 +171,7 @@ async fn dimension_mismatch_audit_row_pins_full_detail() {
         audits.len()
     );
     let details = &audits[0];
-    assert_eq!(details.tool, "memory.search");
+    assert_eq!(details.tool, "memory_search");
     assert!(
         details.duration_ms < 60_000,
         "duration_ms must be sane (< 60s for a stub adapter), got {}",

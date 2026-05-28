@@ -59,11 +59,11 @@ pub struct MockAdapter {
     deletes: Mutex<Vec<MemoryId>>,
     audits: Mutex<Vec<ToolInvokeDetails>>,
     /// Configurable result for `lookup_boundary` calls. Default `None`
-    /// means handle_delete surfaces NotFound at the lookup layer.
-    /// ADR-025 amendment 2026-05-05 trust-boundary delete pinning
-    /// test sets this to `Some(Boundary("personal"))` while the server
-    /// is constructed with `trusted: vec!["work"]` to pin the
-    /// AccessDenied path.
+    /// means the memory does not exist; per ADR-056 (2026-05-28)
+    /// handle_delete then returns idempotent success. The ADR-025
+    /// amendment 2026-05-05 trust-boundary delete pinning test sets this
+    /// to `Some(Boundary("personal"))` while the server is constructed
+    /// with `trusted: vec!["work"]` to pin the AccessDenied path.
     lookup_result: Mutex<Option<Boundary>>,
 }
 
@@ -93,7 +93,7 @@ impl MockAdapter {
     }
 
     /// Snapshot of `read()` calls. Added at T0.2.7 Phase 4 alongside
-    /// the new `memory.read` tool surface.
+    /// the new `memory_read` tool surface.
     pub fn read_calls(&self) -> Vec<ReadQuery> {
         self.reads
             .lock()

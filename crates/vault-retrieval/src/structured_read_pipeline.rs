@@ -118,7 +118,7 @@ pub struct ReadQuery {
 // Output — locked by ADR-054 Contract 2
 // =============================================================================
 
-/// The structured read-pipeline response the MCP `memory.read` tool
+/// The structured read-pipeline response the MCP `memory_read` tool
 /// surfaces to the calling agent.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct StructuredReadResponse {
@@ -152,7 +152,7 @@ pub struct RelevantFact {
     /// - `topic_names_unavailable` on the loaded REPORT (placeholder labels).
     pub topic: Option<String>,
     /// UUID string. Agents can resolve back to a typed `MemoryId` if
-    /// needed for follow-up MCP calls (e.g. `memory.delete`).
+    /// needed for follow-up MCP calls (e.g. `memory_delete`).
     pub memory_id: String,
     /// Fact-time anchor — when this fact became true in the world
     /// (`Memory::valid_from`). NOT when the memory row was added.
@@ -583,7 +583,7 @@ impl std::fmt::Debug for StructuredReadPipeline {
 #[cfg(test)]
 mod tests {
     //! Unit tests pinning the locked-next-arc Plan Iteration 3 contracts:
-    //! - Contract 2 (this module): MCP `memory.read` response shape +
+    //! - Contract 2 (this module): MCP `memory_read` response shape +
     //!   7 health-warning codes + severity / aggregate-status rules.
     //! - Contract 3 (light coverage): consolidator-produced REPORT shape
     //!   that this pipeline consumes.
