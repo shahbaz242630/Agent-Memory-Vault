@@ -169,6 +169,27 @@ pub struct AppConfig {
     /// **Migration anchor:** new field at T0.3.x Batch A (2026-05-26).
     /// Not a rename — additive per the rename-prohibition discipline.
     pub phi4_model_path: Option<PathBuf>,
+
+    /// Path to the Qwen3-Reranker-0.6B seq-cls ONNX model (the read-time
+    /// cross-encoder relevance reranker per the ADR-057 amendment,
+    /// 2026-05-29). When `Some` (with [`Self::rerank_tokenizer_path`] also
+    /// set), [`crate::Application::new`] opens a
+    /// `vault_embedding::Qwen3RerankerProvider` and wires it as the read
+    /// pipeline's relevance gate (`with_reranker`), SUPERSEDING the cosine
+    /// floor. When `None`, the pipeline falls back to the cosine
+    /// `with_relevance_gate` — backward-compatible graceful degradation so
+    /// deployments / tests without the ~1.2 GB model still read correctly
+    /// (no-signal abstention only, without the topical-noise discrimination
+    /// the reranker adds).
+    ///
+    /// **Migration anchor:** new field at the T0.3.x reranker arc (2026-05-29).
+    /// Additive per the rename-prohibition discipline.
+    pub rerank_model_path: Option<PathBuf>,
+
+    /// Path to the Qwen3-Reranker tokenizer.json. Paired with
+    /// [`Self::rerank_model_path`]; both must be `Some` to wire the reranker.
+    /// Reuses [`Self::ort_lib_path`] for the ONNX Runtime dylib.
+    pub rerank_tokenizer_path: Option<PathBuf>,
 }
 
 impl fmt::Debug for AppConfig {
@@ -188,6 +209,8 @@ impl fmt::Debug for AppConfig {
             .field("at_rest_key", &"<redacted>")
             .field("qwen_model_path", &self.qwen_model_path)
             .field("phi4_model_path", &self.phi4_model_path)
+            .field("rerank_model_path", &self.rerank_model_path)
+            .field("rerank_tokenizer_path", &self.rerank_tokenizer_path)
             .finish()
     }
 }
@@ -209,10 +232,9 @@ mod tests {
     /// ≠ rename."*
     #[test]
     fn appconfig_field_names_are_locked_to_phase_1_inline_param_names() {
-        // Construct an AppConfig naming all seven fields explicitly.
-        // The variable is unused; what matters is that the struct
-        // literal compiles — which proves the field names match the
-        // expected set verbatim.
+        // Construct an AppConfig naming every field explicitly. The variable
+        // is unused; what matters is that the struct literal compiles — which
+        // proves the field names match the expected set verbatim.
         let _config = AppConfig {
             metadata_path: PathBuf::new(),
             vector_dir: PathBuf::new(),
@@ -224,6 +246,8 @@ mod tests {
             at_rest_key: Zeroizing::new([0u8; 32]),
             qwen_model_path: None,
             phi4_model_path: None,
+            rerank_model_path: None,
+            rerank_tokenizer_path: None,
         };
     }
 
@@ -246,6 +270,8 @@ mod tests {
             at_rest_key: at_rest_bytes,
             qwen_model_path: Some(PathBuf::from("/tmp/qwen-7b.gguf")),
             phi4_model_path: Some(PathBuf::from("/tmp/phi-4-mini.gguf")),
+            rerank_model_path: Some(PathBuf::from("/tmp/qwen3-reranker.onnx")),
+            rerank_tokenizer_path: Some(PathBuf::from("/tmp/qwen3-reranker-tokenizer.json")),
         };
         let dbg_str = format!("{config:?}");
         assert!(

@@ -19,22 +19,14 @@
 use crate::integrity::{
     verify_file_sha256, BGE_SMALL_EN_V1_5_MODEL_SHA256, BGE_SMALL_EN_V1_5_TOKENIZER_SHA256,
 };
+use crate::ort_init::ensure_ort_initialised;
 use crate::provider::{EmbeddingProvider, EMBEDDING_DIM};
 use async_trait::async_trait;
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use tokenizers::Tokenizer;
 use vault_core::{VaultError, VaultResult};
-
-/// Process-global ort initialisation gate. First `BgeSmallProvider::open`
-/// call wins and runs `ort::init_from(dylib_path).commit()`; subsequent
-/// calls (including concurrent ones from parallel cargo test threads) see
-/// the cached result without re-initialising. The `Result<(), String>`
-/// payload preserves the first-call outcome — error or success — so a
-/// degraded process surfaces the original failure on every subsequent
-/// open attempt rather than silently retrying.
-static ORT_INIT: OnceLock<Result<(), String>> = OnceLock::new();
 
 /// ONNX-Runtime-backed embedding provider for bge-small-en-v1.5.
 ///
@@ -111,26 +103,6 @@ impl BgeSmallProvider {
             session: Arc::new(Mutex::new(session)),
             tokenizer: Arc::new(tokenizer),
         })
-    }
-}
-
-/// Process-global ort initialisation under `load-dynamic`. First-call
-/// wins; subsequent calls see the same cached result without re-running
-/// `ort::init_from`. Concurrent callers all observe the same outcome.
-fn ensure_ort_initialised(dylib_path: &Path) -> VaultResult<()> {
-    let result = ORT_INIT.get_or_init(|| {
-        let path_str = dylib_path
-            .to_str()
-            .ok_or_else(|| "ort dylib path is not valid UTF-8".to_string())?;
-        ort::init_from(path_str)
-            .commit()
-            .map(|_| ())
-            .map_err(|e| format!("ort init_from: {e}"))
-    });
-
-    match result {
-        Ok(()) => Ok(()),
-        Err(s) => Err(VaultError::Embedding(format!("ort init: {s}"))),
     }
 }
 

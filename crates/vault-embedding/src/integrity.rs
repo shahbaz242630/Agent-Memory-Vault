@@ -35,6 +35,23 @@ pub const BGE_SMALL_EN_V1_5_MODEL_SHA256: &str =
 pub const BGE_SMALL_EN_V1_5_TOKENIZER_SHA256: &str =
     "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66";
 
+/// Canonical SHA-256 of the Qwen3-Reranker-0.6B seq-cls ONNX model
+/// (`qwen3-reranker-0.6b-seq-cls/model.onnx`, f16, ~1.19 GB).
+///
+/// Source: `shawnw3i/Qwen3-Reranker-0.6B-seq-cls-ONNX` (Apache-2.0), a
+/// SequenceClassification conversion of `Qwen/Qwen3-Reranker-0.6B`
+/// (base_model `tomaarsen/Qwen3-Reranker-0.6B-seq-cls`). Captured at first
+/// fixture download 2026-05-29 — the model is community-converted
+/// (per spike-playbook: provenance noted, integrity-pinned to the bytes we
+/// validated). Selected via the `reranker_spike` model-fit evaluation.
+pub const QWEN3_RERANKER_MODEL_SHA256: &str =
+    "bd3ee3865c63d1bec518d0785ff551f7c0b78af0d4bf4855653a0c765a2a1292";
+
+/// Canonical SHA-256 of the Qwen3-Reranker-0.6B seq-cls tokenizer
+/// (`qwen3-reranker-0.6b-seq-cls/tokenizer.json`). Captured 2026-05-29.
+pub const QWEN3_RERANKER_TOKENIZER_SHA256: &str =
+    "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4";
+
 /// Verify a file's bytes against an expected SHA-256 hex string.
 ///
 /// `file_label` is the logical name surfaced in the error (`"model"`,

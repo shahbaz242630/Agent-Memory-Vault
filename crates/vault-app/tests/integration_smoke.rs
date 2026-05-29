@@ -160,6 +160,10 @@ async fn setup_application() -> TestApp {
         // `VaultError::Config("consolidator not configured")` which is
         // the graceful absent-model surface per locked-next-arc Thread 3.
         phi4_model_path: None,
+        // No reranker model in CI (no ~1.2 GB ONNX on disk); the read pipeline
+        // falls back to the cosine relevance gate. Wiring-only smoke test.
+        rerank_model_path: None,
+        rerank_tokenizer_path: None,
     };
 
     let application = Application::new(&config).await.expect(

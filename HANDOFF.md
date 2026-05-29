@@ -6,6 +6,109 @@
 
 ---
 
+## 🎯 NEXT SESSION OPENER (2026-05-29 — **FIX A5: contradiction detection**) — READ THIS FIRST
+
+**Start here. The cross-encoder reranker arc SHIPPED this session (read-path correctness — see "Reranker arc — SHIPPED" just below). The next correctness battle, and the V0.2 ship-gate, is A5.**
+
+### The problem (exact — live-confirmed 2026-05-29)
+**A5 = knowledge-update / contradiction detection.** When a newer fact contradicts an older one on the same subject (canonical case: "the user works at Vega Bridgeworks" → later "the user works at Atlas Structures, having left Vega"), the consolidator must: **detect the contradiction → `invalidate()` the stale fact → reads return ONLY the current truth.**
+
+**It does not.** A live `vault-cli consolidate run` on `testeval` (2026-05-29, both Vega + Atlas facts seeded) returned **`contradictions queued: 0`** — the contradiction was never detected. (Merges work — it correctly dedup-merged an identical pair — so the consolidator runs end-to-end; it just never sees the contradiction.)
+
+**Root cause #1 — the clustering gate (primary blocker).** Phase-1 clustering (`crates/vault-consolidator/src/phases/cluster.rs`) groups memories by cosine **≥ 0.92** (union-find transitive closure). Contradictory facts are semantically *related* but their pairwise cosine sits **below 0.92**, so Vega and Atlas **never land in the same cluster** → Phi-4's judge (`phases/merge.rs::decide_merge`) never receives them as a pair → 0 contradictions. This is [[contradiction-gated-by-merge-threshold]], now reproduced LIVE (not just spike).
+
+**Root cause #2 — `as_of` is write-time, not fact-time.** `memory_write`/`memory_update` capture `as_of` = the write timestamp; the real-world date in the content ("As of 2026-04-01…") is NOT parsed into `valid_from`. So even once facts cluster, "which is current?" can't be decided by recency. **Open product decision for Shahbaz (do NOT fold into spec silently): (a) add a writer-settable `as_of` field to the write/update tools, or (b) extract dates from content.** See [[as-of-write-time-blocks-a5-temporal]].
+
+### Fix direction (parked, ready for plan iteration 1)
+**Decouple contradiction detection from the 0.92 merge gate — run it at the K-means TOPIC-CLUSTER level.** K-means topic discovery (`crates/vault-consolidator/src/topics.rs`, shipped Batch A) already co-locates Vega + Atlas in one topic (both "employment"), even though their pairwise cosine is < 0.92. So: within each K-means topic, run a contradiction pass (Phi-4 judges the set) SEPARATE from the 0.92 near-duplicate MERGE clustering. The 0.92 gate stays for merging; contradiction detection moves to the looser topic grouping. First task next session = plan iteration 1 on this.
+
+### What's already built (don't re-discover)
+- Phase 1 clustering (cosine 0.92, union-find) — `phases/cluster.rs`.
+- Phase 2 Phi-4 `decide_merge` → `MergeOutcome::{Merge, KeepSeparate, Contradiction}` — `phases/merge.rs`.
+- `invalidate()` bi-temporal API (ADR-051) — consumed on a `clear_winner`.
+- K-means topic discovery — `topics.rs` (already co-locates the contradiction pair — the lever).
+- REPORT generation + read pipeline — shipped; REPORTs now written live (K1/K2 ✅: `personal.report.json` + `testeval.report.json` on disk under the vault data dir).
+- The **reranker (read-path)** is DONE + live-proven (A6/A7) — it does NOT touch A5 (separate engine; don't conflate).
+
+### Memories to load
+[[contradiction-gated-by-merge-threshold]] · [[as-of-write-time-blocks-a5-temporal]] · [[project-reranker-qwen3-solves-model-fit]] · [[correctness-is-the-product]] · [[no-sub-7b-models-for-synthesis]] · [[parallel-agent-pairs-for-strategic-decisions]]
+
+---
+
+## ✅ Reranker arc — SHIPPED this session (2026-05-29)
+
+The read-path model-fit problem ([[bge-small-cannot-separate-relevant]]) is **fixed and live-verified.** A cross-encoder reranker (**Qwen3-Reranker-0.6B**, seq-cls, Apache-2.0) re-scores BGE's top-8 retrieved candidates and gates on its own relevance score, **replacing the ADR-057 cosine-0.66 floor**.
+
+**How we got here:** comprehensive model search → `reranker_spike.rs` bake-off (BGE / ms-marco / gte-modernbert / Qwen3) on a hardened A7 fixture incl. topically-adjacent "wrong-attribute" traps. Only Qwen3-Reranker + a strict-yes/no instruction separated cleanly (0 false-answers, 8/8 recall, 8/8 ranking at a logit-0 cutoff). gte collapsed on the hard cases; the others failed. Full detail: [[project-reranker-qwen3-solves-model-fit]].
+
+**Live dogfood (§7, Claude Desktop, server-log-verified):** **A6** abstains on no-signal ("blood type"); **A7** no longer over-abstains — a loose paraphrase ("outdoors for fun on weekends") surfaced the hiking fact. The exact over-abstention BGE couldn't handle is fixed. C4–C9 + I2 also passed.
+
+**Code (this commit):**
+- `crates/vault-embedding/src/reranker.rs` — `RerankProvider` trait + `Qwen3RerankerProvider` (batched, left-padded, f16-aware via ort `half` feature, `spawn_blocking`); v4 instruction + logit-0 floor as calibrated consts.
+- `crates/vault-embedding/src/ort_init.rs` — shared process-global ORT init (extracted from `bge_small.rs` so embedder + reranker don't double-init).
+- `integrity.rs` — SHA-256 pins for the reranker model + tokenizer; `Cargo.toml` — `half` promoted to a real dep + ort `half` feature.
+- `crates/vault-retrieval/src/structured_read_pipeline.rs` — `with_reranker` builder + `apply_reranker` (rerank top-8 → filter ≥ floor → re-sort → abstain if none pass); reranker takes precedence over the cosine gate (cosine retained as no-reranker fallback). 4 MockReranker tests.
+- `crates/vault-app` (config + application) + `vault-cli` (`--rerank-model`/`--rerank-tokenizer` args, env fallbacks) + `vault-tauri`/integration/harness construction sites.
+- Spike + hardened fixture (`reranker_spike.rs`, `read_quality_eval.json`) + read-quality harness ride here per [[commit-only-with-tested-fix]].
+
+### ADR-059 — Cross-encoder reranker as the read relevance gate (supersedes ADR-057's cosine floor)
+
+**Status:** Accepted, 2026-05-29. Supersedes ADR-057's deterministic cosine-0.66 floor for read relevance (ADR-057 itself foresaw this: "deferred to a non-LLM cross-encoder reranker at V1.0+" — pulled into V0.2 because the over-abstention was a live dogfood blocker).
+
+**Decision.** `StructuredReadPipeline`, when a reranker is wired (`Application` opens `Qwen3RerankerProvider` iff `rerank_model_path` + `rerank_tokenizer_path` are configured), reranks the top **8** retrieved candidates with Qwen3-Reranker-0.6B (seq-cls, f16) under the **v4 strict-yes/no instruction**, keeps those scoring **≥ logit 0** (sigmoid 0.5), re-sorts by reranker score, abstains if none pass. The cosine `with_relevance_gate` path is retained as the no-reranker fallback (graceful degradation for deployments without the ~1.2 GB model).
+
+**Calibration.** `reranker_spike` hardened A7 set, v4 instruction: every real answer scored > 0, every guard (incl. adjacent-attribute traps) < 0, ~3-logit margin. Top-8 = recall-first (Shahbaz's call).
+
+**Latency (known, deferred).** ~12–13s/read on CPU (Intel iGPU box) for top-8; cold-first ~36s; sub-second on GPU. int8 + GPU are the fast-follow (int8 local-quant from the f16 export hit a tooling wall — needs a clean fp32 optimum re-export). Per [[project-correctness-before-latency]]: correctness proven first, latency next.
+
+**Bundled:** the shared-ORT-init extraction is required (not drive-by) so the embedder + reranker share one `ort::init`.
+
+> **⚠️ The opener below ("meaning-similarity calibration") is HISTORICAL — superseded by the A5 opener above.**
+
+## 🎯 NEXT SESSION OPENER (2026-05-29 close — meaning-similarity calibration) — HISTORICAL
+
+**This supersedes the older "Commit 8 close" opener further down (now historical).**
+
+### Where we are
+- ✅ **Commit 10 shipped + CI GREEN** (`474c367`): ADR-058 wired per-boundary REPORT generation into the consolidation run. `vault-cli consolidate run` now writes `<vault_root>/reports/<boundary>.report.json`; live-verified — Claude Desktop reads return `health: ok` + topics. That work is DONE and committed.
+- 🔬 **Active workstream: "meaning-similarity calibration."** Two live-dogfood findings (2026-05-29) share ONE root cause:
+  - **A7 — read over-abstention:** `memory_read` says "I don't know" to questions it HAS answers to (5/6 of realistic queries in the fixture).
+  - **A5 — contradiction not retired (ship-gate):** the Vega→Atlas contradiction never clusters (cosine < 0.92), so the consolidator never detects it. See [[contradiction-gated-by-merge-threshold]].
+
+### Tests already run this session (all measured, not guessed)
+1. **Read-quality baseline harness** (`crates/vault-app/tests/read_quality_eval.rs`, `#[ignore]`, real BGE) against the 8-case A7 fixture (`crates/vault-retrieval/tests/fixtures/read_quality_eval.json`): BGE-small top-1 cosine — real-answer cosines `0.461–0.751`, guard cosines `0.525, 0.593` → **interleave, NOT separable by any floor** (a correct answer at 0.461 scores BELOW an unrelated guard at 0.593).
+2. **BGE query-instruction prefix** (model-card s2p usage, query only): measured in the same harness → **did not help** (slightly *lowered* real answers, e.g. Lisbon 0.461→0.431; still not separable).
+3. **Cross-encoder re-ranker spike** (`crates/vault-embedding/tests/reranker_spike.rs`, `#[ignore]`, real ONNX) with `ms-marco-MiniLM-L-6-v2`: **integration VALIDATED** (reproduces the model card's reference example to 3 decimals: relevant 8.846 / irrelevant −11.246) — but on OUR data it **also does not separate** (real −10.8..+5.7, guards −11.1..−6.3; only literal-overlap case scored positive). It *did* rank the right fact #1 in 5/6 cases though.
+
+### THE CORE FINDING
+**Our data shape is out-of-distribution for off-the-shelf, web-search-trained models.** Ours = *conversational questions* ("is the user bothered by bright screens?") matched to *short first-person personal facts* ("…finds light themes straining"). BGE-small (bi-encoder cosine) and MS-MARCO MiniLM (cross-encoder) both fail to separate relevant from irrelevant by an absolute threshold on this shape — confirmed with hard numbers, not hypothesis. It is **not a threshold-tuning problem and not a "rerankers don't work" problem — it's a model-fit problem.** Full detail + the ruled-out cheap levers (K-means, threshold, prefix) in [[bge-small-cannot-separate-relevant]].
+
+### FIRST THING NEXT SESSION
+**Run a comprehensive web search to identify the RIGHT model for our specific requirement** before downloading/wiring anything else. Requirements to search against:
+- Fits our shape: **conversational / question → short personal-fact relevance** (asymmetric, QA-style or instruction-tuned retrieval/rerank — NOT pure MS-MARCO web search). Candidates to investigate: `bge-reranker-base` / `bge-reranker-v2-m3`, newer instruction rerankers (mxbai-rerank, jina-reranker-v2), Qwen3-Embedding/-Reranker, etc.
+- **Local-runnable** (on-device for Local mode — small/base size, ONNX-able to reuse our `ort` stack). Per [[three-mode-deployment]].
+- **🔑 LICENSE: must be MIT or Apache-2.0 (commercial use explicitly allowed).** This is a hard gate — verify each candidate's license before shortlisting. Reject non-commercial / research-only / restrictive licenses outright.
+- Then test the shortlist against the **already-validated spike instrument** — swap the model path in `reranker_spike.rs` (or add an embedder to `read_quality_eval.rs`), re-run, read the separability + the abstention confusion matrix in ~10s each. If a model separates (real answers clear, guards stay below, FALSE-ANSWER = 0), THAT is the fix → wire it in, then commit harness + fixture + spike + fix together.
+- If NO off-the-shelf model separates: fall back to (a) fine-tune a small reranker on our data shape, or (b) rethink abstain — note relative ranking already works 5/6, so abstain may not need an absolute-score threshold at all.
+
+### Uncommitted working tree (rides with the eventual fix — do NOT commit alone, per [[commit-only-with-tested-fix]])
+- `crates/vault-app/tests/read_quality_eval.rs` (harness, real-BGE, `#[ignore]`)
+- `crates/vault-retrieval/tests/fixtures/read_quality_eval.json` (8-case A7 fixture, from Claude Desktop)
+- `crates/vault-embedding/tests/reranker_spike.rs` (validated re-ranker instrument)
+- `crates/vault-embedding/test-fixtures/ms-marco-minilm-l6-v2/` (downloaded model — keep or delete depending on whether MiniLM stays a candidate)
+- `Memory Vault Tests.md` is COMMITTED (rode with Commit 10).
+
+### Parked / secondary items (don't lose, but not the main thread)
+- **A5 fix direction:** contradiction detection at the **topic-cluster** level (K-means already co-locates Vega+Atlas), not behind the 0.92 merge gate. Same model-fit root — a better model may also lift clustering.
+- **§0 spec amendment** (`Memory Vault Tests.md`): change `test.eval` → a **dot-free authorized eval boundary** (dots are `-32602`-rejected before auth). Unblocks I3 + clean eval isolation. One-line MCP config edit + Claude Desktop restart.
+- **Claude Desktop [STORAGE]-tier hand-offs:** C4 50K/100K byte-intact sweep (note: >100KB clean-rejection already unit-tested at `vault-core/src/memory.rs:182`); I2 storage-half (row+embedding+cascade gone, no orphan).
+- **Minor:** `generate_reports` includes invalidated rows in the REPORT (retriever hides them at read, so harmless) — `vault-consolidator`; Unicode NFC/NFKC normalization decision (dedup correctness); `memory_delete` `{deleted}` no-op indistinguishable (dogfood #8).
+
+### Memories to load next session
+[[bge-small-cannot-separate-relevant]] · [[contradiction-gated-by-merge-threshold]] · [[commit-only-with-tested-fix]] · [[correctness-is-the-product]] · [[architectural-lock-llm-out-of-read-path]] · [[three-mode-deployment]]
+
+---
+
 ## 🆕 Current state
 
 **Live arc:** [[locked-next-arc-t03x]] (amended 2026-05-26) — T0.3.x consolidator-driven structured-fact read pipeline + founder-dogfood. Phase C (write-time decision loop) DEFERRED to V1.0+. Four-step sequence:

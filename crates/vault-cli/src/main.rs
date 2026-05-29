@@ -150,6 +150,16 @@ enum Command {
         /// jobs (uncommon for the MCP-server role).
         #[arg(long, env = "VAULT_PHI4_MODEL_PATH", value_name = "PATH")]
         phi4_model: Option<PathBuf>,
+        /// Path to the Qwen3-Reranker-0.6B seq-cls ONNX model. When supplied
+        /// (with `--rerank-tokenizer`), the read pipeline uses the cross-encoder
+        /// reranker as its relevance gate (ADR-057 amendment). Omit both to fall
+        /// back to the cosine relevance gate (no-signal abstention only).
+        #[arg(long, env = "VAULT_RERANK_MODEL_PATH", value_name = "PATH")]
+        rerank_model: Option<PathBuf>,
+        /// Path to the Qwen3-Reranker tokenizer.json. Required iff
+        /// `--rerank-model` is supplied; reuses `--ort-lib` for the dylib.
+        #[arg(long, env = "VAULT_RERANK_TOKENIZER_PATH", value_name = "PATH")]
+        rerank_tokenizer: Option<PathBuf>,
         /// Authorized boundary to expose to the MCP client. Repeatable;
         /// defaults to ["personal"] when not supplied. Each boundary the
         /// client can read/write/update/delete must be listed here at
@@ -304,6 +314,8 @@ async fn real_main() -> Result<()> {
             bge_tokenizer,
             ort_lib,
             phi4_model,
+            rerank_model,
+            rerank_tokenizer,
             boundary,
             action,
         } => {
@@ -318,6 +330,8 @@ async fn real_main() -> Result<()> {
                 bge_tokenizer,
                 ort_lib,
                 phi4_model,
+                rerank_model,
+                rerank_tokenizer,
                 boundary,
                 action,
             )
@@ -420,6 +434,9 @@ async fn dispatch_consolidate(
         bge_tokenizer,
         ort_lib,
         Some(phi4_model),
+        // Consolidate has no read pipeline → no reranker.
+        None,
+        None,
     )
     .await?;
     match action {
@@ -447,6 +464,8 @@ async fn dispatch_mcp(
     bge_tokenizer: PathBuf,
     ort_lib: PathBuf,
     phi4_model: Option<PathBuf>,
+    rerank_model: Option<PathBuf>,
+    rerank_tokenizer: Option<PathBuf>,
     boundary: Vec<String>,
     action: McpAction,
 ) -> Result<()> {
@@ -472,6 +491,8 @@ async fn dispatch_mcp(
         bge_tokenizer,
         ort_lib,
         phi4_model,
+        rerank_model,
+        rerank_tokenizer,
     )
     .await?;
 
@@ -522,6 +543,8 @@ async fn build_application(
     bge_tokenizer: PathBuf,
     ort_lib: PathBuf,
     phi4_model: Option<PathBuf>,
+    rerank_model: Option<PathBuf>,
+    rerank_tokenizer: Option<PathBuf>,
 ) -> Result<Application> {
     let master_key = read_or_init_master_key(PRODUCTION_NAMESPACE, VAULT_ID).map_err(|e| {
         tracing::warn!(error = %e, "keychain read failed");
@@ -549,6 +572,11 @@ async fn build_application(
         // retired Qwen-7B from the read path entirely.
         qwen_model_path: None,
         phi4_model_path: phi4_model,
+        // Cross-encoder reranker (ADR-057 amendment). Supplied for the
+        // mcp-serve path; None for consolidate (no read pipeline there).
+        // Both must be Some for Application::new to wire the reranker.
+        rerank_model_path: rerank_model,
+        rerank_tokenizer_path: rerank_tokenizer,
     };
 
     Application::new(&config).await.map_err(|e| {
@@ -1151,6 +1179,8 @@ mod tests {
                 bge_tokenizer,
                 ort_lib,
                 phi4_model,
+                rerank_model,
+                rerank_tokenizer,
                 boundary,
                 action,
             } => {
@@ -1160,6 +1190,15 @@ mod tests {
                 assert!(
                     phi4_model.is_none() || std::env::var("VAULT_PHI4_MODEL_PATH").is_ok(),
                     "mcp-serve without --phi4-model MUST yield None unless env var supplies it"
+                );
+                assert!(
+                    rerank_model.is_none() || std::env::var("VAULT_RERANK_MODEL_PATH").is_ok(),
+                    "mcp-serve without --rerank-model MUST yield None unless env var supplies it"
+                );
+                assert!(
+                    rerank_tokenizer.is_none()
+                        || std::env::var("VAULT_RERANK_TOKENIZER_PATH").is_ok(),
+                    "mcp-serve without --rerank-tokenizer MUST yield None unless env var supplies it"
                 );
                 assert_eq!(
                     boundary,

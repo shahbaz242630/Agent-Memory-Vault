@@ -67,6 +67,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use vault_core::{Boundary, MemoryId, VaultError, VaultResult};
+use vault_embedding::RerankProvider;
 
 use crate::report_io::{LoadedReport, ReportLoader};
 use crate::retriever::{RetrievalOptions, RetrievalQuery, RetrievedMemory, Retriever};
@@ -89,6 +90,13 @@ pub const DEFAULT_MAX_CANDIDATES: usize = 20;
 /// diluted; for a memory vault, recall > precision (hiding a real memory is the
 /// worst failure). See ADR-057 over-abstain amendment.
 const RELEVANCE_GATE_TOP_K: usize = 1;
+
+/// Number of top retrieved candidates handed to the cross-encoder reranker
+/// (ADR-057 amendment, 2026-05-29). **8** — recall-first (Shahbaz's call): the
+/// reranker re-scores BGE's 8 best candidates so a real-but-lower-ranked memory
+/// still gets a chance, at ~0.39s/candidate CPU (≈3s top-8; sub-second GPU).
+/// Candidates beyond the cap are dropped (BGE already ranked them lowest).
+const RERANK_CANDIDATE_CAP: usize = 8;
 
 /// Minimum top-1 BGE cosine for a query to count as having relevant content.
 /// Below this the read abstains (no-signal). Calibrated 2026-05-28
@@ -297,6 +305,15 @@ pub struct StructuredReadPipeline {
     /// [`Self::with_relevance_gate`]; `None` (the `new` default) disables the
     /// gate so unit tests exercising other contracts are unaffected.
     semantic: Option<Arc<dyn Retriever>>,
+    /// Optional cross-encoder reranker (ADR-057 amendment, 2026-05-29). When
+    /// `Some`, the top [`RERANK_CANDIDATE_CAP`] retrieved candidates are
+    /// re-scored, filtered to those at/above the reranker's relevance floor,
+    /// and re-sorted by reranker score — the relevance gate that SUPERSEDES the
+    /// cosine `semantic` floor (which couldn't separate topically-adjacent
+    /// wrong-attribute facts). When wired, the reranker is the relevance gate
+    /// and the cosine `semantic` probe is not consulted. `None` (the `new`
+    /// default) leaves the prior behaviour for tests + the no-reranker fallback.
+    reranker: Option<Arc<dyn RerankProvider>>,
     report_loader: Arc<dyn ReportLoader>,
     clock: Arc<dyn Clock>,
     max_candidates: usize,
@@ -310,10 +327,23 @@ impl StructuredReadPipeline {
         Self {
             retriever,
             semantic: None,
+            reranker: None,
             report_loader,
             clock: Arc::new(SystemClock),
             max_candidates: DEFAULT_MAX_CANDIDATES,
         }
+    }
+
+    /// Enable the cross-encoder reranker relevance gate (ADR-057 amendment).
+    /// When wired, [`Self::read`] reranks the top [`RERANK_CANDIDATE_CAP`]
+    /// retrieved candidates, keeps those scoring at/above the reranker's
+    /// [`RerankProvider::relevance_floor`], and re-sorts by reranker score.
+    /// This is the production relevance gate; it supersedes (and bypasses) the
+    /// cosine `semantic` floor from [`Self::with_relevance_gate`].
+    #[must_use]
+    pub fn with_reranker(mut self, reranker: Arc<dyn RerankProvider>) -> Self {
+        self.reranker = Some(reranker);
+        self
     }
 
     /// Enable the relevance gate (ADR-057) with a semantic-only probe channel
@@ -502,17 +532,18 @@ impl StructuredReadPipeline {
             options: RetrievalOptions::default(),
         };
 
-        // Relevance gate (Approach P, ADR-057). When a semantic probe channel
-        // is wired, abstain if the top-K-mean BGE cosine is below the floor:
-        // a query with no semantically relevant content must NOT return the
-        // whole boundary (the no-signal A6 ship-gate). Cosine is the one
-        // signal immune to the canonical-format shared-subject-token
-        // degeneracy that defeats a keyword gate. The BM25 top-1 gate in
-        // `AbstainingRetriever` is left in place but is now vestigial for the
-        // read path — superseded in effect by this gate; its formal
-        // retirement + per-candidate relevance filtering are deferred to the
-        // carry-cosine-through-fusion follow-up (tracked tech-debt).
-        let candidates = if let Some(semantic) = &self.semantic {
+        // Relevance gate. Production (ADR-057 amendment, 2026-05-29) uses the
+        // CROSS-ENCODER RERANKER: retrieve the top-N, then rerank + filter by
+        // the reranker's relevance floor. This supersedes the cosine `semantic`
+        // floor, which could not separate topically-adjacent wrong-attribute
+        // facts (the Q21 class ADR-057 deferred). The cosine gate (Approach P)
+        // remains as the no-reranker fallback + for its existing tests. The
+        // BM25 top-1 gate in `AbstainingRetriever` stays vestigial for the read
+        // path. Precedence: reranker > cosine gate > plain retrieve.
+        let candidates = if self.reranker.is_some() {
+            let retrieved = self.retriever.retrieve(retrieval_query).await?;
+            self.apply_reranker(&query_echo, retrieved).await?
+        } else if let Some(semantic) = &self.semantic {
             let gate_query = RetrievalQuery {
                 query_text: query_echo.clone(),
                 authorized_boundaries: query.authorized_boundaries.clone(),
@@ -564,6 +595,68 @@ impl StructuredReadPipeline {
             abstain,
             health: HealthInfo { status, warnings },
         })
+    }
+
+    /// Rerank the top [`RERANK_CANDIDATE_CAP`] retrieved candidates with the
+    /// cross-encoder, keep those at/above the reranker's relevance floor, and
+    /// re-sort by reranker score (DESC). An empty result → the read abstains.
+    /// Candidates are assumed sorted by retriever score DESC (the [`Retriever`]
+    /// trait invariant), so truncating to the cap keeps the strongest.
+    async fn apply_reranker(
+        &self,
+        query: &str,
+        mut candidates: Vec<RetrievedMemory>,
+    ) -> VaultResult<Vec<RetrievedMemory>> {
+        let Some(reranker) = &self.reranker else {
+            return Ok(candidates);
+        };
+        if candidates.is_empty() {
+            return Ok(candidates);
+        }
+        candidates.truncate(RERANK_CANDIDATE_CAP);
+
+        let docs: Vec<String> = candidates
+            .iter()
+            .map(|c| c.memory.content.clone())
+            .collect();
+        let scores = reranker.rerank(query, &docs).await?;
+        if scores.len() != candidates.len() {
+            return Err(VaultError::Embedding(format!(
+                "reranker returned {} scores for {} candidates",
+                scores.len(),
+                candidates.len()
+            )));
+        }
+
+        let floor = reranker.relevance_floor();
+        let mut kept: Vec<RetrievedMemory> = candidates
+            .into_iter()
+            .zip(scores)
+            .filter_map(|(mut c, score)| {
+                if score >= floor {
+                    c.score = score;
+                    c.explanation = format!("reranked: score={score:.4} (floor {floor:.4})");
+                    Some(c)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        // Re-sort by reranker score DESC (the reranker, not the retriever, now
+        // decides ordering). NaN scores sort last via the unwrap_or fallback.
+        kept.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        tracing::info!(
+            target: "vault_retrieval::reranker",
+            kept = kept.len(),
+            floor,
+            "reranked candidates; kept those at/above floor"
+        );
+        Ok(kept)
     }
 }
 
@@ -1281,6 +1374,214 @@ mod tests {
             "gate-off pipeline MUST NOT abstain on a returned candidate"
         );
         assert_eq!(resp.relevant_facts.len(), 1);
+    }
+
+    // ---------------------------------------------------------------------
+    // Group C.6 — reranker gate (ADR-057 amendment): cross-encoder relevance.
+    // Filter-by-floor, re-sort-by-score, abstain-when-none-pass, top-N cap.
+    // (RerankProvider is in scope via `use super::*`.)
+    // ---------------------------------------------------------------------
+
+    /// Mock reranker — returns a score per doc from a content→score map
+    /// (unknown content → `default`), with a configurable floor.
+    struct MockReranker {
+        scores: HashMap<String, f32>,
+        default: f32,
+        floor: f32,
+    }
+
+    impl MockReranker {
+        fn new(scores: Vec<(&str, f32)>, default: f32, floor: f32) -> Arc<Self> {
+            Arc::new(Self {
+                scores: scores
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect(),
+                default,
+                floor,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl RerankProvider for MockReranker {
+        async fn rerank(&self, _query: &str, docs: &[String]) -> VaultResult<Vec<f32>> {
+            Ok(docs
+                .iter()
+                .map(|d| self.scores.get(d).copied().unwrap_or(self.default))
+                .collect())
+        }
+        fn relevance_floor(&self) -> f32 {
+            self.floor
+        }
+    }
+
+    #[tokio::test]
+    async fn reranker_filters_candidates_below_floor() {
+        // Two retrieved candidates; the reranker scores one above the floor and
+        // one below. Only the above-floor fact survives; abstain=false.
+        let now = read_clock_now();
+        let keep = fake_memory(
+            1,
+            "the user finds light themes straining",
+            "personal",
+            now,
+            0.9,
+            None,
+        );
+        let drop = fake_memory(
+            2,
+            "the user collects vintage keyboards",
+            "personal",
+            now,
+            0.9,
+            None,
+        );
+        let reranker = MockReranker::new(
+            vec![
+                ("the user finds light themes straining", 4.2),
+                ("the user collects vintage keyboards", -3.1),
+            ],
+            -10.0,
+            0.0,
+        );
+        let pipeline = StructuredReadPipeline::new(
+            // retriever order: keep first, drop second (both returned).
+            MockRetriever::new(vec![retrieved(keep, 0.5), retrieved(drop, 0.4)]),
+            MockReportLoader::empty(),
+        )
+        .with_clock(FixedClock::arc(now))
+        .with_reranker(reranker);
+        let resp = pipeline
+            .read(ReadQuery {
+                query_text: "is the user bothered by bright screens?".into(),
+                authorized_boundaries: vec![boundary("personal")],
+            })
+            .await
+            .unwrap();
+        assert!(!resp.abstain, "an above-floor candidate MUST proceed");
+        assert_eq!(
+            resp.relevant_facts.len(),
+            1,
+            "below-floor candidate MUST be dropped"
+        );
+        assert_eq!(
+            resp.relevant_facts[0].fact,
+            "the user finds light themes straining"
+        );
+    }
+
+    #[tokio::test]
+    async fn reranker_abstains_when_all_candidates_below_floor() {
+        // The A7-guard case: a topically-adjacent but non-answering fact scores
+        // below the floor → abstain, even though retrieval returned it.
+        let now = read_clock_now();
+        let guard = fake_memory(
+            1,
+            "the user relocated to Lisbon",
+            "personal",
+            now,
+            0.9,
+            None,
+        );
+        let reranker = MockReranker::new(vec![("the user relocated to Lisbon", -5.4)], -10.0, 0.0);
+        let pipeline = StructuredReadPipeline::new(
+            MockRetriever::new(vec![retrieved(guard, 0.7)]),
+            MockReportLoader::empty(),
+        )
+        .with_clock(FixedClock::arc(now))
+        .with_reranker(reranker);
+        let resp = pipeline
+            .read(ReadQuery {
+                query_text: "what city did the user grow up in?".into(),
+                authorized_boundaries: vec![boundary("personal")],
+            })
+            .await
+            .unwrap();
+        assert!(
+            resp.abstain,
+            "all-below-floor MUST abstain (adjacent-but-wrong guard)"
+        );
+        assert!(resp.relevant_facts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reranker_reorders_by_rerank_score_not_retrieval_order() {
+        // Retriever ranks A above B; the reranker disagrees (B more relevant).
+        // The response MUST be reranker-ordered: B first.
+        let now = read_clock_now();
+        let a = fake_memory(1, "fact A", "personal", now, 0.9, None);
+        let b = fake_memory(2, "fact B", "personal", now, 0.9, None);
+        let reranker = MockReranker::new(vec![("fact A", 1.0), ("fact B", 6.0)], -10.0, 0.0);
+        let pipeline = StructuredReadPipeline::new(
+            // retriever order: A (0.9) before B (0.8)
+            MockRetriever::new(vec![retrieved(a, 0.9), retrieved(b, 0.8)]),
+            MockReportLoader::empty(),
+        )
+        .with_clock(FixedClock::arc(now))
+        .with_reranker(reranker);
+        let resp = pipeline
+            .read(ReadQuery {
+                query_text: "q".into(),
+                authorized_boundaries: vec![boundary("personal")],
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.relevant_facts.len(), 2);
+        assert_eq!(
+            resp.relevant_facts[0].fact, "fact B",
+            "reranker score MUST decide order, not retrieval rank"
+        );
+        assert_eq!(resp.relevant_facts[1].fact, "fact A");
+    }
+
+    #[tokio::test]
+    async fn reranker_caps_at_top_8_candidates() {
+        // 10 retrieved candidates; only the top RERANK_CANDIDATE_CAP (8) are
+        // reranked. The 9th/10th are dropped even though the mock would score
+        // them above the floor — they never reach the reranker.
+        let now = read_clock_now();
+        let canned: Vec<RetrievedMemory> = (0..10)
+            .map(|i| {
+                let m = fake_memory(
+                    100 + i,
+                    &format!("candidate {i}"),
+                    "personal",
+                    now,
+                    0.9,
+                    None,
+                );
+                // retriever score DESC so truncate keeps candidates 0..8
+                retrieved(m, 1.0 - (i as f32) * 0.01)
+            })
+            .collect();
+        // Mock scores every candidate above the floor.
+        let reranker = MockReranker::new(vec![], 5.0, 0.0);
+        let pipeline =
+            StructuredReadPipeline::new(MockRetriever::new(canned), MockReportLoader::empty())
+                .with_clock(FixedClock::arc(now))
+                .with_reranker(reranker);
+        let resp = pipeline
+            .read(ReadQuery {
+                query_text: "q".into(),
+                authorized_boundaries: vec![boundary("personal")],
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.relevant_facts.len(),
+            RERANK_CANDIDATE_CAP,
+            "only top-{RERANK_CANDIDATE_CAP} candidates are reranked + surfaced"
+        );
+        let facts: Vec<&str> = resp
+            .relevant_facts
+            .iter()
+            .map(|f| f.fact.as_str())
+            .collect();
+        assert!(
+            !facts.contains(&"candidate 8") && !facts.contains(&"candidate 9"),
+            "candidates beyond the cap MUST be dropped (never reranked)"
+        );
     }
 
     // ---------------------------------------------------------------------

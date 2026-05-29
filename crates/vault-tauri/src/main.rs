@@ -267,6 +267,10 @@ fn main() {
                 at_rest_key,
                 qwen_model_path: None,
                 phi4_model_path: None,
+                // V0.1 Tauri shell is UI-only (ADR-034, no MCP server bound):
+                // no read pipeline, so no reranker. Both None.
+                rerank_model_path: None,
+                rerank_tokenizer_path: None,
             };
 
             // 6. Construct Application and spawn the cascading retry

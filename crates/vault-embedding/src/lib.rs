@@ -22,7 +22,9 @@
 
 pub mod bge_small;
 pub mod integrity;
+pub mod ort_init;
 pub mod provider;
+pub mod reranker;
 
 /// Test-verification helpers — gated `testing` cargo feature.
 /// Self-enabled for integration tests via the `[dev-dependencies]`
@@ -34,5 +36,9 @@ pub mod testing;
 pub use bge_small::BgeSmallProvider;
 pub use integrity::{
     verify_file_sha256, BGE_SMALL_EN_V1_5_MODEL_SHA256, BGE_SMALL_EN_V1_5_TOKENIZER_SHA256,
+    QWEN3_RERANKER_MODEL_SHA256, QWEN3_RERANKER_TOKENIZER_SHA256,
 };
 pub use provider::{EmbeddingProvider, EMBEDDING_DIM};
+pub use reranker::{
+    Qwen3RerankerProvider, RerankProvider, QWEN3_RERANKER_INSTRUCT, RERANK_RELEVANCE_FLOOR,
+};

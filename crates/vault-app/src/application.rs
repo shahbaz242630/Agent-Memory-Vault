@@ -47,7 +47,9 @@ use vault_consolidator::{
     write_report_atomic, ConsolidationReport, Consolidator, ConsolidatorConfig,
 };
 use vault_core::{Boundary, VaultError, VaultResult};
-use vault_embedding::{BgeSmallProvider, EmbeddingProvider, EMBEDDING_DIM};
+use vault_embedding::{
+    BgeSmallProvider, EmbeddingProvider, Qwen3RerankerProvider, RerankProvider, EMBEDDING_DIM,
+};
 use vault_llm::{LlmProvider, Phi4MiniConfig, Phi4MiniProvider};
 use vault_mcp::{Adapter, StdioServer};
 use vault_retrieval::{
@@ -289,12 +291,35 @@ impl Application {
         //    `AppConfig.qwen_model_path` field is now dead (kept with
         //    #[allow(dead_code)] until Commit 8 removes it).
         let report_loader = Arc::new(FilesystemReportLoader::new(vault_root.clone()));
-        // Wire the relevance gate (ADR-057): the same `semantic` retriever
-        // that backs the hybrid's dense leg is the probe channel. The pipeline
-        // abstains when a query's top-K-mean BGE cosine is below the floor —
-        // closing the no-signal ship-gate. `semantic` is moved here (last use).
-        let read_pipeline = StructuredReadPipeline::new(retriever.clone(), report_loader)
-            .with_relevance_gate(semantic);
+        // Relevance gate. Production (ADR-057 amendment, 2026-05-29): the
+        // cross-encoder reranker (Qwen3-Reranker-0.6B) is the relevance gate —
+        // it separates topically-adjacent-but-wrong facts that the cosine floor
+        // could not. When both rerank paths are configured, open the reranker
+        // and wire `with_reranker`; otherwise fall back to the cosine
+        // `with_relevance_gate(semantic)` so a deployment without the ~1.2 GB
+        // model still abstains on no-signal queries (graceful degradation).
+        let base_pipeline = StructuredReadPipeline::new(retriever.clone(), report_loader);
+        let read_pipeline = match (&config.rerank_model_path, &config.rerank_tokenizer_path) {
+            (Some(rerank_model), Some(rerank_tokenizer)) => {
+                let reranker: Arc<dyn RerankProvider> = Arc::new(Qwen3RerankerProvider::open(
+                    rerank_model,
+                    rerank_tokenizer,
+                    &config.ort_lib_path,
+                )?);
+                tracing::info!(
+                    target: "vault_app::startup",
+                    "read relevance gate: cross-encoder reranker (Qwen3-Reranker-0.6B, ADR-057 amendment)"
+                );
+                base_pipeline.with_reranker(reranker)
+            }
+            _ => {
+                tracing::info!(
+                    target: "vault_app::startup",
+                    "read relevance gate: cosine floor (no reranker model configured — graceful fallback)"
+                );
+                base_pipeline.with_relevance_gate(semantic)
+            }
+        };
         tracing::info!(
             target: "vault_app::startup",
             vault_root = %vault_root.display(),

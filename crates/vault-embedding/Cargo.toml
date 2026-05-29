@@ -17,7 +17,12 @@ testing = []
 
 [dependencies]
 vault-core = { path = "../vault-core" }
-ort = { workspace = true }
+# `half` feature enables f16 logit extraction — the Qwen3-Reranker seq-cls
+# model emits f16 logits. Pure-Rust, cross-platform (no CI-matrix risk).
+ort = { workspace = true, features = ["half"] }
+# f16 → f32 conversion of reranker logits (reranker.rs). Pinned to the version
+# already resolved in the tree via ort.
+half = "=2.7.1"
 tokenizers = { workspace = true }
 sha2 = { workspace = true }
 async-trait = { workspace = true }
