@@ -42,7 +42,9 @@ use vault_storage::{MemoryFilter, StorageBackend};
 
 use crate::phases::cluster::{find_candidate_clusters, Cluster};
 use crate::phases::merge::{apply_merge, decide_merge, AppliedMerge, MergeOutcome};
+use crate::report::{generate_report, Report};
 use crate::summary::generate_summary_markdown;
+use crate::topics::discover_topics;
 
 /// Sleep-cycle orchestrator per BRD §5.6 lines 895-913.
 ///
@@ -334,6 +336,70 @@ impl Consolidator {
             conflicts_for_user_review,
             summary_markdown,
         })
+    }
+
+    /// Build the per-boundary REPORT artifacts (ADR-053) for the current
+    /// vault state — the curated "what is currently true, grouped by
+    /// topic" view the structured read pipeline serves from (NOT the
+    /// run-audit `summary_markdown` produced by [`Self::run_consolidation`]).
+    ///
+    /// Intended to be called by the application layer immediately AFTER
+    /// [`Self::run_consolidation`] within the same safety wrapper, so the
+    /// topics + facts reflect the post-merge / post-invalidate state. The
+    /// consolidator builds the [`Report`] values but does NOT persist them:
+    /// the filesystem write (`<vault_root>/reports/<boundary>.report.json`)
+    /// lives in `vault-app::Application::run_consolidation_with_safety`,
+    /// which owns the `vault_root` path. This keeps the consolidator
+    /// filesystem-agnostic (it talks only to storage traits + the
+    /// embedder + the LLM), mirroring how the cross-process lockfile also
+    /// lives in the app layer.
+    ///
+    /// One [`Report`] per non-empty boundary, in deterministic
+    /// (alphabetical) boundary order. `run_id` is stamped into each report
+    /// so a reader can correlate a REPORT with the run that produced it.
+    ///
+    /// # Errors
+    ///
+    /// - [`vault_core::VaultError`] propagated from `list_memories` or from
+    ///   [`discover_topics`] (embedding failure / dim mismatch). A failure
+    ///   here aborts report generation for the whole run; the app layer's
+    ///   safety wrapper surfaces it. The previous REPORT files (if any)
+    ///   stay untouched because no write has happened yet.
+    #[instrument(skip(self), fields(run_id = %run_id))]
+    pub async fn generate_reports(&self, run_id: Uuid) -> VaultResult<Vec<Report>> {
+        let generated_at = Utc::now();
+
+        // Re-enumerate active (non-superseded) memories and group by
+        // boundary — mirrors run_consolidation steps 1-2 so topic discovery
+        // sees exactly the set that survived the merge pipeline.
+        let all_memories = self
+            .storage
+            .list_memories(MemoryFilter::default(), None)
+            .await?;
+        let mut by_boundary: BTreeMap<Boundary, Vec<Memory>> = BTreeMap::new();
+        for memory in all_memories {
+            by_boundary
+                .entry(memory.boundary.clone())
+                .or_default()
+                .push(memory);
+        }
+
+        let mut reports = Vec::with_capacity(by_boundary.len());
+        for (boundary, memories) in by_boundary {
+            // Pass the LLM so Phi-4 names each topic cluster; discover_topics
+            // falls back to placeholder labels + topic_names_unavailable=true
+            // if the LLM is unavailable or returns malformed JSON, which the
+            // read pipeline surfaces as the TOPIC_NAMES_UNAVAILABLE warning.
+            let topic_map = discover_topics(
+                &boundary,
+                &memories,
+                self.embeddings.as_ref(),
+                Some(self.llm.as_ref()),
+            )
+            .await?;
+            reports.push(generate_report(&topic_map, &memories, run_id, generated_at));
+        }
+        Ok(reports)
     }
 
     /// Schedule the consolidator to run at the configured `run_at` time.

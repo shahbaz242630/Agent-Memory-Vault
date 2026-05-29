@@ -43,7 +43,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use uuid::Uuid;
-use vault_consolidator::{ConsolidationReport, Consolidator, ConsolidatorConfig};
+use vault_consolidator::{
+    write_report_atomic, ConsolidationReport, Consolidator, ConsolidatorConfig,
+};
 use vault_core::{Boundary, VaultError, VaultResult};
 use vault_embedding::{BgeSmallProvider, EmbeddingProvider, EMBEDDING_DIM};
 use vault_llm::{LlmProvider, Phi4MiniConfig, Phi4MiniProvider};
@@ -568,13 +570,51 @@ impl Application {
         // unwind) which removes the lockfile.
         let _lock = ConsolidatorLock::try_acquire(&self.vault_root)?;
 
-        // Wrap the consolidator's run_consolidation in the hard timeout.
-        // We .clone() the Arc<Consolidator> so the future is 'static-
-        // friendly (no borrow on self threaded through tokio::timeout's
-        // internal future polling).
+        // Wrap the consolidator's run_consolidation + per-boundary REPORT
+        // generation in one hard timeout — both phases call the LLM and
+        // re-embed, so both belong under the same cancellation budget. We
+        // .clone() the Arc<Consolidator> so the future is 'static-friendly
+        // (no borrow on self threaded through tokio::timeout's internal
+        // future polling). generate_reports runs AFTER run_consolidation so
+        // the topics + facts reflect the post-merge / post-invalidate state
+        // (ADR-058).
         let consolidator = consolidator.clone();
-        let inner = async move { consolidator.run_consolidation().await };
-        let report = timeout_or_consolidator_timeout(CONSOLIDATOR_HARD_TIMEOUT, inner).await?;
+        let inner = async move {
+            let report = consolidator.run_consolidation().await?;
+            let reports = consolidator.generate_reports(run_id).await?;
+            Ok::<_, VaultError>((report, reports))
+        };
+        let (report, reports) =
+            timeout_or_consolidator_timeout(CONSOLIDATOR_HARD_TIMEOUT, inner).await?;
+
+        // Persist each per-boundary REPORT atomically to the vault root.
+        // The filesystem write lives in this app layer (it owns
+        // `vault_root`); the consolidator stays filesystem-agnostic. A
+        // single REPORT write failure is logged-and-continued rather than
+        // aborting the whole run — mirrors the contradiction-invalidate
+        // philosophy (a transient failure is retried next cycle, and a
+        // missing REPORT surfaces as REPORT_MISSING at read time, which is
+        // the correct degraded signal). The merge work already committed to
+        // storage above is durable regardless.
+        for report_artifact in &reports {
+            match write_report_atomic(report_artifact, &self.vault_root) {
+                Ok(path) => tracing::info!(
+                    target: "vault_app::consolidator",
+                    run_id = %run_id,
+                    boundary = %report_artifact.boundary.as_str(),
+                    topics = report_artifact.facts_by_topic.len(),
+                    path = %path.display(),
+                    "per-boundary REPORT written"
+                ),
+                Err(e) => tracing::warn!(
+                    target: "vault_app::consolidator",
+                    run_id = %run_id,
+                    boundary = %report_artifact.boundary.as_str(),
+                    error = %e,
+                    "REPORT write failed; REPORT_MISSING will surface at read until the next run succeeds"
+                ),
+            }
+        }
 
         tracing::info!(
             target: "vault_app::consolidator",
@@ -582,6 +622,7 @@ impl Application {
             memories_processed = report.memories_processed,
             memories_merged = report.memories_merged,
             contradictions_resolved = report.contradictions_resolved,
+            reports_written = reports.len(),
             "consolidation run completed under safety wrapper"
         );
 

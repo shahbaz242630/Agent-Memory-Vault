@@ -273,6 +273,24 @@ Read this whole block before any new work. **The detailed Step 1–4 plan furthe
 
 ---
 
+### ADR-058 — Wire per-boundary REPORT generation into the consolidation run (Commit 10, 2026-05-29)
+
+**Status:** Accepted, T0.3.x Batch B Commit 10 (2026-05-29). Surfaced by the **FIRST live consolidation dogfood** (`vault-cli consolidate run` against the live vault — 9 memories, exit 0, 0 merges).
+
+**Context.** Batch A (`f0cc158`) shipped `topics.rs` (`discover_topics`, K-means) + `report.rs` (`generate_report` + `write_report_atomic`), and Commit 6 (`99052f2`) shipped the read-side `report_io.rs` + `StructuredReadPipeline` that serves from the REPORT. All three producer functions were unit-tested in isolation and exported from the crate — **but nothing in the run path ever called them.** `Consolidator::run_consolidation` built only the run-audit `ConsolidationReport` (+ `summary_markdown`); `Application::run_consolidation_with_safety` ran it, logged, and returned. Consequence, proven by the first live run: **no `reports/` dir or `<boundary>.report.json` was ever written**, so `memory_read` surfaced `REPORT_MISSING` / `health: degraded` on every read and `topic` was null on every fact — permanently, no matter how often consolidation ran. The "Consolidator → REPORT" link of [[locked-next-arc-t03x]] had no body. The unit tests passed because they exercised the producer functions directly; **no test exercised the run → disk path**, which is exactly why the gap shipped silently.
+
+**Decision.** Add `Consolidator::generate_reports(run_id) -> VaultResult<Vec<Report>>`: re-enumerate active (non-superseded) memories, group by boundary, `discover_topics` (Phi-4 labels via the consolidator's own LLM handle) → `generate_report` per boundary. `Application::run_consolidation_with_safety` calls it immediately AFTER `run_consolidation` (under the same 30-min hard-timeout — both phases call the LLM + re-embed), then persists each REPORT via `write_report_atomic(&self.vault_root)`.
+
+**Layering:** the consolidator BUILDS the reports (it owns storage + embedder + LLM); the app layer WRITES them (it owns `vault_root`). The consolidator stays filesystem-agnostic — mirrors how the cross-process lockfile already lives in the app layer. No change to `run_consolidation`'s audit return → zero ripple to its existing tests.
+
+**Failure semantics:** a single REPORT write failure is logged-and-continued (WARN), NOT a run abort — mirrors the contradiction-invalidate philosophy; the merge work already committed durably, the next run retries, and a missing REPORT degrades to `REPORT_MISSING` at read (the correct signal).
+
+**Pinned by** (CI every cycle, mocks — `vault-consolidator/tests/report_generation.rs`): `generate_reports_produces_topical_report_per_boundary` (one topical REPORT per boundary; every seeded fact present exactly once, none invented) + `generated_report_round_trips_to_disk_at_expected_path` (producer → `<vault_root>/reports/<boundary>.report.json` → JSON round-trip at the exact path `FilesystemReportLoader` reads). The full `run_consolidation_with_safety` → file-on-disk path is proven by the live dogfood re-run; a CI-level test of that path is blocked by `Application::new` loading the real Phi-4 GGUF — see Tech-debt below.
+
+**Tech-debt (logged, not addressed here):** no CI-level test exercises `Application::run_consolidation_with_safety`'s REPORT-write because `Application::new` constructs the `Consolidator` internally from a real Phi-4 path (no injection seam). A mock-consolidator injection seam on `Application` would let this run in CI with mocks; until then the cron-gated real-Phi-4 path + live dogfood cover it.
+
+---
+
 > **⚠️ The Step 1–4 plan below (Commits 7 + 8) is HISTORICAL** — superseded by the block above. Kept for the design-reasoning trail only.
 
 ### Step 1 — Sanity check working tree + CI
