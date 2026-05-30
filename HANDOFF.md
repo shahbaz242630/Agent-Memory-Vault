@@ -2,11 +2,64 @@
 
 **Current version:** V0.2 Closed Beta (BRD §6.2 — sleep consolidator, boundaries hardening, cross-device sync, 30 beta users)
 
-**Last updated:** 2026-05-28 (T0.3.x **Batch B Commit 9** — *read-relevance cosine-floor gate* — in working tree, local DoD gates ALL GREEN (fmt/clippy/build/test), awaiting commit. Closes the dogfood-found **A6 no-signal ship-gate**: `memory_read` now abstains when a query's top-1 BGE cosine < 0.66 (**ADR-057**, Approach P — gate lives in `StructuredReadPipeline`; `memory_search` + the `abstain_tests` BM25 suite untouched). Floor (top-1, 0.66) measured via the n=5 `abstain_channel_diagnostic`; an initial top-3-mean choice over-abstained on a real query in live dogfood → switched to top-1, re-validated live (blood-type abstains, zafflang proceeds). Bundles the **JoinHandle clean-disconnect panic fix** Codex found (`is_finished()` guard in `ApplicationHandle::shutdown` + regression test). **Commit 8 shipped at `b772d9d`** (MCP serve entrypoint + `memory.X`→`memory_X` rename + ADR-056 dogfood fixes); **Commit 7 at `f6293c6`** (CI green). **Cross-agent dogfood:** Claude Desktop + Codex (GPT-5.5, full write→search→update→read→delete CRUD) both verified live; Cursor is the next connection. See **ADR-057** below + [[cross-agent-mcp-connection]]. The 🎯 opener block further down is now HISTORICAL (Commit 8 close).)
+**Last updated:** 2026-05-30 (**A5 contradiction detection SHIPPED + live-proven** — see the "A5 SHIPPED" opener block immediately below; bundles the clustering-divergence robustness fix + the macOS reranker CI fix in one commit. — Prior context: 2026-05-28 (T0.3.x **Batch B Commit 9** — *read-relevance cosine-floor gate* — in working tree, local DoD gates ALL GREEN (fmt/clippy/build/test), awaiting commit. Closes the dogfood-found **A6 no-signal ship-gate**: `memory_read` now abstains when a query's top-1 BGE cosine < 0.66 (**ADR-057**, Approach P — gate lives in `StructuredReadPipeline`; `memory_search` + the `abstain_tests` BM25 suite untouched). Floor (top-1, 0.66) measured via the n=5 `abstain_channel_diagnostic`; an initial top-3-mean choice over-abstained on a real query in live dogfood → switched to top-1, re-validated live (blood-type abstains, zafflang proceeds). Bundles the **JoinHandle clean-disconnect panic fix** Codex found (`is_finished()` guard in `ApplicationHandle::shutdown` + regression test). **Commit 8 shipped at `b772d9d`** (MCP serve entrypoint + `memory.X`→`memory_X` rename + ADR-056 dogfood fixes); **Commit 7 at `f6293c6`** (CI green). **Cross-agent dogfood:** Claude Desktop + Codex (GPT-5.5, full write→search→update→read→delete CRUD) both verified live; Cursor is the next connection. See **ADR-057** below + [[cross-agent-mcp-connection]]. The 🎯 opener block further down is now HISTORICAL (Commit 8 close).)
 
 ---
 
-## 🎯 NEXT SESSION OPENER (2026-05-29 — **FIX A5: contradiction detection**) — READ THIS FIRST
+## 🎯 NEXT SESSION OPENER (2026-05-30 — **A5 SHIPPED ✅** · next: Phi-4 precision + settable `as_of`) — READ THIS FIRST
+
+**A5 (knowledge-update / contradiction detection) — the V0.2 ship-gate — is SHIPPED and LIVE-PROVEN on real Phi-4-mini.** Committed this session (hash in `git log`; ADR-060 + ADR-061). The "FIX A5" opener further below is now HISTORICAL.
+
+### What shipped this session
+1. **Topic-level contradiction detection (ADR-060 — the A5 fix).** Detection is decoupled from the 0.92 merge gate and now runs over the looser K-means **topic** grouping. New `crates/vault-consolidator/src/phases/contradiction.rs`: per topic of ≥2 facts, Phi-4 returns explicit `stale_memory_ids` (never a whole-group winner-sweep — a topic is a loose grouping, so a winner-takes-all verdict would wrongly retire compatible facts). Wired into `run_consolidation` after the merge pass; re-enumerates the post-merge active set, skips already-invalidated rows, groups via `discover_topics(.., llm=None)` (grouping only — no naming calls), invalidates exactly the model-named stale ids via the existing ADR-051 `invalidate()` path, with a **guard that refuses to retire an entire group** + ignores ids outside the group. Retirement is non-destructive (rows persist with `valid_until`; recoverable; visible in `include_archived` search).
+2. **Clustering divergence robustness (ADR-061).** `find_candidate_clusters` panicked (`no entry found for key`, `cluster.rs:294`) on real data: LanceDB returns NN hits for superseded/invalidated memories whose vectors linger but which `list_memories` excludes, so `union_find` looked up a non-node. Fixed: drop NN edges to non-member ids (normal SQLite/Lance divergence hygiene, WARN-logged) + defensive `union_find` (unknown id → own root, never panics). Pinned by `union_find_treats_unknown_edge_endpoint_as_root`. **Caught by the live consolidation dogfood — a latent crash that would hit ANY real consolidation with superseded data, independent of A5.**
+3. **macOS reranker CI fix.** The previous push `87d0b72` reddened macOS clippy: `reranker.rs`'s `#[ignore]`d real-model test had `ort_lib` cfg-branches for windows/linux only → `E0425` on macOS (`--all-targets` still *compiles* ignored tests). Added the macOS `.dylib` branch. Rides here so one CI cycle goes green. (Per [[broken-ci-is-regression-not-techdebt]] + [[cfg-gate-transitively-platform-only-items]].)
+
+### Live dogfood — DECISIVE PASS (server-log-verified, real Phi-4-mini)
+Ran `vault-cli consolidate run` on the live vault (real Phi-4, run `0a55c212…`), then the §7 [LIVE] batch from Claude Desktop, monitored via a server-log watcher. **Two independent reviews agree** (the §7 run + the advisory Claude's adversarial per-test review):
+- **A5 ✅ ship-gate:** "where does the user work now?" → **only Atlas, no Vega**. Both Vega facts (two write-batches) `invalidate()`d; `health: ok` (REPORT_MISSING gone); `topic` populated. The exact session-open bug ("read returns both Vega + Atlas") is FIXED on real models.
+- Full §7 green: **A4 ✅ A6 ✅ A7 ✅ C5 ✅** (clean `-32602`, log-confirmed — Claude Desktop's UI collapses it to "Tool execution failed", the log is ground truth) **C6 ✅ C7 ✅ C9 ✅ I2 ✅ K1 ✅ K2 ✅**. C8 not re-run (proven 2026-05-29; auth path untouched).
+- Vega confirmed **invalidated-NOT-deleted** via `include_archived` search — ADR-051 bi-temporal semantics working; over-retirements are reversible.
+
+### NEXT STEPS (next session, priority order)
+1. **Step 1b — Phi-4 over-flagging precision (the one open item).** Real Phi-4-mini is too eager: it flagged contradictions in non-contradictory topics (the `personal` boundary's 3/3 topics; the `memory_ceiling_probes` topic of 3 distinct probes). On `testeval` the employment detections were *correct*. **NOT ship-blocking** (consolidator is manual-trigger only until the T0.2.6 scheduler; over-retirement is reversible). Try: tighten/few-shot `CONTRADICTION_SYSTEM_PROMPT`; add a confidence/abstain step; or judge **pairwise within a topic** instead of N-ary (N-ary dilutes the signal). Harden against false positives, then re-dogfood. See [[no-sub-7b-models-for-synthesis]] (Phi-4 is the merge-classifier floor; contradiction *classification* is closer to its strength than *synthesis*, but precision needs work).
+2. **Step 2 — settable `as_of` on `memory_write`.** Independently confirmed needed by BOTH the §7 dogfood AND the advisory review: `as_of` = write-time; real dates live only in content; so A4/A5 temporal correctness rode entirely on the contradiction mechanism, not `as_of` ranking. Add an optional `as_of` param to `WriteToolParams` → `NewMemory.valid_from` (vault-core ALREADY accepts `valid_from: Option<DateTime>`); falls back to write-time when absent. **Write-only** (update keeps ADR-028 date-preservation). Decision locked 2026-05-30 (Shahbaz: agent sets the date, layered on write-time as the safety net — a forgotten date degrades to write-time, never breaks). See [[as-of-write-time-blocks-a5-temporal]].
+3. **Tech-debt / hygiene (logged, not blocking):**
+   - Topic-pass auto-invalidations are **tracing-only**, not counted in `ConsolidationReport.contradictions_resolved` (mirrors the existing clear_winner path; report says "0 queued" even when N were invalidated). Surface a count.
+   - Ambiguous topic contradictions (model returns empty `stale_memory_ids`) are **not queued** to `conflicts_for_user_review` — V0.2 only auto-resolves the determinable ones. Wire queuing if dogfood shows ambiguous cases matter.
+   - `generate_reports` includes invalidated rows in the REPORT (retriever hides them at read, so harmless — but noisy).
+   - `testeval`/`personal` eval boundaries aren't isolated (both authorized) — blocks a clean §2 precision baseline + I3 isolation. Want a `testeval`-only MCP session.
+   - Probe accumulation in the live vault needs teardown (advisory left: `C6MARKER` vermilion, `C7MARKER` unicode, two `C9MARKER` in testeval).
+   - Topic labels imperfect (hiking landed under `career_transition`) — K-means/Phi-4 labeling noise; cosmetic, not a read-correctness issue.
+
+### Memories to load next session
+[[contradiction-gated-by-merge-threshold]] · [[as-of-write-time-blocks-a5-temporal]] · [[no-sub-7b-models-for-synthesis]] · [[correctness-is-the-product]] · [[reference-mcp-dogfood-log-is-ground-truth]] · [[feedback-review-prior-session-logs-before-fixing]]
+
+---
+
+### ADR-060 — Topic-level contradiction detection (A5 ship-gate, 2026-05-30)
+
+**Status:** Accepted, shipped 2026-05-30. Closes the A5 ship-gate ([[contradiction-gated-by-merge-threshold]]).
+
+**Context.** Contradiction detection only ran on Phase-1 merge clusters (cosine ≥ 0.92). A knowledge-update contradiction ("works at Vega" → "works at Atlas, having left Vega") is semantically related but sits BELOW 0.92, so the pair never clustered and Phi-4 never judged it — reads returned both stale + current truth. Reproduced live 2026-05-29 (`contradictions queued: 0`).
+
+**Decision.** A new contradiction pass (`phases/contradiction.rs`) runs over the looser K-means **topic** grouping (`discover_topics`, which already co-locates the conflicting pair), SEPARATE from the 0.92 merge gate (which stays for near-duplicate *merging*). `detect_contradiction(group, llm)` returns a `ContradictionVerdict { stale_memory_ids, reasoning }` — **explicit stale ids, never a winner-takes-all sweep** (a topic is a loose grouping; a whole-group verdict would retire compatible facts). The orchestrator invalidates exactly those ids via the ADR-051 `invalidate()` API, with two safety nets: (a) ignore returned ids not in the group, (b) refuse to invalidate an ENTIRE group (≥1 fact must remain current). The judge prompt is conservative (same-subject/same-attribute incompatibility only) and is fed each fact's `as_of`. Failure semantics: per-topic LLM failure or a failed invalidate is logged-and-continued, not a run abort.
+
+**Live-proven** end-to-end on real Phi-4-mini (see dogfood above). **Known limitation:** Phi-4-mini over-flags on some topics (Step 1b precision work); not ship-blocking (manual-trigger only; reversible). Pinned by `tests/contradiction_resolution.rs` (Vega→Atlas retires; co-topical-compatible survives; mass-invalidate refused) + `phases/contradiction.rs` unit tests.
+
+### ADR-061 — Clustering robustness to vector-store / metadata divergence (2026-05-30)
+
+**Status:** Accepted, shipped 2026-05-30. Bug fix surfaced by the A5 live consolidation dogfood.
+
+**Context.** `find_candidate_clusters` panicked `no entry found for key` (`cluster.rs:294`) on the real `testeval` vault. Root cause: `mark_superseded`/`invalidate` update SQLite metadata only — the LanceDB vector lingers — so an NN search returns ids that `list_memories` (default filter) excludes. `union_find_components` then indexed a non-node id and panicked. This SQLite/Lance divergence is an EXPECTED steady-state after any merge/supersede/invalidate, so it crashed every real consolidation run with superseded data — independent of A5.
+
+**Decision.** Two layers: (a) in `find_candidate_clusters`, build a `member_ids` set and **drop NN edges to non-member ids** (normal divergence hygiene, count WARN-logged); (b) make `union_find`'s `find()` **defensive** — an id with no parent entry is its own root (loop simply doesn't run), so the disjoint-set primitive can never panic on input shape. Pinned by `union_find_treats_unknown_edge_endpoint_as_root`. (Forward note: physically GC-ing superseded vectors from LanceDB is the real cure — deferred; this makes clustering robust regardless.)
+
+---
+
+> **⚠️ The "FIX A5" opener below is HISTORICAL — A5 shipped 2026-05-30 (see the block above).**
+
+## 🎯 NEXT SESSION OPENER (2026-05-29 — **FIX A5: contradiction detection**) — HISTORICAL
 
 **Start here. The cross-encoder reranker arc SHIPPED this session (read-path correctness — see "Reranker arc — SHIPPED" just below). The next correctness battle, and the V0.2 ship-gate, is A5.**
 

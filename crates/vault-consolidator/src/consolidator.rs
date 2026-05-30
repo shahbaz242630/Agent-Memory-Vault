@@ -27,7 +27,7 @@
 //! [`ConsolidationReport`] carries per-boundary sub-sections inside
 //! `summary_markdown`, not separate runs per boundary.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,6 +41,7 @@ use vault_llm::LlmProvider;
 use vault_storage::{MemoryFilter, StorageBackend};
 
 use crate::phases::cluster::{find_candidate_clusters, Cluster};
+use crate::phases::contradiction::detect_contradiction;
 use crate::phases::merge::{apply_merge, decide_merge, AppliedMerge, MergeOutcome};
 use crate::report::{generate_report, Report};
 use crate::summary::generate_summary_markdown;
@@ -293,6 +294,132 @@ impl Consolidator {
                 }
             }
             run_state.per_boundary.insert(boundary, boundary_summary);
+        }
+
+        // ── Phase 2b: topic-level contradiction detection (T0.3.x A5) ──────
+        //
+        // Decoupled from the 0.92 merge gate, which can never catch a
+        // knowledge-update contradiction (the conflicting pair sits below
+        // 0.92, so Phase 1 never clusters it). Re-enumerate the post-merge
+        // active set — excludes superseded rows (default filter) AND
+        // already-invalidated rows (`valid_until` set) so retired facts are
+        // not re-judged — group each boundary's memories into K-means topics
+        // (grouping only; `llm = None` skips topic-naming calls), and ask the
+        // LLM whether each topic group of ≥ 2 holds a same-subject
+        // contradiction. Stale facts are invalidated via the bi-temporal
+        // `invalidate()` API (ADR-051); retrieval then returns only the
+        // current truth.
+        //
+        // Safety: only ids the model returns that are actually in the group
+        // are invalidated, and an entire-group invalidation is refused (at
+        // least one fact must survive as the current truth) — a misbehaving
+        // model cannot mass-retire a topic.
+        //
+        // Failure semantics (locked-next-arc Step 4): a per-topic LLM failure
+        // or a single failed invalidate is logged-and-continued, NOT a run
+        // abort — the merge work already committed durably; the next nightly
+        // cycle retries.
+        let active: Vec<Memory> = self
+            .storage
+            .list_memories(MemoryFilter::default(), None)
+            .await?
+            .into_iter()
+            .filter(|m| m.valid_until.is_none())
+            .collect();
+        let mut active_by_boundary: BTreeMap<Boundary, Vec<Memory>> = BTreeMap::new();
+        for memory in active {
+            active_by_boundary
+                .entry(memory.boundary.clone())
+                .or_default()
+                .push(memory);
+        }
+        for (boundary, memories) in &active_by_boundary {
+            if memories.len() < 2 {
+                continue;
+            }
+            // `llm = None`: we need the topic GROUPING, not Phi-4 topic
+            // labels (labelling is the REPORT's job). This keeps the
+            // contradiction pass to exactly one LLM call per multi-member
+            // topic.
+            let topic_map =
+                discover_topics(boundary, memories, self.embeddings.as_ref(), None).await?;
+            let lookup: HashMap<MemoryId, &Memory> = memories.iter().map(|m| (m.id, m)).collect();
+
+            for topic in &topic_map.topics {
+                if topic.member_ids.len() < 2 {
+                    continue;
+                }
+                let group: Vec<&Memory> = topic
+                    .member_ids
+                    .iter()
+                    .filter_map(|id| lookup.get(id).copied())
+                    .collect();
+                if group.len() < 2 {
+                    continue;
+                }
+
+                let verdict = match detect_contradiction(&group, self.llm.as_ref()).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "vault_consolidator::contradiction",
+                            topic = %topic.label,
+                            error = %e,
+                            "contradiction detection failed for topic; skipping (next cycle retries)"
+                        );
+                        continue;
+                    }
+                };
+
+                let group_ids: HashSet<MemoryId> = group.iter().map(|m| m.id).collect();
+                let stale: Vec<MemoryId> = verdict
+                    .stale_memory_ids
+                    .iter()
+                    .copied()
+                    .filter(|id| group_ids.contains(id))
+                    .collect();
+
+                if stale.is_empty() {
+                    continue;
+                }
+                // Safety net: never retire an entire topic group — at least
+                // one fact must remain as the current truth. A model marking
+                // everything stale is misbehaving; skip it loudly.
+                if stale.len() >= group.len() {
+                    tracing::warn!(
+                        target: "vault_consolidator::contradiction",
+                        topic = %topic.label,
+                        stale_count = stale.len(),
+                        group_size = group.len(),
+                        "contradiction judge marked the ENTIRE group stale; refusing to \
+                         mass-invalidate (at least one fact must remain current) — skipping"
+                    );
+                    continue;
+                }
+
+                let now = Utc::now();
+                tracing::info!(
+                    target: "vault_consolidator::contradiction",
+                    topic = %topic.label,
+                    stale_count = stale.len(),
+                    group_size = group.len(),
+                    "topic-level contradiction detected; invalidating stale facts per ADR-051"
+                );
+                for stale_id in stale {
+                    let reason = format!(
+                        "auto-invalidated by consolidator (topic '{}'): {}",
+                        topic.label, verdict.reasoning
+                    );
+                    if let Err(e) = self.storage.invalidate(stale_id, now, reason).await {
+                        tracing::warn!(
+                            target: "vault_consolidator::contradiction",
+                            stale = %stale_id,
+                            error = %e,
+                            "invalidate failed; next consolidation cycle will retry"
+                        );
+                    }
+                }
+            }
         }
 
         // Step 4: build the report. Populate RunState.duration first so

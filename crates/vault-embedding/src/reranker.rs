@@ -305,6 +305,15 @@ mod tests {
         let ort_lib = base.join("bge-small-en-v1.5/onnxruntime.dll");
         #[cfg(target_os = "linux")]
         let ort_lib = base.join("bge-small-en-v1.5/libonnxruntime.so");
+        // macOS branch is required for `--all-targets` to COMPILE on the CI
+        // macos-latest runner even though the test is `#[ignore]`d there (the
+        // ONNX Runtime macOS process-exit SIGABRT per ADR-033 keeps it from
+        // running). Without it, `ort_lib` is undefined on macOS → E0425, which
+        // is exactly what reddened the `87d0b72` reranker push's macOS clippy
+        // leg. Local Windows clippy cannot catch this; the CI matrix is the
+        // canonical surface.
+        #[cfg(target_os = "macos")]
+        let ort_lib = base.join("bge-small-en-v1.5/libonnxruntime.dylib");
 
         let provider =
             Qwen3RerankerProvider::open(&model, &tok, &ort_lib).expect("open reranker provider");

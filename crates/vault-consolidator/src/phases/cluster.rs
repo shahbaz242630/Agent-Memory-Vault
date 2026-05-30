@@ -44,7 +44,7 @@
 //! such noise (well within the 1e-3 worst-case headroom against a 0.92
 //! threshold). See ADR-045 §c.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -186,12 +186,31 @@ pub async fn find_candidate_clusters(
     let mut edges: Vec<(MemoryId, MemoryId)> = Vec::new();
     let max_distance = 1.0_f32 - threshold;
 
+    // The set of valid graph nodes — only the active memories
+    // `list_memories` returned. The vector store can return neighbour ids
+    // that are NOT in this set: a superseded/invalidated memory's LanceDB
+    // vector lingers (supersede/invalidate update SQLite metadata only, not
+    // the vector), so an NN search may surface it even though `list_memories`
+    // (default filter) excludes it. Edges to such non-member ids must be
+    // dropped — otherwise `union_find_components` looks up an id that has no
+    // parent entry and panics. This SQLite/LanceDB divergence is an expected
+    // steady-state condition after any merge/supersede/invalidate, so the
+    // drop is normal hygiene, not an error.
+    let member_ids: HashSet<MemoryId> = memories.iter().map(|m| m.id).collect();
+    let mut divergent_neighbours_dropped = 0usize;
+
     for memory in &memories {
         let embedding = embeddings.embed(&memory.content).await?;
         let neighbours =
             collect_edges_for_memory(storage, &memory.id, &embedding, boundary, max_distance)
                 .await?;
         for neighbour_id in neighbours {
+            // Drop edges to ids not among the active members (vector-store /
+            // metadata divergence — see the `member_ids` comment above).
+            if !member_ids.contains(&neighbour_id) {
+                divergent_neighbours_dropped += 1;
+                continue;
+            }
             // Canonicalise edge orientation (smaller-id, larger-id) so the
             // edge set deduplicates trivially across the symmetric pairs
             // produced by querying both endpoints.
@@ -204,6 +223,13 @@ pub async fn find_candidate_clusters(
         }
     }
 
+    if divergent_neighbours_dropped > 0 {
+        warn!(
+            dropped = divergent_neighbours_dropped,
+            "dropped NN edges to non-member ids (vector-store/metadata divergence — \
+             superseded or invalidated vectors lingering in LanceDB)"
+        );
+    }
     debug!(edge_count = edges.len(), "edges collected pre-dedup");
 
     // Step 4: union-find transitive closure.
@@ -290,10 +316,20 @@ fn union_find_components(
 
     fn find(parent: &mut HashMap<MemoryId, MemoryId>, mut id: MemoryId) -> MemoryId {
         // Iterative path compression — avoids recursion depth on chains.
+        //
+        // Defensive against an `id` with no parent entry: `find_candidate_clusters`
+        // already filters edges to member ids, so in production every endpoint is
+        // a node here — but indexing `parent[&id]` on an absent key panics, and a
+        // disjoint-set primitive should never panic on input shape. An unknown id
+        // is treated as its own root (the loop simply doesn't run). Belt-and-braces
+        // with the edge filter; pinned by `union_find_treats_unknown_edge_endpoint_as_root`.
         let mut path: Vec<MemoryId> = Vec::new();
-        while parent[&id] != id {
+        while let Some(&next) = parent.get(&id) {
+            if next == id {
+                break;
+            }
             path.push(id);
-            id = parent[&id];
+            id = next;
         }
         for p in path {
             parent.insert(p, id);
@@ -425,6 +461,34 @@ mod tests {
             .find(|m| m.len() == 1000)
             .expect("must have one 1000-member component");
         assert_eq!(chain.len(), 1000);
+    }
+
+    #[test]
+    fn union_find_treats_unknown_edge_endpoint_as_root() {
+        // Regression (live dogfood 2026-05-30): an edge endpoint absent from
+        // `nodes` — a superseded/invalidated memory whose LanceDB vector
+        // lingers and gets returned by an NN search — must NOT panic. Before
+        // the defensive `find`, `parent[&id]` on the unknown id panicked
+        // "no entry found for key" (cluster.rs:294), crashing the entire
+        // consolidation run on real divergent data. `find_candidate_clusters`
+        // now also filters these edges out; this pins the primitive-level
+        // safety net independently.
+        let nodes = vec![mk_id(1), mk_id(2)];
+        let unknown = mk_id(999); // deliberately not in `nodes`
+        let edges = vec![(mk_id(1), unknown)];
+
+        // Must not panic.
+        let groups = union_find_components(&nodes, &edges);
+
+        // The phantom endpoint must not pull a real node into a size-≥2
+        // cluster; both real nodes stay singletons.
+        let total: usize = groups.values().map(|m| m.len()).sum();
+        assert_eq!(total, 2, "both real nodes must be accounted for");
+        assert!(
+            groups.values().all(|m| m.len() == 1),
+            "an edge to a phantom (non-member) id must leave real nodes as singletons; \
+             got {groups:?}"
+        );
     }
 
     // ─── Threshold validation ──────────────────────────────────────────────

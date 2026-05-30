@@ -8,13 +8,17 @@
 //! | Phase | Module | Lands at |
 //! |---|---|---|
 //! | 1 — Identify candidate clusters | [`cluster`] | T0.2.2 (shipped at `a889931` + `a53e3a5`) |
-//! | 2 — LLM merge decisions | `merge` (not yet created) | T0.2.3 commit 1 |
-//! | 3 — Apply merges | `merge` (not yet created) | T0.2.3 commit 2 |
+//! | 2 — LLM merge decisions | [`merge`] | T0.2.3 commit 1 |
+//! | 3 — Apply merges | [`merge`] | T0.2.3 commit 2 |
+//! | 2b — Topic-level contradiction detection | [`contradiction`] | T0.3.x (A5 ship-gate) |
 //! | 4 — Decay and archive | `decay` (not yet created) | T0.2.4 |
 //!
 //! File layout matches BRD §5.6 lines 987-989 verbatim (T0.2.3 commit 1
 //! refactor — T0.2.2 commit 1 shipped clustering as `src/clustering.rs`
-//! flat-layout; corrected here).
+//! flat-layout; corrected here). [`contradiction`] is the A5 fix: it runs
+//! over the looser K-means topic grouping rather than the 0.92 merge gate,
+//! so knowledge-update contradictions (which sit below 0.92) get detected.
 
 pub mod cluster;
+pub mod contradiction;
 pub mod merge;
