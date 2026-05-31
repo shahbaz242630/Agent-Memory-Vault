@@ -76,6 +76,7 @@ use tantivy::schema::{
 };
 use tantivy::tokenizer::{
     Language, LowerCaser, RemoveLongFilter, SimpleTokenizer, StopWordFilter, TextAnalyzer,
+    TokenStream,
 };
 use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 use tokio::sync::Mutex;
@@ -271,10 +272,34 @@ impl KeywordIndex {
         Ok(())
     }
 
+    /// Returns `true` if `text` yields at least one token under the
+    /// `vault_text` analyzer (SimpleTokenizer → RemoveLong → LowerCaser →
+    /// StopWordFilter).
+    ///
+    /// A query that reduces to zero tokens — e.g. an all-stopword query
+    /// like `"the a is of and to"` — has no searchable terms. Tantivy
+    /// 0.26.1's `QueryParser` does NOT return an empty query for this; it
+    /// rejects it with `AllButQueryForbidden` ("Only excluding terms
+    /// given"), which we wrap as `VaultError::Storage` (→ JSON-RPC
+    /// `-32603 internal error` at the MCP boundary). Callers short-circuit
+    /// on `!has_searchable_terms(..)` BEFORE `parse_query` so a degenerate
+    /// query is a graceful empty result, not an internal error. Surfaced
+    /// in §7 live dogfood 2026-05-30.
+    fn has_searchable_terms(&self, text: &str) -> bool {
+        match self.index.tokenizers().get(VAULT_TOKENIZER_NAME) {
+            Some(mut analyzer) => analyzer.token_stream(text).advance(),
+            // The tokenizer is always registered in `new()`. If it were
+            // somehow absent we don't suppress the query — fall through to
+            // the parser so any genuine error still surfaces. Defensive.
+            None => true,
+        }
+    }
+
     /// BM25 search for `query` over indexed content. Returns up to
     /// `limit` `(MemoryId, score)` pairs in descending score order.
-    /// Empty / whitespace queries and `limit == 0` short-circuit to an
-    /// empty `Vec` without error.
+    /// Empty / whitespace queries, `limit == 0`, and queries with no
+    /// searchable terms (all-stopword / all-punctuation) short-circuit to
+    /// an empty `Vec` without error.
     ///
     /// Query text is sanitised (Lucene operator chars stripped) before
     /// parsing — see module-level docs for the empirical basis.
@@ -286,6 +311,14 @@ impl KeywordIndex {
         }
         let sanitized = sanitize_query(trimmed);
         if sanitized.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        // Degenerate-query guard: a query that tokenizes to zero terms
+        // under the stopword-filtered analyzer (e.g. "the a is of and to")
+        // is rejected by `parse_query` as AllButQueryForbidden. Treat it
+        // as "no searchable terms → matches nothing" — see
+        // `has_searchable_terms`.
+        if !self.has_searchable_terms(&sanitized) {
             return Ok(Vec::new());
         }
 

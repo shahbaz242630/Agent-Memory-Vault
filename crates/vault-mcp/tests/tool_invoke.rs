@@ -161,6 +161,7 @@ async fn tool_write_success_records_audit_returns_id_and_omits_search_only_keys(
             memory_type: None,
             source_agent: None,
             confidence: None,
+            as_of: None,
         }))
         .await
         .expect("SuccessAdapter::write returns Ok; tool_write must succeed");
@@ -286,6 +287,7 @@ async fn tool_write_access_denied_pins_wire_code_and_audit_shape() {
             memory_type: None,
             source_agent: None,
             confidence: None,
+            as_of: None,
         }))
         .await;
     let err =

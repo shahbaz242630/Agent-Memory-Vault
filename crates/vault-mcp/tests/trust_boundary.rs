@@ -196,6 +196,7 @@ async fn write_to_unauthorized_boundary_returns_access_denied_before_adapter() {
         memory_type: None,
         source_agent: None,
         confidence: None,
+        as_of: None,
     };
     let res = server.handle_write(params).await;
     match res {

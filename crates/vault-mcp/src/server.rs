@@ -27,6 +27,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use chrono::{DateTime, NaiveDate, Utc};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, ErrorCode, ServerCapabilities, ServerInfo};
@@ -156,6 +157,18 @@ pub struct WriteToolParams {
     /// resolution.
     #[serde(default)]
     pub confidence: Option<f32>,
+    /// Optional date the fact became true ("as of"), as an ISO-8601 date
+    /// (`YYYY-MM-DD`, e.g. "2026-02-01") or an RFC-3339 timestamp
+    /// (`2026-02-01T00:00:00Z`). Set this when the content states when a
+    /// fact started holding — e.g. "As of 2026-02-01 the user drives a
+    /// Tesla" → `as_of: "2026-02-01"`. It seeds the memory's `valid_from`,
+    /// which the nightly consolidator uses to order competing facts and
+    /// retire the stale side of a knowledge update. If omitted, the vault
+    /// falls back to the write timestamp — so a forgotten date degrades
+    /// gracefully, it never breaks. Applies to `memory_write` only;
+    /// `memory_update` preserves the original date.
+    #[serde(default)]
+    pub as_of: Option<String>,
 }
 
 /// JSON-RPC parameters for the `memory_update` tool — combines the target
@@ -314,13 +327,22 @@ impl StdioServer {
                 )));
             }
         };
+        // Optional agent-supplied "as of" date → valid_from. Parsed BEFORE
+        // moving `params` fields into NewMemory. A parse failure surfaces as
+        // InvalidInput (→ -32602) so a malformed date is a clear rejection,
+        // not a silent fallback to write-time. Absent → None, which
+        // `Memory::try_new` defaults to the write timestamp.
+        let valid_from = match params.as_of.as_deref() {
+            Some(s) => Some(parse_as_of(s)?),
+            None => None,
+        };
         let new_memory = NewMemory {
             content: params.content,
             memory_type,
             boundary,
             source_agent: params.source_agent,
             confidence: params.confidence.unwrap_or(0.9),
-            valid_from: None,
+            valid_from,
             valid_until: None,
             metadata: serde_json::json!({}),
         };
@@ -836,6 +858,9 @@ impl StdioServer {
             memory_type: p.memory_type,
             source_agent: p.source_agent,
             confidence: p.confidence,
+            // memory_update preserves the original valid_from (ADR-028);
+            // as_of is a write-only field, so it is never set here.
+            as_of: None,
         };
 
         let boundary_count_recorded: u32 = self.authorized_boundaries.len() as u32;
@@ -1092,6 +1117,32 @@ fn vault_error_to_mcp(err: VaultError) -> McpError {
         | VaultError::ConsolidatorBusy(_)
         | VaultError::ConsolidatorTimeout(_) => McpError::internal_error("internal error", None),
     }
+}
+
+/// Parse the optional `as_of` write param into a `DateTime<Utc>`.
+///
+/// Accepts two shapes, in priority order:
+/// 1. An RFC-3339 timestamp (`2026-02-01T00:00:00Z`, with offset or `Z`).
+/// 2. An ISO-8601 calendar date (`YYYY-MM-DD`), interpreted as midnight
+///    UTC — the common case, since agents typically know the day a fact
+///    became true, not the second.
+///
+/// Anything else is a `VaultError::InvalidInput` (→ JSON-RPC `-32602`),
+/// so a malformed date is a clear rejection rather than a silent
+/// fallback to write-time. See `WriteToolParams::as_of`.
+fn parse_as_of(s: &str) -> VaultResult<DateTime<Utc>> {
+    let trimmed = s.trim();
+    if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
+        return Ok(dt.with_timezone(&Utc));
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
+        if let Some(naive) = date.and_hms_opt(0, 0, 0) {
+            return Ok(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc));
+        }
+    }
+    Err(VaultError::InvalidInput(format!(
+        "as_of must be an ISO-8601 date (YYYY-MM-DD) or RFC-3339 timestamp; got {trimmed:?}"
+    )))
 }
 
 /// Serialise a value to a `CallToolResult` with a single JSON content

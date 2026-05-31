@@ -429,6 +429,54 @@ async fn new_index_is_empty() {
     assert!(results.is_empty());
 }
 
+/// Degenerate-query robustness: a query consisting ENTIRELY of stopwords
+/// reduces to zero searchable terms once the `vault_text` analyzer's
+/// StopWordFilter runs. Such a query must return a graceful empty result —
+/// NOT a `VaultError::Storage` (which maps to JSON-RPC `-32603 internal
+/// error` at the MCP boundary). Surfaced in §7 live dogfood 2026-05-30:
+/// `memory_search "the a is of and to"` returned `-32603`. The keyword
+/// channel is the relevant path because `AbstainingRetriever` probes it
+/// before any threshold check, so an error here propagates straight out
+/// before the abstain gate can return empty.
+#[tokio::test]
+async fn all_stopword_query_returns_empty_not_error() {
+    let s = setup_keyword().await;
+    let b = boundary("work");
+    // Populate the index so we exercise the real (non-empty-index) path.
+    insert_memory(&s, "Comcast bill is $89 per month", &b).await;
+
+    let result = s.index.search("the a is of and to", 200).await;
+    assert!(
+        result.is_ok(),
+        "all-stopword query must not error (got {result:?})"
+    );
+    assert!(
+        result.expect("ok").is_empty(),
+        "all-stopword query has no searchable terms; result must be empty"
+    );
+}
+
+/// No over-suppression: a query that mixes stopwords with a single real
+/// content word still tokenizes to ≥1 term, so it must reach the parser
+/// and find the matching memory. Guards the degenerate-query short-circuit
+/// against accidentally swallowing legitimate queries.
+#[tokio::test]
+async fn mixed_stopword_and_content_query_still_matches() {
+    let s = setup_keyword().await;
+    let b = boundary("work");
+    let id = insert_memory(&s, "Comcast bill is $89 per month", &b).await;
+
+    let hits = s
+        .index
+        .search("what is the Comcast", 200)
+        .await
+        .expect("search must not error");
+    assert!(
+        hits.iter().any(|(hit_id, _)| *hit_id == id),
+        "query with one content word ('Comcast') must still match"
+    );
+}
+
 #[tokio::test]
 async fn unicode_content_searchable() {
     let s = setup_keyword().await;

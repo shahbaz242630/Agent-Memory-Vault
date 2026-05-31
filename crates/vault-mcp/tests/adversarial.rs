@@ -90,6 +90,7 @@ async fn oversized_content_rejected_with_invalid_params() {
         memory_type: None,
         source_agent: None,
         confidence: None,
+        as_of: None,
     };
     let err = server
         .tool_write(Parameters(params))
@@ -128,6 +129,7 @@ async fn oversized_boundary_name_rejected_with_invalid_params() {
         memory_type: None,
         source_agent: None,
         confidence: None,
+        as_of: None,
     };
     let err = server
         .tool_write(Parameters(params))
@@ -165,6 +167,7 @@ async fn boundary_with_unicode_rejected_with_invalid_params() {
         memory_type: None,
         source_agent: None,
         confidence: None,
+        as_of: None,
     };
     let err = server
         .tool_write(Parameters(params))
@@ -195,6 +198,7 @@ async fn boundary_with_control_char_rejected_with_invalid_params() {
         memory_type: None,
         source_agent: None,
         confidence: None,
+        as_of: None,
     };
     let err = server
         .tool_write(Parameters(params))
@@ -247,6 +251,7 @@ async fn content_with_unicode_passes_byte_identical_to_adapter() {
         memory_type: None,
         source_agent: None,
         confidence: None,
+        as_of: None,
     };
     server
         .tool_write(Parameters(params))

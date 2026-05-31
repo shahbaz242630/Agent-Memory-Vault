@@ -76,6 +76,12 @@ rmcp = { workspace = true, features = ["server", "macros", "transport-io", "tran
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+# chrono — parse the optional `as_of` write param (ISO-8601 date or
+# RFC-3339 timestamp) into the `DateTime<Utc>` that `NewMemory.valid_from`
+# expects. Workspace-pinned (=0.4.44 per ADR-013 amendment); already in the
+# tree via vault-core, so this adds no new transitive deps.
+chrono = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 tokio-test.workspace = true
