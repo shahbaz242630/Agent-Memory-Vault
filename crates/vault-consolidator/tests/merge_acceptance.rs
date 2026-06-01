@@ -376,10 +376,13 @@ async fn summary_markdown_is_non_empty_and_contains_required_sections() {
     let embedder = open_bge_provider();
     let (storage, _dir) = open_sealed_storage_for_test("summary-sections-test-passphrase").await;
 
-    // 4 memories in one boundary — 2 form a tight cluster (BGE should
-    // cluster at the 0.92 default threshold), 2 are unrelated singletons.
-    // MockLlmProvider returns "merge" for any LLM call so the one
-    // cluster Phase 1 finds produces a merge in Phase 3.
+    // 4 memories in one boundary — 2 form a tight, near-identical cluster
+    // (BGE clusters them at the 0.92 default threshold), 2 are unrelated
+    // singletons. Because the pair is near-identical, the deterministic dedup
+    // pass (ADR-063) — which runs BEFORE the LLM merge step — collapses them
+    // (keep canonical survivor, supersede the rest) and SKIPS the LLM. So this
+    // run is non-trivial via dedup, not merge. The LLM-merge path is exercised
+    // by the #[ignore]d real-Phi-4 acceptance test in this file.
     //
     // Paraphrases mirror T0.2.2 `clustering_acceptance_100.json:38-42` (the
     // standup-time-change cluster) — those are proven to cluster at the
@@ -473,12 +476,15 @@ async fn summary_markdown_is_non_empty_and_contains_required_sections() {
         "Footer T0.2.5 rollback literal phrase missing:\n{md}"
     );
 
-    // Sanity: Phase 1 produced at least one cluster, Phase 2 returned
-    // merge, Phase 3 applied it. So memories_merged should be > 0.
+    // Sanity: the run was non-trivial. Phase 1 clustered the near-identical
+    // standup pair, and the deterministic dedup pass (ADR-063, which runs
+    // before the LLM merge step) collapsed it — so the pair is DEDUPED, not
+    // merged. memories_merged stays 0; memories_deduped is what proves the
+    // run did real work on the cluster.
     assert!(
-        report.memories_merged > 0,
-        "expected MockLlmProvider's merge response to drive at least one \
-         merge in the test fixture (BGE should cluster the standup-related \
-         pair at the default 0.92 threshold); got memories_merged=0"
+        report.memories_deduped > 0,
+        "expected the near-identical standup pair to be collapsed by deterministic \
+         dedup (ADR-063 runs before the LLM merge step, so it is deduped not merged); \
+         got memories_deduped=0"
     );
 }

@@ -54,11 +54,15 @@ use common::{
 /// BRD §5.6 line 981: *consolidation is idempotent* — after run 1
 /// stabilizes state, run 2 produces no further state change.
 ///
-/// Mechanics: Phase 1 reads non-superseded memories (default filter); after
-/// run 1 marks cluster members `superseded_by = Some(new_id)`, run 2's
-/// Phase 1 enumeration excludes them, so the only surviving rows are
-/// singletons + newly-written merged memories. No new duplicate pairs exist
-/// → no clusters → no Phase 2/3 → `report.memories_merged == 0`.
+/// Mechanics: Phase 1 reads non-superseded memories (default filter). The
+/// standup pair is near-identical, so the deterministic dedup pass (ADR-063,
+/// which runs before the LLM merge step) collapses it on run 1 — keep the
+/// canonical survivor, supersede the loser — and run 1's work shows up as
+/// `memories_deduped` (not `memories_merged`). After run 1 marks the loser
+/// `superseded_by = Some(survivor)`, run 2's Phase 1 enumeration excludes it,
+/// so the only surviving rows are singletons + the dedup survivor. No new
+/// duplicate pairs exist → no clusters → no dedup, no merge, no contradiction
+/// → run 2 is a no-op.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn consolidation_is_idempotent() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
@@ -107,12 +111,14 @@ async fn consolidation_is_idempotent() {
         run = 1,
         memories_processed = report1.memories_processed,
         memories_merged = report1.memories_merged,
+        memories_deduped = report1.memories_deduped,
         "first consolidation run"
     );
     assert!(
-        report1.memories_merged > 0,
-        "run 1 should merge the standup cluster (2 paraphrases at 0.92 \
-         cosine threshold); got memories_merged=0"
+        report1.memories_deduped > 0,
+        "run 1 should DEDUP the near-identical standup pair (ADR-063 dedup runs \
+         before the LLM merge step, so the pair is deduped not merged); got \
+         memories_deduped=0"
     );
 
     // Run 2: state is stabilized. No new clusters should form because the
@@ -131,7 +137,15 @@ async fn consolidation_is_idempotent() {
         "second consolidation run (should be no-op)"
     );
 
-    // Property: run 2 is a no-op on stabilized state.
+    // Property: run 2 is a no-op on stabilized state — no further dedup,
+    // merge, or contradiction once run 1 has collapsed the duplicate pair.
+    assert_eq!(
+        report2.memories_deduped, 0,
+        "BRD §5.6 line 981 violated: run 2 deduped {} additional memories on \
+         stabilized state — consolidation is not idempotent (the run-1 dedup \
+         survivor must be alone, its loser excluded by the default filter)",
+        report2.memories_deduped
+    );
     assert_eq!(
         report2.memories_merged, 0,
         "BRD §5.6 line 981 violated: run 2 produced {} additional merges \

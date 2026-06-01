@@ -33,6 +33,9 @@ tracing = { workspace = true }
 [dev-dependencies]
 tokio-test = { workspace = true }
 tempfile = { workspace = true }
+# Parse the A7 labelled fixture (read_quality_eval.json) in the conformal
+# reranker-floor calibration harness (reranker_fun_diagnostic.rs). Test-only.
+serde_json = { workspace = true }
 # Self-referential dev-dep enables the `testing` feature for integration
 # tests in `tests/`. Without this, integration tests would have to be invoked
 # with `cargo test --features testing`; with this, plain `cargo test` works

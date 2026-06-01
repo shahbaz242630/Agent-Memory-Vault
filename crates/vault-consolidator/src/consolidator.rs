@@ -27,7 +27,7 @@
 //! [`ConsolidationReport`] carries per-boundary sub-sections inside
 //! `summary_markdown`, not separate runs per boundary.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -40,12 +40,60 @@ use vault_embedding::EmbeddingProvider;
 use vault_llm::LlmProvider;
 use vault_storage::{MemoryFilter, StorageBackend};
 
+use crate::phases::candidates::nearest_neighbor_candidate_pairs;
 use crate::phases::cluster::{find_candidate_clusters, Cluster};
-use crate::phases::contradiction::detect_contradiction;
+use crate::phases::contradiction::judge_candidate_pairs;
+use crate::phases::dedup;
 use crate::phases::merge::{apply_merge, decide_merge, AppliedMerge, MergeOutcome};
 use crate::report::{generate_report, Report};
 use crate::summary::generate_summary_markdown;
 use crate::topics::discover_topics;
+
+/// The outcome of reconciling a contradiction verdict against the topic group
+/// it was judged over — the safety net that stops a misbehaving model from
+/// retiring an entire topic. See [`resolve_stale_ids`].
+#[derive(Debug, PartialEq, Eq)]
+enum StaleResolution {
+    /// No in-group stale ids were named — nothing to invalidate.
+    Nothing,
+    /// Invalidate exactly these ids (a strict, non-empty subset of the group).
+    Invalidate(Vec<MemoryId>),
+    /// The verdict would retire the whole group; refused. Carries counts for
+    /// the WARN line.
+    RefusedMassInvalidate { in_group: usize, group: usize },
+}
+
+/// Reconcile a contradiction verdict's stale ids against the id set it was
+/// judged over (the boundary's active set in the ADR-065 nearest-neighbor
+/// path):
+/// - keep only ids that are actually members of the set (ignore strays a
+///   misbehaving model might invent),
+/// - deduplicate,
+/// - refuse a sweep that would retire every member — at least one fact must
+///   remain as the current truth.
+///
+/// Extracted as a pure function so the safety net is unit-testable
+/// independently of candidate generation. Used by `run_consolidation`'s
+/// Phase 2b. `group_ids` is named generically — it is whatever id set the
+/// verdict was produced over.
+fn resolve_stale_ids(verdict_ids: &[MemoryId], group_ids: &HashSet<MemoryId>) -> StaleResolution {
+    let mut in_group: Vec<MemoryId> = Vec::new();
+    for id in verdict_ids {
+        if group_ids.contains(id) && !in_group.contains(id) {
+            in_group.push(*id);
+        }
+    }
+    if in_group.is_empty() {
+        return StaleResolution::Nothing;
+    }
+    if in_group.len() >= group_ids.len() {
+        return StaleResolution::RefusedMassInvalidate {
+            in_group: in_group.len(),
+            group: group_ids.len(),
+        };
+    }
+    StaleResolution::Invalidate(in_group)
+}
 
 /// Sleep-cycle orchestrator per BRD §5.6 lines 895-913.
 ///
@@ -190,8 +238,54 @@ impl Consolidator {
 
             let mut boundary_summary = BoundarySummary::default();
             for cluster in &clusters {
+                // ── Phase 2-pre (ADR-063): deterministic dedup ────────────
+                // If the cluster is near-identical (calibrated two-axis gate),
+                // collapse it with plain code — keep the canonical survivor,
+                // supersede the rest, roll aggregates — and SKIP the LLM. This
+                // is the structural-overflow case, so removing it from the LLM
+                // path makes the overflow/skip class disappear. A dedup failure
+                // is logged-and-skipped (counted), never a run abort.
+                match self.try_dedup_cluster(cluster, &memories).await {
+                    Ok(Some(superseded_count)) => {
+                        boundary_summary.deduped_clusters += 1;
+                        boundary_summary.deduped_memories += superseded_count;
+                        continue;
+                    }
+                    Ok(None) => { /* not near-identical — fall through to LLM */ }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "vault_consolidator::dedup",
+                            cluster_id = cluster.id,
+                            error = %e,
+                            "deterministic dedup failed for cluster; skipping (next cycle retries)"
+                        );
+                        boundary_summary.skipped_clusters += 1;
+                        continue;
+                    }
+                }
+
+                // Per-cluster resilience (ADR-062 iter 2): a Phase-2 LLM
+                // failure (e.g. a truncated/malformed merge response on an
+                // oversized cluster) is logged-and-skipped, NOT propagated —
+                // one bad cluster must never abort the whole consolidation run.
+                // Mirrors the topic-level contradiction pass's failure
+                // semantics. The skipped cluster's members stay active
+                // (unmerged); the next nightly cycle retries.
                 let outcome =
-                    decide_merge(cluster, self.llm.as_ref(), self.storage.as_ref()).await?;
+                    match decide_merge(cluster, self.llm.as_ref(), self.storage.as_ref()).await {
+                        Ok(o) => o,
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "vault_consolidator::merge",
+                                cluster_size = cluster.member_row_ids.len(),
+                                error = %e,
+                                "Phase 2 merge decision failed for cluster; skipping \
+                                 (next cycle retries)"
+                            );
+                            boundary_summary.skipped_clusters += 1;
+                            continue;
+                        }
+                    };
                 match outcome {
                     MergeOutcome::Merge {
                         merged_text,
@@ -210,14 +304,28 @@ impl Consolidator {
                             .map(|m| (m.id, m.content.clone()))
                             .collect();
 
-                        let applied = apply_merge(
+                        let applied = match apply_merge(
                             cluster,
                             &merged_text,
                             &reasoning,
                             self.storage.as_ref(),
                             self.embeddings.as_ref(),
                         )
-                        .await?;
+                        .await
+                        {
+                            Ok(a) => a,
+                            Err(e) => {
+                                tracing::warn!(
+                                    target: "vault_consolidator::merge",
+                                    cluster_size = cluster.member_row_ids.len(),
+                                    error = %e,
+                                    "Phase 3 apply_merge failed for cluster; skipping \
+                                     (next cycle retries)"
+                                );
+                                boundary_summary.skipped_clusters += 1;
+                                continue;
+                            }
+                        };
                         boundary_summary
                             .applied_merges
                             .push(AppliedMergeWithContext {
@@ -296,29 +404,35 @@ impl Consolidator {
             run_state.per_boundary.insert(boundary, boundary_summary);
         }
 
-        // ── Phase 2b: topic-level contradiction detection (T0.3.x A5) ──────
+        // ── Phase 2b: nearest-neighbor contradiction detection (T0.3.x A5, ADR-065) ──
         //
-        // Decoupled from the 0.92 merge gate, which can never catch a
-        // knowledge-update contradiction (the conflicting pair sits below
-        // 0.92, so Phase 1 never clusters it). Re-enumerate the post-merge
-        // active set — excludes superseded rows (default filter) AND
-        // already-invalidated rows (`valid_until` set) so retired facts are
-        // not re-judged — group each boundary's memories into K-means topics
-        // (grouping only; `llm = None` skips topic-naming calls), and ask the
-        // LLM whether each topic group of ≥ 2 holds a same-subject
-        // contradiction. Stale facts are invalidated via the bi-temporal
-        // `invalidate()` API (ADR-051); retrieval then returns only the
-        // current truth.
+        // Decoupled from the 0.92 merge gate (which never clusters a
+        // knowledge-update pair — it sits below 0.92) AND from K-means topic
+        // grouping. ADR-060's premise — that a topic co-locates the
+        // conflicting pair — was proven FALSE in the §7 dogfood (2026-06-01):
+        // K-means split the Tesla→Rivian pair across groups, so it was never
+        // judged and A5 silently failed. Contradiction detection is a
+        // nearest-neighbor problem: for each active fact, its top-K cosine
+        // neighbors above a floor are the candidate partners (the conflicting
+        // pair is each other's *nearest* neighbor, so it is always surfaced).
         //
-        // Safety: only ids the model returns that are actually in the group
-        // are invalidated, and an entire-group invalidation is refused (at
-        // least one fact must survive as the current truth) — a misbehaving
-        // model cannot mass-retire a topic.
+        // Re-enumerate the post-merge active set — excludes superseded rows
+        // (default filter) AND already-invalidated rows (`valid_until` set) so
+        // retired facts are not re-judged — embed each fact, generate
+        // candidate pairs (`phases::candidates`), and hand them to the pairwise
+        // judge + recency aggregator (`judge_candidate_pairs`). Stale facts are
+        // invalidated via the bi-temporal `invalidate()` API (ADR-051);
+        // retrieval then returns only the current truth.
         //
-        // Failure semantics (locked-next-arc Step 4): a per-topic LLM failure
-        // or a single failed invalidate is logged-and-continued, NOT a run
-        // abort — the merge work already committed durably; the next nightly
-        // cycle retries.
+        // Safety: only ids actually in the boundary's active set are
+        // invalidated, and a sweep of the ENTIRE set is refused (≥ 1 fact must
+        // remain current). Recency already keeps the newest fact in any chain;
+        // this guard is belt-and-braces against a misbehaving model.
+        //
+        // Failure semantics (locked-next-arc Step 4): a per-pair LLM failure or
+        // a single failed invalidate is logged-and-continued, NOT a run abort —
+        // the merge work already committed durably; the next nightly cycle
+        // retries.
         let active: Vec<Memory> = self
             .storage
             .list_memories(MemoryFilter::default(), None)
@@ -337,87 +451,89 @@ impl Consolidator {
             if memories.len() < 2 {
                 continue;
             }
-            // `llm = None`: we need the topic GROUPING, not Phi-4 topic
-            // labels (labelling is the REPORT's job). This keeps the
-            // contradiction pass to exactly one LLM call per multi-member
-            // topic.
-            let topic_map =
-                discover_topics(boundary, memories, self.embeddings.as_ref(), None).await?;
-            let lookup: HashMap<MemoryId, &Memory> = memories.iter().map(|m| (m.id, m)).collect();
 
-            for topic in &topic_map.topics {
-                if topic.member_ids.len() < 2 {
-                    continue;
-                }
-                let group: Vec<&Memory> = topic
-                    .member_ids
-                    .iter()
-                    .filter_map(|id| lookup.get(id).copied())
-                    .collect();
-                if group.len() < 2 {
-                    continue;
-                }
+            // Embed each active fact. Memory rows carry `embedding: None`
+            // (vectors live in LanceDB per ADR-045 §c); re-embed via the shared
+            // provider — embeds are deterministic, so the vectors match those
+            // Phase 1 clustering computed.
+            let mut embeddings = Vec::with_capacity(memories.len());
+            for m in memories {
+                embeddings.push(self.embeddings.embed(&m.content).await?);
+            }
 
-                let verdict = match detect_contradiction(&group, self.llm.as_ref()).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "vault_consolidator::contradiction",
-                            topic = %topic.label,
-                            error = %e,
-                            "contradiction detection failed for topic; skipping (next cycle retries)"
-                        );
-                        continue;
-                    }
-                };
+            // Nearest-neighbor candidate pairs (index pairs into `memories`).
+            let pair_indices = nearest_neighbor_candidate_pairs(&embeddings);
+            if pair_indices.is_empty() {
+                continue;
+            }
+            let pairs: Vec<(&Memory, &Memory)> = pair_indices
+                .iter()
+                .map(|&(i, j)| (&memories[i], &memories[j]))
+                .collect();
+            tracing::info!(
+                target: "vault_consolidator::contradiction",
+                boundary = %boundary,
+                active = memories.len(),
+                candidate_pairs = pairs.len(),
+                "Phase 2b: judging nearest-neighbor contradiction candidates"
+            );
 
-                let group_ids: HashSet<MemoryId> = group.iter().map(|m| m.id).collect();
-                let stale: Vec<MemoryId> = verdict
-                    .stale_memory_ids
-                    .iter()
-                    .copied()
-                    .filter(|id| group_ids.contains(id))
-                    .collect();
-
-                if stale.is_empty() {
-                    continue;
-                }
-                // Safety net: never retire an entire topic group — at least
-                // one fact must remain as the current truth. A model marking
-                // everything stale is misbehaving; skip it loudly.
-                if stale.len() >= group.len() {
+            let verdict = match judge_candidate_pairs(&pairs, self.llm.as_ref()).await {
+                Ok(v) => v,
+                Err(e) => {
                     tracing::warn!(
                         target: "vault_consolidator::contradiction",
-                        topic = %topic.label,
-                        stale_count = stale.len(),
-                        group_size = group.len(),
-                        "contradiction judge marked the ENTIRE group stale; refusing to \
+                        boundary = %boundary,
+                        error = %e,
+                        "contradiction judging failed for boundary; skipping (next cycle retries)"
+                    );
+                    continue;
+                }
+            };
+
+            // Reconcile the verdict against the boundary's active set: keep
+            // only real members, dedup, and refuse a sweep of the entire set
+            // (≥ 1 fact must remain the current truth).
+            let active_ids: HashSet<MemoryId> = memories.iter().map(|m| m.id).collect();
+            let stale = match resolve_stale_ids(&verdict.stale_memory_ids, &active_ids) {
+                StaleResolution::Nothing => continue,
+                StaleResolution::RefusedMassInvalidate {
+                    in_group,
+                    group: active_count,
+                } => {
+                    tracing::warn!(
+                        target: "vault_consolidator::contradiction",
+                        boundary = %boundary,
+                        stale_count = in_group,
+                        active = active_count,
+                        "contradiction judging marked the ENTIRE active set stale; refusing to \
                          mass-invalidate (at least one fact must remain current) — skipping"
                     );
                     continue;
                 }
+                StaleResolution::Invalidate(ids) => ids,
+            };
 
-                let now = Utc::now();
-                tracing::info!(
-                    target: "vault_consolidator::contradiction",
-                    topic = %topic.label,
-                    stale_count = stale.len(),
-                    group_size = group.len(),
-                    "topic-level contradiction detected; invalidating stale facts per ADR-051"
+            let now = Utc::now();
+            tracing::info!(
+                target: "vault_consolidator::contradiction",
+                boundary = %boundary,
+                stale_count = stale.len(),
+                active = memories.len(),
+                "nearest-neighbor contradiction(s) detected; invalidating stale facts per ADR-051"
+            );
+            for stale_id in stale {
+                let reason = format!(
+                    "auto-invalidated by consolidator (boundary '{boundary}'): {}",
+                    verdict.reasoning
                 );
-                for stale_id in stale {
-                    let reason = format!(
-                        "auto-invalidated by consolidator (topic '{}'): {}",
-                        topic.label, verdict.reasoning
+                if let Err(e) = self.storage.invalidate(stale_id, now, reason).await {
+                    tracing::warn!(
+                        target: "vault_consolidator::contradiction",
+                        stale = %stale_id,
+                        error = %e,
+                        "invalidate failed; next consolidation cycle will retry"
                     );
-                    if let Err(e) = self.storage.invalidate(stale_id, now, reason).await {
-                        tracing::warn!(
-                            target: "vault_consolidator::contradiction",
-                            stale = %stale_id,
-                            error = %e,
-                            "invalidate failed; next consolidation cycle will retry"
-                        );
-                    }
                 }
             }
         }
@@ -446,6 +562,22 @@ impl Consolidator {
             .values()
             .flat_map(|b| b.contradictions.iter().cloned())
             .collect();
+        // ADR-063 dedup + skip accounting, summed across boundaries.
+        let clusters_deduped: usize = run_state
+            .per_boundary
+            .values()
+            .map(|b| b.deduped_clusters)
+            .sum();
+        let memories_deduped: usize = run_state
+            .per_boundary
+            .values()
+            .map(|b| b.deduped_memories)
+            .sum();
+        let clusters_skipped: usize = run_state
+            .per_boundary
+            .values()
+            .map(|b| b.skipped_clusters)
+            .sum();
 
         // T0.2.5 wires the real checkpoint identifier here; at T0.2.3 we
         // pass a stable placeholder string so the footer renders the
@@ -459,10 +591,64 @@ impl Consolidator {
             memories_merged,
             contradictions_resolved,
             memories_archived: 0, // Phase 4 ships at T0.2.4.
+            clusters_deduped,
+            memories_deduped,
+            clusters_skipped,
             duration,
             conflicts_for_user_review,
             summary_markdown,
         })
+    }
+
+    /// Phase 2-pre (ADR-063): attempt deterministic dedup of one cluster.
+    ///
+    /// Hydrates the cluster's members from the in-scope per-boundary
+    /// enumeration and re-embeds each (embeds are deterministic — the vectors
+    /// match the ones clustering computed), then applies the calibrated
+    /// two-axis near-identical gate ([`dedup::plan_dedup`]). On eligibility it
+    /// supersedes the losers into the canonical survivor and rolls the
+    /// aggregates atomically via [`StorageBackend::apply_dedup`], returning
+    /// `Ok(Some(n))` where `n` is the number of superseded members. `Ok(None)`
+    /// means "not near-identical" — the caller falls through to the LLM merge.
+    ///
+    /// A hydration mismatch (a member absent from the enumeration — the
+    /// SQLite/LanceDB divergence steady-state) returns `Ok(None)`, so the
+    /// cluster falls through to the LLM path rather than dedup-ing on partial
+    /// data.
+    ///
+    /// [`StorageBackend::apply_dedup`]: vault_storage::StorageBackend::apply_dedup
+    async fn try_dedup_cluster(
+        &self,
+        cluster: &Cluster,
+        memories: &[Memory],
+    ) -> VaultResult<Option<usize>> {
+        let member_set: HashSet<MemoryId> = cluster.member_row_ids.iter().copied().collect();
+        let members: Vec<Memory> = memories
+            .iter()
+            .filter(|m| member_set.contains(&m.id))
+            .cloned()
+            .collect();
+        if members.len() != cluster.size() {
+            return Ok(None);
+        }
+        let mut embeddings = Vec::with_capacity(members.len());
+        for m in &members {
+            embeddings.push(self.embeddings.embed(&m.content).await?);
+        }
+        match dedup::plan_dedup(&members, &embeddings) {
+            None => Ok(None),
+            Some(plan) => {
+                self.storage
+                    .apply_dedup(
+                        plan.survivor,
+                        &plan.superseded,
+                        plan.summed_access_count,
+                        plan.max_confidence,
+                    )
+                    .await?;
+                Ok(Some(plan.superseded.len()))
+            }
+        }
     }
 
     /// Build the per-boundary REPORT artifacts (ADR-053) for the current
@@ -552,6 +738,18 @@ pub struct ConsolidationReport {
     pub memories_merged: usize,
     pub contradictions_resolved: usize,
     pub memories_archived: usize,
+    /// ADR-063: clusters resolved by deterministic dedup (near-identical,
+    /// no LLM). Distinct from `memories_merged` (LLM-driven merges).
+    #[serde(default)]
+    pub clusters_deduped: usize,
+    /// ADR-063: memories superseded by deterministic dedup across the run.
+    #[serde(default)]
+    pub memories_deduped: usize,
+    /// ADR-063: clusters skipped due to a per-cluster failure (dedup or LLM
+    /// merge). Previously log-only; surfaced so persistent skips aren't
+    /// silent (closes the "skips are invisible" gap).
+    #[serde(default)]
+    pub clusters_skipped: usize,
     pub duration: Duration,
     pub conflicts_for_user_review: Vec<ConflictReview>,
     /// Human-readable Markdown summary per BRD §5.6 lines 959-973. Outer
@@ -626,6 +824,15 @@ pub(crate) struct RunState {
 pub(crate) struct BoundarySummary {
     pub applied_merges: Vec<AppliedMergeWithContext>,
     pub contradictions: Vec<ConflictReview>,
+    /// ADR-063: count of clusters resolved by deterministic dedup (no LLM).
+    pub deduped_clusters: usize,
+    /// ADR-063: count of memories superseded by deterministic dedup (the
+    /// non-survivor members rolled into a canonical survivor).
+    pub deduped_memories: usize,
+    /// ADR-063: count of clusters skipped due to a per-cluster failure
+    /// (dedup error, or LLM merge decision / apply failure). Previously
+    /// log-only — surfaced here so persistent skips are visible, not silent.
+    pub skipped_clusters: usize,
 }
 
 /// An applied merge plus the inputs the summary markdown needs:
@@ -663,5 +870,90 @@ mod tests {
         assert_eq!(c.decay_after_days, 180);
         assert_eq!(c.archive_after_days, 365);
         assert_eq!(c.max_memories_per_run, 1000);
+    }
+
+    // ─── resolve_stale_ids — Phase 2b mass-invalidate safety net ─────────────
+
+    fn id_set(ids: &[MemoryId]) -> HashSet<MemoryId> {
+        ids.iter().copied().collect()
+    }
+
+    #[test]
+    fn resolve_stale_invalidates_a_strict_subset() {
+        let a = MemoryId::new();
+        let b = MemoryId::new();
+        let c = MemoryId::new();
+        let group = id_set(&[a, b, c]);
+        // One stale of three → invalidate exactly that one.
+        assert_eq!(
+            resolve_stale_ids(&[a], &group),
+            StaleResolution::Invalidate(vec![a])
+        );
+    }
+
+    #[test]
+    fn resolve_stale_refuses_whole_group_sweep() {
+        let a = MemoryId::new();
+        let b = MemoryId::new();
+        let group = id_set(&[a, b]);
+        // Both members stale → refused (≥1 must remain current).
+        assert_eq!(
+            resolve_stale_ids(&[a, b], &group),
+            StaleResolution::RefusedMassInvalidate {
+                in_group: 2,
+                group: 2
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_stale_refuses_whole_group_via_cycle_union() {
+        // The pairwise aggregator can surface all members in a cycle; the
+        // orchestrator must still refuse to wipe the topic.
+        let a = MemoryId::new();
+        let b = MemoryId::new();
+        let c = MemoryId::new();
+        let group = id_set(&[a, b, c]);
+        assert!(matches!(
+            resolve_stale_ids(&[a, b, c], &group),
+            StaleResolution::RefusedMassInvalidate { .. }
+        ));
+    }
+
+    #[test]
+    fn resolve_stale_ignores_ids_outside_the_group() {
+        let a = MemoryId::new();
+        let b = MemoryId::new();
+        let outsider = MemoryId::new();
+        let group = id_set(&[a, b]);
+        // The stray id is dropped; `a` remains a strict subset → invalidate a.
+        assert_eq!(
+            resolve_stale_ids(&[a, outsider], &group),
+            StaleResolution::Invalidate(vec![a])
+        );
+    }
+
+    #[test]
+    fn resolve_stale_dedups_before_the_whole_group_check() {
+        let a = MemoryId::new();
+        let b = MemoryId::new();
+        let group = id_set(&[a, b]);
+        // Duplicated `a` must dedup to one — NOT be mistaken for a 2-of-2 sweep.
+        assert_eq!(
+            resolve_stale_ids(&[a, a], &group),
+            StaleResolution::Invalidate(vec![a])
+        );
+    }
+
+    #[test]
+    fn resolve_stale_nothing_when_no_in_group_ids() {
+        let a = MemoryId::new();
+        let outsider = MemoryId::new();
+        let group = id_set(&[a]);
+        assert_eq!(
+            resolve_stale_ids(&[outsider], &group),
+            StaleResolution::Nothing
+        );
+        assert_eq!(resolve_stale_ids(&[], &group), StaleResolution::Nothing);
     }
 }

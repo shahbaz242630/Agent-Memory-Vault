@@ -115,6 +115,14 @@ const MERGE_DECISION_SYSTEM_PROMPT: &str =
      JSON matching the schema. For merge decisions, set merged_text to the \
      consolidated content; for keep_separate and contradiction, omit merged_text.";
 
+/// Output-token budget for the merge decision. A `Merge` echoes the
+/// consolidated content in `merged_text`, so the provider default (256) is too
+/// small and truncates the JSON on real merges. ~1K tokens (~4K chars) covers
+/// merging near-duplicate facts (a cluster collapses to roughly one fact's
+/// length, not the sum). Clusters whose merged_text still overflows are skipped
+/// by the orchestrator rather than crashing the run.
+const MERGE_MAX_TOKENS: u32 = 1024;
+
 /// Phase 2 primitive — ask the LLM to classify a cluster.
 ///
 /// **Inputs:**
@@ -196,8 +204,17 @@ pub async fn decide_merge(
     // Call the LLM with the N-ary merge-decision system prompt override.
     // ADR-044 Amendment 1: `system_prompt: Some(...)` swaps the provider's
     // default merge-classifier text for the N-ary cluster shape.
+    //
+    // `max_tokens`: a `Merge` outcome echoes the consolidated content in
+    // `merged_text`, so the default 256 truncates the JSON mid-string on any
+    // non-trivial merge → parse failure (observed live 2026-05-30 merging the
+    // CAP_OK content-ceiling probes). MERGE_MAX_TOKENS gives normal merges room;
+    // pathologically large clusters that still overflow are handled by the
+    // orchestrator skipping the cluster (ADR-062 iter 2 — merge is now
+    // log-and-continue, not run-aborting), so this never crashes the run.
     let params = CompletionParams {
         system_prompt: Some(MERGE_DECISION_SYSTEM_PROMPT.to_string()),
+        max_tokens: MERGE_MAX_TOKENS,
         ..CompletionParams::default()
     };
     let raw = llm

@@ -13,8 +13,8 @@ Each test is tagged with an execution status:
 
 ## 0. Preconditions / setup (Claude Code)
 
-1. **Dedicated eval boundary.** Authorize a throwaway boundary (e.g. `test.eval`) in the MCP session config so eval writes don't pollute `personal` / `project.memory-vault`. All seed data below assumes `test.eval`. Tear down after each run (or use a fresh vault dir per run).
-2. **Consolidator runnable.** `vault-cli consolidate run --boundary test.eval ...` wired and green (Commit 8 dogfood prereq). Needed for all [CONSOLIDATE] tests.
+1. **Dedicated eval boundary.** Authorize a throwaway boundary (e.g. `testeval`) in the MCP session config so eval writes don't pollute `personal` / `project.memory-vault`. All seed data below assumes `testeval`. **NB: boundary names must be dot-free** — `test.eval` (with a dot) is rejected by input validation (`-32602`) before the auth gate, so use `testeval`. Tear down after each run (or use a fresh vault dir per run).
+2. **Consolidator runnable.** `vault-cli consolidate run --boundary testeval ...` wired and green (Commit 8 dogfood prereq). Needed for all [CONSOLIDATE] tests. (Boundary is dot-free `testeval`, never `test.eval`.)
 3. **Models on disk.** `scripts/setup-dev-env.ps1` has pulled BGE + ort + tokenizer; Phi-4 GGUF present (needed for consolidation labels + merge classifier).
 4. **Two eval fixtures:**
    - `merge_acceptance_100.json` — **already exists** (T0.2.3 realism rewrite: 100 entries, 17 clusters, 50/50 boundary split, 42-merge/54-keep/4-contradiction, within-cluster length variance, BGE-truncation entries). Used by the consolidation-correctness tests.
@@ -109,7 +109,7 @@ Run against `merge_acceptance_100.json` (exists). Several already have property 
 ```json
 {
   "schema_version": 1,
-  "boundary": "test.eval",
+  "boundary": "testeval",
   "cases": [
     {
       "id": "A1-employer",
@@ -160,28 +160,88 @@ Harness: seed each case's memories (via MCP `memory_write` or a direct test API)
 
 ---
 
-## 7. What I can execute live right now (over MCP, no setup)
+## 7. Live dogfood runbook — Claude Desktop
 
-Ready to fire this batch against the live vault on your go:
+**This is the batch to run.** It has two parts. **Part A** is the live contract + abstention surface (run straight through, no setup). **Part B** tests the **consolidation features**: **deterministic dedup of near-identical duplicates (ADR-063 — new this session)**, **knowledge-update contradiction detection (A5) + precision**, and **settable `as_of`**. Part B has a **HANDOFF**: you seed the data, then PAUSE while Claude Code runs `vault-cli consolidate run` (you cannot run consolidation yourself), then you verify.
 
-- **C4** content-ceiling probe (5K / 10K / 50K)
-- **C5** malformed-id delete
-- **C6** update round-trip
-- **C7** unicode round-trip
-- **C8** boundary-auth rejection (attempt write to an unauthorized boundary)
-- **C9** normalization determinism
-- **A4** temporal-reasoning smoke (two `as_of`s, query "latest")
-- **A6** abstention true-negative
-- **A7** abstention no-over-abstain smoke
-- **I2** delete-removes-from-retrieval (the retrieval half)
-- **I3** boundary read isolation (if a second boundary is seedable this session)
+**Headline this run — A5 knowledge-update contradiction now fires via nearest-neighbor candidates (ADR-065, 2026-06-01):** the consolidator no longer relies on K-means topic grouping (which split the conflicting pair into different buckets so the judge never saw it and A5 silently failed). It now pairs each fact with its nearest cosine neighbors above a **0.70** similarity floor and judges those pairs with the existing Phi-4 + recency logic. **B1 (Tesla→Rivian) is the live ship-gate for this fix.** Expected: the run report shows the contradiction detected and ONLY the older Tesla invalidated. The Tesla/Rivian pair (measured cosine 0.823, mutual #1 neighbors) is the *only* candidate the floor admits in this seed set — every other seeded fact sits ≤0.634, below the floor — so Claude Code confirms a small `candidate_pairs` count + a single invalidation in the log.
 
-These give immediate signal on the contract surface + abstention while Claude Code wires the consolidator and builds `read_quality_eval.json` for the fixture-gated tiers.
+**Also confirming fires live (carried from the prior session's arc):**
+1. **Deterministic dedup (ADR-063):** near-identical duplicates collapse to one canonical copy with **no LLM call** — the case that used to overflow the merge model and skip forever. Surfaced + counted in the run report (`clusters deduped` / `memories deduped` / `clusters skipped`).
+2. **Settable `as_of` on `memory_write`:** an optional date param that seeds the fact's `valid_from`.
+3. **Degenerate-query robustness:** an all-stopword search now returns a graceful empty result, not an internal error.
+4. **Bug-2 read fix — subject-less facts surface (ADR-064, 2026-06-01):** the read reranker used to reject facts stored WITHOUT a subject (a bare "Plays the cello…" scored below the floor even for near-literal queries) → the read abstained on facts the vault holds. Fixed read-side by framing every candidate as "The user — {fact}" before scoring. **A7 is the live gate** — the seeded cello hobby (item 4 in B-seed) is now deliberately subject-less, and two loosely-phrased reads must surface it.
+
+**Conventions for the whole batch:**
+- **Clean slate:** Claude Code wiped the vault data stores (vault.db + lance + graph.duckdb + reports) immediately before this run, so `testeval` (and `personal`) start empty. Seed ONLY the facts listed here — leftover data (especially the giant CAP_OK probes) pollutes clustering and muddies the dedup / A5 verdicts.
+- **Boundary:** every write/read/search below uses the `testeval` boundary. Never use a boundary name with a dot.
+- **Single-writer:** while this batch runs, no other agent writes to the vault.
+- **Ground truth:** the Claude Desktop UI collapses JSON-RPC errors to a generic "Tool execution failed" and can echo stale tool descriptions. For any test that hinges on an error code, the **server log is authoritative** — Claude Code reads `%APPDATA%\Claude\logs\mcp-server-memory-vault.log` and confirms.
+- **Record per test:** PASS / FAIL / rough-edge + paste the actual tool response.
+
+### Part A — live contract + abstention (no consolidation needed)
+
+- **C4 — content ceiling (⚠️ ENFORCE THE FULL DUMP — do NOT shorten).** This probes the SERVER's storage ceiling, so the **full literal payload MUST reach the server** — a shortened payload silently invalidates the test. `memory_write` three facts to `testeval`, each of the form `CAP_OK_<n>_START` + filler + `CAP_OK_<n>_END`, where the **filler is the 10-character block `ABCDEFGHIJ` repeated EXACTLY**:
+  - probe 1 (5K):  **500** repeats → ~5,000 chars
+  - probe 2 (10K): **1,000** repeats → ~10,000 chars
+  - probe 3 (50K): **5,000** repeats → ~50,000 chars
+
+  **HARD RULES for the writer (you, Claude Desktop) — this is the part that got skipped last time:** put the FULL literal string in the `content` field. Do **NOT** abbreviate. Do **NOT** write `…`, `[repeated]`, `(50000 chars)`, `... and so on`, or any placeholder. Do **NOT** summarize, sample, or shorten. The literal character count IS the entire test — emitting `ABCDEFGHIJ` 5,000 times is the work, not a formality. **Before each write, state the exact character count you are about to send.** If you genuinely cannot emit the full 50K string in one tool call, SAY SO and stop — never send a shortened version and report success.
+
+  Then `memory_search` each `CAP_OK_<n>` marker. **PASS** = each is either stored intact (both brackets returned, full length, nothing missing mid/tail) OR rejected with a clear, documented error — never a silent success returning truncated content. Note the largest size that stored.
+
+  **Claude Code backstop (ground truth, catches laziness):** for each probe, Claude Code reads the ACTUAL stored content length from storage/log and confirms it matches the intended size. A short read = the writer truncated (a writer FAIL, distinct from a server-truncation FAIL); a full read with both brackets = real PASS. If Desktop cannot emit the 50K payload after trying, Claude Code writes the exact-length probe via the same MCP server path as a fallback so the ceiling still gets measured.
+
+  **THEN, once C4 passes, `memory_delete` all three CAP_OK probes** (capture each returned id at write time). They are giant blobs; left in `testeval` they dominate Part B's clustering and contaminated the A5 verdict last session. The storage-ceiling check is complete the moment they store/reject — delete them before moving on.
+- **C5 — malformed-id delete.** `memory_delete` with `id` = `"not-a-uuid"`. **PASS** = clean rejection, session survives (UI may say "Tool execution failed" — that's the client collapsing a structured `-32602`; Claude Code confirms `-32602` in the log). NOT a crash/hang.
+- **C6 — update round-trip.** `memory_write` `"C6COLOR The user's favorite color is teal."` → capture the returned id → `memory_update` that id with `"C6COLOR The user's favorite color is amber."` → `memory_read` `"what is the user's favorite color?"`. **PASS** = read returns **amber**, teal not surfaced, id stable.
+- **C7 — unicode round-trip.** `memory_write` `"C7UNI 🔐 日本語 Ωβγ café résumé ﬁnesse."` → `memory_search` **`"C7UNI"`** (query the literal marker token — it's the only term guaranteed to be in the content; a query like "unicode probe" shares NO tokens/semantics with a mixed-script string and won't retrieve it). **PASS** = content returned byte-identical (incl. the ﬁ ligature U+FB01 NOT decomposed; modulo a documented trailing-period normalization). NB: `memory_search` is the *raw* hybrid retriever (no reranker — that lives in `memory_read`), so on a tiny vault unrelated large entries can out-rank via RRF; query the marker, don't eyeball top results.
+- **C8 — boundary-auth rejection.** `memory_write` to boundary **`secretwork`** — a VALID, dot-free name that is NOT in the authorized set. **Do NOT use a name containing a dot** (a dot trips input-validation `-32602` *before* the auth gate and gives a false pass). **PASS** = rejected, nothing written; the server returns **`-32001` AccessDenied** (Claude Code confirms in the log — `-32001` = unauthorized, distinct from `-32602` = malformed input). Then `memory_search` `"secretwork"` in your authorized boundary to confirm nothing leaked.
+- **C9 — normalization determinism.** `memory_write` the SAME raw content twice: `"  C9NORM the user is checking normalization determinism.  "` (note the leading/trailing spaces). **PASS** = both stored in identical canonical form (only documented transforms, e.g. trimmed edges + trailing period).
+- **A6 — abstention (true negative).** `memory_read` `"what is the user's blood type?"`. **PASS** = `abstain:true`, empty `relevant_facts`, no fabrication.
+- **A7 — abstention (no over-abstain) — THE BUG-2 LIVE GATE (ADR-064).** Run this **after B-seed** (relies on the cello hobby fact, B-seed #4, stored **subject-less** — `"Plays the cello…"`, no "The user" — exactly the phrasing class that made the read abstain before this session's fix). Issue **two** loosely-phrased reads, each of which scored deeply below the reranker floor BEFORE the fix (−4.46 and −5.21 respectively):
+  - `memory_read "what does the user do for fun?"` (zero keyword overlap with "cello")
+  - `memory_read "what music does the user play?"` (near-literal, yet was the *worst* pre-fix score)
+
+  **PASS** = BOTH return `abstain:false` with the cello fact surfaced. `abstain:true` on either = the subject framing didn't take (Bug-2 regressed). Don't phrase it "outdoors" — the seeded hobby is indoor, so an outdoors query *should* abstain and would mis-score.
+- **I2 — delete removes from retrieval.** `memory_write` `"I2DEL zzqx-sentinel single-use deletion probe."` → `memory_search` to confirm present → capture id → `memory_delete` that id → `memory_search` again with `include_archived:true`. **PASS** = the fact is gone from BOTH normal and archived results (hard delete, no orphan).
+- **I3 — boundary read isolation.** Only if a second authorized boundary is seedable this session; otherwise skip and note "not run (single boundary)".
+- **C10 — degenerate query (new this session).** `memory_search "the a is of and to"` (all stopwords — no searchable terms after the stopword filter). **PASS** = a clean **empty result**, no error, no crash. (Claude Code confirms **no `-32603`** in the log — this query previously returned an internal error.)
+- **C11 — settable `as_of` (new this session).** `memory_write` `"C11ASOF The user adopted a rescue dog."` to `testeval` with the optional param **`as_of: "2024-01-15"`**. **PASS** = the write succeeds cleanly (no `-32602`). The `as_of` seeds the fact's `valid_from`; Claude Code confirms the stored `valid_from` is `2024-01-15` (the supplied date, not the write timestamp) if storage inspection is available — otherwise this confirms the live MCP path accepts the param (the date→`valid_from` mapping itself is unit-tested in `as_of_write.rs`). **Delete the C11ASOF probe after** (keeps Part B's set clean).
+
+### Part B — dedup (ADR-063) + contradiction detection (A5) + precision  ← the features under test
+
+**B-seed (Claude Desktop).** `memory_write` each of these to `testeval`, one call each:
+1. `"A5CAR The user drives a Tesla Model 3."` — with param **`as_of: "2026-02-01"`** *(older)*
+2. `"A5CAR The user sold the Tesla and now drives a Rivian R1T."` — with param **`as_of: "2026-05-01"`** *(newer — supersedes #1)*
+3. `"PRECJOB The user works as a data scientist at Helix Labs."`
+4. `"Plays the cello in a community orchestra on Sunday afternoons."` *(seed VERBATIM — subject-LESS and **NO marker prefix**, on purpose. This is the exact phrasing the Bug-2 fix (ADR-064) rescues; a marker like "PRECHOBBY " would sit between the subject-frame and the verb and drag the read below the floor — Claude Code pre-verified the clean form surfaces at +3.2/+2.1/+1.3 for the A7/B3 reads. Do not add a marker to this one.)*
+5. `"PRECFOOD The user's favourite cuisine is Japanese."`
+6. **Dedup triplet (new this session)** — `memory_write` this **exact same content three times** (three separate calls, verbatim): `"DEDUPDOG The user's dog is a Labrador named Biscuit."` *(three near-identical copies → must collapse to one at consolidation, no LLM)*
+
+(Items 1–2 now carry the date as an `as_of` param, not just in the text — this exercises settable `as_of` end-to-end and feeds the fact's `valid_from`.)
+
+Then **STOP and hand off:** tell Shahbaz "B-seed complete — ready for consolidation." Claude Code runs `vault-cli consolidate run` (real Phi-4) and confirms via the log + report. **Do not proceed to B-verify until Claude Code says consolidation is done.**
+
+**B-verify (Claude Desktop, only after consolidation).**
+- **B1 — A5 catch (the ship-gate).** `memory_read` `"what does the user drive now?"`. **PASS** = returns **ONLY the Rivian fact (#2)**; the Tesla fact (#1) does NOT appear; `abstain:false`.
+- **B2 — reversible, not deleted.** `memory_search` `"Tesla Model 3"` with `include_archived:true`. **PASS** = the Tesla fact IS found (archived / invalidated — retained, recoverable, not destroyed).
+- **B3 — precision (no false retirement).** `memory_read` each, and confirm the fact still surfaces (not retired):
+  - `"where does the user work?"` → **PRECJOB** present
+  - `"what hobby does the user have?"` → **the cello hobby fact (#4)** present
+  - `"what food does the user like?"` → **PRECFOOD** present
+  **PASS** = all three still present. **The job and hobby facts must BOTH survive** — a weak model previously called "works as an engineer" and "enjoys hiking" *contradictory*; nothing here may be wrongly retired. (Claude Code cross-checks the consolidation log: exactly the Tesla fact invalidated, zero false flags.)
+- **B4 — deterministic dedup (the new ADR-063 feature).** After consolidation: `memory_read "what is the user's dog?"` → returns the Labrador/Biscuit fact **exactly once** (not three copies; `abstain:false`). Then `memory_search "Biscuit"` with `include_archived:true` → the duplicate copies ARE still present as **archived/superseded** (collapsed, not deleted — reversible). **PASS** = one canonical copy at read; the other two retained-but-superseded. (Claude Code confirms the run report shows `clusters deduped: ≥1` and `memories deduped: 2`, and that the dedup happened with **zero LLM merge calls** — the survivor + two `memory.superseded` events in the log, no merge skip.)
+
+**Teardown note.** Seeded this run: `CAP_OK_*` (deleted after C4), `C6COLOR`, `C7UNI`, `C9NORM` ×2, `I2DEL` (deleted), `C11ASOF` (deleted after C11), `A5CAR` ×2, `PRECJOB`, the **markerless cello hobby fact (#4)**, `PRECFOOD`, `DEDUPDOG` ×3. Teardown is a **full boundary wipe** by Claude Code (vault.db + lance + graph.duckdb + reports), so no per-fact deletion is needed afterward.
+
+### What Part B proves
+B4 = near-identical duplicates collapse **deterministically, with no LLM call**, surfaced + counted in the report (ADR-063 — the overflow/skip class that previously sat unmerged forever is gone). B1 = the consolidator detects a real knowledge-update contradiction and retires only the stale side (A5 ship-gate, on real Phi-4). B3 = the precision fix holds — different-attribute facts are no longer mistaken for contradictions. C11 (Part A) = `as_of` seeds `valid_from`. Together they are the end-to-end confirmation of this session's consolidation work; Part A confirms nothing else regressed.
 
 ## 8. Suggested sequencing
 
 1. **Now:** I run the §7 live batch → report pass/rough-edge per test.
-2. **Claude Code, parallel:** finish Commit 8 (MCP serve + dogfood), then run `consolidate run` on `test.eval` → unblocks K1–K6, A5, X1–X4.
+2. **Claude Code, parallel:** finish Commit 8 (MCP serve + dogfood), then run `consolidate run` on `testeval` → unblocks K1–K6, A5, X1–X4.
 3. **Claude Code:** build `read_quality_eval.json` + scoring harness → unblocks A1–A3, A7, S1–S2. Baseline the numbers; set CI gates.
 4. **Ship gate:** A5 (knowledge-update/contradiction) and A6 (abstention) must clear before V0.2 beta — they are the correctness story the category is decided on.
 

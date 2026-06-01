@@ -665,6 +665,119 @@ impl StorageBackend {
         })
     }
 
+    /// Apply a deterministic dedup atomically: supersede every loser into the
+    /// survivor AND roll the cluster's aggregates onto the survivor, in ONE
+    /// transaction (all-or-nothing — no partial dedup on mid-loop failure).
+    /// Consolidator Phase 2-pre primitive per ADR-063.
+    ///
+    /// For each `loser_ids` member: set `superseded_by = survivor_id` and emit
+    /// [`AuditEventType::MemorySuperseded`] (same per-loser semantics as
+    /// [`Self::mark_superseded`]). For the survivor: set `access_count =
+    /// summed_access_count` and `confidence = max_confidence` (BRD §5.6 line
+    /// 988) and emit [`AuditEventType::MemoryDeduped`]. The survivor's CONTENT
+    /// is unchanged, so this is **metadata-only** — no LanceDB/DuckDB cascade,
+    /// no re-embed (the existing vector stays valid). Mirrors `mark_superseded`
+    /// / `invalidate`'s metadata-only contract.
+    ///
+    /// **Boundary check is the caller's responsibility** (consolidator clusters
+    /// within one boundary) — same convention as `mark_superseded` / `invalidate`.
+    ///
+    /// **Errors:**
+    /// - [`VaultError::InvalidInput`] if `loser_ids` is empty or contains
+    ///   `survivor_id` (a memory cannot supersede itself).
+    /// - [`VaultError::NotFound`] if the survivor or any loser does not exist.
+    /// - [`VaultError::Storage`] on transaction-side failure.
+    #[instrument(
+        skip(self),
+        fields(survivor = %survivor_id, loser_count = loser_ids.len())
+    )]
+    pub async fn apply_dedup(
+        &self,
+        survivor_id: MemoryId,
+        loser_ids: &[MemoryId],
+        summed_access_count: u32,
+        max_confidence: f32,
+    ) -> VaultResult<Ack> {
+        if loser_ids.is_empty() {
+            return Err(VaultError::InvalidInput(
+                "apply_dedup requires at least one loser".into(),
+            ));
+        }
+        if loser_ids.contains(&survivor_id) {
+            return Err(VaultError::InvalidInput(format!(
+                "apply_dedup survivor {survivor_id} cannot also be a loser"
+            )));
+        }
+
+        let losers: Vec<MemoryId> = loser_ids.to_vec();
+        let metadata = self.metadata.clone();
+        let committed_at: DateTime<Utc> = metadata
+            .with_transaction(move |tx| {
+                // 1. Supersede each loser → survivor (one MemorySuperseded each).
+                for loser_id in &losers {
+                    let loser = tx_get_memory(tx, loser_id)?.ok_or_else(|| {
+                        VaultError::NotFound(format!("loser memory {loser_id} does not exist"))
+                    })?;
+                    if let Some(existing) = loser.superseded_by {
+                        warn!(
+                            loser_id = %loser_id,
+                            existing_supersedence = %existing,
+                            new_supersedence = %survivor_id,
+                            "apply_dedup: loser already superseded — chain extending \
+                             (production clustering filters superseded rows; unexpected)"
+                        );
+                    }
+                    let boundary_for_audit = loser.boundary.clone();
+                    let mut updated = loser;
+                    updated.superseded_by = Some(survivor_id);
+                    tx_update_memory(tx, &updated)?;
+
+                    let mut pending = PendingAuditEvent::success(
+                        AuditEventType::MemorySuperseded,
+                        ActorKind::System,
+                    )
+                    .with_resource("memory", loser_id.to_string())
+                    .with_boundary(boundary_for_audit);
+                    pending.details_json =
+                        format!(r#"{{"superseded_by":{}}}"#, json_string(&survivor_id.to_string()));
+                    tx_append_audit(tx, pending)?;
+                }
+
+                // 2. Roll aggregates onto the survivor (one MemoryDeduped).
+                let survivor = tx_get_memory(tx, &survivor_id)?.ok_or_else(|| {
+                    VaultError::NotFound(format!("survivor memory {survivor_id} does not exist"))
+                })?;
+                let boundary_for_audit = survivor.boundary.clone();
+                let mut updated = survivor;
+                updated.access_count = summed_access_count;
+                updated.confidence = max_confidence;
+                updated.validate()?;
+                tx_update_memory(tx, &updated)?;
+
+                let absorbed_json = losers
+                    .iter()
+                    .map(|id| json_string(&id.to_string()))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let mut pending =
+                    PendingAuditEvent::success(AuditEventType::MemoryDeduped, ActorKind::System)
+                        .with_resource("memory", survivor_id.to_string())
+                        .with_boundary(boundary_for_audit);
+                pending.details_json = format!(
+                    r#"{{"absorbed":[{absorbed_json}],"summed_access_count":{summed_access_count},"max_confidence":{max_confidence}}}"#
+                );
+                let event = tx_append_audit(tx, pending)?;
+
+                Ok::<_, VaultError>(event.timestamp)
+            })
+            .await?;
+
+        Ok(Ack {
+            memory_id: survivor_id,
+            sqlite_committed_at: committed_at,
+        })
+    }
+
     /// List memories matching `filter`. The `limit` parameter accepts
     /// `None` (return ALL matching rows — no SQL `LIMIT` clause) or
     /// `Some(N)` (cap at `N`).
@@ -1440,6 +1553,206 @@ mod tests {
             updates.is_empty(),
             "mark_superseded must NOT emit MemoryUpdate events; found {} update events",
             updates.len()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // apply_dedup — ADR-063 (deterministic dedup, T0.3.x)
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn apply_dedup_supersedes_losers_and_bumps_survivor_metadata_only() {
+        let (_tmp, backend) = make_backend().await;
+        let survivor = sample_memory("work", "the user drives a Rivian R1T");
+        let loser_a = sample_memory("work", "the user drives a Rivian R1T truck");
+        let loser_b = sample_memory("work", "the user now drives a Rivian R1T");
+        backend
+            .write_memory(&survivor, &embedding(0.1))
+            .await
+            .unwrap();
+        backend
+            .write_memory(&loser_a, &embedding(0.1))
+            .await
+            .unwrap();
+        backend
+            .write_memory(&loser_b, &embedding(0.1))
+            .await
+            .unwrap();
+
+        // Baseline: three Write enqueues from the three write_memory calls.
+        let baseline = backend.retry_queue.len().await.unwrap();
+
+        backend
+            .apply_dedup(survivor.id, &[loser_a.id, loser_b.id], 12, 0.95)
+            .await
+            .unwrap();
+
+        // Metadata-only: apply_dedup MUST NOT enqueue any cascade row
+        // (content unchanged → no re-embed, no LanceDB upsert).
+        let after = backend.retry_queue.len().await.unwrap();
+        assert_eq!(
+            after, baseline,
+            "apply_dedup must be metadata-only (no cascade enqueue)"
+        );
+
+        // Losers superseded → survivor.
+        for loser_id in [loser_a.id, loser_b.id] {
+            let l = backend
+                .metadata
+                .get_memory(&loser_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                l.superseded_by,
+                Some(survivor.id),
+                "loser must be superseded → survivor"
+            );
+        }
+
+        // Survivor: aggregates rolled, content + supersede-state untouched.
+        let s = backend
+            .metadata
+            .get_memory(&survivor.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s.access_count, 12, "survivor access_count = summed");
+        assert!(
+            (s.confidence - 0.95).abs() < 1e-6,
+            "survivor confidence = max"
+        );
+        assert_eq!(s.content, survivor.content, "survivor content unchanged");
+        assert_eq!(s.superseded_by, None, "survivor is NOT superseded");
+    }
+
+    #[tokio::test]
+    async fn apply_dedup_emits_deduped_on_survivor_and_superseded_on_losers() {
+        let (_tmp, backend) = make_backend().await;
+        let survivor = sample_memory("work", "canonical fact");
+        let loser = sample_memory("work", "canonical fact dup");
+        backend
+            .write_memory(&survivor, &embedding(0.1))
+            .await
+            .unwrap();
+        backend.write_memory(&loser, &embedding(0.1)).await.unwrap();
+
+        backend
+            .apply_dedup(survivor.id, &[loser.id], 5, 0.9)
+            .await
+            .unwrap();
+
+        let events = backend
+            .metadata
+            .list_audit_events(usize::MAX)
+            .await
+            .unwrap();
+
+        // Exactly one MemoryDeduped, on the survivor, listing the absorbed loser.
+        let deduped: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == AuditEventType::MemoryDeduped)
+            .collect();
+        assert_eq!(deduped.len(), 1, "exactly one memory.deduped event");
+        assert_eq!(
+            deduped[0].resource_id.as_deref(),
+            Some(survivor.id.to_string().as_str())
+        );
+        assert_eq!(deduped[0].actor_kind, ActorKind::System);
+        assert!(
+            deduped[0].details_json.contains(&loser.id.to_string()),
+            "deduped details must list the absorbed loser id: {}",
+            deduped[0].details_json
+        );
+
+        // The loser carries a MemorySuperseded event (resource = loser).
+        let superseded: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                e.event_type == AuditEventType::MemorySuperseded
+                    && e.resource_id.as_deref() == Some(loser.id.to_string().as_str())
+            })
+            .collect();
+        assert_eq!(
+            superseded.len(),
+            1,
+            "loser must have one memory.superseded event"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_dedup_rejects_empty_losers_and_self_loser() {
+        let (_tmp, backend) = make_backend().await;
+        let survivor = sample_memory("work", "x");
+        backend
+            .write_memory(&survivor, &embedding(0.1))
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(
+                backend.apply_dedup(survivor.id, &[], 0, 0.9).await,
+                Err(VaultError::InvalidInput(_))
+            ),
+            "empty losers must be rejected"
+        );
+        assert!(
+            matches!(
+                backend
+                    .apply_dedup(survivor.id, &[survivor.id], 0, 0.9)
+                    .await,
+                Err(VaultError::InvalidInput(_))
+            ),
+            "survivor as its own loser must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_dedup_is_atomic_unknown_loser_rolls_back_all() {
+        let (_tmp, backend) = make_backend().await;
+        let survivor = sample_memory("work", "canonical");
+        let real_loser = sample_memory("work", "canonical dup");
+        backend
+            .write_memory(&survivor, &embedding(0.1))
+            .await
+            .unwrap();
+        backend
+            .write_memory(&real_loser, &embedding(0.1))
+            .await
+            .unwrap();
+
+        let bogus = MemoryId::new();
+        // real_loser is processed first (superseded inside the tx), then the
+        // bogus id fails → the whole transaction must roll back.
+        let result = backend
+            .apply_dedup(survivor.id, &[real_loser.id, bogus], 9, 0.9)
+            .await;
+        assert!(
+            matches!(result, Err(VaultError::NotFound(_))),
+            "unknown loser → NotFound"
+        );
+
+        // Rollback proof: the real loser is NOT superseded and the survivor's
+        // aggregates are unchanged.
+        let l = backend
+            .metadata
+            .get_memory(&real_loser.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            l.superseded_by, None,
+            "rollback: real loser must NOT be superseded"
+        );
+        let s = backend
+            .metadata
+            .get_memory(&survivor.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            s.access_count, survivor.access_count,
+            "rollback: survivor aggregates unchanged"
         );
     }
 

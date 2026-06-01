@@ -8,17 +8,24 @@
 //! | Phase | Module | Lands at |
 //! |---|---|---|
 //! | 1 — Identify candidate clusters | [`cluster`] | T0.2.2 (shipped at `a889931` + `a53e3a5`) |
+//! | 2-pre — Deterministic dedup (near-identical, no LLM) | [`dedup`] | T0.3.x (ADR-063) |
 //! | 2 — LLM merge decisions | [`merge`] | T0.2.3 commit 1 |
 //! | 3 — Apply merges | [`merge`] | T0.2.3 commit 2 |
-//! | 2b — Topic-level contradiction detection | [`contradiction`] | T0.3.x (A5 ship-gate) |
+//! | 2b — Nearest-neighbor contradiction candidates | [`candidates`] | T0.3.x (ADR-065) |
+//! | 2b — Pairwise contradiction judging | [`contradiction`] | T0.3.x (A5 ship-gate) |
 //! | 4 — Decay and archive | `decay` (not yet created) | T0.2.4 |
 //!
 //! File layout matches BRD §5.6 lines 987-989 verbatim (T0.2.3 commit 1
 //! refactor — T0.2.2 commit 1 shipped clustering as `src/clustering.rs`
-//! flat-layout; corrected here). [`contradiction`] is the A5 fix: it runs
-//! over the looser K-means topic grouping rather than the 0.92 merge gate,
-//! so knowledge-update contradictions (which sit below 0.92) get detected.
+//! flat-layout; corrected here). The A5 fix is two cooperating modules:
+//! [`candidates`] generates nearest-neighbor candidate pairs (ADR-065,
+//! replacing the K-means topic grouping that did NOT co-locate the
+//! conflicting pair) and [`contradiction`] judges each pair with Phi-4 +
+//! recency, so knowledge-update contradictions (which sit below the 0.92
+//! merge gate) get detected.
 
+pub mod candidates;
 pub mod cluster;
 pub mod contradiction;
+pub mod dedup;
 pub mod merge;

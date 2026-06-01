@@ -2,9 +2,342 @@
 
 **Current version:** V0.2 Closed Beta (BRD §6.2 — sleep consolidator, boundaries hardening, cross-device sync, 30 beta users)
 
-**Last updated:** 2026-05-30 (**A5 contradiction detection SHIPPED + live-proven** — see the "A5 SHIPPED" opener block immediately below; bundles the clustering-divergence robustness fix + the macOS reranker CI fix in one commit. — Prior context: 2026-05-28 (T0.3.x **Batch B Commit 9** — *read-relevance cosine-floor gate* — in working tree, local DoD gates ALL GREEN (fmt/clippy/build/test), awaiting commit. Closes the dogfood-found **A6 no-signal ship-gate**: `memory_read` now abstains when a query's top-1 BGE cosine < 0.66 (**ADR-057**, Approach P — gate lives in `StructuredReadPipeline`; `memory_search` + the `abstain_tests` BM25 suite untouched). Floor (top-1, 0.66) measured via the n=5 `abstain_channel_diagnostic`; an initial top-3-mean choice over-abstained on a real query in live dogfood → switched to top-1, re-validated live (blood-type abstains, zafflang proceeds). Bundles the **JoinHandle clean-disconnect panic fix** Codex found (`is_finished()` guard in `ApplicationHandle::shutdown` + regression test). **Commit 8 shipped at `b772d9d`** (MCP serve entrypoint + `memory.X`→`memory_X` rename + ADR-056 dogfood fixes); **Commit 7 at `f6293c6`** (CI green). **Cross-agent dogfood:** Claude Desktop + Codex (GPT-5.5, full write→search→update→read→delete CRUD) both verified live; Cursor is the next connection. See **ADR-057** below + [[cross-agent-mcp-connection]]. The 🎯 opener block further down is now HISTORICAL (Commit 8 close).)
+**Last updated:** 2026-06-01 evening (**A5 + DEDUP SHIPPED & DOGFOOD-CONFIRMED on real Phi-4 — and COMMITTED this session.** Nearest-neighbor candidate generation (ADR-065) replaced K-means topic grouping; the live §7 dogfood proved A5 (B1 ship-gate: read "what does the user drive now?" → ONLY Rivian, stale Tesla retired) + dedup (B4: 3→1, recoverable, zero LLM). All 5 DoD gates green pre-commit. **BUT the dogfood also confirmed read-side over-abstention is NOT fully solved** — "what food does the user like?" abstains on "favourite cuisine is Japanese" (synonym gap, zero token overlap); ADR-064 fixed the subject-less case, the synonym-gap case remains. That + 3 rough edges (C4 backstop owed, C7 single-token marker search, K-means topic mislabels) are next session's work. See the 🟦 opener immediately below. Prior openers HISTORICAL.)
 
 ---
+
+## 🟦 NEXT SESSION OPENER (2026-06-01 evening) — **A5 + DEDUP SHIPPED & DOGFOOD-CONFIRMED on real Phi-4 (committed). NEXT: fix read over-abstention (synonym gap) + 3 rough edges.** — READ THIS FIRST
+
+> This session implemented + SHIPPED the A5 nearest-neighbor fix (ADR-065), ran the full §7 live dogfood on real Phi-4 (Claude Desktop seeded; Claude Code watched the MCP log + ran `consolidate`), and **committed the whole arc** this session. **A5 (the V0.2 ship-gate) + dedup PASS live.** The dogfood ALSO confirmed read-side over-abstention is not fully solved (synonym-gap case) — that is the headline next-session task. All older openers are HISTORICAL.
+
+### ✅ SHIPPED + COMMITTED THIS SESSION (see `git log` on `main`)
+- **A5 nearest-neighbor contradiction detection (ADR-065)** — Phase 2b computes per-fact top-K (=3) nearest cosine neighbors above a **0.70** floor, unions to candidate pairs, feeds the EXISTING Phi-4 pairwise judge + recency aggregator. Replaces K-means topic grouping (ADR-060's "topics co-locate the pair" premise was FALSE). Only candidate *generation* changed.
+- **Floor 0.70 measured, not guessed** (`nn_contradiction_spike.rs`, real bge-small): real contradictions Vega/Atlas **0.905** + Tesla/Rivian **0.823** (mutual #1 neighbors); unrelated-noise ceiling **0.634**. 0.70 sits in the clean 0.634→0.823 gap.
+- Also in this commit (prior-uncommitted arc, now all green + shipped): **dedup ADR-063**, **A5 pairwise ADR-062**, **Bug-1 recency** (`stale_by_recency`), **merge-resilience**, **read-side ADR-064** (`DOC_SUBJECT_FRAME "The user — "` subject framing) + **rerank-cap 8→20**.
+- All 5 DoD gates green pre-commit: `test -p vault-consolidator` (99 unit + all integration) · `clippy --workspace --all-targets -D warnings` 0 · `build --workspace` 0 · `fmt --all --check` 0.
+
+### 🎯 DOGFOOD VERDICT (real Phi-4, §7 runbook, 2026-06-01 evening)
+- **B1 — A5 ship-gate ✅** `memory_read "what does the user drive now?"` → ONLY the Rivian (id …2859); Tesla NOT surfaced; `abstain:false`. Read path honors the invalidation.
+- **B2 — reversible ✅** Tesla (id …1bc8) retained via `valid_until` (`superseded_by:null`), recoverable under `include_archived:true`.
+- **B3 — no false retirement ✅ (core)** PRECJOB, cello, PRECFOOD all stayed active (`valid_until:null`, rank-1 in search). Consolidator precision held; the old "engineer vs hiking" false-contradiction did NOT recur. ⚠️ but see read over-abstention below.
+- **B4 — dedup ✅** `"what is the user's dog?"` → Biscuit once (survivor …8350); the 2 copies `superseded_by` the survivor (recoverable).
+- **Part A:** C5 (−32602) C6 (update→amber) C7 (unicode, via NL query) C8 (−32001) C9 (norm-determinism) C10 (stopword→empty, no −32603) C11 (`as_of`→`valid_from` 2024-01-15 confirmed in the read) A6 (abstain) I2 (hard-delete) — **all ✅**. C4 NOT run (see rough edges).
+- **Consolidation log evidence:** Phase 2b `active=9, candidate_pairs=1` (only Tesla/Rivian cleared 0.70), `stale_count=1` (older Tesla); summary `clusters deduped: 2, memories deduped: 3` (DEDUPDOG ×3→1 +2, C9NORM ×2→1 +1), `clusters skipped: 0`, `memories_merged: 0` (dedup is deterministic — zero LLM merge calls).
+
+### 🟦 NEXT SESSION — FIX THESE (priority order)
+
+**1. READ OVER-ABSTENTION on synonym gaps — TOP PRIORITY (this is the product-thesis bug, "correct output every time").**
+- **Symptom (live):** `memory_read "what food does the user like?"` → `abstain:true`, EMPTY — but the vault holds "PRECFOOD The user's favourite cuisine is Japanese" (fully active, `valid_until:null`, rank-1 in `memory_search`). Reword to "what is the user's favourite **cuisine**?" → surfaces cleanly. The miss is a **zero-token-overlap synonym leap** (food↔cuisine).
+- **This is the SAME class as Bug-2 (A7) — NOT fully fixed.** ADR-064 (subject framing `"The user — "`) fixed the *subject-less* case (cello). The *synonym-gap* case survives it. So the read-relevance gate still over-abstains.
+- **Correct attribution (don't mis-target the fix):** the LIVE MCP server runs WITH the Qwen3 reranker (ADR-059) — those reads take ~13s, the reranker ran. So the over-abstention is the **reranker scoring food→cuisine below its logit-0 floor**, NOT the ADR-057 cosine floor (that's only the no-reranker fallback, e.g. inside `consolidate`). Target the reranker gate.
+- **The structural fix is already designed** — see [[project-reranker-conformal-not-absolute-threshold]] + the HISTORICAL 2026-06-01 opener's "controllable-algorithm" research: an absolute logit-0 floor is wrong; calibrate τ via **split-conformal** on a labelled fixture (knob α = miss-rate), pluggable `RelevanceGate` (Conformal now → learned Combiner later), capture labelled read features in prod. Start by adding food→cuisine to a `read_quality_eval` fixture and reproducing via `reranker_fun_diagnostic.rs` (edit `doc`/`queries`).
+- **Decision needed from Shahbaz:** is read over-abstention now the priority arc (vs latency, vs other V0.2 items)? It directly breaks the core promise. Recommend yes.
+
+**2. C4 content-ceiling backstop — OWED (I deferred it).** This run did NOT verify C4: Claude Desktop wrote only 1 of 3 probes and it was short (3787 chars, not ~5000) — correctly refusing to send a shortened payload. The 10K/50K exact-length probes are Claude Code's to write via the MCP path (no `vault-cli write` subcommand exists → spin a short-lived `vault-cli mcp serve` + send `memory_write` JSON-RPC, OR write a tiny harness). **Do on a CLEAN slate** (giant CAP_OK blobs pollute clustering/dedup — never seed them before an A5 run). Ceiling already ~≥26K-characterized in a prior dogfood; this is "confirm a known-good behavior," low priority.
+
+**3. C7 single-token marker search short-circuit — rough edge.** `memory_search "C7UNI"` (one alphanumeric token) returns EMPTY in ~0 ms (BM25 leg finds no match → abstains before the semantic leg). The doc IS stored (a natural-language query finds it byte-identical incl. ﬁ ligature). Investigate the BM25 abstain / degenerate-guard path in the search pipeline; affects single-token marker queries (workaround: natural-language query). Reproduced twice live this session.
+
+**4. K-means topic mislabeling (K1 not gate-ready) — rough edge, display-only.** On the tiny `testeval` boundary the labeler found ~2 clusters and mis-assigned 3 of 4: PRECJOB→`vehicle_transitions`, cello→`japanese_cuisine`, Biscuit→`vehicle_transitions` (only PRECFOOD→`japanese_cuisine` correct). It's coarse cluster *assignment*, not a random labeler. Does NOT affect read correctness (B1/B3/B4 returned correct facts despite junk topics). Folds into the deferred clustering rework (threshold connected-components / HDBSCAN). K1 (topics populate) can't gate until this improves.
+
+### ADR-065 — contradiction candidate generation by nearest neighbor, not K-means topics (SHIPPED)
+**Decision:** Phase 2b generates contradiction candidate pairs via per-fact top-K nearest cosine neighbors above a similarity floor (`phases::candidates::nearest_neighbor_candidate_pairs`), replacing the K-means topic grouping of ADR-060.
+**Why:** ADR-060's premise — "a K-means topic co-locates the conflicting pair" — was proven FALSE in the §7 dogfood: K-means split Tesla→Rivian across groups, so the judge never saw it. Contradiction detection is a nearest-neighbor problem, not a partitioning one.
+**Mechanics:** top-K = 3, floor = 0.70 (measured). Bounded ≤ N·K/2. Existing `judge_candidate_pairs` (Phi-4 pairwise + `shared_attribute` gate + recency `stale_by_recency`) + the whole-active-set mass-invalidate refusal UNCHANGED. The 0.92 merge gate untouched.
+**Live-confirmed:** real Phi-4, `candidate_pairs=1`, older Tesla retired, B1 read returns only Rivian. **Supersedes** ADR-060's K-means premise; K-means stays in `topics.rs` for REPORT display only (see rough edge #4).
+
+### Tech debt logged (NOT addressed — no drive-by refactor)
+- **N-ary contradiction fallback now unreferenced by production.** `detect_contradiction` (dispatcher), `detect_contradiction_nary`, `detect_contradictions_pairwise` are off the production path (Phase 2b calls `judge_candidate_pairs` directly). Still `pub` + unit-tested (no dead-code warning). Evaluate removing them + `MAX_PAIRWISE_GROUP_SIZE` + the N-ary prompt/schema in a focused cleanup. Kept to avoid scope creep.
+- **K-means topic cohesion** (rough edge #4) — display-only.
+- **Phase 2b invalidations not counted in `contradictions_resolved`.** The summary's `contradictions_resolved`/`contradictions queued` counters track the legacy merge-gate ConflictReview path, NOT the Phase 2b NN invalidations (those log `stale_count` but aren't summed into the report counter). Cosmetic reporting gap; consider surfacing an `a5_invalidated` count in `ConsolidationReport`.
+
+### How to get up to speed next session (fast)
+- Re-read this opener + [[project-reranker-conformal-not-absolute-threshold]], [[bge-small-cannot-separate-relevant]], [[project-reranker-qwen3-solves-model-fit]], [[correctness-is-the-product]], [[kmeans-wrong-for-contradiction-use-nn]] (now SHIPPED), [[anchor-on-measured-not-projected]], [[reference-mcp-dogfood-log-is-ground-truth]], [[confirm-before-cargo-build-and-check-disk]], [[feedback-confirm-before-commit-push]].
+- Live dogfood harness (works, reuse it): wipe vault stores at `C:\Users\shahb\AppData\Roaming\com.shahbaz242630.memory-vault\` (`vault.db` + `graph.duckdb` + empty `lance/` + `reports/`; keep `models/`). MCP server binary = `target\debug\vault-cli.exe` (Claude Desktop config at `%APPDATA%\Claude\claude_desktop_config.json`, boundaries `personal`+`testeval`, reranker wired). MCP log (ground truth, Desktop UI hides error codes) = `%APPDATA%\Roaming\Claude\logs\mcp-server-memory-vault.log` — byte-offset tail watcher pattern in this session's transcript pings on each new entry. Consolidate cmd: `vault-cli --vault-db … --vector-dir … --graph-db … consolidate --bge-model … --bge-tokenizer … --ort-lib … --phi4-model C:\Users\shahb\AppData\Roaming\com.shahbaz242630.memory-vault\models\Phi-4-mini-instruct-Q4_K_M.gguf run` (set `$env:RUST_LOG="info,vault_consolidator=debug"`). **Desktop must be CLOSED during consolidate** (DuckDB/SQLite file locks); reopen for B-verify.
+- Reranker measurement instrument: `crates/vault-embedding/tests/reranker_fun_diagnostic.rs` (`#[ignore]`, edit `doc`/`queries`, run `--ignored --nocapture`).
+
+### Disk / env
+- C: ~125 GB free; `target/` ~workspace-built (heavy native deps: llama-cpp/Vulkan, lance, duckdb, aws-lc). Confirm before any cargo build/test/clippy + check disk ([[confirm-before-cargo-build-and-check-disk]]); only `cargo fmt` is free. Consolidation loads Phi-4 on the Intel UHD Vulkan GPU (~33/33 layers offloaded) — fine on this machine. Reads take ~3–13s (Qwen3 reranker on CPU) — latency arc is post-correctness.
+
+---
+
+## 🟥 NEXT SESSION OPENER (2026-06-01 late) — **[HISTORICAL — superseded by the 🟩 2026-06-01 evening opener above. A5 is now FIXED via ADR-065 nearest-neighbor candidates; the fix designed here was implemented + DoD-green.]** READ SIDE SOLID; A5 CONTRADICTION IS STRUCTURALLY BROKEN (K-means). Fix = nearest-neighbor candidate pairs.
+
+> This session ran the full §7 clean-vault dogfood with the watcher streaming the MCP log live. It (a) confirmed the Bug-2 read fix, (b) found AND fixed a second read bug (rerank-cap) the dogfood exposed, (c) confirmed dedup, and (d) surfaced the headline problem: **A5 contradiction detection does not fire because K-means topic clustering doesn't co-locate the conflicting pair.** Root cause is definitively pinned (not Phi-4, not the aggregator) and the fix is designed + spiked. The 2026-06-01 (earlier) opener below is now HISTORICAL.
+
+### TL;DR — where we are
+- ✅ **Bug 2 (read over-abstention) — FIXED + live-confirmed.** ADR-064 read-side subject framing (`DOC_SUBJECT_FRAME = "The user — "` in `reranker.rs`). Root cause was subject-LESS stored facts, NOT the floor. Live A7 reads surface the cello after the rerank-cap fix below.
+- ✅ **Rerank-cap bug — FIXED (found live this session).** `RERANK_CANDIDATE_CAP` 8 → `DEFAULT_MAX_CANDIDATES` (20) in `structured_read_pipeline.rs`. The live A7 read abstained on a populated vault because BGE-small ranked the cello BELOW the top-8, so the (correctly-framed) reranker never scored it. Now reranks the full retrieved pool. **Pinned by a NEW multi-fact regression test** (`vault-app/tests/read_no_keyword_overlap.rs::cello_surfaces_amid_distractors_and_still_abstains_on_no_signal`) — GREEN. The old 1-fact test couldn't catch this.
+- ✅ **§7 Part A dogfood: 10/10 PASS** (C4 content-ceiling ≥26K + 50K→backstop, C5 −32602, C6 update→amber, C7 unicode byte-identical incl. ﬁ ligature, C8 −32001, C9 norm-determinism, C10 degenerate→empty, C11 settable as_of, A6 abstain, I2 hard-delete). Dedup (ADR-063) confirmed live (2 clusters / 3 memories: DEDUPDOG ×3 + C9NORM ×2).
+- 🟥 **A5 (knowledge-update contradiction) — STRUCTURALLY BROKEN. THE V0.2 SHIP-GATE. This is the next arc.** See the full diagnosis + fix below.
+- ⚠️ **Everything UNCOMMITTED.** Read-side wins are committable independently of the A5 fix.
+
+### 🟥 A5 — THE ISSUE (definitively diagnosed this session)
+**Symptom:** live consolidation on the seeded Tesla→Rivian vault → `contradictions: 0, archived: 0`. The stale Tesla is NOT retired; B1 (the ship-gate read "what does the user drive now?") would return BOTH cars.
+
+**Root cause (pinned by a verbose-logging diagnostic re-run — ruled out everything else):**
+- ❌ NOT Phi-4 — it correctly judged all 6 pairs it was handed (`contradiction=false` on genuinely-unrelated pairs).
+- ❌ NOT the Bug-1 recency aggregator (`stale_by_recency`) — it's sound.
+- ✅ **It's the K-means topic clustering.** The contradiction pass (`consolidator.rs` Phase 2b) groups facts via `discover_topics` (K-means) and only judges pairs WITHIN a topic. K-means does NOT reliably put the conflicting Tesla/Rivian pair in the same group — knowledge-update pairs aren't near-duplicates (cosine < 0.92), so K-means happily splits them. **The verbose run showed the Tesla/Rivian pair was NEVER judged** (0 log mentions; the 6 judged pairs were all other facts). It's also unstable: the REPORT and the contradiction pass — same run, same facts — grouped differently.
+- This is the SAME "[[contradiction-gated-by-merge-threshold]]" failure recurring at the topic level. ADR-060's premise ("K-means topics co-locate the conflicting pair") is FALSE.
+
+### ▶️ A5 — THE FIX (do this next session)
+**Replace K-means grouping in contradiction detection with per-fact NEAREST-NEIGHBOR candidate pairs.** Contradiction detection is a similarity-search problem, not a partitioning problem — "for fact X, is there a more-recent fact about the same thing?"
+1. In `consolidator.rs` Phase 2b: instead of `discover_topics` → per-topic groups, for each active fact compute its **top-K cosine neighbors** (reuse the vector store / BGE embeddings) and union into an unordered candidate-pair set (bounded ~N·K/2, with a similarity floor).
+2. Feed those candidate pairs to the EXISTING `detect_pair_contradiction` (the Phi-4 pairwise judge — already works) and the EXISTING aggregator (`stale_by_recency` — already correct). Only the CANDIDATE-GENERATION step changes.
+3. **Spike status: ✅ PASSED + VALIDATED (`vault-consolidator/tests/nn_contradiction_spike.rs`, real BGE).** The (Tesla, Rivian) pair K-means dropped is the **single strongest edge in the neighbor graph: cosine 0.823** (next-highest pair only 0.634), and they are **MUTUAL #1 nearest neighbors** (rivian = tesla's #1 of 8, tesla = rivian's #1 of 8). Candidate set bounded (19 of 36 all-pairs at top-K=3). The weak distractor pairs (0.43–0.63, BGE-small noise) Phi-4 already rejects correctly. **A similarity floor ~0.7 cleanly isolates the real contradiction.** → Direction confirmed; promote the spike's per-fact top-K logic into `consolidator.rs` Phase 2b (add a `≥~0.7` floor + cap K), keep the spike as executable documentation.
+4. Bound cost: similarity floor + cap K (offline nightly run; O(N·K) Phi-4 calls).
+5. **Cleanup:** remove the temporary diagnostic `tracing::info!("pairwise contradiction verdict" …)` line added to `phases/contradiction.rs` this session (it was for the diagnosis only).
+6. K-means for the REPORT topic *display* (facts_by_topic) is a SEPARATE, lower-priority concern — it produced junk clusters (lumped normalization/job/dog with the cars) but it's display-only, not correctness. Defer; if improved, use threshold connected-components (the union-find we already have at 0.92, run lower) or HDBSCAN.
+
+### ✅ Read-side wins — files (committable independently of A5)
+- `crates/vault-embedding/src/reranker.rs` — `DOC_SUBJECT_FRAME` (ADR-064) + `format_prompt_with` + `testing`-gated `rerank_with_instruction` seam; `format_prompt` removed; pins `doc_subject_frame_is_pinned` + `rerank_frames_each_doc_with_the_subject`.
+- `crates/vault-retrieval/src/structured_read_pipeline.rs` — `RERANK_CANDIDATE_CAP = DEFAULT_MAX_CANDIDATES` (the cap fix) + updated `reranker_caps_at_rerank_candidate_cap` test.
+- `crates/vault-app/tests/read_no_keyword_overlap.rs` — NEW multi-fact regression (the cap-fix gate).
+- `crates/vault-embedding/tests/reranker_fun_diagnostic.rs` — the 3 measurement instruments (conformal / subject-prefix / framing sweep) + serde_json dev-dep.
+- `crates/vault-mcp/src/server.rs` — write-size observability log (`content_bytes`); `crates/vault-cli/src/main.rs` — EnvFilter adds `vault_mcp=info`.
+
+### Rough edges logged (not blocking)
+- **`memory_search` single-token short-circuit:** a marker-token query like `"C7UNI"` returns empty in ~0ms (BM25 leg finds no match → abstains before the semantic leg). The doc IS indexed (natural queries find it). Investigate the BM25 abstain/degenerate-guard path; affects single-token marker searches (workaround: natural-language queries).
+- **K-means topic cohesion:** junk clusters (display REPORT). Folds into the A5 clustering rework.
+
+### Commit state + disk
+- `main` HEAD = `2302842`. ALL session work UNCOMMITTED.
+- **Suggested commit split:** Commit A = read-side arc (Bug-2 ADR-064 + rerank-cap + regression + diagnostics + write-log) — green, self-contained, committable now. Commit B = the A5 nearest-neighbor rework (next arc). Plus the prior-uncommitted dedup (ADR-063) + A5 pairwise (ADR-062) + merge-resilience.
+- **Per-action approval for every commit + push** ([[feedback-confirm-before-commit-push]]).
+- **DISK:** did a full `cargo clean` at session end (target/ had ballooned to 136 GB across the day's rebuilds; disk hit 3 GB free). Next session's first build is a ~30–40 min from-scratch rebuild. Watch disk; clear `target/debug/incremental` for cheap regenerable space.
+
+### Memories to load next session
+[[contradiction-gated-by-merge-threshold]] · [[project-reranker-subjectless-facts-framing]] · [[bge-small-cannot-separate-relevant]] · [[correctness-is-the-product]] · [[no-sub-7b-models-for-synthesis]] · [[source-read-call-graph-upstream-of-empirical]] · [[reference-mcp-dogfood-log-is-ground-truth]] · [[dev-vault-is-throwaway-test-data]] · [[feedback-confirm-before-commit-push]] · [[confirm-before-cargo-build-and-check-disk]]
+
+---
+
+## 🟩🟩 NEXT SESSION OPENER (2026-06-01) — **[HISTORICAL — superseded by the 🟥 2026-06-01-late opener above. Bug 2 still fixed; but A5 turned out structurally broken in the live dogfood, and a rerank-cap bug was found + fixed.]** Bug 1 (A5 polarity) + Bug 2 (read over-abstention) BOTH FIXED. — READ THIS FIRST
+
+> Prior session (2026-05-31) found two critical bugs in the clean-vault dogfood. **This session FIXED BOTH and proved them green.** Bug 1 (A5 polarity) fixed by recency-based stale selection. Bug 2 (read over-abstention) — we FALSIFIED the handoff's "reranker floor too high" hypothesis with a measurement, found the REAL cause (the reranker mis-scores subject-LESS facts), and fixed it read-side with a measured framing change (ADR-064). Read this whole block before touching anything. The 2026-05-31 opener further down is now HISTORICAL.
+>
+> **⚠️ The conformal-calibration plan in the OLD step-1 below is SUPERSEDED — do NOT pursue it for Bug 2.** The measurement proved floor 0 is correct (it separates the A7 set cleanly once facts carry a subject); the bug was phrasing, not the threshold. The conformal harness stays in the tree as a measurement instrument and is still the right tool *if* score-drift ever reappears, but it is NOT the Bug-2 fix. See the "✅ BUG 2 FIXED" block for what actually happened.
+
+### TL;DR — where we are
+- ✅ **Bug 1 (A5 contradiction POLARITY INVERSION) — FIXED.** The consolidator no longer trusts Phi-4's `stale` label; **code now picks the stale fact deterministically by recency (older `valid_from` = stale, "newest-wins")**, with a tie → abstain. Inversion is now structurally impossible. Pinned by a Tesla→Rivian regression test that reproduces the exact dogfood bug.
+- ✅ **Two stale dedup tests fixed** (`merge_acceptance` + `properties` idempotency) — they assumed the near-identical "standup" pair would be LLM-*merged*, but dedup (ADR-063) now collapses it *before* merge, so they correctly assert `memories_deduped > 0`.
+- ✅ **ALL GATES GREEN on Windows (2026-06-01):** `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` — all pass (full from-scratch rebuild after a `cargo clean`).
+- ✅ **Bug 2 (read OVER-ABSTENTION / A7) — FIXED + regression GREEN.** Root cause was NOT the floor. A measurement falsified that: on the labelled A7 fixture the reranker at floor 0 already separates relevant (all +0.57…+8.65) from guards (all −7.36…−1.38) cleanly. The live failure was specific to the cello fact — a subject-LESS fragment ("Plays the cello…") that the reranker reads as not-about-the-user and rejects even for near-literal queries. **Fix (ADR-064): read-side subject framing — prepend `"The user — "` to every candidate before the reranker scores it.** Measured winner of an A/B sweep (8/8 relevant clear floor incl. cello, 0 guard leaks, widest gap +1.69). `read_no_keyword_overlap` regression GREEN through the real BGE+reranker stack (cello surfaces for "for fun"; blood-type still abstains).
+- ⚠️ **NOTHING is committed.** All Bug-1 + Bug-2 + dedup + A5 + test-fix work is in the working tree. Commit needs Shahbaz approval + a clean A5 re-dogfood (see Commit Plan below).
+
+### ✅ DONE this session — details + files
+
+**Bug 1 — A5 polarity inversion (the V0.2 ship-gate blocker).**
+- Root cause CONFIRMED (not a comparison bug): `phases/contradiction.rs::detect_contradictions_pairwise` mapped the model's `stale` side label straight to an id (`StaleSide::A => a.id`). On the polluted Tesla/Rivian topic Phi-4 labelled the *newer* Rivian stale and the code obeyed → vault served the stale Tesla as current truth.
+- Fix: new pure fn `stale_by_recency(a, b)` — older `valid_from` is stale; `None` on a tie. The aggregator calls it AFTER the contradiction + shared-attribute gates; the model's `stale` label no longer drives retirement. Tie (identical `valid_from`) → WARN + abstain (keep both — Shahbaz's locked decision: never confidently serve the wrong one).
+- Files: `crates/vault-consolidator/src/phases/contradiction.rs` (fn + aggregator + doc comments + tests). Tests added/updated: `aggregator_retires_older_fact_even_when_model_mislabels_newer_as_stale` (THE regression), `aggregator_abstains_on_contradiction_with_tied_valid_from`, `aggregator_recency_keeps_only_the_newest_in_a_conflict_chain`, plus the existing aggregator tests re-pinned to explicit dates. Integration `tests/contradiction_resolution.rs` comments corrected; assertions unchanged + still green.
+
+**Stale dedup test fixes** (same root: ADR-063 dedup runs BEFORE the LLM merge step, so the near-identical "standup" pair is deduped, not merged):
+- `crates/vault-consolidator/tests/merge_acceptance.rs::summary_markdown_is_non_empty_and_contains_required_sections` → now asserts `memories_deduped > 0`.
+- `crates/vault-consolidator/tests/properties.rs::consolidation_is_idempotent` → run 1 asserts `memories_deduped > 0`; run 2 also asserts `memories_deduped == 0` (idempotency on the dedup dimension). `no_memory_is_ever_lost` already passed under dedup (no change needed).
+
+**Bug 2 — wiring fix (correct + necessary, KEEP — rode in earlier this session):**
+- `crates/vault-app/src/application.rs`: the `StructuredReadPipeline` is now built from the **raw `hybrid`** retriever, NOT the BM25 `AbstainingRetriever`. The keyword abstain gate is now `memory_search`-only. The reranker owns read abstention.
+- `crates/vault-retrieval/src/structured_read_pipeline.rs`: corrected the false "BM25 gate stays vestigial" comment.
+
+### ✅ BUG 2 FIXED (2026-06-01, later) — read-side subject framing (ADR-064)
+
+**What it was, really.** NOT a threshold problem. Three measurements (all via `reranker_fun_diagnostic.rs`, single model, `--ignored --nocapture`):
+1. **Conformal calibration over the A7 fixture** → relevant logits all POSITIVE (+0.57…+8.65), guard logits all NEGATIVE (−7.36…−1.38). Clean +1.95 gap. **Floor 0 already separates the A7 set perfectly (6/6 recall, 0 leak).** This FALSIFIED the handoff's "reranker floor too high for prose facts" hypothesis — that table tested only ONE doc (the cello fact), an outlier.
+2. **Subject-prefix diagnostic** → the cello fact's problem is the missing subject. ADD "The user" to the cello fact: for-fun −4.46→+1.75, music −5.21→+1.58 (both cross the floor). STRIP "The user" from known-good A7 facts: every one drops (Δ −1.3…−3.6). The reranker's instruction matches "a question about a USER to a personal fact"; a subject-less fragment doesn't read as about-the-user, so it's rejected even near-literally.
+3. **A/B framing sweep** (full A7 + cello, under floor 0): **Variant A1 — frame the doc as `"The user — {fact}"` — WINS:** 8/8 relevant clear the floor (cello for-fun +3.23, music +2.08), 0 guard leaks (cello no-signal blood-type stays −6.86), widest gap +1.69. Beat `"The user: "` (fragile +0.18 cello/music), `"About the user: "` (broke 2 cases), and BOTH instruction-hint variants (Variant B) which actually **leaked a guard** — measuring saved us from shipping B.
+
+**The fix (read-side, robust to uncontrolled stored prose, no new model, floor unchanged at 0):**
+- `crates/vault-embedding/src/reranker.rs`: new `const DOC_SUBJECT_FRAME = "The user — "`; the production `RerankProvider::rerank` prepends it to every candidate before scoring. The instruction is now parameterised (`format_prompt_with`) and a `testing`-gated `rerank_with_instruction` seam lets the sweep measure variants without touching the production path. Old dead `format_prompt` removed; unit tests `doc_subject_frame_is_pinned` + `rerank_frames_each_doc_with_the_subject` pin the fix.
+- `crates/vault-embedding/tests/reranker_fun_diagnostic.rs`: the 3 measurement instruments (conformal calibration, subject-prefix, framing sweep), all `#[ignore]`. Added `serde_json` dev-dep to parse the A7 fixture.
+- **Regression GREEN:** `crates/vault-app/tests/read_no_keyword_overlap.rs::no_keyword_overlap_read_surfaces_fact_and_still_abstains_on_no_signal` passes through the REAL BGE + reranker stack (cello surfaces for "for fun"; blood-type abstains). DoD gates all green (fmt / clippy `--workspace --all-targets -D warnings` / build `--workspace` / `-p vault-embedding` + `-p vault-app` regression).
+
+### 🟥 [HISTORICAL — see "✅ BUG 2 FIXED" above; this hypothesis was FALSIFIED] Bug 2 — THE PROBLEM, in full
+
+**Symptom (live dogfood 2026-05-31):** answerable, loosely-phrased reads abstain. `"what hobby does the user have?"` returns the cello fact, but `"what does the user do for fun?"` (no shared keywords with "plays the cello in a community orchestra") returns `abstain: true`. A vault that says "I don't know" about facts it holds is broken for the agent-read workload ([[correctness-is-the-product]]).
+
+**Handoff hypothesis (FALSIFIED this session):** "the BM25 abstain gate runs upstream of the reranker; remove it and the reranker will surface the fact." We removed it. The read STILL abstains.
+
+**Actual root cause (measured 2026-06-01):** the production reranker (`Qwen3RerankerProvider`, v4 instruction, floor = **logit 0**) scores our prose facts BELOW the floor for these conversational questions. It RANKS correctly (relevant questions score least-negative, no-signal most-negative) but the **absolute cut-off (0) is too high** for conversational→prose-fact leaps — so everything abstains.
+
+### 🔬 THE DECISIVE MEASUREMENT (re-run any time — see instrument below)
+
+Production reranker scoring the doc `"Plays the cello in a community orchestra on Sunday afternoons."` (floor = logit 0; ≥0 = surfaces):
+
+| Query | logit | result |
+|---|---|---|
+| "what does the user enjoy in their spare time?" | −2.17 | abstain |
+| "what hobby does the user have?" | −2.57 | abstain |
+| "what does the user do for fun?" | −4.46 | abstain |
+| "what does the user do to relax?" | −4.68 | abstain |
+| "what music does the user play?" | **−5.21** | abstain |
+| "what is the user's blood type?" (no-signal) | −6.57 | abstain |
+
+**Read this carefully:** even `"what music does the user play?"` → `"plays the cello"` (near-literal) scores −5.21. That is a RED FLAG that the 0.6B reranker may have a real *ceiling* for pure-meaning matching, not just an instruction-wording problem. BUT note the apparent contradiction: in the 2026-05-29 dogfood the reranker DID surface a hobby for a "fun"-ish query ("outdoors for fun on weekends" → hiking). Difference = lexical/semantic anchor + doc phrasing. **So we MEASURE, we don't assume.**
+
+### 🧭 THE DECISION FRAMING (locked context: storage = uncontrolled LLM prose)
+
+The agent saves whatever it wants — a full sentence, a paragraph, several facts mushed together. We do NOT control the wording. So **the fix must live on the READ side (robust to whatever prose got stored), not the write side.** Write-side canonical phrasing was considered and DROPPED (can't guarantee clean input; a paragraph can't be canonicalized to one tidy fact without loss).
+
+### 🔬 RESEARCH DONE (2026-06-01) — the controllable-algorithm answer (2 parallel research threads, STRONG convergence)
+
+Shahbaz's question: *"can we use an ALGORITHM we control, instead of swapping in another model?"* → **YES, and it's the right move.** Both threads converged on the same root cause + fix:
+
+- **Root cause (textbook):** an ABSOLUTE, global threshold on a reranker/cosine score is *structurally* wrong — those scores are only meaningful **relative to each query** (Elastic et al.: "dense scores only make sense in the context of the specific query"). Our cosine-floor + reranker-floor failures and the whole "fix-one-break-another" history are the documented symptom. **The model RANKS fine; the fixed cut-off is the bug.**
+- **THE FIX (controllable, deterministic, local, tiny-data, ONE knob): split-CONFORMAL calibration of the reranker threshold.** Don't *guess* the cut-off — *measure* it from our own labelled A7 examples: run the reranker on each (query, known-relevant fact), take a quantile of those scores as the threshold τ (replacing the guessed `RERANK_RELEVANCE_FLOOR = 0.0`). One plain-English knob **α = accepted miss-rate** (lower α = surface more eagerly; matches our locked recall>precision stance). ~20 lines of pure Rust, **computed OFFLINE → zero read-time cost** (decisive: reads are already ~12s), **works with a single candidate** (τ is external to the candidate set — unlike top1−top2 gap methods, which break on our exact one-memory cello case), no new deps. It is THE small-data abstention method — honest even at n=8–25 and it tightens as the fixture grows.
+- **Alternative considered + rejected for us: per-query "irrelevant-anchor noise floor"** (each read, score the query against ~5–8 known-irrelevant facts; surface only candidates that clearly beat that floor). Equally controllable + per-query-adaptive, BUT it costs N extra reranker passes PER READ (~0.39s each, on top of an already-slow read). Conformal precomputes the same per-query awareness OFFLINE → conformal wins on our latency reality. Keep anchor-probe as a possible diagnostic / future feature, not the gate.
+- **The DESTINATION (once data grows past ~150 labelled cases): a tiny learned COMBINER we fully own** — logistic regression over `[reranker_logit, bge_cosine, bm25, score-gap]`, interpretable weights, pure-Rust dot-product+sigmoid inference, retrainable. It OVERFITS at today's n=8–25 (don't start here). Build the feature-extraction plumbing NOW so the decision head can evolve conformal → combiner with no churn.
+- **SCALE-READINESS — agreed with Shahbaz 2026-06-01 (build NOW, don't wait):** production fills FAST (one Claude Code session = lots of memories), and MORE stored memories means MORE distractors per read → the gate gets harder, sooner. So build for the graduation now. **Critical distinction:** the combiner (and conformal) train on LABELLED relevance judgments (query → which fact is relevant / which are guards / abstain), NOT on raw stored memories — so a fast-filling vault does NOT auto-produce training data. The readiness levers are therefore: (a) **make the relevance gate PLUGGABLE** (a `RelevanceGate` abstraction: `Conformal` now → `Combiner` later = a one-line swap, not a rewrite); (b) **CAPTURE labelled data in production** (log per-read features + the decision, ideally a lightweight "was this right?" signal) so "fills fast" becomes combiner FUEL; (c) flip to the combiner only when we have ~150+ REAL captured labels, trained + validated. Do NOT train/activate the combiner on the tiny hand-labelled fixture (overfits → confident-but-wrong, worse than honest conformal).
+- **Rejected as the gate:** Platt/temperature scaling (monotonic global rescale — fixes offset but NOT per-query drift; weaker than conformal at equal data cost; keep only for a cosmetic `confidence` field). Industry reality check: LlamaIndex / Mem0 / Elastic all default to an absolute similarity cutoff — the exact brittle thing we proved fails — so conformal puts us *ahead* of the default, locally, with no LLM in the read path. Full sources in the session transcript; see [[count-vs-score-filters-in-retrieval]] + [[fix-one-break-another-signals-structural]] (this is the structural fix those memories pointed at).
+
+### ▶️ WHAT TO DO NEXT SESSION (in order)
+
+1. **FIRST EXPERIMENT — conformal-calibrate the reranker threshold (the controllable algorithm; ~1 day, no new deps).** Offline: for each A7 fixture case run the production reranker on (query, expected-surface fact), collect the logits; set τ = the `⌈(n+1)(1−α)⌉/n` quantile of `−logit` for α ∈ {0.05, 0.10, 0.20}. Replace `RERANK_RELEVANCE_FLOOR = 0.0` (`crates/vault-embedding/src/reranker.rs`) with the derived τ. **Validate leave-one-out on the fixture:** per held-out case, recall (expected fact clears τ) + guard-leakage (any must-exclude clears τ). Pick the lowest α (most recall-aggressive) with **zero guard-leakage**. Extend `reranker_fun_diagnostic.rs` (it already prints the logits you need) into the calibration harness.
+2. **Build the feature-extraction plumbing** (`[reranker_logit, bge_cosine, bm25, score-gap]` per candidate) alongside step 1 — the shared substrate for both conformal and the future combiner; no rework later.
+3. **(SCALE-READINESS) Make the relevance gate PLUGGABLE.** Introduce a small `RelevanceGate` abstraction (trait/enum) with `Conformal` as the active impl now and a `Combiner` slot for later. The point: graduating to the learned combiner becomes a ~one-line swap of the decision head, not a read-pipeline rewrite. Cheap to build now, expensive to retrofit later.
+4. **(SCALE-READINESS) Capture labelled relevance data in production.** Production fills fast, but raw memories are NOT training labels — the combiner needs (query → relevant/guard/abstain) judgments. Add a lightweight capture path: log each read's features (`[reranker_logit, bge_cosine, bm25, score-gap]`) + the gate decision, with room for a "was this right?" signal. THIS is what turns the fast-filling vault into combiner FUEL. Keep it simple (a log/table); do NOT over-build a feedback UI for V0.2.
+5. **Make the Bug-2 regression test green:** with the calibrated τ, `crates/vault-app/tests/read_no_keyword_overlap.rs` should now surface "for fun"→cello AND still abstain on no-signal "blood type" (A6 guard). Re-measure on `read_quality_eval.rs` (real A7 fixture) — MUST NOT regress A6 or introduce false-answers.
+6. **ONLY IF conformal can't separate on the fixture** (good answers + guards still interleave even with a data-derived τ → the reranker genuinely can't tell them apart): THEN consider (a) a sharper "v5" reranker instruction (re-measure via the diagnostic against a subject-bearing doc too), or (b) a stronger local reranker (Apache/MIT, ONNX-able) via a model search — a bigger joint decision, surfaced with measured data, NOT a blind swap. ([[project-reranker-qwen3-solves-model-fit]], [[bge-small-cannot-separate-relevant]])
+7. **Grow the A7 fixture + flip to the COMBINER when ready.** Keep adding query/fact/guard cases (conformal's honesty scales with it). Once we have **~150+ real, production-captured labels** (from step 4), train the tiny logistic combiner on REAL data, validate leave-one-query-out (recall + zero guard-leakage), and swap it in via the pluggable gate (step 3). Do NOT train the combiner on the tiny hand-labelled fixture — it overfits.
+
+> NOTE: the Bug-2 regression test (`read_no_keyword_overlap.rs`) is currently RED by design (failing-first; `#[ignore]`d so it does NOT break the normal gates: `cargo test -p vault-app --test read_no_keyword_overlap -- --ignored`). It must go green before Bug 2 is "done."
+
+### 🧰 Instruments left in the tree (re-measure fast)
+- `crates/vault-embedding/tests/reranker_fun_diagnostic.rs` — **NEW**, `#[ignore]`. Prints the production-reranker logit for a doc vs a spread of queries + the floor. ~1 min. This is how you measure any reranker change. Edit the `doc`/`queries` to test new phrasings.
+- `crates/vault-app/tests/read_no_keyword_overlap.rs` — **NEW**, `#[ignore]`. The Bug-2 end-to-end regression (BGE + reranker through the real read stack).
+- `crates/vault-app/tests/read_quality_eval.rs` — the existing A7 calibration harness (real BGE; characterization, not a gate). Use for floor re-calibration.
+
+### 🌳 Tree / commit state + COMMIT PLAN
+- `main` HEAD = `2302842` (the two small fixes, CI green — verified this session).
+- **Uncommitted (ALL gate-green now):** the prior dedup (ADR-063) + A5 pairwise (ADR-062) + merge-resilience work, PLUS this session's Bug-1 recency fix, the 2 stale-test fixes, the Bug-2 wiring change, **and the Bug-2 read-side framing fix (ADR-064) + its 3 `#[ignore]` measurement instruments + the green `read_no_keyword_overlap` regression.**
+- **Recommended commit plan — SPLIT the arc (they're independent layers):**
+  - **Commit A (ready after a clean A5 re-dogfood):** dedup (ADR-063) + A5 recency fix (Bug 1) + merge resilience + the 2 stale-test fixes. This is the consolidator / write-side arc; it's green and self-contained.
+  - **Commit B (READY):** Bug 2 read-side framing fix (ADR-064 — `reranker.rs` `DOC_SUBJECT_FRAME` + `format_prompt_with`/`rerank_with_instruction` seam) + the `read_no_keyword_overlap` regression (GREEN) + the 3 diagnostics + the `serde_json` dev-dep + the Bug-2 wiring change (`application.rs` raw-hybrid + `structured_read_pipeline.rs` comment). This is the retrieval/read side; self-contained and green.
+  - **Note:** the Bug-2 *wiring* change rides with Commit B (its natural home — same read-side arc). Earlier "ride with A?" open question resolved: B.
+- **Before Commit A:** wipe the dev vault and re-run the §7 A5 dogfood (Tesla→Rivian: read "what does the user drive now?" must return ONLY Rivian; `include_archived` shows ONLY the older Tesla retired). The earlier A5 dogfood that found Bug 1 is now stale ([[dev-vault-is-throwaway-test-data]]).
+- **Per-action approval still required for every commit + push** ([[feedback-confirm-before-commit-push]]).
+
+### ⚠️ Environment note (disk)
+`target/` filled the disk this session (down to 0.3 GB free) and a full-workspace test link failed (LNK1318) purely from lack of space. Did a full `cargo clean` (reclaimed ~147 GB). From-scratch rebuilds are ~30–40 min on this machine (heavy native deps: llama-cpp, lance, datafusion, duckdb, aws-lc). Watch disk; clear `target/debug/incremental` + leftover `%TEMP%\.tmp*` dirs for cheap regenerable space before nuking the whole cache.
+
+### Memories to load next session
+[[correctness-is-the-product]] · [[bge-small-cannot-separate-relevant]] · [[project-reranker-qwen3-solves-model-fit]] · [[no-sub-7b-models-for-synthesis]] · [[anchor-on-measured-not-projected]] · [[count-vs-score-filters-in-retrieval]] · [[fix-one-break-another-signals-structural]] · [[reference-mcp-dogfood-log-is-ground-truth]] · [[dev-vault-is-throwaway-test-data]] · [[feedback-confirm-before-commit-push]]
+
+---
+
+## 🟥🟥 NEXT SESSION OPENER (2026-05-31) — **[HISTORICAL — superseded by the 2026-06-01 opener above]** DOGFOOD DONE: dedup SHIPS, A5 + read BROKEN. Fix 2 critical bugs before any commit.
+
+**Nothing is committed this session beyond the two small fixes already on `main` (`2302842`).** The dedup + A5 + merge-resilience work is DoD-gate-green but **UNCOMMITTED** in the working tree, held because the live clean-vault dogfood surfaced **two critical correctness bugs**. Do NOT commit until both are fixed and re-dogfooded.
+
+### What this session did
+- **Shipped + pushed (`2302842`):** (1) degenerate/all-stopword `memory_search` → graceful empty result (was `-32603`); (2) settable `as_of` param on `memory_write` → seeds `valid_from`. ⚠️ **At session open, confirm `2302842` CI went green** (`gh run list --workflow=ci.yml -L 1`) — it was in-flight when we moved on.
+- **Built + DoD-green + dogfood-PROVEN (UNCOMMITTED): deterministic dedup (ADR-063).** `phases/dedup.rs` (two-axis near-identical gate **cos ≥ 0.93 AND containment ≥ 0.80**, golden-record survivor pick, all-pairs over-merge guard) + `StorageBackend::apply_dedup` (atomic supersede-losers + roll survivor aggregates, metadata-only/no re-embed, new `MemoryDeduped` audit event) + orchestrator dedup step **before** `decide_merge` + `clusters_deduped`/`memories_deduped`/`clusters_skipped` in `ConsolidationReport` + CLI. **Thresholds calibrated from real BGE on a hand-labeled pair set** (`tests/dedup_threshold_calibration.rs`, run 2026-05-31 — near-identical cos floor 0.962 vs next-class ceiling 0.883; containment floor 0.889 vs 0.556). Decision (locked with Shahbaz on the calibration data): ship **dedup-core only**; the LLM-classifier complementary-merge band is DEFERRED (the data showed nothing reaches the 0.92 cluster gate except near-identical, and contradictions are already handled by the A5 topic pass). 21 dedup unit tests + 4 `apply_dedup` storage tests green; `merge_resilience.rs` rewritten (constant-vector mock embedder → platform-independent, asserts the new skip counter); new `dedup_integration.rs` (real-BGE end-to-end, proves dedup fires with zero LLM calls).
+- **Ran the §7 clean-vault dogfood:** wiped vault → Claude Desktop ran Part A + B-seed (with `as_of` on the A5 cars + a DEDUPDOG ×3 triplet) → Claude Code ran `vault-cli consolidate run` on real Phi-4 → Desktop ran B-verify. **§7 runbook updated** for dedup (B4), settable `as_of` (C11), stopword (C10), + a contamination guard (delete CAP_OK before consolidating).
+
+### ✅ What WORKS (dogfood-confirmed)
+- **Dedup (ADR-063): PASS.** DEDUPDOG ×3 → 1 canonical survivor + 2 superseded (reversible), **zero LLM calls, zero skips**; also collapsed the accidental C9NORM ×2 pair. Report: `clusters deduped: 2, memories deduped: 3, clusters skipped: 0`. **The structural overflow/skip class is gone.** This is the session's shippable win.
+- **Part A contract surface: all PASS** — C4 (content ceiling), C5 (`-32602` malformed-id), C6 (update→amber), C7 (unicode ﬁ ligature byte-identical), C8 (`-32001` AccessDenied), C9 (normalization determinism), **C10 (all-stopword search → empty, no `-32603`)**, **C11 (settable `as_of` accepted live)**, A6 (blood-type → abstain true-negative), I2 (delete removes from retrieval incl. archived).
+- **A5 precision at the DATA layer (B3): PASS** — PRECJOB / PRECHOBBY / PRECFOOD all stayed active (`valid_until: null`); no false-contradiction retirement of different-attribute facts (the "engineer vs hiking" false-positive class did NOT recur).
+
+### 🟥 TWO CRITICAL BUGS TO FIX NEXT SESSION (priority order)
+
+**BUG 1 — A5 contradiction POLARITY INVERSION (CRITICAL — V0.2 ship-gate blocker).**
+The consolidator retired the **WRONG side** of the Tesla→Rivian knowledge update: it invalidated the **newer** Rivian fact (`valid_from 2026-05-01`, `valid_until` set at consolidation `13:28:50`) and kept the **older** Tesla fact (`2026-02-01`, still active, ranks #1 in a normal search). **The vault now confidently serves the STALE fact ("the user drives a Tesla") as current truth** — the exact failure the whole product thesis exists to prevent. `as_of` seeded `valid_from` correctly (verified in storage), so the INPUT was right; the **resolution step chose the wrong fact to retire.** It also false-flagged the C9NORM survivor (`stale_count=2`, group of 6).
+- **Root-cause hypothesis:** the topic-contradiction pass lets **Phi-4-mini pick which id is stale** (`stale_memory_ids`); on a polluted 6-fact topic it picked the newer one + an unrelated extra. This is the over-flag precision risk flagged last session, now manifesting as an inversion.
+- **Fix direction (structural, classifier-not-writer — same principle as dedup):** Phi-4 should only *DETECT* the contradiction; **code retires the fact with the OLDER `valid_from` deterministically** (newest-wins). This makes inversion structurally impossible regardless of how Phi-4 labels the ids. **First step:** source-read `crates/vault-consolidator/src/phases/contradiction.rs` + the topic-contradiction loop in `consolidator.rs` to confirm it's "LLM-picks-stale" (vs an actual comparison bug), then make retirement recency-deterministic, test-first.
+
+**BUG 2 — read pipeline OVER-ABSTENTION / keyword-gating (CRITICAL — A7, the read-path correctness gap).**
+Loosely-phrased but answerable reads abstain. Claude Desktop's clean diagnostic: `"what hobby does the user have?"` / "play" / "orchestra" → returns PRECHOBBY (`abstain:false`); but `"what does the user do for fun?"` (zero lexical overlap with "plays the cello in a community orchestra") → `abstain:true`. Same for `"where does the user work?"`, `"what does the user drive now?"`, etc. — **purely-semantic matches with no keyword anchor get floored.** A memory vault that says "I don't know" about facts it holds is broken for the agent-read workload ([[correctness-is-the-product]]).
+- **Root-cause hypothesis:** `AbstainingRetriever` (`crates/vault-retrieval/src/strategies/abstain.rs`) gates on **top-1 BM25 (lexical) score < 1.0 → abstain**, and it runs UPSTREAM of the semantic channel + reranker. A no-lexical-overlap query → BM25 top-1 = 0 → abstains immediately; the reranker never gets to judge semantic relevance. (This is why "dog"→"dog" passed but "for fun"→cello did not.)
+- **Fix direction (measured):** make the abstain decision **semantic/reranker-aware**, not BM25-keyword-gated — e.g. let the reranker be the relevance/abstain authority, or also consider the semantic channel's top score. **Use the `read_quality_eval` harness to measure** and MUST NOT regress the true-negatives we want (A6 blood-type abstain). Files: `abstain.rs` + the `StructuredReadPipeline` wiring in `vault-app`.
+
+**(Secondary — feeds BUG 1) Topic clustering pollution.** K-means lumped 6 unrelated facts (the two cars + job + hobby + dog + C9NORM) into ONE mislabeled topic `"electric_vehicle_ownership"` (the dog fact landed in the car topic). The contradiction pass ran over this polluted group, amplifying BUG 1's mis-judgment. `crates/vault-consolidator/src/topics.rs`. Lower priority than 1 & 2 but related to BUG 1's root.
+  - **Root cause is k-means itself:** it is *forced* to fill a fixed number of groups, so unrelated facts get shoved together rather than left apart.
+  - **Candidate fix — switch to a density-based / no-forced-fit clustering algorithm:**
+    - **HDBSCAN / DBSCAN** (density-based) — finds *natural* clusters and **leaves outliers ungrouped** (the dog would NOT be forced into the car topic). Strongest candidate.
+    - Hierarchical/agglomerative + distance threshold — only groups items closer than a cutoff.
+    - Affinity propagation — infers the cluster count itself (no guessing "k").
+  - **Caution:** any clustering still runs on BGE-small embeddings, which we *measured* as unreliable at fine distinctions ([[bge-small-cannot-separate-relevant]]) — so calibrate/measure the new algorithm on a real labeled set (as we did for the dedup thresholds) before trusting it; a smarter algorithm on shaky inputs is not a guaranteed win.
+  - **Note:** BUG 1's recency-deterministic fix should make A5 robust to topic pollution on its own; this topic-clustering upgrade is a quality improvement that also cleans up the REPORT's topic labels (V1.0+ polish, not a ship-gate).
+
+### Tree / commit state
+- `main` HEAD = `2302842` (the 2 small fixes, pushed).
+- **Uncommitted (gate-green, HELD pending the 2 fixes):** dedup (ADR-063) + A5 pairwise (ADR-062) + merge resilience + this HANDOFF update + the updated §7 (`Memory Vault Tests.md`). Dedup is committable on its own merit but is entangled with the A5 work in `consolidator.rs`/`merge.rs`; **plan: commit dedup + the A5 fix together after a clean re-dogfood.**
+- **Vault state:** `testeval` holds the post-dogfood state (Rivian WRONGLY invalidated, Tesla active, DEDUPDOG deduped to 1). Throwaway ([[dev-vault-is-throwaway-test-data]]) — **wipe before the next dogfood.** Single-writer: fully quit Claude Desktop before any `consolidate run` (DuckDB is single-process RW). Teardown markers: A5CAR ×2, PRECJOB/HOBBY/FOOD, DEDUPDOG ×3 (1 active + 2 superseded), C6COLOR, C7UNI, C9NORM ×2.
+
+### Plan for next session (in order)
+1. Confirm `2302842` CI is green.
+2. **BUG 1 (A5 polarity):** source-read `contradiction.rs` → confirm root cause → make retirement recency-deterministic (test-first) → DoD gates.
+3. **BUG 2 (read over-abstention):** confirm root cause in `abstain.rs` → de-keyword-gate (reranker-aware abstain), measured on `read_quality_eval`, guard A6 → DoD gates.
+4. (Optional) topic-cohesion tightening (`topics.rs`).
+5. Wipe vault → re-run §7 dogfood (esp. B1 A5 + the A7/B3 reads) → if clean, **commit the whole arc** (dedup + A5 fix + merge resilience) with Shahbaz approval, then CI green.
+
+### Memories to load next session
+[[correctness-is-the-product]] · [[bge-small-cannot-separate-relevant]] · [[no-sub-7b-models-for-synthesis]] · [[reference-mcp-dogfood-log-is-ground-truth]] · [[as-of-write-time-blocks-a5-temporal]] · [[byte-equality-probe-before-non-determinism-hunt]] · [[anchor-on-measured-not-projected]] · [[source-read-call-graph-upstream-of-empirical]]
+
+---
+
+## 🎯🎯 NEXT SESSION OPENER (2026-05-30 late) — **[HISTORICAL — merge-gap = dedup ADR-063, BUILT this session 2026-05-31]** — PRIORITY #1: merge consolidation gap (RESEARCH → implement)
+
+**Do this first next session. Research the best solution BEFORE implementing — do not jump straight to code.**
+
+### The problem (surfaced live 2026-05-30)
+The consolidator's Phase-2 **merge** step can **skip** a near-duplicate cluster when the LLM merge response fails (e.g. truncated/oversized). This session we made the skip *safe* (resilience + token-budget fixes — see "Current in-flight state" below), so a skip no longer crashes the run and never loses or corrupts data. **But two real gaps remain about what happens to the skipped, still-un-consolidated data:**
+
+1. **Persistent skips never resolve.** Clustering re-runs nightly, so *transient* merge failures self-heal next cycle. But a *structural* failure (content genuinely too large to merge, e.g. the CAP_OK 50K probes) overflows identically every run → those near-duplicates sit un-merged **forever**. Pure retry can't fix a structural overflow.
+2. **Skips are log-only.** A skipped cluster emits a `WARN` but is **not counted or surfaced** in `ConsolidationReport` — so you can't see "N clusters never consolidate." Borderline silent.
+
+### What to research (NOT yet decided — find the best approach first)
+- **Deterministic dedup for near-identical clusters** (leading candidate): when members are near-identical (cosine ~1.0 — exactly the overflow case), **skip the LLM entirely** — keep the canonical member (longest / highest-confidence / newest) and `mark_superseded` the rest. No LLM call → nothing to truncate → the overflow class disappears. Reserve LLM-merge for genuinely *different-but-related* content. **Research:** where's the cosine cutoff between "deterministic dedup" and "needs LLM merge"? How do other memory/dedup systems split these? Risk of deterministic dedup discarding a better-phrased variant?
+- **Report/queue tracking of skipped clusters** — surface a count + ids in `ConsolidationReport` (cheap; closes the silent-skip gap). Possibly queue persistent skips like `conflicts_for_user_review` does.
+- **Dead-letter integration** — the CLI already has a `dead-letter` subsystem; could persistent merge-skips be dead-lettered for inspection/retry instead of only logged?
+
+**Approach:** research the options (web + codebase), pick the best, write an ADR, then implement with failing-first tests. This is correctness-of-stored-state — treat it like the A5 work: measured, not guessed. See [[correctness-is-the-product]] and [[spike-playbook-for-unknowns]].
+
+### ✅ RESEARCH DONE (2026-05-30 — 3 parallel agents: competitor scan + dedup-algorithm scan + codebase recon). Next session: write the ADR from this, then implement.
+
+**The convergent answer (all three tracks agree): make the small LLM a CLASSIFIER, not a WRITER, and dedup near-identical content deterministically (no LLM at all).** This kills the truncation/overflow class at the root — a label + an id is ~10 tokens and cannot truncate, no matter how large the memories.
+
+**Recommended design (4 parts):**
+1. **Deterministic dedup for near-identical clusters (no LLM).** When members are near-identical — high cosine AND high lexical overlap — pick a **canonical survivor** and `mark_superseded` the rest. Survivorship rule (data-fusion "golden record" standard): **newest `valid_from`/`created_at` → longest/most-complete text → highest confidence → most-accessed**, and **union the metadata + sum `access_count`** onto the survivor (honors BRD §5.6 line 947). The survivor is an EXISTING member — **no new merged row written, no re-embed** (simpler + cheaper than today's `apply_merge`). This is the Zep/Graphiti + Cognee + Mem0g consensus: on dup/update they keep a canonical record + flip a supersede/`valid_until` flag, never re-emit merged prose.
+2. **Two-axis routing (cosine is NOT enough — our own measured finding).** Add a cheap lexical axis (token **Jaccard / containment**) alongside cosine: `cos ≥ ~0.92 AND high lexical overlap` → deterministic pick-one (the common case, no LLM); `cos ~0.82–0.92 AND LOW lexical overlap` → genuinely complementary → the ONLY case that earns an LLM call; disagreement on a value → supersede / contradiction (the A5 path, already shipped).
+3. **When the LLM IS needed (rare complementary merge): emit a structured delta/field, NEVER echo full text** — with a hard token cap + truncation-fallback (keep the longer original). Keeps the "LLM out of the heavy path" lock.
+4. **Clustering: keep union-find connected-components at the high cosine gate** (we already do this), add a **centroid-linkage per-group check** to block transitive over-merge (A~B~C drift). Stay **batch-nightly**. Calibrate the 0.92 / near-identical thresholds on a **hand-labeled BGE-small memory-pair set** — do NOT trust literature numbers (our BGE cosine is measurably unreliable; [[bge-small-cannot-separate-relevant]]).
+
+**Codebase fit (recon):**
+- `Cluster` (`phases/cluster.rs:88`) carries **only member ids** — pairwise cosines are computed in `collect_edges_for_memory` then **discarded** (`cluster.rs:299-300`). To gate near-identical vs different, **extend `Cluster` to retain pairwise distances** (capture what's already computed) — cheapest slot.
+- Deterministic-dedup path slots into the orchestrator loop **before `decide_merge`** (`consolidator.rs:236`): hydrate members → compute/read pairwise cosine + lexical overlap → if near-identical, pick canonical → `storage.mark_superseded(loser, winner)` for the rest (winner = existing id; no `write_memory`, no re-embed). Else fall through to the existing LLM `decide_merge`.
+- Constraints to honor: supersede-not-delete (BRD §5.6 line 948), Σ access_count + max confidence (line 947), `mark_superseded` is metadata-only (ADR-046).
+- **Phase 2b contradiction (the just-shipped A5 work) is fully independent** of the merge flow — this redesign does NOT touch `contradiction.rs`/`topics.rs`. Confirmed by recon.
+
+**Key external references:** Zep/Graphiti 3-tier dedup (exact→MinHash/Jaccard→LLM, invalidate-not-rewrite) `arxiv 2501.13956`; Mem0 ADD/UPDATE/DELETE/NOOP classifier `arxiv 2504.19413`; data-fusion "golden record" survivorship (Bleiholder & Naumann, ACM CSUR); SemDeDup/SemHash cosine sweep bands; Letta proposed dup gate `cosine > 0.9` (next to our 0.92 — our gate is already industry-sane). Full citations in the session transcript / to be carried into the ADR.
+
+### Current in-flight state (this session — code is GATE-GREEN but NOT committed)
+- **A5 contradiction precision — pairwise rewrite (ADR-062, iter 1 + 2) is in the working tree.** Pairwise judging + few-shot prompt + **index-return (`stale: "a"/"b"/"neither"`, no UUID echo)** + **`shared_attribute` precision gate**. Earlier live run (pre-contamination): **0 false positives, 0 parse failures** vs the prior N-ary run. Unit + integration tests green.
+- **Merge resilience + token-budget fixes** (which spawned this opener): Phase-2 loop logs-and-skips a failed cluster instead of aborting the whole run; merge `max_tokens` 256 → 1024. New test `tests/merge_resilience.rs`. **Live-proven 2026-05-30:** the CAP_OK giant cluster overflowed even 1024 tokens and **skipped gracefully — run completed (exit 0)** where it previously crashed (exit 1). The resilience fix WORKS.
+- **All 4 DoD gates GREEN** (fmt / clippy `-D warnings` / build zero-warnings / test incl. `malformed_merge_response_does_not_abort_the_run`). **NOT committed, NOT CI-verified.** Commit needs Shahbaz per-action approval, gated on the clean A5 verify below.
+
+### 🟥 NEXT-SESSION TASKS — in order (start fresh here)
+
+**TASK 1 (close out this session): clean A5 end-to-end verify → then commit.**
+The 2026-05-30 retest was **CONTAMINATED and is NOT a valid A5 verdict.** Cause: Part-A's 3 giant `CAP_OK` probes were still in the vault and K-means **mis-clustered them into the same topic as the Tesla/Rivian facts** (`topic "Tesla_Rivian_Transition"` held all 3 CAP_OK + Tesla + Rivian). The contradiction pass reported `stale_count=3, group_size=5` — muddied; **cannot confirm which 3 were retired** because `generate_reports` **includes invalidated rows** (logged tech-debt) so the REPORT can't show `valid_until`. The clean PREC facts (separate topic) **all survived — precision held there** (no employment-vs-hobby false positive), which is the one solid A5 signal from the run.
+- **Do:** wipe vault ([[dev-vault-is-throwaway-test-data]]: delete `vault.db`/`lance/`/`graph.duckdb`/`reports/`, keep `models/`) → reopen Desktop → seed **ONLY** the 5 B-facts (Tesla, Rivian, PRECJOB, PRECHOBBY, PRECFOOD) — **NOT** Part A's CAP_OK/C6/C7/C9 → close Desktop → `vault-cli consolidate run` (real Phi-4) → reopen → B-verify: "what does the user drive now?" returns **only Rivian**; `include_archived` shows **only Tesla** retired (`valid_until` set); PREC all survive.
+- **If clean-green → COMMIT** the in-flight work (A5 pairwise ADR-062 + merge resilience/token + ADR updates + `Memory Vault Tests.md` §7 runbook) in ONE commit (per [[admin-changes-ride-with-code]]), Shahbaz-approved, then **CI green** ([[ci-green-per-commit-vault-code]]). Suggested msg: `T0.3.x A5 pairwise precision (ADR-062) + merge resilience/token-budget fixes`.
+
+**TASK 2 (Priority #1 project): merge consolidation gap — write ADR from the RESEARCH DONE block above, then implement** (deterministic dedup for near-identical clusters + classifier-not-writer + skip-tracking in the report). The "report includes invalidated rows" issue (which blocked TASK-1 verification) overlaps the report-tracking sub-item — fix together.
+
+**TASK 3 (lower priority — after 1 & 2):**
+
+### Lower-priority findings logged this session
+- **A7 over-abstention** (read path / reranker): `memory_read "what does the user do for fun?"` abstained despite the cello hobby present. **May be collateral** from the polluted tiny vault (giant CAP_OK blobs crowding BGE top-K) — **re-test on the clean vault first**; if it persists, fix via the `read_quality_eval` harness (measured), NOT a blind reranker-floor nudge (risks regressing A6/false-answers). Separate from A5/merge.
+- **`-32603` on all-stopword query**: `memory_search "the a is of and to"` returned an internal error instead of a graceful empty/abstain. Degenerate-query robustness; search path.
+- **Settable `as_of` on `memory_write`** (carried from prior session — Step 2): add an optional `as_of` param → `NewMemory.valid_from` (vault-core already accepts `valid_from: Option<DateTime>`), falling back to write-time when absent. Write-only (update keeps ADR-028 date-preservation). Decision locked 2026-05-30 (agent sets the date, layered on write-time as the safety net). See [[as-of-write-time-blocks-a5-temporal]].
+
+### Memories to load next session
+[[correctness-is-the-product]] · [[no-sub-7b-models-for-synthesis]] · [[dev-vault-is-throwaway-test-data]] · [[reference-mcp-dogfood-log-is-ground-truth]] · [[spike-playbook-for-unknowns]] · [[anchor-on-measured-not-projected]]
+
+---
+
+> **⚠️ The opener below is from the PRIOR session (A5 SHIPPED). The "Phi-4 precision" item it names as "next" was DONE this session (pairwise rewrite, ADR-062 — see the in-flight block above). `settable as_of` (Step 2) is still open.**
 
 ## 🎯 NEXT SESSION OPENER (2026-05-30 — **A5 SHIPPED ✅** · next: Phi-4 precision + settable `as_of`) — READ THIS FIRST
 
@@ -54,6 +387,16 @@ Ran `vault-cli consolidate run` on the live vault (real Phi-4, run `0a55c212…`
 **Context.** `find_candidate_clusters` panicked `no entry found for key` (`cluster.rs:294`) on the real `testeval` vault. Root cause: `mark_superseded`/`invalidate` update SQLite metadata only — the LanceDB vector lingers — so an NN search returns ids that `list_memories` (default filter) excludes. `union_find_components` then indexed a non-node id and panicked. This SQLite/Lance divergence is an EXPECTED steady-state after any merge/supersede/invalidate, so it crashed every real consolidation run with superseded data — independent of A5.
 
 **Decision.** Two layers: (a) in `find_candidate_clusters`, build a `member_ids` set and **drop NN edges to non-member ids** (normal divergence hygiene, count WARN-logged); (b) make `union_find`'s `find()` **defensive** — an id with no parent entry is its own root (loop simply doesn't run), so the disjoint-set primitive can never panic on input shape. Pinned by `union_find_treats_unknown_edge_endpoint_as_root`. (Forward note: physically GC-ing superseded vectors from LanceDB is the real cure — deferred; this makes clustering robust regardless.)
+
+### ADR-064 — Read-side subject framing for the reranker (Bug-2 over-abstention fix, 2026-06-01)
+
+**Status:** Accepted, fix in working tree (UNCOMMITTED), regression green through the real BGE+reranker stack, all DoD gates green.
+
+**Context.** The live clean-vault dogfood (2026-05-31) showed answerable reads abstaining: `"what does the user do for fun?"` returned `abstain:true` against a vault holding `"Plays the cello in a community orchestra on Sunday afternoons."`. The prior handoff hypothesised the cross-encoder reranker's floor (logit 0) was simply too high for conversational→prose-fact leaps and proposed split-conformal recalibration of the floor. **A measurement (conformal harness over the labelled A7 fixture) FALSIFIED that:** at floor 0 the reranker already separates the A7 relevant set (all logits +0.57…+8.65) from guards (all −7.36…−1.38) cleanly. The live failure was specific to the cello fact, whose distinguishing feature is the **missing subject** — a bare `"Plays the cello…"`. A subject-prefix diagnostic confirmed bidirectionally: adding `"The user"` lifts the cello above the floor (−4.46→+1.75); stripping it collapses known-good A7 facts. The reranker's task instruction matches *"a question about a **user** to a personal fact"*, so a subject-less fragment scores as not-about-the-user and is rejected even for near-literal queries. The agent stores **uncontrolled prose**, so subject-less facts are a permanent real-world input — the fix must be read-side, not write-side canonicalisation (which can't guarantee clean input; locked decision).
+
+**Decision.** Prepend a fixed subject frame — `DOC_SUBJECT_FRAME = "The user — "` — to every candidate document in the production `RerankProvider::rerank` path before scoring. The **relevance floor stays at 0** (it was never the problem). The reranker instruction is parameterised via `format_prompt_with(instruct, query, doc)`; production passes `QWEN3_RERANKER_INSTRUCT` + framed docs, and a `#[cfg(feature="testing")]` `rerank_with_instruction` seam scores raw docs so the framing sweep can measure variants without mutating the production path. The frame was the **measured winner of an A/B sweep** over the full A7 set + the live cello case (`reranker_fun_diagnostic.rs::framing_variant_sweep`): `"The user — "` gave 8/8 relevant above floor (cello for-fun +3.23, music +2.08), 0 guard leaks (no-signal blood-type −6.86), widest gap +1.69 — beating `"The user: "` (fragile), `"About the user: "` (broke 2 cases), and BOTH instruction-hint variants (which leaked a guard). Pinned by `doc_subject_frame_is_pinned` + `rerank_frames_each_doc_with_the_subject` unit tests and the real-model `read_no_keyword_overlap` regression.
+
+**Consequences / known limits.** (a) Double-subjecting facts that already say "The user…" is harmless — measured: those A7 facts stay comfortably above floor when framed (min relevant +1.19). (b) The frame is a single global string; a future re-sweep (e.g. after a reranker model swap) must re-break the pin consciously. (c) Conformal calibration is NOT used as the gate — it stays in the tree as a measurement instrument and remains the right tool if per-query score-drift ever reappears, but floor 0 + framing is the V0.2 fix. (d) The earlier ADR-057 cosine `RELEVANCE_COSINE_FLOOR` path is unaffected (reranker remains the relevance authority when wired).
 
 ---
 

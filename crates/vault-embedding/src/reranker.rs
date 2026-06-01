@@ -57,6 +57,21 @@ pub const QWEN3_RERANKER_INSTRUCT: &str =
 /// floor as the read relevance gate.
 pub const RERANK_RELEVANCE_FLOOR: f32 = 0.0;
 
+/// Subject frame prepended to every candidate document before the production
+/// reranker scores it (Bug-2 fix, 2026-06-01). The 0.6B reranker mis-scores
+/// subject-LESS stored facts: a bare "Plays the cello in a community orchestra"
+/// is read as not-about-the-user and rejected even for the near-literal "what
+/// music does the user play?" (logit −5.2). The agent stores uncontrolled prose,
+/// so the fix lives on the read side — prepend an explicit subject so floor 0
+/// separates subject-bearing AND subject-less facts. Measured winner of the
+/// A/B framing sweep (2026-06-01): "The user — " gave 8/8 relevant above floor,
+/// 0 guard leaks, the widest separation gap (+1.69 logits) — beating "The user:
+/// " (fragile +0.18 on cello/music), "About the user: " (broke 2 cases), and
+/// every instruction-only variant (which leaked a guard). Reproduce via
+/// `reranker_fun_diagnostic.rs::framing_variant_sweep`. A change here re-scores
+/// every read — re-break the [`doc_subject_frame_is_pinned`] test consciously.
+const DOC_SUBJECT_FRAME: &str = "The user — ";
+
 /// Per-document character cap applied BEFORE chat-template wrapping. Keeps the
 /// prompt's system prefix + assistant suffix intact (truncating the formatted
 /// string would corrupt the last-token-pooled seq-cls signal) and bounds
@@ -71,15 +86,19 @@ const QWEN_PAD_ID: i64 = 151643;
 const QWEN_PREFIX: &str = "<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be \"yes\" or \"no\".<|im_end|>\n<|im_start|>user\n";
 const QWEN_SUFFIX: &str = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
 
-/// Format one `(query, document)` pair into the reranker's chat-template
-/// prompt with the baked-in task instruction.
-fn format_prompt(query: &str, doc: &str) -> String {
+/// Format one `(instruct, query, document)` triple into the reranker's
+/// chat-template prompt. Production scores via [`RerankProvider::rerank`], which
+/// applies the [`DOC_SUBJECT_FRAME`] to `doc` and passes
+/// [`QWEN3_RERANKER_INSTRUCT`]; the `testing`-gated
+/// [`Qwen3RerankerProvider::rerank_with_instruction`] seam passes `doc` raw so
+/// the framing sweep can measure variants.
+fn format_prompt_with(instruct: &str, query: &str, doc: &str) -> String {
     let doc = if doc.chars().count() > DOC_CHAR_CAP {
         doc.chars().take(DOC_CHAR_CAP).collect()
     } else {
         doc.to_string()
     };
-    format!("{QWEN_PREFIX}<Instruct>: {QWEN3_RERANKER_INSTRUCT}\n<Query>: {query}\n<Document>: {doc}{QWEN_SUFFIX}")
+    format!("{QWEN_PREFIX}<Instruct>: {instruct}\n<Query>: {query}\n<Document>: {doc}{QWEN_SUFFIX}")
 }
 
 /// Abstract relevance reranker. Scores `(query, document)` relevance with a
@@ -158,12 +177,37 @@ impl Qwen3RerankerProvider {
             tokenizer: Arc::new(tokenizer),
         })
     }
-}
 
-#[async_trait]
-impl RerankProvider for Qwen3RerankerProvider {
-    #[tracing::instrument(level = "debug", skip(self, query, docs), fields(n_docs = docs.len()))]
-    async fn rerank(&self, query: &str, docs: &[String]) -> VaultResult<Vec<f32>> {
+    /// Test-only seam: rerank with a caller-supplied task instruction so the
+    /// Bug-2 framing sweep (2026-06-01) can measure instruction variants
+    /// without mutating the production path. Gated on the `testing` feature so
+    /// it never reaches the production surface. Production reranking goes through
+    /// the [`RerankProvider::rerank`] trait method (fixed
+    /// [`QWEN3_RERANKER_INSTRUCT`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`RerankProvider::rerank`].
+    #[cfg(feature = "testing")]
+    pub async fn rerank_with_instruction(
+        &self,
+        instruct: &str,
+        query: &str,
+        docs: &[String],
+    ) -> VaultResult<Vec<f32>> {
+        self.rerank_inner(instruct, query, docs).await
+    }
+
+    /// Core rerank: tokenise `(instruct, query, doc)` prompts, left-pad to a
+    /// uniform batch, run one forward pass, extract the seq-cls logit per row.
+    /// The production trait method delegates here with [`QWEN3_RERANKER_INSTRUCT`].
+    #[tracing::instrument(level = "debug", skip(self, instruct, query, docs), fields(n_docs = docs.len()))]
+    async fn rerank_inner(
+        &self,
+        instruct: &str,
+        query: &str,
+        docs: &[String],
+    ) -> VaultResult<Vec<f32>> {
         if docs.is_empty() {
             return Ok(Vec::new());
         }
@@ -172,7 +216,7 @@ impl RerankProvider for Qwen3RerankerProvider {
         // chat-template control tokens are explicit, so add_special_tokens=false.
         let mut rows: Vec<Vec<i64>> = Vec::with_capacity(docs.len());
         for doc in docs {
-            let prompt = format_prompt(query, doc);
+            let prompt = format_prompt_with(instruct, query, doc);
             let enc = self
                 .tokenizer
                 .encode(prompt.as_str(), false)
@@ -238,6 +282,22 @@ impl RerankProvider for Qwen3RerankerProvider {
         .await
         .map_err(|e| VaultError::Embedding(format!("spawn_blocking join: {e}")))?
     }
+}
+
+#[async_trait]
+impl RerankProvider for Qwen3RerankerProvider {
+    async fn rerank(&self, query: &str, docs: &[String]) -> VaultResult<Vec<f32>> {
+        // Bug-2 fix (2026-06-01): frame each candidate with an explicit subject
+        // before scoring so the reranker scores subject-less stored facts
+        // correctly. Measured winner of the A/B framing sweep — see
+        // [`DOC_SUBJECT_FRAME`].
+        let framed: Vec<String> = docs
+            .iter()
+            .map(|d| format!("{DOC_SUBJECT_FRAME}{d}"))
+            .collect();
+        self.rerank_inner(QWEN3_RERANKER_INSTRUCT, query, &framed)
+            .await
+    }
 
     fn relevance_floor(&self) -> f32 {
         RERANK_RELEVANCE_FLOOR
@@ -256,8 +316,37 @@ mod tests {
     }
 
     #[test]
+    fn doc_subject_frame_is_pinned() {
+        // Bug-2 fix (2026-06-01): the measured winning subject frame. Every
+        // production reranker score depends on it — re-break only after a
+        // re-sweep (reranker_fun_diagnostic.rs::framing_variant_sweep).
+        assert_eq!(DOC_SUBJECT_FRAME, "The user — ");
+    }
+
+    #[test]
+    fn rerank_frames_each_doc_with_the_subject() {
+        // The production gate: the trait `rerank` path prepends DOC_SUBJECT_FRAME
+        // to every candidate (the fix). We can't run the model here, but we pin
+        // the framing transform the path applies.
+        let docs = [
+            "Plays the cello.".to_string(),
+            "The user lives in Lisbon.".to_string(),
+        ];
+        let framed: Vec<String> = docs
+            .iter()
+            .map(|d| format!("{DOC_SUBJECT_FRAME}{d}"))
+            .collect();
+        assert_eq!(framed[0], "The user — Plays the cello.");
+        assert_eq!(framed[1], "The user — The user lives in Lisbon.");
+    }
+
+    #[test]
     fn format_prompt_embeds_instruction_query_and_document() {
-        let p = format_prompt("where does the user live?", "The user lives in Lisbon.");
+        let p = format_prompt_with(
+            QWEN3_RERANKER_INSTRUCT,
+            "where does the user live?",
+            "The user lives in Lisbon.",
+        );
         assert!(
             p.contains(QWEN3_RERANKER_INSTRUCT),
             "instruction must be present"
@@ -277,7 +366,7 @@ mod tests {
     #[test]
     fn format_prompt_caps_overlong_document_but_keeps_suffix() {
         let long = "x".repeat(DOC_CHAR_CAP + 500);
-        let p = format_prompt("q", &long);
+        let p = format_prompt_with(QWEN3_RERANKER_INSTRUCT, "q", &long);
         assert!(
             p.ends_with(QWEN_SUFFIX),
             "suffix MUST survive doc truncation"

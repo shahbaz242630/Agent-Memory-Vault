@@ -117,6 +117,24 @@ pub enum AuditEventType {
     ///
     /// [`StorageBackend::invalidate`]: crate::cascading::StorageBackend::invalidate
     MemoryInvalidated,
+
+    /// Recorded on the SURVIVOR of a deterministic dedup
+    /// ([`StorageBackend::apply_dedup`], consolidator Phase 2-pre per ADR-063).
+    /// Distinct from [`Self::MemorySuperseded`] (which fires on each LOSER) and
+    /// from [`Self::MemoryUpdate`] (user-driven content edits): a dedup roll-up
+    /// is a consolidator-driven aggregate bump (summed `access_count`, max
+    /// `confidence`) onto an existing canonical memory whose CONTENT is
+    /// unchanged — no re-embed. The audit viewer (T0.2.15) filters these
+    /// distinctly so a near-identical-dedup roll-up is never mistaken for a
+    /// content edit.
+    ///
+    /// `details_json` shape:
+    /// `{"absorbed":["<MemoryId>",...],"summed_access_count":<u32>,"max_confidence":<f32>}`
+    /// — the `resource_id` field carries the survivor MemoryId; `absorbed`
+    /// lists the superseded (loser) ids rolled into it.
+    ///
+    /// [`StorageBackend::apply_dedup`]: crate::cascading::StorageBackend::apply_dedup
+    MemoryDeduped,
 }
 
 impl AuditEventType {
@@ -137,6 +155,7 @@ impl AuditEventType {
             Self::TauriCommandInvoke => "ui.tauri_command_invoke",
             Self::MemorySuperseded => "memory.superseded",
             Self::MemoryInvalidated => "memory.invalidated",
+            Self::MemoryDeduped => "memory.deduped",
         }
     }
 
@@ -162,6 +181,7 @@ impl AuditEventType {
             "ui.tauri_command_invoke" => Some(Self::TauriCommandInvoke),
             "memory.superseded" => Some(Self::MemorySuperseded),
             "memory.invalidated" => Some(Self::MemoryInvalidated),
+            "memory.deduped" => Some(Self::MemoryDeduped),
             _ => None,
         }
     }
@@ -521,6 +541,7 @@ mod tests {
             AuditEventType::McpToolInvoke,
             AuditEventType::MemorySuperseded,
             AuditEventType::MemoryInvalidated,
+            AuditEventType::MemoryDeduped,
         ] {
             assert_eq!(AuditEventType::parse(et.as_str()), Some(et));
         }
@@ -537,6 +558,10 @@ mod tests {
             AuditEventType::MemorySuperseded.as_str(),
             "memory.superseded"
         );
+        // Pin the memory.deduped wire-format string per ADR-063 — load-bearing
+        // for the audit-viewer filter (distinguishes dedup roll-ups from
+        // user-driven memory.update edits and from memory.superseded losers).
+        assert_eq!(AuditEventType::MemoryDeduped.as_str(), "memory.deduped");
         // Confirm the old v1.2 retrieval wire-format string no longer
         // round-trips — T0.1.9 §6.2 rule 1 specifies non-backward-compat.
         assert_eq!(AuditEventType::parse("retrieval.query"), None);

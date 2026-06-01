@@ -238,8 +238,8 @@ async fn main() -> ExitCode {
 
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn,vault_cli=info"));
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("warn,vault_cli=info,vault_mcp=info"));
     // Write to STDERR, not STDOUT. The `mcp serve` subcommand reserves
     // STDOUT for the MCP JSON-RPC protocol stream — any byte written
     // there that isn't a valid JSON-RPC message corrupts the channel
@@ -609,9 +609,19 @@ fn print_consolidation_report(r: &ConsolidationReport) {
     println!("consolidation run complete.");
     println!("  memories processed   : {}", r.memories_processed);
     println!("  merges applied       : {}", r.memories_merged);
+    println!("  clusters deduped     : {}", r.clusters_deduped);
+    println!("  memories deduped     : {}", r.memories_deduped);
+    println!("  clusters skipped     : {}", r.clusters_skipped);
     println!("  contradictions queued: {}", r.contradictions_resolved);
     println!("  memories archived    : {}", r.memories_archived);
     println!("  duration             : {:.2}s", r.duration.as_secs_f64());
+    if r.clusters_skipped > 0 {
+        println!(
+            "  note: {} cluster(s) were skipped (a merge failed and was logged); \
+             they remain unmerged and the next run retries.",
+            r.clusters_skipped
+        );
+    }
     if !r.conflicts_for_user_review.is_empty() {
         println!();
         println!("contradictions surfaced for user review:");

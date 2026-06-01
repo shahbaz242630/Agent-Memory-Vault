@@ -317,6 +317,17 @@ impl StdioServer {
                 params.boundary
             )));
         }
+        // Write observability (C4 content-ceiling ground truth): record the size
+        // the CLIENT actually sent, at the MCP boundary — independent of any
+        // client-side display truncation, so a silently-shortened payload is
+        // visible in the server log. Size only; the content itself is never
+        // logged (privacy / zero-knowledge posture).
+        tracing::info!(
+            target: "vault_mcp::write",
+            content_bytes = params.content.len(),
+            content_chars = params.content.chars().count(),
+            "memory_write received"
+        );
         let memory_type = match params.memory_type.as_deref() {
             None | Some("semantic") => MemoryType::Semantic,
             Some("episodic") => MemoryType::Episodic,

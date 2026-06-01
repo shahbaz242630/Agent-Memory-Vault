@@ -1,9 +1,8 @@
-//! T0.3.x A5 — topic-level contradiction detection + auto-invalidation.
+//! T0.3.x A5 — nearest-neighbor contradiction detection + auto-invalidation.
 //!
-//! **Failing-first** (test discipline, CLAUDE.md §test) for the locked A5
-//! fix. The V0.2 ship-gate: when a newer fact contradicts an older one on
-//! the same subject, the nightly consolidator must detect it, `invalidate()`
-//! the stale fact, so reads return only the current truth.
+//! The V0.2 ship-gate: when a newer fact contradicts an older one on the same
+//! subject, the nightly consolidator must detect it, `invalidate()` the stale
+//! fact, so reads return only the current truth.
 //!
 //! ## What this pins (the bug, exactly)
 //!
@@ -16,11 +15,13 @@
 //! `consolidate run` → `contradictions queued: 0`, a `memory_read` returned
 //! BOTH Vega and Atlas).
 //!
-//! The fix decouples contradiction detection from the 0.92 merge gate by
-//! running it over the looser K-means **topic** grouping (which already
-//! co-locates the pair — verified live: both carried
-//! `topic: "professional_transitions"`). The 0.92 gate stays as-is for
-//! merging near-duplicates.
+//! The fix decouples contradiction detection from the 0.92 merge gate and
+//! generates candidate pairs by **nearest neighbor** (ADR-065): each fact's
+//! top-K closest cosine neighbors above a floor are judged pairwise. The
+//! conflicting pair are each other's nearest neighbor, so they are always
+//! surfaced — unlike K-means topic grouping (the prior ADR-060 design), which
+//! split the pair across groups and never judged it (proven in the §7 dogfood,
+//! 2026-06-01). The 0.92 gate stays as-is for merging near-duplicates.
 //!
 //! ## Fixture provenance
 //!
@@ -73,9 +74,11 @@ fn fact(content: &str, boundary: &Boundary, valid_from: DateTime<Utc>) -> Memory
 
 /// THE A5 ship-gate. Vega (older) + Atlas (newer) on one boundary, below the
 /// 0.92 merge gate. After consolidation the stale Vega fact MUST be
-/// invalidated and the current Atlas fact MUST stay valid.
+/// invalidated and the current Atlas fact MUST stay valid. The pair is
+/// surfaced by nearest-neighbor candidate generation (ADR-065), not K-means
+/// topic grouping.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn topic_level_contradiction_retires_stale_employment_fact() {
+async fn nearest_neighbor_contradiction_retires_stale_employment_fact() {
     let (storage, _dir) = open_sealed_storage_for_test("a5-contradiction-vega-atlas").await;
     let storage = Arc::new(storage);
     let embedder = open_bge_provider();
@@ -113,14 +116,15 @@ async fn topic_level_contradiction_retires_stale_employment_fact() {
 
     insert_and_drain(&storage, vec![(vega, vega_emb), (atlas, atlas_emb)]).await;
 
-    // Phi-4 stand-in: when handed the topic group, identify the older Vega
-    // fact as the stale one (superseded by Atlas). The contradiction pass in
-    // `run_consolidation` invalidates exactly the returned stale ids.
+    // Phi-4 stand-in (pairwise judge, ADR-062 iter 2): the Vega/Atlas group is
+    // a single pair → exactly one `complete_json` call. The model only DETECTS
+    // the contradiction (contradiction=true + shared_attribute); CODE then
+    // retires the OLDER fact by recency (the Bug-1 fix) — Vega (valid_from Jan)
+    // is older than Atlas (Apr), so Vega is invalidated regardless of the
+    // model's `stale` label.
     let llm = Arc::new(MockLlmProvider::new(
         "phi-4-mini-test",
-        format!(
-            r#"{{"stale_memory_ids":["{vega_id}"],"reasoning":"Atlas explicitly supersedes Vega; the user left Vega Bridgeworks"}}"#
-        ),
+        r#"{"shared_attribute":"employer","contradiction":true,"stale":"a","reasoning":"Atlas explicitly supersedes Vega; the user left Vega Bridgeworks"}"#,
     ));
 
     let consolidator = Consolidator::new(
@@ -167,11 +171,12 @@ async fn topic_level_contradiction_retires_stale_employment_fact() {
     );
 }
 
-/// Adversarial guard (the false-positive risk of looser topic grouping):
-/// two facts that share a topic but are NOT contradictory must both survive.
-/// "works at Atlas" + "commutes by train" are co-topical (employment) but
-/// compatible. Phi-4 returns `keep_separate`; the consolidator must NOT
-/// invalidate either. Guards against the looser grouping over-invalidating.
+/// Adversarial guard (the false-positive risk of looser candidate pairing):
+/// two related facts that are NOT contradictory must both survive. "works at
+/// Atlas" + "commutes by train" are co-topical (employment) but compatible. If
+/// they are close enough to become a candidate pair, Phi-4 returns
+/// `contradiction=false`; the consolidator must NOT invalidate either. Guards
+/// against the nearest-neighbor pairing over-invalidating.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn co_topical_but_compatible_facts_are_not_falsely_invalidated() {
     let (storage, _dir) = open_sealed_storage_for_test("a5-no-false-positive").await;
@@ -202,11 +207,12 @@ async fn co_topical_but_compatible_facts_are_not_falsely_invalidated() {
     )
     .await;
 
-    // Phi-4 stand-in: these are not in conflict — no stale facts. No
-    // invalidation expected.
+    // Phi-4 stand-in (pairwise judge, ADR-062 iter 2): the single pair is
+    // compatible (different attributes) — shared_attribute=null,
+    // contradiction=false, stale="neither". No invalidation expected.
     let llm = Arc::new(MockLlmProvider::new(
         "phi-4-mini-test",
-        r#"{"stale_memory_ids":[],"reasoning":"distinct compatible facts about the same person; no contradiction"}"#,
+        r#"{"shared_attribute":null,"contradiction":false,"stale":"neither","reasoning":"distinct compatible facts about the same person; no contradiction"}"#,
     ));
 
     let consolidator = Consolidator::new(
@@ -224,54 +230,18 @@ async fn co_topical_but_compatible_facts_are_not_falsely_invalidated() {
     assert_neither_invalidated(&storage, employer_id, commute_id).await;
 }
 
-/// Safety net: if the judge misbehaves and marks the ENTIRE group stale, the
-/// consolidator MUST refuse to mass-invalidate — at least one fact survives
-/// as the current truth. Pins that a runaway model can't wipe a whole topic.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn refuses_to_invalidate_entire_topic_group() {
-    let (storage, _dir) = open_sealed_storage_for_test("a5-mass-invalidate-guard").await;
-    let storage = Arc::new(storage);
-    let embedder = open_bge_provider();
-    let boundary = Boundary::new("testeval").expect("valid boundary");
-
-    let now = Utc::now();
-    let a = fact(
-        "As of 2026-01-10 the user worked at Vega Bridgeworks.",
-        &boundary,
-        now,
-    );
-    let b = fact(
-        "As of 2026-04-01 the user works at Atlas Structures, having left Vega Bridgeworks.",
-        &boundary,
-        now,
-    );
-    let a_id = a.id;
-    let b_id = b.id;
-    let a_emb = embedder.embed(&a.content).await.expect("embed");
-    let b_emb = embedder.embed(&b.content).await.expect("embed");
-    insert_and_drain(&storage, vec![(a, a_emb), (b, b_emb)]).await;
-
-    // Misbehaving judge marks BOTH facts stale. The guard MUST refuse so
-    // neither is invalidated.
-    let llm = Arc::new(MockLlmProvider::new(
-        "phi-4-mini-test",
-        format!(
-            r#"{{"stale_memory_ids":["{a_id}","{b_id}"],"reasoning":"runaway model marks everything stale"}}"#
-        ),
-    ));
-    let consolidator = Consolidator::new(
-        storage.clone(),
-        llm,
-        embedder.clone(),
-        ConsolidatorConfig::default(),
-    );
-    consolidator
-        .run_consolidation()
-        .await
-        .expect("consolidation run must succeed");
-
-    assert_neither_invalidated(&storage, a_id, b_id).await;
-}
+// Mass-invalidate safety net (a runaway model can't wipe the active set):
+// under pairwise judging (ADR-062) with recency-deterministic stale selection
+// (the Bug-1 fix), the globally-newest fact in a conflict chain is never
+// flagged (it is never the older side of any pair), so a run cannot sweep the
+// entire active set. The orchestrator's whole-set-refusal guard is therefore
+// belt-and-braces and is covered reliably at the unit layer:
+//   - `consolidator::tests::resolve_stale_*` (the orchestrator refuses a sweep,
+//     dedups, and ignores out-of-group ids), and
+//   - `phases::contradiction::tests::aggregator_recency_keeps_only_the_newest_in_a_conflict_chain`
+//     (recency retires the older members and keeps the newest).
+// The two end-to-end tests above still exercise the orchestrator's
+// `resolve_stale_ids` wiring through its Invalidate and Nothing branches.
 
 async fn assert_neither_invalidated(storage: &StorageBackend, a: MemoryId, b: MemoryId) {
     let all = storage

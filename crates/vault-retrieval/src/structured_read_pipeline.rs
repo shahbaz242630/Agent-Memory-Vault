@@ -91,12 +91,24 @@ pub const DEFAULT_MAX_CANDIDATES: usize = 20;
 /// worst failure). See ADR-057 over-abstain amendment.
 const RELEVANCE_GATE_TOP_K: usize = 1;
 
-/// Number of top retrieved candidates handed to the cross-encoder reranker
-/// (ADR-057 amendment, 2026-05-29). **8** — recall-first (Shahbaz's call): the
-/// reranker re-scores BGE's 8 best candidates so a real-but-lower-ranked memory
-/// still gets a chance, at ~0.39s/candidate CPU (≈3s top-8; sub-second GPU).
-/// Candidates beyond the cap are dropped (BGE already ranked them lowest).
-const RERANK_CANDIDATE_CAP: usize = 8;
+/// Number of top retrieved candidates handed to the cross-encoder reranker.
+/// **Rerank the FULL retrieved pool** (= [`DEFAULT_MAX_CANDIDATES`]), not a
+/// smaller slice.
+///
+/// History: ADR-057 amendment (2026-05-29) capped this at **8** as a latency
+/// compromise. The §7 live dogfood (2026-06-01) proved that wrong on a
+/// populated vault: with 13 facts seeded, a subject-less hobby fact
+/// ("Plays the cello…") was retrieved by BGE at a rank BELOW 8 for a
+/// loosely-phrased query ("what does the user do for fun?"), so it was
+/// truncated away BEFORE the reranker could score it — and the read abstained
+/// on a fact the vault held (Bug-2 / ADR-064 recurrence). The cap re-introduced
+/// exactly the BGE-ranking weakness ([[bge-small-cannot-separate-relevant]])
+/// that the reranker exists to correct. The reranker is the relevance
+/// authority; it must see every retrieved candidate, not BGE's top-8. Cost:
+/// ~0.39s/candidate CPU → ≤8s worst case at 20 (correctness-before-latency;
+/// GPU/int8 is the latency fast-follow). Bounded — retrieval itself caps at
+/// [`DEFAULT_MAX_CANDIDATES`], so this never reranks more than that.
+const RERANK_CANDIDATE_CAP: usize = DEFAULT_MAX_CANDIDATES;
 
 /// Minimum top-1 BGE cosine for a query to count as having relevant content.
 /// Below this the read abstains (no-signal). Calibrated 2026-05-28
@@ -537,9 +549,15 @@ impl StructuredReadPipeline {
         // the reranker's relevance floor. This supersedes the cosine `semantic`
         // floor, which could not separate topically-adjacent wrong-attribute
         // facts (the Q21 class ADR-057 deferred). The cosine gate (Approach P)
-        // remains as the no-reranker fallback + for its existing tests. The
-        // BM25 top-1 gate in `AbstainingRetriever` stays vestigial for the read
-        // path. Precedence: reranker > cosine gate > plain retrieve.
+        // remains as the no-reranker fallback + for its existing tests.
+        // Precedence: reranker > cosine gate > plain retrieve.
+        //
+        // `self.retriever` is the RAW hybrid (BGE + Tantivy + RRF), NOT the BM25
+        // `AbstainingRetriever` (Bug-2 fix, 2026-05-31). The lexical abstain gate
+        // keyword-blocked purely-semantic reads ("what does the user do for fun?"
+        // → "plays the cello…", BM25 ~0) before this relevance gate could run;
+        // read abstention is now owned here. The app wires the keyword gate to
+        // `memory_search` only.
         let candidates = if self.reranker.is_some() {
             let retrieved = self.retriever.retrieve(retrieval_query).await?;
             self.apply_reranker(&query_echo, retrieved).await?
@@ -1536,22 +1554,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reranker_caps_at_top_8_candidates() {
-        // 10 retrieved candidates; only the top RERANK_CANDIDATE_CAP (8) are
-        // reranked. The 9th/10th are dropped even though the mock would score
-        // them above the floor — they never reach the reranker.
+    async fn reranker_caps_at_rerank_candidate_cap() {
+        // `RERANK_CANDIDATE_CAP + 5` retrieved candidates; only the top
+        // RERANK_CANDIDATE_CAP are reranked. The overflow are dropped even
+        // though the mock would score them above the floor — they never reach
+        // the reranker. (The cap was raised 8→DEFAULT_MAX_CANDIDATES at the
+        // 2026-06-01 dogfood: BGE's weak ranking must not displace a relevant
+        // fact out of the reranker's view; see RERANK_CANDIDATE_CAP docs.)
+        let n = RERANK_CANDIDATE_CAP + 5;
         let now = read_clock_now();
-        let canned: Vec<RetrievedMemory> = (0..10)
+        let canned: Vec<RetrievedMemory> = (0..n)
             .map(|i| {
                 let m = fake_memory(
-                    100 + i,
+                    100 + i as u128,
                     &format!("candidate {i}"),
                     "personal",
                     now,
                     0.9,
                     None,
                 );
-                // retriever score DESC so truncate keeps candidates 0..8
+                // retriever score DESC so truncate keeps candidates 0..CAP
                 retrieved(m, 1.0 - (i as f32) * 0.01)
             })
             .collect();
@@ -1578,10 +1600,14 @@ mod tests {
             .iter()
             .map(|f| f.fact.as_str())
             .collect();
-        assert!(
-            !facts.contains(&"candidate 8") && !facts.contains(&"candidate 9"),
-            "candidates beyond the cap MUST be dropped (never reranked)"
-        );
+        // The overflow candidates (indices CAP..n) MUST be dropped.
+        for i in RERANK_CANDIDATE_CAP..n {
+            let dropped = format!("candidate {i}");
+            assert!(
+                !facts.contains(&dropped.as_str()),
+                "candidate {i} (beyond the cap) MUST be dropped (never reranked)"
+            );
+        }
     }
 
     // ---------------------------------------------------------------------

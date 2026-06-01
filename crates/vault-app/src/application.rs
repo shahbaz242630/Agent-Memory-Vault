@@ -262,12 +262,22 @@ impl Application {
         let hybrid: Arc<dyn Retriever> =
             Arc::new(HybridRetriever::new(semantic.clone(), keyword.clone()));
 
-        // 8. AbstainingRetriever — gates on top-1 BM25 score; below
-        //    threshold (default 6.0) returns empty result so the LLM
-        //    isn't asked to synthesise from a hard-negative corpus
-        //    (T0.2.7 Phase 3). Wraps the hybrid; probes the keyword
-        //    channel directly for the threshold check.
-        let retriever: Arc<dyn Retriever> = Arc::new(AbstainingRetriever::new(hybrid, keyword));
+        // 8. AbstainingRetriever — gates on top-1 BM25 score (default
+        //    threshold 1.0); below it returns an empty result. Wraps the
+        //    hybrid; probes the keyword channel directly for the threshold
+        //    check. This powers the `memory_search` tool ONLY.
+        //
+        //    NOT the read path (Bug-2 fix, 2026-05-31): the BM25 keyword gate
+        //    over-abstained on purely-semantic reads — a query with no lexical
+        //    overlap with its answer ("what does the user do for fun?" vs
+        //    "plays the cello in a community orchestra") scored BM25 ~0 and
+        //    was short-circuited to empty BEFORE the cross-encoder reranker
+        //    (the real read relevance authority, ADR-059) could judge it. So
+        //    the StructuredReadPipeline (step 9) is wired against the RAW
+        //    `hybrid` and lets the reranker / cosine floor own read
+        //    abstention; only `memory_search` keeps this keyword gate.
+        let retriever: Arc<dyn Retriever> =
+            Arc::new(AbstainingRetriever::new(hybrid.clone(), keyword));
 
         // 9. StructuredReadPipeline — deterministic filter+pack for the
         //    `memory_read` MCP tool per ADR-052 + ADR-054 (Commit 6 of
@@ -298,7 +308,12 @@ impl Application {
         // and wire `with_reranker`; otherwise fall back to the cosine
         // `with_relevance_gate(semantic)` so a deployment without the ~1.2 GB
         // model still abstains on no-signal queries (graceful degradation).
-        let base_pipeline = StructuredReadPipeline::new(retriever.clone(), report_loader);
+        // Bug-2 fix (2026-05-31): the read pipeline uses the RAW `hybrid`, NOT
+        // the BM25 `AbstainingRetriever` (step 8). Read abstention is owned by
+        // the reranker floor (production) or the cosine floor (fallback) below —
+        // both judge meaning, so a no-keyword-overlap-but-relevant read is no
+        // longer short-circuited by the lexical gate.
+        let base_pipeline = StructuredReadPipeline::new(hybrid, report_loader);
         let read_pipeline = match (&config.rerank_model_path, &config.rerank_tokenizer_path) {
             (Some(rerank_model), Some(rerank_tokenizer)) => {
                 let reranker: Arc<dyn RerankProvider> = Arc::new(Qwen3RerankerProvider::open(
