@@ -296,3 +296,120 @@ async fn cello_surfaces_amid_distractors_and_still_abstains_on_no_signal() {
             .collect::<Vec<_>>()
     );
 }
+
+/// ADR-066 recall-first regression (2026-06-02): the read must surface facts
+/// across a zero-token-overlap SYNONYM gap — "what food does the user like?" →
+/// "favourite cuisine is Japanese". The 0.6B reranker scores such matches only
+/// slightly positive/negative and cannot be made a clean precision authority
+/// (measured: hard synonyms interleave with ambiguous guards at any single
+/// floor). The fix is recall-first: the reranker gate is a coarse NO-SIGNAL floor
+/// (`RERANK_NO_SIGNAL_FLOOR` ≈ −2.5), so real synonym matches flow through to the
+/// agent while genuine no-signal still abstains. This pins both directions end-to-
+/// end through real BGE + the real reranker. It FAILS on the precision-floor-0
+/// build (the synonym matches scored below 0 → abstained), PASSES recall-first.
+///
+/// `#[ignore]` like its siblings (real models, over the 5s budget); runs in the
+/// weekly real-model smoke.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real BGE + Qwen3-Reranker recall-first synonym regression; run with --ignored"]
+async fn synonym_gap_reads_surface_recall_first_and_still_abstain_on_no_signal() {
+    let tmp = TempDir::new().expect("tempdir");
+    let config = AppConfig {
+        metadata_path: tmp.path().join("vault.db"),
+        vector_dir: tmp.path().join("lance"),
+        graph_path: tmp.path().join("graph.duckdb"),
+        key: SqlCipherKey::new("read-synonym-recall-first-key"),
+        model_path: fixture(BGE_FIXTURE_REL, "model.onnx"),
+        tokenizer_path: fixture(BGE_FIXTURE_REL, "tokenizer.json"),
+        ort_lib_path: ort_lib(),
+        at_rest_key: zeroize::Zeroizing::new([0u8; 32]),
+        qwen_model_path: None,
+        phi4_model_path: None,
+        rerank_model_path: Some(fixture(RERANK_FIXTURE_REL, "model.onnx")),
+        rerank_tokenizer_path: Some(fixture(RERANK_FIXTURE_REL, "tokenizer.json")),
+    };
+    let app = Application::new(&config)
+        .await
+        .expect("Application::new must compose the read stack (BGE + reranker)");
+    let _shutdown = app.start();
+    let adapter = app.adapter();
+    let boundary = Boundary::new("evalsyn").expect("valid boundary");
+
+    // Three synonym targets (each a zero/low-overlap leap from its query) +
+    // realistic distractors. Targets chosen for reliable retrieval into the
+    // rerank pool; the gate must not discard them.
+    const CUISINE: &str = "The user's favourite cuisine is Japanese.";
+    const LANGS: &str = "The user is fluent in Mandarin and English.";
+    const PET: &str = "The user has a golden retriever named Biscuit.";
+    let seeds = [
+        CUISINE,
+        LANGS,
+        PET,
+        "The user works as a data scientist at Helix Labs.",
+        "The user drives a Rivian R1T.",
+        "The user's favorite color is amber.",
+        "The user collects vintage mechanical keyboards.",
+        "The user prefers per-action commit approvals and four definition-of-done gates.",
+        "The user enjoys trail running in the foothills on weekends.",
+    ];
+    let mut ids: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
+    for content in seeds {
+        let nm = NewMemory {
+            content: content.into(),
+            memory_type: MemoryType::Semantic,
+            boundary: boundary.clone(),
+            source_agent: Some("claude".into()),
+            confidence: 0.95,
+            valid_from: None,
+            valid_until: None,
+            metadata: serde_json::json!({}),
+        };
+        let id = adapter.write(nm).await.expect("seed write").to_string();
+        ids.insert(content, id);
+    }
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    // Each synonym query MUST surface its target fact (recall-first).
+    for (query, target) in [
+        ("what food does the user like?", CUISINE),
+        ("what languages can the user speak?", LANGS),
+        ("does the user have any pets?", PET),
+    ] {
+        let resp = adapter
+            .read(ReadQuery {
+                query_text: query.into(),
+                authorized_boundaries: vec![boundary.clone()],
+            })
+            .await
+            .expect("read must not error");
+        let want = &ids[target];
+        assert!(
+            !resp.abstain && resp.relevant_facts.iter().any(|f| &f.memory_id == want),
+            "{query:?} MUST surface {target:?} (recall-first across the synonym gap); \
+             abstain={}, got {:?}",
+            resp.abstain,
+            resp.relevant_facts
+                .iter()
+                .map(|f| &f.fact)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // No-signal guard still holds — recall-first must not become a firehose.
+    let blood = adapter
+        .read(ReadQuery {
+            query_text: "what is the user's blood type?".into(),
+            authorized_boundaries: vec![boundary.clone()],
+        })
+        .await
+        .expect("read must not error");
+    assert!(
+        blood.abstain,
+        "no-signal read MUST still abstain (coarse no-signal floor); got {:?}",
+        blood
+            .relevant_facts
+            .iter()
+            .map(|f| &f.fact)
+            .collect::<Vec<_>>()
+    );
+}

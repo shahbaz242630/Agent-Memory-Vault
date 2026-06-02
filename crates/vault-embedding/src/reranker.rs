@@ -25,9 +25,10 @@
 //! ## Integration
 //!
 //! The read pipeline ([`vault_retrieval::StructuredReadPipeline`]) reranks the
-//! top retrieved candidates, keeps those scoring ≥ [`RERANK_RELEVANCE_FLOOR`],
-//! and re-sorts by reranker score — replacing the ADR-057 cosine floor as the
-//! relevance gate. CPU cost ≈ 0.39 s per candidate (f16); GPU sub-second.
+//! top retrieved candidates, keeps those scoring ≥ [`RERANK_NO_SIGNAL_FLOOR`]
+//! (recall-first: a coarse no-signal cut, NOT a precision gate — ADR-066), and
+//! re-sorts by reranker score. CPU cost ≈ 0.39 s per candidate (f16); GPU
+//! sub-second.
 
 use crate::integrity::{
     verify_file_sha256, QWEN3_RERANKER_MODEL_SHA256, QWEN3_RERANKER_TOKENIZER_SHA256,
@@ -41,21 +42,43 @@ use std::sync::{Arc, Mutex};
 use tokenizers::Tokenizer;
 use vault_core::{VaultError, VaultResult};
 
-/// The task instruction handed to the reranker (the "v4 strict-yes/no"
-/// variant — the instruction-tuning sweep winner). The instruction is the
-/// lever that closes topically-adjacent "wrong-attribute" traps: it tells the
-/// model to answer *no* for same-topic facts that don't actually contain the
-/// answer. Calibrated 2026-05-29 via the `reranker_spike` sweep.
+/// The task instruction handed to the reranker (the **"v5 synonym-aware"**
+/// variant). It tells the model to answer *yes* across a synonym/paraphrase gap
+/// (food↔cuisine) while still answering *no* for same-topic facts that don't
+/// contain the answer.
+///
+/// History + honest scope (ADR-066, 2026-06-02): the v4 "strict-yes/no" variant
+/// (2026-05-29) closed wrong-attribute traps but was TOO strict on
+/// zero-token-overlap synonym leaps (real `food↔cuisine` scored +0.07, below a
+/// leaking guard). v5 substantially lifts synonym RECALL (food↔cuisine +0.07 →
+/// +2.15; allergy→avoid, settled→home recovered on the 4B). BUT measured over the
+/// *grown* 16-case fixture, v5 does NOT fully separate real from guard by a
+/// single precision floor — the hardest real cases and the most ambiguous guards
+/// still interleave (gap −0.33). That is a 0.6B model-capacity ceiling, not an
+/// instruction bug. So we do NOT chase a precision floor: the read goes
+/// **recall-first** (ADR-066) — the reranker re-orders candidates and applies
+/// only the coarse [`RERANK_NO_SIGNAL_FLOOR`] (drop deep no-signal junk), and the
+/// calling agent makes the fine relevance call. Reproduce the measurements via
+/// `reranker_fun_diagnostic.rs::{conformal_calibrate_reranker_floor,synonym_gap_fix_sweep}`.
 pub const QWEN3_RERANKER_INSTRUCT: &str =
-    "You are matching a question about a user to a personal fact. Answer yes only if the fact lets you answer the question with confidence. Same-topic facts that do not contain the answer must be answered no.";
+    "You are matching a question about a user to a personal fact. Answer yes if the fact answers the question, even when the question and the fact use different words for the same idea (synonyms or paraphrases). Answer no only when the fact does not actually contain the answer, even if it is on the same topic.";
 
-/// Relevance floor on the reranker logit. A candidate scoring below this is
-/// not relevant to the query. **0.0** = sigmoid 0.5 ("more likely yes than
-/// no"). Calibrated 2026-05-29 (`reranker_spike`, v4 instruction): on the
-/// hardened A7 set every real answer scored above 0 and every guard below it,
-/// with a ~3-logit margin. ADR-057 amendment: this supersedes the cosine-0.66
-/// floor as the read relevance gate.
-pub const RERANK_RELEVANCE_FLOOR: f32 = 0.0;
+/// **No-signal floor** on the reranker logit (ADR-066, recall-first read,
+/// 2026-06-02). A candidate scoring below this is treated as *no signal at all*
+/// and dropped; everything at/above is returned to the calling agent, which
+/// makes the fine relevance call.
+///
+/// This is deliberately NOT a precision floor. The prior 0.0 floor (sigmoid 0.5,
+/// "more likely yes than no") tried to make the 0.6B reranker the relevance
+/// *authority* and caused over-abstention — it discarded real facts on
+/// synonym/paraphrase leaps that the reranker scored slightly negative. Measured
+/// 2026-06-02 over the grown A7 fixture (v5 instruction): genuine should-surface
+/// facts score **≥ −0.35** while true no-signal queries top out at **≤ −4.4** —
+/// a clean ~4-logit gap. **−2.5** sits in that gap (≈2.1 below the worst real
+/// fact, ≈1.9 above the strongest no-signal), recall-leaning per the locked
+/// recall-&gt;precision stance. Calibrated on a small fixture → treated as a
+/// starting value to confirm in live dogfood, not a final constant.
+pub const RERANK_NO_SIGNAL_FLOOR: f32 = -2.5;
 
 /// Subject frame prepended to every candidate document before the production
 /// reranker scores it (Bug-2 fix, 2026-06-01). The 0.6B reranker mis-scores
@@ -300,7 +323,7 @@ impl RerankProvider for Qwen3RerankerProvider {
     }
 
     fn relevance_floor(&self) -> f32 {
-        RERANK_RELEVANCE_FLOOR
+        RERANK_NO_SIGNAL_FLOOR
     }
 }
 
@@ -309,10 +332,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn relevance_floor_is_pinned_at_zero() {
-        // ADR-057 amendment: logit 0 (sigmoid 0.5). A future re-calibration
-        // MUST break this consciously, not drift.
-        assert_eq!(RERANK_RELEVANCE_FLOOR, 0.0);
+    fn no_signal_floor_is_pinned() {
+        // ADR-066 (recall-first read, 2026-06-02): the reranker gate is a coarse
+        // NO-SIGNAL floor, not a precision gate. -2.5 sits in the measured gap
+        // between the worst real should-surface fact (≥ -0.35) and the strongest
+        // true no-signal query (≤ -4.4) over the grown A7 fixture under v5. A
+        // future re-calibration (esp. after live dogfood) MUST break this
+        // consciously, not drift.
+        assert_eq!(RERANK_NO_SIGNAL_FLOOR, -2.5);
     }
 
     #[test]
@@ -422,8 +449,8 @@ mod tests {
             "the relevant fact MUST outscore the irrelevant one (got {scores:?})"
         );
         assert!(
-            scores[0] >= RERANK_RELEVANCE_FLOOR,
-            "the relevant fact MUST clear the relevance floor (got {})",
+            scores[0] >= RERANK_NO_SIGNAL_FLOOR,
+            "the relevant fact MUST clear the no-signal floor (got {})",
             scores[0]
         );
     }

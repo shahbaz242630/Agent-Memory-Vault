@@ -40,5 +40,5 @@ pub use integrity::{
 };
 pub use provider::{EmbeddingProvider, EMBEDDING_DIM};
 pub use reranker::{
-    Qwen3RerankerProvider, RerankProvider, QWEN3_RERANKER_INSTRUCT, RERANK_RELEVANCE_FLOOR,
+    Qwen3RerankerProvider, RerankProvider, QWEN3_RERANKER_INSTRUCT, RERANK_NO_SIGNAL_FLOOR,
 };

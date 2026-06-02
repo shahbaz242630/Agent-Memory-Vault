@@ -492,3 +492,173 @@ async fn read_quality_eval_baseline() {
         "every fixture case must be scored exactly once"
     );
 }
+
+// ---------------------------------------------------------------------------
+// GO/NO-GO (2026-06-02): recall-first read measurement.
+//
+// The thesis under test: "correct output every time" is achievable if the
+// recall-first candidate path (memory_search: hybrid BGE+BM25+RRF, NO read
+// abstain gate) RETURNS the correct fact for every should-surface case — i.e.
+// the over-abstention bug is caused by the read GATE discarding retrieved facts,
+// not by retrieval losing them. If recall is ~100%, the agent (frontier LLM in
+// the MCP loop) can do the precision half; the thesis holds. If facts aren't
+// even retrieved, the thesis is in real trouble.
+//
+// cargo test -p vault-app --test read_quality_eval recall_first_go_no_go -- --ignored --nocapture
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real-BGE recall-first go/no-go; run with --ignored --nocapture"]
+async fn recall_first_go_no_go() {
+    // Measure RAW semantic-retrieval recall (BGE dense, NO abstain gate) against
+    // a REALISTIC pooled distractor set: all fixture facts in one pool. For each
+    // query, rank the whole pool by cosine and ask whether the correct fact lands
+    // in the top-k. This is the recall-first ceiling the read path would use
+    // (StructuredReadPipeline wraps the raw hybrid). NB: adapter.search() routes
+    // through the BM25 keyword gate (AbstainingRetriever) which abstains on
+    // zero-keyword-overlap queries — that is NOT the read path and is measured
+    // elsewhere; here we isolate semantic retrieval depth.
+    let probe = BgeSmallProvider::open(
+        &bge_fixture("model.onnx"),
+        &bge_fixture("tokenizer.json"),
+        &ort_lib(),
+    )
+    .expect("open BGE probe");
+
+    let bytes = std::fs::read(eval_fixture_path()).expect("read fixture");
+    let value: Value = serde_json::from_slice(&bytes).expect("parse fixture");
+    let cases = parse_fixture(&value);
+
+    // Pool = unique fact contents across ALL cases (realistic distractor set).
+    let mut pool: Vec<String> = Vec::new();
+    for case in &cases {
+        for sm in &case.seed_memories {
+            if !pool.contains(&sm.content) {
+                pool.push(sm.content.clone());
+            }
+        }
+    }
+    // Embed the whole pool once.
+    let mut pool_emb: Vec<Vec<f32>> = Vec::with_capacity(pool.len());
+    for content in &pool {
+        pool_emb.push(probe.embed(content).await.expect("embed pool"));
+    }
+    println!(
+        "\n================ RECALL-FIRST GO/NO-GO (raw BGE semantic, pooled) ================"
+    );
+    println!("pool size: {} distinct facts\n", pool.len());
+
+    // Rank the whole pool against a query; return Vec of (pool_idx, cosine) DESC.
+    let rank_pool = |q_emb: &[f32], pool_emb: &[Vec<f32>]| -> Vec<(usize, f32)> {
+        let mut scored: Vec<(usize, f32)> = pool_emb
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (i, cosine(q_emb, e)))
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored
+    };
+
+    let mut surface_total = 0usize;
+    let mut found_top20 = 0usize;
+    let mut found_top5 = 0usize;
+    let mut missed: Vec<String> = Vec::new();
+    let mut real_ranks: Vec<usize> = Vec::new();
+    let mut nosignal_top: Vec<f32> = Vec::new();
+    let mut real_surface_cos: Vec<f32> = Vec::new();
+
+    for case in &cases {
+        let q_emb = probe.embed(&case.query).await.expect("embed query");
+        let ranked = rank_pool(&q_emb, &pool_emb);
+        let pos_of = |content: &str| -> Option<(usize, f32)> {
+            let idx = pool.iter().position(|p| p == content)?;
+            ranked
+                .iter()
+                .position(|(i, _)| *i == idx)
+                .map(|rk| (rk, ranked[rk].1))
+        };
+
+        if case.expect.abstain {
+            let top = ranked.first().map(|(_, c)| *c).unwrap_or(f32::NAN);
+            nosignal_top.push(top);
+            println!("[{}] NO-SIGNAL  q={:?}\n   top pool cosine {top:.4} (a no-signal-only floor must sit ABOVE this)\n", case.id, case.query);
+            continue;
+        }
+
+        let mut line = format!("[{}] q={:?}", case.id, case.query);
+        for key in &case.expect.must_surface {
+            surface_total += 1;
+            let idx: usize = key
+                .rsplit('#')
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let content = &case.seed_memories[idx].content;
+            match pos_of(content) {
+                Some((rk, cos)) => {
+                    real_ranks.push(rk + 1);
+                    real_surface_cos.push(cos);
+                    if rk < 20 {
+                        found_top20 += 1;
+                    }
+                    if rk < 5 {
+                        found_top5 += 1;
+                    }
+                    line.push_str(&format!(
+                        "\n   {} {key} at rank {} (cos {:.4})",
+                        if rk < 5 {
+                            "✅"
+                        } else if rk < 20 {
+                            "🟡"
+                        } else {
+                            "❌"
+                        },
+                        rk + 1,
+                        cos
+                    ));
+                }
+                None => {
+                    missed.push(key.clone());
+                    line.push_str(&format!("\n   ❌ {key} NOT in pool ranking"));
+                }
+            }
+        }
+        println!("{line}\n");
+    }
+
+    let worst_real = real_surface_cos
+        .iter()
+        .copied()
+        .fold(f32::INFINITY, f32::min);
+    let worst_nosignal = nosignal_top
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+
+    println!("---------------- SCORECARD ----------------");
+    println!("RECALL @ top-5 : {found_top5}/{surface_total}");
+    println!("RECALL @ top-20: {found_top20}/{surface_total}   <-- the go/no-go number");
+    if !real_ranks.is_empty() {
+        let max_rank = real_ranks.iter().max().copied().unwrap_or(0);
+        println!("worst real-fact rank: {max_rank}   (lower = better)");
+    }
+    println!("\nno-signal separation:");
+    println!("  worst (lowest) real should-surface cosine : {worst_real:.4}");
+    println!("  worst (highest) no-signal top cosine      : {worst_nosignal:.4}");
+    println!(
+        "  → a no-signal-only floor is feasible if real-min > no-signal-max: {}",
+        worst_real > worst_nosignal
+    );
+    if missed.is_empty() {
+        println!("\n✅ GO (retrieval): every should-surface fact is RETRIEVED by raw BGE semantic. Over-abstention was the GATE discarding retrieved facts, not retrieval losing them. Recall-first + agent-judge can hit the thesis.");
+    } else {
+        println!("\n❌ NO-GO (retrieval): facts NOT retrieved even ungated: {missed:?}");
+    }
+    println!("===========================================\n");
+
+    assert_eq!(
+        found_top20 + (real_ranks.iter().filter(|r| **r > 20).count()) + missed.len(),
+        surface_total,
+        "every must_surface scored"
+    );
+}

@@ -10,8 +10,8 @@
 //!
 //! 2. [`conformal_calibrate_reranker_floor`] — split-conformal calibration of
 //!    the reranker relevance floor against the A7 labelled fixture
-//!    (`read_quality_eval.json`). The production floor `RERANK_RELEVANCE_FLOOR =
-//!    0.0` is a *guessed* absolute cut-off; the research (handoff 2026-06-01)
+//!    (`read_quality_eval.json`). The historical precision floor was a *guessed*
+//!    absolute cut-off (logit 0.0); the research (handoff 2026-06-01)
 //!    found that is structurally wrong — reranker logits are only meaningful
 //!    relative to the query, so a guessed global floor over-abstains. This
 //!    instrument *measures* a data-derived threshold τ from our own labelled
@@ -383,7 +383,9 @@ async fn conformal_calibrate_reranker_floor() {
             "      conformal α≈0.20 τ = {:+.4}.)",
             conformal_tau(&rel_logits, 0.20)
         );
-        println!("     → set RERANK_RELEVANCE_FLOOR accordingly in crates/vault-embedding/src/reranker.rs");
+        println!(
+            "     → set the reranker floor accordingly in crates/vault-embedding/src/reranker.rs"
+        );
     } else {
         println!("  ❌ Relevant and guard logits INTERLEAVE — NO single floor separates them.");
         println!("     Conformal cannot fix Bug 2 here. Escalate to handoff step 6:");

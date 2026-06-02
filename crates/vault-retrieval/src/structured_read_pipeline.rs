@@ -616,8 +616,18 @@ impl StructuredReadPipeline {
     }
 
     /// Rerank the top [`RERANK_CANDIDATE_CAP`] retrieved candidates with the
-    /// cross-encoder, keep those at/above the reranker's relevance floor, and
-    /// re-sort by reranker score (DESC). An empty result → the read abstains.
+    /// cross-encoder, keep those at/above the reranker's floor, and re-sort by
+    /// reranker score (DESC). An empty result → the read abstains.
+    ///
+    /// **Recall-first (ADR-066, 2026-06-02).** The reranker's floor is now a
+    /// coarse NO-SIGNAL cut (`RERANK_NO_SIGNAL_FLOOR`, ~−2.5), NOT a precision
+    /// gate. Its job here is (1) re-ordering and (2) dropping only deep no-signal
+    /// junk; every plausibly-relevant candidate (including synonym/paraphrase
+    /// matches the 0.6B scores slightly negative) flows through to the calling
+    /// agent, which makes the fine relevance call. This replaced the precision
+    /// floor (logit 0) that over-abstained by discarding real facts — measured
+    /// 2026-06-02: the 0.6B cannot separate hard synonym leaps from ambiguous
+    /// guards by any single floor, so we stop trying and trust the agent.
     /// Candidates are assumed sorted by retriever score DESC (the [`Retriever`]
     /// trait invariant), so truncating to the cap keeps the strongest.
     async fn apply_reranker(
@@ -671,8 +681,8 @@ impl StructuredReadPipeline {
         tracing::info!(
             target: "vault_retrieval::reranker",
             kept = kept.len(),
-            floor,
-            "reranked candidates; kept those at/above floor"
+            no_signal_floor = floor,
+            "recall-first rerank: re-ordered + dropped only below-no-signal-floor candidates"
         );
         Ok(kept)
     }

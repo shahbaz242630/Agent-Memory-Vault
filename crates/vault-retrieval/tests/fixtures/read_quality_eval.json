@@ -95,6 +95,156 @@
       }
     },
     {
+      "id": "A7-synonym-food-cuisine",
+      "ability": "abstention_no_over_abstain",
+      "_targets": "SYNONYM GAP (the live 2026-06-01 bug): zero-token-overlap meaning leap food<->cuisine. memory_read 'what food does the user like?' false-abstained on an active 'favourite cuisine is Japanese' fact (rank-1 in memory_search). must_exclude is a topically-adjacent eating-habit near-miss that does NOT state a food preference.",
+      "seed_memories": [
+        {"content": "The user's favourite cuisine is Japanese.", "source_agent": "claude-opus-4-7", "as_of": "2026-02-15", "confidence": 0.95},
+        {"content": "The user usually skips breakfast on weekdays.", "source_agent": "gpt-5", "as_of": "2026-02-16", "confidence": 0.9}
+      ],
+      "query": "what food does the user like?",
+      "expect": {
+        "must_surface": ["A7-synonym-food-cuisine#0"],
+        "must_exclude": ["A7-synonym-food-cuisine#1"],
+        "abstain": false
+      }
+    },
+    {
+      "id": "A7-synonym-commute-cycle",
+      "ability": "abstention_no_over_abstain",
+      "_targets": "SYNONYM GAP: 'how does the user get to work?' <-> 'cycles to the office'. Tests the same class as food/cuisine on a different domain (transport). must_exclude is a commute-adjacent gripe that does NOT state the mode of travel.",
+      "seed_memories": [
+        {"content": "The user cycles to the office most mornings.", "source_agent": "claude-opus-4-7", "as_of": "2026-02-20", "confidence": 0.93},
+        {"content": "The user finds the morning traffic on the bridge frustrating.", "source_agent": "gpt-5", "as_of": "2026-02-21", "confidence": 0.9}
+      ],
+      "query": "how does the user get to work?",
+      "expect": {
+        "must_surface": ["A7-synonym-commute-cycle#0"],
+        "must_exclude": ["A7-synonym-commute-cycle#1"],
+        "abstain": false
+      }
+    },
+    {
+      "id": "A7-synonym-pet-dog",
+      "ability": "abstention_no_over_abstain",
+      "_targets": "SYNONYM GAP: 'does the user have any pets?' <-> 'has a golden retriever named Biscuit' (pet<->dog/retriever, category<->instance). must_exclude is an animal-adjacent fact that does NOT imply pet ownership.",
+      "seed_memories": [
+        {"content": "The user has a golden retriever named Biscuit.", "source_agent": "claude-opus-4-7", "as_of": "2026-01-25", "confidence": 0.95},
+        {"content": "The user volunteers at an animal shelter on Saturdays.", "source_agent": "gpt-5", "as_of": "2026-01-26", "confidence": 0.9}
+      ],
+      "query": "does the user have any pets?",
+      "expect": {
+        "must_surface": ["A7-synonym-pet-dog#0"],
+        "must_exclude": ["A7-synonym-pet-dog#1"],
+        "abstain": false
+      }
+    },
+    {
+      "id": "A7-synonym-occupation-living",
+      "ability": "abstention_no_over_abstain",
+      "_targets": "SYNONYM GAP: 'what does the user do for a living?' <-> 'works as a structural engineer' (for-a-living<->works-as, occupation idiom). must_exclude is a career-adjacent fact (a certification in progress) that is NOT the user's occupation.",
+      "seed_memories": [
+        {"content": "The user works as a structural engineer.", "source_agent": "claude-opus-4-7", "as_of": "2026-03-01", "confidence": 0.95},
+        {"content": "The user is studying for a project management certification.", "source_agent": "gpt-5", "as_of": "2026-03-02", "confidence": 0.9}
+      ],
+      "query": "what does the user do for a living?",
+      "expect": {
+        "must_surface": ["A7-synonym-occupation-living#0"],
+        "must_exclude": ["A7-synonym-occupation-living#1"],
+        "abstain": false
+      }
+    },
+    {
+      "id": "A7-synonym-drink-coffee",
+      "ability": "abstention_no_over_abstain",
+      "_targets": "SYNONYM GAP: 'what does the user drink in the morning?' <-> 'starts every morning with a flat white' (drink<->flat white, category<->instance). must_exclude names a beverage they STOPPED, not their morning drink.",
+      "seed_memories": [
+        {"content": "The user starts every morning with a flat white.", "source_agent": "claude-opus-4-7", "as_of": "2026-02-22", "confidence": 0.93},
+        {"content": "The user gave up energy drinks last year.", "source_agent": "gpt-5", "as_of": "2026-02-23", "confidence": 0.9}
+      ],
+      "query": "what does the user drink in the morning?",
+      "expect": {
+        "must_surface": ["A7-synonym-drink-coffee#0"],
+        "must_exclude": ["A7-synonym-drink-coffee#1"],
+        "abstain": false
+      }
+    },
+    {
+      "id": "A7-synonym-age-born",
+      "ability": "abstention_no_over_abstain",
+      "_targets": "SYNONYM GAP: 'how old is the user?' <-> 'was born in 1990' (age<->birth year, inference). must_exclude is age-adjacent ('since their teenage years') but states no age.",
+      "seed_memories": [
+        {"content": "The user was born in 1990.", "source_agent": "claude-opus-4-7", "as_of": "2026-01-10", "confidence": 0.95},
+        {"content": "The user has been programming since their teenage years.", "source_agent": "gpt-5", "as_of": "2026-01-11", "confidence": 0.9}
+      ],
+      "query": "how old is the user?",
+      "expect": {
+        "must_surface": ["A7-synonym-age-born#0"],
+        "must_exclude": ["A7-synonym-age-born#1"],
+        "abstain": false
+      }
+    },
+    {
+      "id": "A7-synonym-exercise-running",
+      "ability": "abstention_no_over_abstain",
+      "_targets": "SYNONYM GAP: 'how does the user stay in shape?' <-> 'runs ten kilometres three times a week' (stay in shape<->running). must_exclude is health-adjacent (food diary) but not an exercise.",
+      "seed_memories": [
+        {"content": "The user runs ten kilometres three times a week.", "source_agent": "claude-opus-4-7", "as_of": "2026-02-05", "confidence": 0.93},
+        {"content": "The user keeps a detailed food diary.", "source_agent": "gpt-5", "as_of": "2026-02-06", "confidence": 0.9}
+      ],
+      "query": "how does the user stay in shape?",
+      "expect": {
+        "must_surface": ["A7-synonym-exercise-running#0"],
+        "must_exclude": ["A7-synonym-exercise-running#1"],
+        "abstain": false
+      }
+    },
+    {
+      "id": "A7-synonym-home-settled",
+      "ability": "abstention_no_over_abstain",
+      "_targets": "SYNONYM GAP: 'what city does the user call home?' <-> 'settled in Porto' (call home<->settled). must_exclude is location-adjacent (travels to Madrid for work) but not their home.",
+      "seed_memories": [
+        {"content": "The user settled in Porto after years of moving around.", "source_agent": "claude-opus-4-7", "as_of": "2026-03-10", "confidence": 0.93},
+        {"content": "The user flies to Madrid for work most months.", "source_agent": "gpt-5", "as_of": "2026-03-11", "confidence": 0.9}
+      ],
+      "query": "what city does the user call home?",
+      "expect": {
+        "must_surface": ["A7-synonym-home-settled#0"],
+        "must_exclude": ["A7-synonym-home-settled#1"],
+        "abstain": false
+      }
+    },
+    {
+      "id": "A7-synonym-language-fluent",
+      "ability": "abstention_no_over_abstain",
+      "_targets": "SYNONYM GAP: 'what languages can the user speak?' <-> 'is fluent in Mandarin and English' (speak<->fluent in). must_exclude is words/study-adjacent (studied comparative literature) but names no spoken language.",
+      "seed_memories": [
+        {"content": "The user is fluent in Mandarin and English.", "source_agent": "claude-opus-4-7", "as_of": "2026-01-18", "confidence": 0.95},
+        {"content": "The user studied comparative literature at university.", "source_agent": "gpt-5", "as_of": "2026-01-19", "confidence": 0.9}
+      ],
+      "query": "what languages can the user speak?",
+      "expect": {
+        "must_surface": ["A7-synonym-language-fluent#0"],
+        "must_exclude": ["A7-synonym-language-fluent#1"],
+        "abstain": false
+      }
+    },
+    {
+      "id": "A7-synonym-avoid-allergy",
+      "ability": "abstention_no_over_abstain",
+      "_targets": "SYNONYM GAP: 'what food should the user avoid?' <-> 'is allergic to peanuts' (avoid<->allergic). must_exclude is consumption-adjacent (cutting back on caffeine) but is a preference, not a must-avoid.",
+      "seed_memories": [
+        {"content": "The user is allergic to peanuts.", "source_agent": "claude-opus-4-7", "as_of": "2026-02-12", "confidence": 0.96},
+        {"content": "The user is cutting back on caffeine this year.", "source_agent": "gpt-5", "as_of": "2026-02-13", "confidence": 0.9}
+      ],
+      "query": "what food should the user avoid?",
+      "expect": {
+        "must_surface": ["A7-synonym-avoid-allergy#0"],
+        "must_exclude": ["A7-synonym-avoid-allergy#1"],
+        "abstain": false
+      }
+    },
+    {
       "id": "A7-guard-absent",
       "ability": "abstention_true_negative",
       "_targets": "OVER-CORRECTION GUARD: subject genuinely absent. Recalibrating the floor down to fix the cliff must NOT make this answer (would convert a true-negative into a false-answer).",
