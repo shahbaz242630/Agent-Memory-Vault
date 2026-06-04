@@ -53,8 +53,8 @@ use vault_embedding::{
 use vault_llm::{LlmProvider, Phi4MiniConfig, Phi4MiniProvider};
 use vault_mcp::{Adapter, StdioServer};
 use vault_retrieval::{
-    AbstainingRetriever, FilesystemReportLoader, HybridRetriever, KeywordIndex, KeywordRetriever,
-    Retriever, SemanticRetriever, StructuredReadPipeline,
+    FilesystemReportLoader, HybridRetriever, KeywordIndex, KeywordRetriever, Retriever,
+    SemanticRetriever, StructuredReadPipeline,
 };
 use vault_storage::{MemoryFilter, MetadataStore, RetryWorker, StorageBackend};
 
@@ -258,26 +258,29 @@ impl Application {
         let keyword: Arc<dyn Retriever> = Arc::new(keyword);
 
         // 7. HybridRetriever — fuses semantic + keyword via Reciprocal
-        //    Rank Fusion (k=60, top_n_each=200) per T0.2.7 Phase 2.
-        let hybrid: Arc<dyn Retriever> =
-            Arc::new(HybridRetriever::new(semantic.clone(), keyword.clone()));
+        //    Rank Fusion (k=60, top_n_each=200) per T0.2.7 Phase 2. `keyword`
+        //    is moved in here (its last use) — the `memory_search` retriever
+        //    below is now the raw hybrid, so there is no separate keyword-gate
+        //    handle to retain.
+        let hybrid: Arc<dyn Retriever> = Arc::new(HybridRetriever::new(semantic.clone(), keyword));
 
-        // 8. AbstainingRetriever — gates on top-1 BM25 score (default
-        //    threshold 1.0); below it returns an empty result. Wraps the
-        //    hybrid; probes the keyword channel directly for the threshold
-        //    check. This powers the `memory_search` tool ONLY.
+        // 8. `memory_search` retriever = the RAW hybrid (recall-first, ADR-067,
+        //    2026-06-04). Previously the search path wrapped `hybrid` in an
+        //    `AbstainingRetriever` whose top-1 BM25 gate returned an empty
+        //    result whenever the lexical channel scored below 1.0. On a
+        //    single-token or no-lexical-overlap query that short-circuited in
+        //    ~0ms BEFORE the semantic channel ran, dropping semantically-
+        //    findable facts (live dogfood 2026-06-02: `memory_search "amber"`
+        //    and `"C7UNI"` returned [] in ~2ms while `memory_read` surfaced the
+        //    same facts). This mirrors the read recall-first stance (ADR-066):
+        //    return the semantic-backed ranked candidates and let the calling
+        //    agent judge relevance. The BM25 leg still contributes to the
+        //    hybrid RRF ranking — it is just no longer a hard gate.
         //
-        //    NOT the read path (Bug-2 fix, 2026-05-31): the BM25 keyword gate
-        //    over-abstained on purely-semantic reads — a query with no lexical
-        //    overlap with its answer ("what does the user do for fun?" vs
-        //    "plays the cello in a community orchestra") scored BM25 ~0 and
-        //    was short-circuited to empty BEFORE the cross-encoder reranker
-        //    (the real read relevance authority, ADR-059) could judge it. So
-        //    the StructuredReadPipeline (step 9) is wired against the RAW
-        //    `hybrid` and lets the reranker / cosine floor own read
-        //    abstention; only `memory_search` keeps this keyword gate.
-        let retriever: Arc<dyn Retriever> =
-            Arc::new(AbstainingRetriever::new(hybrid.clone(), keyword));
+        //    `AbstainingRetriever` is now production-unreferenced (still public
+        //    + unit-tested in vault-retrieval); logged as tech debt rather than
+        //    removed drive-by.
+        let retriever: Arc<dyn Retriever> = hybrid.clone();
 
         // 9. StructuredReadPipeline — deterministic filter+pack for the
         //    `memory_read` MCP tool per ADR-052 + ADR-054 (Commit 6 of
@@ -308,11 +311,12 @@ impl Application {
         // and wire `with_reranker`; otherwise fall back to the cosine
         // `with_relevance_gate(semantic)` so a deployment without the ~1.2 GB
         // model still abstains on no-signal queries (graceful degradation).
-        // Bug-2 fix (2026-05-31): the read pipeline uses the RAW `hybrid`, NOT
-        // the BM25 `AbstainingRetriever` (step 8). Read abstention is owned by
-        // the reranker floor (production) or the cosine floor (fallback) below —
-        // both judge meaning, so a no-keyword-overlap-but-relevant read is no
-        // longer short-circuited by the lexical gate.
+        // Bug-2 fix (2026-05-31): the read pipeline uses the RAW `hybrid`. Read
+        // abstention is owned by the reranker floor (production) or the cosine
+        // floor (fallback) below — both judge meaning, so a no-keyword-overlap-
+        // but-relevant read is not short-circuited by a lexical gate. As of
+        // ADR-067 (2026-06-04) `memory_search` (step 8) is also wired to the raw
+        // `hybrid`, so neither read nor search runs a hard BM25 gate.
         let base_pipeline = StructuredReadPipeline::new(hybrid, report_loader);
         let read_pipeline = match (&config.rerank_model_path, &config.rerank_tokenizer_path) {
             (Some(rerank_model), Some(rerank_tokenizer)) => {

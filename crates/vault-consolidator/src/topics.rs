@@ -1,33 +1,57 @@
-//! K-means topic discovery (T0.3.x Batch A, locked-next-arc Step 2 / 2026-05-26).
+//! Connected-components topic discovery (T0.3.x Batch A, locked-next-arc
+//! Step 2 / 2026-05-26; reworked from K-means to connected-components at
+//! ADR-068, 2026-06-04).
 //!
-//! Per-boundary clustering of memories into ~K topic groups using their BGE
-//! embeddings. Phi-4-mini labels each cluster with a 2-3 word topic name.
-//! The output [`TopicMap`] is consumed by `report.rs` (Commit 4) to produce
-//! the structured per-boundary REPORT artifact that the read pipeline
-//! (Commit 6) consults to enrich retrieved candidates with topic tags.
+//! Per-boundary grouping of memories into topics using their BGE embeddings.
+//! Phi-4-mini labels each group with a 2-3 word topic name. The output
+//! [`TopicMap`] is consumed by `report.rs` (Commit 4) to produce the
+//! structured per-boundary REPORT artifact that the read pipeline (Commit 6)
+//! consults to enrich retrieved candidates with topic tags.
 //!
-//! ## K selection
+//! ## Why connected-components, not K-means (ADR-068)
 //!
-//! `K = ceil(sqrt(N / 4))` clamped to `[3, 20]` and further clamped to `<= N`.
-//! For `N < 3` the function returns a single `"general"` topic with all
-//! members — clustering 1-2 memories has no useful signal.
+//! The original K-means forced every boundary into a *fixed* number of
+//! buckets (`K = ceil(sqrt(N/4))` clamped to `[3, 20]`). On a small, diverse
+//! vault that jams unrelated facts together and mislabels them — the §7 live
+//! dogfood (2026-06-02) showed a job fact and a dog fact both bucketed into
+//! `vehicle_transitions`. K-means *cannot* leave a fact ungrouped; it fills K
+//! clusters whether or not the facts belong together. (The same false-premise
+//! that retired K-means from contradiction detection at ADR-065 — see
+//! [`crate::phases::candidates`].)
 //!
-//! Sample sizes:
-//!   - N=4   → K=3 (floor clamp; ~1-2 memories per topic)
-//!   - N=16  → K=3 (floor clamp; ~5-6 memories per topic)
-//!   - N=100 → K=5 (sqrt(25))
-//!   - N=400 → K=10
-//!   - N=1600 → K=20 (ceiling clamp)
+//! Topic membership is a *similarity* question, not a partitioning one: two
+//! facts share a topic only when they are actually close in embedding space.
+//! So we group by **connected components** over the cosine-similarity graph:
+//! for each fact take its top-[`TOPIC_NN_TOP_K`] neighbors at or above
+//! [`TOPIC_NN_SIMILARITY_FLOOR`], treat those as undirected edges, and run the
+//! union-find transitive closure ([`crate::phases::cluster::union_find_components`]).
+//! Genuinely-related facts cluster; unrelated facts stay as their own
+//! singleton topic with an honest per-fact label. A singleton with a correct
+//! label beats a forced group with a wrong one ([[correctness-is-the-product]]).
+//!
+//! ## Threshold provenance (provisional — calibrate as the vault fills)
+//!
+//! [`TOPIC_NN_SIMILARITY_FLOOR`] = **0.70**, reusing the measured basis of the
+//! contradiction floor ([`crate::phases::candidates::CONTRADICTION_NN_SIMILARITY_FLOOR`]):
+//! on the real bge-small dogfood embeddings the unrelated-fact noise band tops
+//! out at **0.634** and genuine same-subject pairs sit at **0.823+**, so 0.70
+//! sits in the clean gap — above noise, below real relationships. This is
+//! deliberately **conservative**: on today's small vaults it yields mostly
+//! singletons (honest), and as the vault fills with multiple facts per subject
+//! they will cluster. Topic breadth is fuzzier than contradiction detection,
+//! so this floor is **provisional** and should be re-measured on real fill
+//! data (the read_quality / calibration harness is the tool). It is
+//! display-only — it never affects whether a fact surfaces at read time.
 //!
 //! ## Determinism
 //!
-//! K-means init picks the first K memories (sorted ascending by [`MemoryId`])
-//! as initial centroids — no RNG. The assignment + centroid-update loop
-//! runs up to 100 iterations or until no assignments change. The output
-//! `topics` vector is sorted by `topic_id` ascending. Re-running
-//! [`discover_topics`] on the same inputs produces an identical
-//! [`TopicMap`] (modulo bit-exact-equality of the BGE embedder's output —
-//! see ADR-045 §c for the sub-1e-6 IEEE-754 rounding bound).
+//! Memories are sorted ascending by [`MemoryId`] before embedding; edges are
+//! built over that fixed order with deterministic top-K tie-breaking (ascending
+//! index). `union_find_components` is deterministic (BTreeMap/BTreeSet backed),
+//! and topic IDs are assigned by ascending smallest-member order. Re-running
+//! [`discover_topics`] on the same inputs produces an identical [`TopicMap`]
+//! (modulo bit-exact-equality of the BGE embedder's output — see ADR-045 §c
+//! for the sub-1e-6 IEEE-754 rounding bound).
 //!
 //! ## Phi-4 cluster naming + graceful fallback
 //!
@@ -39,7 +63,7 @@
 //! the read pipeline at Commit 6 can surface the `TOPIC_NAMES_UNAVAILABLE`
 //! health-warning per the locked-next-arc Thread 3 contract.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
@@ -47,6 +71,8 @@ use tracing::instrument;
 use vault_core::{Boundary, Memory, MemoryId, VaultError, VaultResult};
 use vault_embedding::EmbeddingProvider;
 use vault_llm::{CompletionParams, LlmProvider};
+
+use crate::phases::cluster::union_find_components;
 
 /// Output of [`discover_topics`]: K topic clusters for one boundary.
 ///
@@ -71,11 +97,23 @@ pub struct Topic {
     pub member_ids: Vec<MemoryId>,
 }
 
-/// Hard upper bound on K-means iterations. Convergence on L2-normalised
-/// 384-dim vectors with deterministic init typically reaches stable
-/// assignments inside 10-30 iterations; 100 is a safety ceiling so a
-/// pathological input cannot pin the consolidator forever.
-const MAX_KMEANS_ITERS: usize = 100;
+/// Per-fact neighbor count for topic edge-building. Each fact contributes at
+/// most its top-K most-similar other facts as topic edges; the union-find
+/// transitive closure then merges chains, so a broad topic forms even though
+/// each fact only edges to a few neighbors. 5 mirrors the BRD §5.6 clustering
+/// `TOP_K_NEIGHBORS` and gives a large topic enough internal connectivity.
+const TOPIC_NN_TOP_K: usize = 5;
+
+/// Minimum cosine similarity for two facts to share a topic edge.
+///
+/// **0.70 is provisional, on the measured basis of the contradiction floor**
+/// ([`crate::phases::candidates::CONTRADICTION_NN_SIMILARITY_FLOOR`]): the
+/// bge-small dogfood noise band tops out at 0.634 and genuine same-subject
+/// pairs sit at 0.823+, so 0.70 sits in the clean gap (above noise, below real
+/// relationships). Conservative by design — see the module "Threshold
+/// provenance" note. Display-only; never gates read-time recall. Re-measure on
+/// real fill data as the vault grows.
+const TOPIC_NN_SIMILARITY_FLOOR: f32 = 0.70;
 
 /// Topic-naming sample size: up to N most-recent member contents passed
 /// in the Phi-4 prompt. Trade-off: more samples = better label quality
@@ -110,7 +148,9 @@ pub async fn discover_topics(
 
     let n = sorted.len();
 
-    // N < 3 → single "general" topic. No K-means needed.
+    // N < 3 → single "general" topic. No clustering needed (0-2 memories
+    // carry no useful grouping signal); preserves the historical small-vault
+    // shape the REPORT consumer expects.
     if n < 3 {
         return Ok(TopicMap {
             boundary: boundary.clone(),
@@ -122,11 +162,6 @@ pub async fn discover_topics(
             topic_names_unavailable: false,
         });
     }
-
-    // K = ceil(sqrt(N/4)) clamped to [3, 20], then capped at N
-    // (can't have more clusters than memories).
-    let k_raw = ((n as f64) / 4.0).sqrt().ceil() as usize;
-    let k = k_raw.clamp(3, 20).min(n);
 
     // Re-embed each memory's content via the shared provider. Memory
     // rows from MetadataStore carry `embedding: None` per ADR-045 §c.
@@ -145,16 +180,20 @@ pub async fn discover_topics(
         }
     }
 
-    // K-means: deterministic init + Lloyd's iteration.
-    let assignments = run_kmeans(&embeddings, k, dim);
-
-    // Build per-cluster member lists, dropping any empty clusters and
-    // renumbering topic_ids contiguously.
-    let mut clusters: Vec<Vec<MemoryId>> = vec![Vec::new(); k];
-    for (i, &t) in assignments.iter().enumerate() {
-        clusters[t].push(sorted[i].id);
-    }
-    let non_empty: Vec<Vec<MemoryId>> = clusters.into_iter().filter(|c| !c.is_empty()).collect();
+    // Connected-components over the cosine-similarity graph (ADR-068). Each
+    // fact edges to its top-K neighbors at/above the floor; the union-find
+    // transitive closure groups them. `union_find_components` returns a group
+    // for EVERY node, so singletons (a fact with no qualifying neighbor) are
+    // kept as their own topic — honest per-fact labelling beats forcing
+    // unrelated facts together (the K-means failure ADR-068 fixes). The
+    // BTreeMap is keyed by component root, which (union-by-smaller-id) is the
+    // smallest member id — so iterating yields components ordered by smallest
+    // member ascending, deterministically.
+    let node_ids: Vec<MemoryId> = sorted.iter().map(|m| m.id).collect();
+    let edges = topic_edges(&embeddings, &node_ids);
+    let non_empty: Vec<Vec<MemoryId>> = union_find_components(&node_ids, &edges)
+        .into_values()
+        .collect();
 
     // Label each topic via Phi-4 (or placeholder when LLM is None / fails).
     let mut topics = Vec::with_capacity(non_empty.len());
@@ -189,67 +228,38 @@ pub async fn discover_topics(
     })
 }
 
-/// Lloyd's K-means with deterministic first-K init. Returns the
-/// assignment vector of length `embeddings.len()`.
-fn run_kmeans(embeddings: &[Vec<f32>], k: usize, dim: usize) -> Vec<usize> {
+/// Build the undirected topic-edge list (ADR-068). For each fact `i`, the
+/// [`TOPIC_NN_TOP_K`] most-similar *other* facts at or above
+/// [`TOPIC_NN_SIMILARITY_FLOOR`] become edges. `ids[i]` is the [`MemoryId`] for
+/// `embeddings[i]` (both in the same sorted order). Edges are canonicalised
+/// `(min_id, max_id)` and deduplicated via a [`BTreeSet`] so the output is
+/// deterministic and a mutually-near pair appears once.
+///
+/// Cost: O(N²) cosine evaluations (cheap, in-memory, offline at nightly
+/// consolidation). Mirrors
+/// [`crate::phases::candidates::nearest_neighbor_candidate_pairs`]; kept
+/// separate so topic grouping can carry its own (provisional) floor + K without
+/// coupling to the contradiction ship-gate path.
+fn topic_edges(embeddings: &[Vec<f32>], ids: &[MemoryId]) -> Vec<(MemoryId, MemoryId)> {
     let n = embeddings.len();
-    let mut centroids: Vec<Vec<f32>> = embeddings[..k].to_vec();
-    let mut assignments = vec![0usize; n];
-
-    for _ in 0..MAX_KMEANS_ITERS {
-        let mut changed = false;
-
-        // Assign each point to nearest centroid (cosine distance).
-        for i in 0..n {
-            let mut best = 0;
-            let mut best_dist = cosine_distance(&embeddings[i], &centroids[0]);
-            for (j, centroid) in centroids.iter().enumerate().skip(1) {
-                let d = cosine_distance(&embeddings[i], centroid);
-                if d < best_dist {
-                    best = j;
-                    best_dist = d;
-                }
-            }
-            if assignments[i] != best {
-                assignments[i] = best;
-                changed = true;
-            }
-        }
-
-        if !changed {
-            break;
-        }
-
-        // Update centroids = mean of assigned vectors; re-normalize so
-        // cosine distance stays well-conditioned.
-        let mut sums = vec![vec![0.0f32; dim]; k];
-        let mut counts = vec![0usize; k];
-        for i in 0..n {
-            let t = assignments[i];
-            for d in 0..dim {
-                sums[t][d] += embeddings[i][d];
-            }
-            counts[t] += 1;
-        }
-        for j in 0..k {
-            if counts[j] == 0 {
-                // Empty cluster: keep the previous centroid. Rare with
-                // deterministic-id init unless multiple init candidates
-                // embed identically; preserving the prior centroid avoids
-                // NaN propagation.
-                continue;
-            }
-            for d in 0..dim {
-                centroids[j][d] = sums[j][d] / counts[j] as f32;
-            }
-            let norm: f32 = centroids[j].iter().map(|x| x * x).sum::<f32>().sqrt();
-            if norm > 0.0 {
-                centroids[j].iter_mut().for_each(|x| *x /= norm);
+    let mut edges: BTreeSet<(MemoryId, MemoryId)> = BTreeSet::new();
+    for i in 0..n {
+        let mut sims: Vec<(usize, f32)> = (0..n)
+            .filter(|&j| j != i)
+            .map(|j| (j, cosine_similarity(&embeddings[i], &embeddings[j])))
+            .collect();
+        // Descending similarity; ascending index breaks ties so the top-K
+        // selection is deterministic. `total_cmp` is NaN-safe (no `.unwrap()`
+        // on `partial_cmp` — hard rule).
+        sims.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        for (j, sim) in sims.into_iter().take(TOPIC_NN_TOP_K) {
+            if sim >= TOPIC_NN_SIMILARITY_FLOOR {
+                let (a, b) = (ids[i].min(ids[j]), ids[i].max(ids[j]));
+                edges.insert((a, b));
             }
         }
     }
-
-    assignments
+    edges.into_iter().collect()
 }
 
 async fn embed_all(
@@ -263,22 +273,22 @@ async fn embed_all(
     Ok(out)
 }
 
-/// Cosine distance: `1 - (a·b / (|a|·|b|))`. For L2-normalised vectors
-/// the denominator is ~1.0 and the formula reduces to `1 - dot`. We
-/// compute the general form here because centroids (mean of normalised
-/// vectors) are not themselves perfectly normalised before the explicit
-/// re-normalise step.
-fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
+/// Cosine similarity: `a·b / (|a|·|b|)`. For the L2-normalised vectors the
+/// [`EmbeddingProvider`] contract guarantees this reduces to a dot product; the
+/// explicit norm denominator (clamped away from zero) is belt-and-braces
+/// against a degenerate input and matches
+/// [`crate::phases::candidates`]'s helper.
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let mut dot = 0.0f32;
     let mut na = 0.0f32;
     let mut nb = 0.0f32;
-    for i in 0..a.len() {
-        dot += a[i] * b[i];
-        na += a[i] * a[i];
-        nb += b[i] * b[i];
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
     }
     let denom = (na.sqrt() * nb.sqrt()).max(1e-12);
-    1.0 - (dot / denom)
+    dot / denom
 }
 
 async fn label_one_cluster(
@@ -439,10 +449,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discover_topics_clamps_k_to_minimum_3_floor_for_small_n() {
-        // N=4 → K = max(3, ceil(sqrt(1))) = 3. With 4 orthogonal axes
-        // (X, Y, Z, W), at most 3 clusters can form; one cluster will
-        // have 2 members or one cluster ends up empty before re-numbering.
+    async fn discover_topics_keeps_orthogonal_facts_as_separate_singleton_topics() {
+        // ADR-068: N=4 mutually-orthogonal facts (cosine 0 between every pair,
+        // all below the 0.70 floor) form NO edges → four singleton components →
+        // four topics. The retired K-means forced these into exactly 3 buckets
+        // (one cluster absorbed the 4th axis), inventing a false grouping; the
+        // connected-components rework leaves unrelated facts apart.
         let mems = vec![
             memory_with_id("ax", 1),
             memory_with_id("ay", 2),
@@ -454,16 +466,73 @@ mod tests {
         let map = discover_topics(&boundary("personal"), &mems, &embedder, None)
             .await
             .unwrap();
-        // 3 non-empty topics expected (one cluster will absorb the 4th
-        // orthogonal axis).
-        assert!(
-            map.topics.len() == 3,
-            "K floor=3 should produce 3 topics for N=4 orthogonal inputs; got {}",
+        assert_eq!(
+            map.topics.len(),
+            4,
+            "4 orthogonal facts (all cosines below the floor) MUST each be their \
+             own singleton topic; got {}",
             map.topics.len()
         );
+        for t in &map.topics {
+            assert_eq!(
+                t.member_ids.len(),
+                1,
+                "each orthogonal fact is its own topic; got {:?}",
+                t.member_ids
+            );
+        }
         // Each member ID appears in exactly one topic.
         let total_members: usize = map.topics.iter().map(|t| t.member_ids.len()).sum();
         assert_eq!(total_members, 4, "every input memory must be assigned");
+    }
+
+    #[tokio::test]
+    async fn discover_topics_groups_related_pair_and_isolates_unrelated_facts() {
+        // ADR-068 core fix, mirroring the §7 dogfood failure: two facts about
+        // the same subject (near-identical embeddings) MUST share one topic,
+        // while unrelated facts (orthogonal) MUST NOT be dragged in. K-means
+        // jammed a job fact + a dog fact into a "vehicle_transitions" bucket;
+        // connected-components keeps them apart.
+        let mems = vec![
+            memory_with_id("car-a", 1),
+            memory_with_id("car-b", 2),
+            memory_with_id("job", 3),
+            memory_with_id("dog", 4),
+        ];
+        // car-a / car-b identical (both on the X axis, cosine 1.0) → one topic.
+        // job (Y) + dog (Z) orthogonal to everything → two singletons.
+        let embedder = MockEmbedder::new(vec![
+            ("car-a", ex()),
+            ("car-b", ex()),
+            ("job", ey()),
+            ("dog", ez()),
+        ]);
+        let map = discover_topics(&boundary("personal"), &mems, &embedder, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            map.topics.len(),
+            3,
+            "two car facts share ONE topic; job + dog each their own → 3 topics; got {}",
+            map.topics.len()
+        );
+        let mut sizes: Vec<usize> = map.topics.iter().map(|t| t.member_ids.len()).collect();
+        sizes.sort_unstable();
+        assert_eq!(
+            sizes,
+            vec![1, 1, 2],
+            "expected one 2-member topic (cars) + two singletons (job, dog); got {sizes:?}"
+        );
+        // The car pair must be co-located in the size-2 topic.
+        let car_a = MemoryId(Uuid::from_u128(1));
+        let car_b = MemoryId(Uuid::from_u128(2));
+        assert!(
+            map.topics
+                .iter()
+                .any(|t| t.member_ids.contains(&car_a) && t.member_ids.contains(&car_b)),
+            "the two car facts MUST share a topic; got {:?}",
+            map.topics
+        );
     }
 
     #[tokio::test]

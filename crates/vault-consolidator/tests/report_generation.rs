@@ -84,9 +84,9 @@ async fn generate_reports_produces_topical_report_per_boundary() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
     let boundary = Boundary::new("personal").expect("valid boundary");
-    // 4 distinct facts → discover_topics runs real K-means (N >= 3) and emits
-    // >= 1 topic. Two are loosely related, two are unrelated, so we don't
-    // depend on any particular cluster count.
+    // 4 distinct facts → discover_topics runs connected-components topic
+    // discovery (ADR-068, N >= 3) and emits >= 1 topic. The facts are mostly
+    // unrelated, so we don't depend on any particular cluster count.
     let contents = [
         "The user's blood pressure was 132 over 85 on Tuesday morning.",
         "The user is learning Spanish using a flashcard app every evening.",

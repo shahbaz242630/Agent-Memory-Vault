@@ -267,6 +267,92 @@
       "expect": {
         "abstain": true
       }
+    },
+    {
+      "id": "A7-guard-populated-absent",
+      "ability": "abstention_true_negative",
+      "_targets": "FLOOR RE-VALIDATION (ADR-066 -2.5 no-signal floor, 2026-06-04): the no-signal floor must still abstain as the vault fills with DISTRACTORS. Five diverse held facts, none about the queried attribute (blood type). This is the A6 case the handoff #4 flags: recalibrate confidence that more distractors don't push a no-signal query over the floor.",
+      "seed_memories": [
+        {"content": "The user's favourite cuisine is Japanese.", "source_agent": "claude-opus-4-7", "as_of": "2026-02-15", "confidence": 0.95},
+        {"content": "The user works as a structural engineer.", "source_agent": "gpt-5", "as_of": "2026-03-01", "confidence": 0.95},
+        {"content": "The user has a golden retriever named Biscuit.", "source_agent": "claude-opus-4-7", "as_of": "2026-01-25", "confidence": 0.95},
+        {"content": "The user is fluent in Mandarin and English.", "source_agent": "gpt-5", "as_of": "2026-01-18", "confidence": 0.95},
+        {"content": "The user cycles to the office most mornings.", "source_agent": "claude-opus-4-7", "as_of": "2026-02-20", "confidence": 0.93}
+      ],
+      "query": "what is the user's blood type?",
+      "expect": {
+        "abstain": true
+      }
+    },
+    {
+      "id": "A7-guard-adjacent-species",
+      "ability": "abstention_true_negative",
+      "_targets": "FLOOR RE-VALIDATION, harder: the vault holds a DOG fact (high topical adjacency to 'cat'), but the user has no cat. Must abstain rather than confabulate a cat from the retriever fact — the no-signal floor must hold against a same-domain near-neighbour distractor.",
+      "seed_memories": [
+        {"content": "The user has a golden retriever named Biscuit.", "source_agent": "claude-opus-4-7", "as_of": "2026-01-25", "confidence": 0.95},
+        {"content": "The user volunteers at an animal shelter on Saturdays.", "source_agent": "gpt-5", "as_of": "2026-01-26", "confidence": 0.9}
+      ],
+      "query": "what breed is the user's cat?",
+      "expect": {
+        "abstain": true
+      }
+    },
+    {
+      "id": "A7-guard-absent-attribute-amid-related",
+      "ability": "abstention_true_negative",
+      "_targets": "FLOOR RE-VALIDATION: the vault holds the user's OCCUPATION but not their SALARY. A career-adjacent query for an absent attribute must abstain, not read a number off the occupation fact.",
+      "seed_memories": [
+        {"content": "The user works as a structural engineer.", "source_agent": "claude-opus-4-7", "as_of": "2026-03-01", "confidence": 0.95},
+        {"content": "The user is studying for a project management certification.", "source_agent": "gpt-5", "as_of": "2026-03-02", "confidence": 0.9}
+      ],
+      "query": "what is the user's annual salary?",
+      "expect": {
+        "abstain": true
+      }
+    },
+    {
+      "id": "A7-guard-absent-amid-preferences",
+      "ability": "abstention_true_negative",
+      "_targets": "FLOOR RE-VALIDATION: several preference facts held, none about the queried preference (preferred OS). Distractor-dense no-signal must still abstain.",
+      "seed_memories": [
+        {"content": "The user works primarily in a dark-themed editor and finds light themes straining.", "source_agent": "claude-opus-4-7", "as_of": "2026-02-01", "confidence": 0.9},
+        {"content": "The user prefers the Rust programming language for backend work.", "source_agent": "gpt-5", "as_of": "2026-02-02", "confidence": 0.9},
+        {"content": "The user collects vintage mechanical keyboards.", "source_agent": "claude-opus-4-7", "as_of": "2026-02-10", "confidence": 0.9}
+      ],
+      "query": "which operating system does the user prefer?",
+      "expect": {
+        "abstain": true
+      }
+    },
+    {
+      "id": "A7-synonym-instrument-cello",
+      "ability": "abstention_no_over_abstain",
+      "_targets": "SYNONYM GAP: 'what instrument does the user play?' <-> 'plays the cello in a community orchestra' (instrument<->cello, category<->instance). must_exclude is music-adjacent (listens to jazz) but names no instrument played.",
+      "seed_memories": [
+        {"content": "Plays the cello in a community orchestra on Sunday afternoons.", "source_agent": "claude-opus-4-7", "as_of": "2026-02-08", "confidence": 0.93},
+        {"content": "The user listens to jazz while working.", "source_agent": "gpt-5", "as_of": "2026-02-09", "confidence": 0.9}
+      ],
+      "query": "what instrument does the user play?",
+      "expect": {
+        "must_surface": ["A7-synonym-instrument-cello#0"],
+        "must_exclude": ["A7-synonym-instrument-cello#1"],
+        "abstain": false
+      }
+    },
+    {
+      "id": "A7-synonym-drive-vehicle",
+      "ability": "abstention_no_over_abstain",
+      "_targets": "SYNONYM GAP: 'what does the user drive?' <-> 'owns a Rivian R1T' (drive<->owns). must_exclude is transport-adjacent (takes the train on Fridays) but is not the vehicle the user drives.",
+      "seed_memories": [
+        {"content": "The user owns a Rivian R1T.", "source_agent": "claude-opus-4-7", "as_of": "2026-03-15", "confidence": 0.94},
+        {"content": "The user takes the train into the city on Fridays.", "source_agent": "gpt-5", "as_of": "2026-03-16", "confidence": 0.9}
+      ],
+      "query": "what does the user drive?",
+      "expect": {
+        "must_surface": ["A7-synonym-drive-vehicle#0"],
+        "must_exclude": ["A7-synonym-drive-vehicle#1"],
+        "abstain": false
+      }
     }
   ]
 }

@@ -307,8 +307,11 @@ async fn collect_edges_for_memory(
 /// adjacency-edge list, returns connected-component groups keyed by the
 /// root ID.
 ///
-/// Internal helper; not part of the crate's public API.
-fn union_find_components(
+/// `pub(crate)` so `topics.rs` can reuse this tested primitive for connected-
+/// components topic discovery (ADR-068) — singletons included (this returns a
+/// group for every node, size ≥ 1; the merge-phase caller filters size-1
+/// itself). Not part of the crate's public API.
+pub(crate) fn union_find_components(
     nodes: &[MemoryId],
     edges: &[(MemoryId, MemoryId)],
 ) -> BTreeMap<MemoryId, Vec<MemoryId>> {
