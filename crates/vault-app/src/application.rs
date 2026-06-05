@@ -48,7 +48,7 @@ use vault_consolidator::{
 };
 use vault_core::{Boundary, VaultError, VaultResult};
 use vault_embedding::{
-    BgeSmallProvider, EmbeddingProvider, Qwen3RerankerProvider, RerankProvider, EMBEDDING_DIM,
+    BgeSmallProvider, EmbeddingProvider, LazyQwen3Reranker, RerankProvider, EMBEDDING_DIM,
 };
 use vault_llm::{LlmProvider, Phi4MiniConfig, Phi4MiniProvider};
 use vault_mcp::{Adapter, StdioServer};
@@ -119,6 +119,12 @@ pub struct Application {
     /// the safety wrapper doesn't require `AppConfig` to be threaded
     /// through the lifecycle.
     vault_root: PathBuf,
+    /// Concrete handle to the lazy reranker (ADR-070, 2026-06-05), kept so the
+    /// serve path can warm the ~1.2 GB model in the background AFTER the MCP
+    /// handshake binds. `None` when no reranker model is configured (the cosine
+    /// fallback needs no warm-up). Shares its `OnceCell` with the
+    /// `dyn RerankProvider` clone held inside the read pipeline.
+    reranker_warmup: Option<Arc<LazyQwen3Reranker>>,
 }
 
 impl Application {
@@ -318,16 +324,31 @@ impl Application {
         // ADR-067 (2026-06-04) `memory_search` (step 8) is also wired to the raw
         // `hybrid`, so neither read nor search runs a hard BM25 gate.
         let base_pipeline = StructuredReadPipeline::new(hybrid, report_loader);
+        // ADR-070 (2026-06-05): the reranker is wrapped in `LazyQwen3Reranker`
+        // so its ~1.2 GB model load is deferred OFF the MCP `initialize`
+        // handshake path. Eager loading here cost ~40 s BEFORE the server could
+        // answer the handshake — that timed out Kimi CLI's connect retries and
+        // sat dangerously close to Claude Desktop's 60 s init window.
+        // Construction does NO disk I/O; the model loads on first read, warmed
+        // in the background by `start_with_mcp`'s `spawn_warmup`.
+        // `relevance_floor()` returns its constant without a load, so nothing on
+        // the handshake path can trigger the load.
+        let mut reranker_warmup: Option<Arc<LazyQwen3Reranker>> = None;
         let read_pipeline = match (&config.rerank_model_path, &config.rerank_tokenizer_path) {
             (Some(rerank_model), Some(rerank_tokenizer)) => {
-                let reranker: Arc<dyn RerankProvider> = Arc::new(Qwen3RerankerProvider::open(
+                let lazy = Arc::new(LazyQwen3Reranker::new(
                     rerank_model,
                     rerank_tokenizer,
                     &config.ort_lib_path,
-                )?);
+                ));
+                // One allocation, two views: the pipeline holds it as the
+                // `dyn RerankProvider` gate; the concrete handle is kept for the
+                // serve path's background warm-up. Both share the same OnceCell.
+                let reranker: Arc<dyn RerankProvider> = lazy.clone();
+                reranker_warmup = Some(lazy);
                 tracing::info!(
                     target: "vault_app::startup",
-                    "read relevance gate: cross-encoder reranker (Qwen3-Reranker-0.6B, ADR-057 amendment)"
+                    "read relevance gate: cross-encoder reranker (Qwen3-Reranker-0.6B, ADR-057 amendment; lazy-loaded per ADR-070)"
                 );
                 // ADR-069 recall-union: also hand the pipeline the semantic
                 // channel. The reranker SUPERSEDES the cosine relevance GATE,
@@ -458,6 +479,7 @@ impl Application {
             storage,
             consolidator,
             vault_root,
+            reranker_warmup,
         })
     }
 
@@ -555,6 +577,15 @@ impl Application {
             // become JoinError on the handle.
             let _ = running.waiting().await;
         });
+
+        // 3b. Warm the lazy reranker OFF the handshake path (ADR-070). The
+        //     transport is bound — `initialize` is answerable now — so kicking
+        //     the ~1.2 GB model load onto a background thread means the first
+        //     read does not pay the full load. No-op when no reranker model is
+        //     configured (the cosine fallback needs no warm-up).
+        if let Some(reranker) = &self.reranker_warmup {
+            reranker.spawn_warmup();
+        }
 
         // 4. Spawn signal handler — first Ctrl-C → graceful shutdown
         //    signal; second Ctrl-C → forced exit per locked semantics.

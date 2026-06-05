@@ -25,6 +25,7 @@ pub mod integrity;
 pub mod ort_init;
 pub mod provider;
 pub mod reranker;
+pub mod reranker_lazy;
 
 /// Test-verification helpers — gated `testing` cargo feature.
 /// Self-enabled for integration tests via the `[dev-dependencies]`
@@ -42,3 +43,4 @@ pub use provider::{EmbeddingProvider, EMBEDDING_DIM};
 pub use reranker::{
     Qwen3RerankerProvider, RerankProvider, QWEN3_RERANKER_INSTRUCT, RERANK_NO_SIGNAL_FLOOR,
 };
+pub use reranker_lazy::LazyQwen3Reranker;
