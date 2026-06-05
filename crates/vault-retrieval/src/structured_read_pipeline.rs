@@ -59,7 +59,7 @@
 //! The seven warning codes ([`WarningCode`]) are locked by ADR-054
 //! Contract 2; any future addition requires a Contract amendment.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -106,9 +106,21 @@ const RELEVANCE_GATE_TOP_K: usize = 1;
 /// that the reranker exists to correct. The reranker is the relevance
 /// authority; it must see every retrieved candidate, not BGE's top-8. Cost:
 /// ~0.39s/candidate CPU → ≤8s worst case at 20 (correctness-before-latency;
-/// GPU/int8 is the latency fast-follow). Bounded — retrieval itself caps at
-/// [`DEFAULT_MAX_CANDIDATES`], so this never reranks more than that.
-const RERANK_CANDIDATE_CAP: usize = DEFAULT_MAX_CANDIDATES;
+/// GPU/int8 is the latency fast-follow).
+///
+/// Scale finding (ADR-069, 2026-06-04): the rerank pool is no longer just the
+/// hybrid's top-N. At 100 facts the hybrid's RRF fusion *starved* a strong
+/// pure-semantic match (a subject-less fact sharing no query keywords ranked
+/// pure-BGE #6/100 but hybrid >20/100, because every "The user …" fact earned a
+/// second RRF term from the incidental "user" keyword overlap). So `read` now
+/// unions the semantic channel's top-[`DEFAULT_MAX_CANDIDATES`] onto the hybrid
+/// hits before reranking (see [`StructuredReadPipeline::union_semantic_recall`]).
+/// The pool is therefore bounded by hybrid([`DEFAULT_MAX_CANDIDATES`]) ∪
+/// semantic([`DEFAULT_MAX_CANDIDATES`]) = at most `2 × DEFAULT_MAX_CANDIDATES`
+/// unique; this cap sizes the reranker batch to that union so a unioned-in
+/// semantic match is never truncated away before the reranker (the relevance
+/// authority) scores it.
+const RERANK_CANDIDATE_CAP: usize = 2 * DEFAULT_MAX_CANDIDATES;
 
 /// Minimum top-1 BGE cosine for a query to count as having relevant content.
 /// Below this the read abstains (no-signal). Calibrated 2026-05-28
@@ -311,11 +323,18 @@ impl Clock for SystemClock {
 #[derive(Clone)]
 pub struct StructuredReadPipeline {
     retriever: Arc<dyn Retriever>,
-    /// Optional semantic-only probe channel for the relevance gate
-    /// (ADR-057). When `Some`, `read` abstains if the top-K-mean BGE cosine
-    /// is below [`RELEVANCE_COSINE_FLOOR`]. Wired in production via
-    /// [`Self::with_relevance_gate`]; `None` (the `new` default) disables the
-    /// gate so unit tests exercising other contracts are unaffected.
+    /// Optional semantic-only channel. Serves two roles depending on wiring:
+    /// - **No reranker (cosine fallback, ADR-057):** the relevance gate — `read`
+    ///   abstains if the top-K-mean BGE cosine is below [`RELEVANCE_COSINE_FLOOR`].
+    /// - **Reranker wired (production, ADR-069):** the recall-union source —
+    ///   [`Self::union_semantic_recall`] widens the rerank pool with this
+    ///   channel's top hits so an RRF-starved pure-semantic match still reaches
+    ///   the reranker. (The cosine gate itself is bypassed when a reranker owns
+    ///   abstention.)
+    ///
+    /// Wired in production via [`Self::with_relevance_gate`]; `None` (the `new`
+    /// default) leaves both behaviours off so unit tests exercising other
+    /// contracts are unaffected.
     semantic: Option<Arc<dyn Retriever>>,
     /// Optional cross-encoder reranker (ADR-057 amendment, 2026-05-29). When
     /// `Some`, the top [`RERANK_CANDIDATE_CAP`] retrieved candidates are
@@ -560,7 +579,14 @@ impl StructuredReadPipeline {
         // `memory_search` only.
         let candidates = if self.reranker.is_some() {
             let retrieved = self.retriever.retrieve(retrieval_query).await?;
-            self.apply_reranker(&query_echo, retrieved).await?
+            // Recall-union (ADR-069): widen the rerank pool with the semantic
+            // channel's top hits so an RRF-starved pure-semantic match still
+            // reaches the reranker (the relevance authority). No-op when no
+            // semantic channel is wired.
+            let pool = self
+                .union_semantic_recall(retrieved, &query_echo, &query.authorized_boundaries)
+                .await?;
+            self.apply_reranker(&query_echo, pool).await?
         } else if let Some(semantic) = &self.semantic {
             let gate_query = RetrievalQuery {
                 query_text: query_echo.clone(),
@@ -615,9 +641,56 @@ impl StructuredReadPipeline {
         })
     }
 
+    /// Widen the rerank candidate pool with the semantic channel's top hits
+    /// (ADR-069, scale finding 2026-06-04).
+    ///
+    /// At scale the hybrid's RRF fusion starves a strong PURE-semantic match: a
+    /// fact sharing no query keywords (e.g. the subject-less "Plays the cello…")
+    /// earns only its semantic-channel RRF term, while every "The user …" fact
+    /// earns a second term from the incidental "user" keyword overlap — pushing
+    /// the keyword-less fact below the hybrid's returned top-N, out of the
+    /// reranker's view (measured: cello at pure-BGE rank 6/100 but dropped past
+    /// hybrid rank 20/100). The reranker is the relevance authority; its pool
+    /// must not be gated by RRF's keyword bias. We union the semantic channel's
+    /// top-[`Self::max_candidates`] (deduped by id) onto the hybrid hits. The
+    /// reranker re-sorts the whole pool by relevance and drops below-floor junk,
+    /// so unioning in extra candidates only widens recall — it cannot lower
+    /// precision. No-op when no semantic channel is wired (e.g. unit tests, or a
+    /// no-reranker deployment where the cosine gate owns abstention instead).
+    async fn union_semantic_recall(
+        &self,
+        mut hits: Vec<RetrievedMemory>,
+        query: &str,
+        boundaries: &[Boundary],
+    ) -> VaultResult<Vec<RetrievedMemory>> {
+        let Some(semantic) = &self.semantic else {
+            return Ok(hits);
+        };
+        let sem_hits = semantic
+            .retrieve(RetrievalQuery {
+                query_text: query.to_string(),
+                authorized_boundaries: boundaries.to_vec(),
+                max_results: self.max_candidates,
+                options: RetrievalOptions::default(),
+            })
+            .await?;
+        let present: HashSet<MemoryId> = hits.iter().map(|h| h.memory.id).collect();
+        for h in sem_hits {
+            if !present.contains(&h.memory.id) {
+                hits.push(h);
+            }
+        }
+        Ok(hits)
+    }
+
     /// Rerank the top [`RERANK_CANDIDATE_CAP`] retrieved candidates with the
     /// cross-encoder, keep those at/above the reranker's floor, and re-sort by
     /// reranker score (DESC). An empty result → the read abstains.
+    ///
+    /// The input pool may be a hybrid ∪ semantic union (see
+    /// [`Self::union_semantic_recall`]); [`RERANK_CANDIDATE_CAP`] is sized to
+    /// that union (`2 × DEFAULT_MAX_CANDIDATES`) so the truncate below never
+    /// drops a unioned-in semantic match before it is scored.
     ///
     /// **Recall-first (ADR-066, 2026-06-02).** The reranker's floor is now a
     /// coarse NO-SIGNAL cut (`RERANK_NO_SIGNAL_FLOOR`, ~−2.5), NOT a precision
@@ -1618,6 +1691,99 @@ mod tests {
                 "candidate {i} (beyond the cap) MUST be dropped (never reranked)"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn union_semantic_recall_rescues_keyword_starved_fact() {
+        // Scale finding (ADR-069, 2026-06-04): a strong PURE-semantic match
+        // (subject-less, no query-keyword overlap) is starved out of the
+        // hybrid's RRF top-N by facts with incidental keyword overlap. Here the
+        // hybrid mock returns ONLY the keyword-y distractor (the cello is beyond
+        // its returned pool, modelling the RRF burial); the semantic channel
+        // ranks the cello #1. The recall-union must feed the cello to the
+        // reranker, which surfaces it. Pre-fix (no union) the cello never
+        // reaches the reranker and the read abstains (distractor below floor).
+        let now = read_clock_now();
+        let cello = fake_memory(
+            1,
+            "plays the cello in a community orchestra",
+            "personal",
+            now,
+            0.9,
+            None,
+        );
+        let distractor = fake_memory(
+            2,
+            "the user listens to jazz while working",
+            "personal",
+            now,
+            0.9,
+            None,
+        );
+        // Hybrid returns ONLY the distractor — the cello is RRF-starved out.
+        let hybrid = MockRetriever::new(vec![retrieved(distractor.clone(), 0.5)]);
+        // Semantic channel ranks the cello highly (its true pure-BGE strength).
+        let semantic = MockRetriever::new(vec![retrieved(cello, 0.8), retrieved(distractor, 0.4)]);
+        // Reranker: cello above floor, jazz distractor below.
+        let reranker = MockReranker::new(
+            vec![
+                ("plays the cello in a community orchestra", 3.0),
+                ("the user listens to jazz while working", -3.0),
+            ],
+            -10.0,
+            0.0,
+        );
+        let pipeline = StructuredReadPipeline::new(hybrid, MockReportLoader::empty())
+            .with_clock(FixedClock::arc(now))
+            .with_relevance_gate(semantic)
+            .with_reranker(reranker);
+        let resp = pipeline
+            .read(ReadQuery {
+                query_text: "what instrument does the user play?".into(),
+                authorized_boundaries: vec![boundary("personal")],
+            })
+            .await
+            .unwrap();
+        assert!(
+            !resp.abstain,
+            "the recall-union MUST rescue the keyword-starved semantic match"
+        );
+        assert_eq!(
+            resp.relevant_facts.len(),
+            1,
+            "only the cello is above floor"
+        );
+        assert_eq!(
+            resp.relevant_facts[0].fact,
+            "plays the cello in a community orchestra"
+        );
+    }
+
+    #[tokio::test]
+    async fn union_semantic_recall_dedups_overlap() {
+        // When the same fact is returned by BOTH the hybrid and the semantic
+        // channel, the union must NOT duplicate it in the response.
+        let now = read_clock_now();
+        let shared = fake_memory(1, "the user owns a rivian", "personal", now, 0.9, None);
+        let hybrid = MockRetriever::new(vec![retrieved(shared.clone(), 0.6)]);
+        let semantic = MockRetriever::new(vec![retrieved(shared, 0.9)]);
+        let reranker = MockReranker::new(vec![("the user owns a rivian", 2.0)], -10.0, 0.0);
+        let pipeline = StructuredReadPipeline::new(hybrid, MockReportLoader::empty())
+            .with_clock(FixedClock::arc(now))
+            .with_relevance_gate(semantic)
+            .with_reranker(reranker);
+        let resp = pipeline
+            .read(ReadQuery {
+                query_text: "what does the user drive?".into(),
+                authorized_boundaries: vec![boundary("personal")],
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.relevant_facts.len(),
+            1,
+            "a fact in both channels must appear once, not twice"
+        );
     }
 
     // ---------------------------------------------------------------------

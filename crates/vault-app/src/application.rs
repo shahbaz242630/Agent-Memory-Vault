@@ -329,7 +329,17 @@ impl Application {
                     target: "vault_app::startup",
                     "read relevance gate: cross-encoder reranker (Qwen3-Reranker-0.6B, ADR-057 amendment)"
                 );
-                base_pipeline.with_reranker(reranker)
+                // ADR-069 recall-union: also hand the pipeline the semantic
+                // channel. The reranker SUPERSEDES the cosine relevance GATE,
+                // but the same semantic channel is reused as the recall-union
+                // source — it widens the rerank pool with strong pure-semantic
+                // matches that the hybrid's RRF fusion starves on a populated
+                // vault (scale finding 2026-06-04: a subject-less fact ranked
+                // pure-BGE #6/100 but hybrid > 20/100, so the reranker never
+                // saw it). Without it the read mis-abstains on findable facts.
+                base_pipeline
+                    .with_reranker(reranker)
+                    .with_relevance_gate(semantic.clone())
             }
             _ => {
                 tracing::info!(

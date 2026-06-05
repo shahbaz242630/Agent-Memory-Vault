@@ -195,6 +195,10 @@ TODO.local.md
 .claude/.session/
 .claude/cache/
 
+# ---------- MCP tool scratch dirs (per-machine, never committed) ----------
+# Playwright MCP writes browser session/trace scratch here during dogfooding.
+.playwright-mcp/
+
 # ---------- Project rules / agent instructions (local-only per Shahbaz) ----------
 # CLAUDE.md is the project-scoped rules file Claude Code auto-loads each session.
 # Shahbaz's preference (2026-04-28): never commit this file — keep it per-machine.
