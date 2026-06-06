@@ -79,6 +79,31 @@ pub struct SearchToolParams {
     pub include_archived: Option<bool>,
 }
 
+/// Wire response for the `memory_search` tool (ADR-071 Option B, 2026-06-06).
+///
+/// Wraps the reordered candidate list with an additive, recall-safe relevance
+/// hint so a calling agent can tell a strong match from a no-signal query
+/// WITHOUT the tool ever dropping results — a drop would re-introduce the
+/// false-empty failure mode ADR-071 fixed. `results` is the full reordered
+/// candidate set; the hint NEVER truncates it.
+///
+/// This changes `memory_search`'s output from a bare JSON array to an object;
+/// an alpha-permitted wire change (V0.x). The honest "not in vault" decision
+/// still lives in `memory_read`'s structured `abstain`.
+#[derive(Debug, Serialize)]
+pub struct SearchResponse {
+    /// Reranked candidates, best-first. Empty ONLY when the vault genuinely
+    /// holds no candidates for the query (never a manufactured false-empty).
+    pub results: Vec<vault_retrieval::RetrievedMemory>,
+    /// The top result's `[0, 1]` relevance score (`0.0` when `results` is
+    /// empty). See [`vault_retrieval::SearchHint`].
+    pub top_relevance: f32,
+    /// `true` when nothing meaningfully matched — treat as "likely not in the
+    /// vault", stop rephrasing, and confirm with `memory_read`. Advisory only;
+    /// `results` is still returned in full.
+    pub weak_match: bool,
+}
+
 /// JSON-RPC parameters for the `memory_read` tool. Added at T0.2.7
 /// Phase 4 (2026-05-20); response shape was rewritten at Commit 6
 /// (locked-next-arc, 2026-05-26 — ADR-052 + ADR-054) when the Qwen-7B
@@ -267,10 +292,7 @@ impl StdioServer {
     /// panics with `unimplemented!()` — the trust-boundary tests assert
     /// the trusted slice was used by inspecting that panic site (or, in
     /// Phase 2, by replacing the adapter with a recording one).
-    pub async fn handle_search(
-        &self,
-        params: SearchToolParams,
-    ) -> VaultResult<Vec<vault_retrieval::RetrievedMemory>> {
+    pub async fn handle_search(&self, params: SearchToolParams) -> VaultResult<SearchResponse> {
         let options = RetrievalOptions {
             score_threshold: params.score_threshold,
             include_archived: params.include_archived.unwrap_or(false),
@@ -283,7 +305,16 @@ impl StdioServer {
             max_results: params.max_results.unwrap_or(10),
             options,
         };
-        self.adapter.search(query).await
+        let results = self.adapter.search(query).await?;
+        // ADR-071 Option B: attach the additive, recall-safe relevance hint.
+        // The results are already relevance-sorted DESC by the retriever; the
+        // hint never drops or reorders them.
+        let hint = vault_retrieval::search_hint(&results);
+        Ok(SearchResponse {
+            results,
+            top_relevance: hint.top_relevance,
+            weak_match: hint.weak_match,
+        })
     }
 
     /// `memory_read` handler. Constructs the [`ReadQuery`] using the
@@ -471,16 +502,19 @@ impl StdioServer {
     /// audit chain is the authoritative record, tracing is operational.
     #[tool(
         name = "memory_search",
-        description = "Browse the user's memory vault by free-text query. Returns \
-                       candidate memories ranked by relevance (a cross-encoder \
-                       reranker), best first, each with a 0-1 relevance score. \
+        description = "Browse the user's memory vault by free-text query. Returns a \
+                       JSON object: `results` (candidate memories ranked by a \
+                       cross-encoder reranker, best first, each with a 0-1 \
+                       relevance score), `top_relevance` (the best result's \
+                       score), and `weak_match` (boolean). \
+                       If `weak_match` is true, nothing meaningfully matched — the \
+                       vault most likely does NOT hold this; tell the user it isn't \
+                       stored and do NOT keep rephrasing the query. \
                        For answering a specific question about the user \
                        (what/who/when/does…), PREFER `memory_read` — it returns a \
                        definitive answer or a clear 'not found', which is more \
                        reliable than judging a raw list. Query in a natural-language \
-                       phrase, not bare keywords. If the top results look unrelated, \
-                       the vault most likely does not hold it — do NOT keep \
-                       rephrasing the query; confirm with `memory_read`. \
+                       phrase, not bare keywords. \
                        Authorization is mediated by the host application, not by \
                        this tool's parameters."
     )]
@@ -503,7 +537,7 @@ impl StdioServer {
         let duration_ms: u64 = start.elapsed().as_millis() as u64;
 
         let (result_count, error_for_audit) = match &dispatch_result {
-            Ok(memories) => (memories.len() as u32, None),
+            Ok(response) => (response.results.len() as u32, None),
             Err(e) => (0_u32, Some(ToolInvokeError::from_vault_error(e))),
         };
 
@@ -547,8 +581,8 @@ impl StdioServer {
             .await
             .map_err(vault_error_to_mcp)?;
 
-        let memories = dispatch_result.map_err(vault_error_to_mcp)?;
-        success_json_result(&memories)
+        let response = dispatch_result.map_err(vault_error_to_mcp)?;
+        success_json_result(&response)
     }
 
     /// `memory_read` MCP tool — the agent-facing surface for the

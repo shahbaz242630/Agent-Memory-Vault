@@ -102,7 +102,7 @@ pub const SEARCH_CANDIDATE_FANOUT: usize = 20;
 pub const RERANK_CANDIDATE_CAP: usize = 2 * SEARCH_CANDIDATE_FANOUT;
 
 /// A [`Retriever`] decorator: base retrieval → recall-union → cross-encoder
-/// rerank → drop-below-floor → top-K. See the module docs for the full
+/// rerank → reorder-only → top-K. See the module docs for the full
 /// rationale (ADR-071).
 pub struct RerankedRetriever {
     /// The base ranking source — production wires the raw [`HybridRetriever`].

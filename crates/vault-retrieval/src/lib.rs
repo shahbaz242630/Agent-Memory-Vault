@@ -27,6 +27,7 @@
 pub mod report_io;
 pub mod reranked_retriever;
 pub mod retriever;
+pub mod search_hint;
 pub mod strategies;
 pub mod structured_read_pipeline;
 
@@ -40,6 +41,7 @@ pub use reranked_retriever::{RerankedRetriever, RERANK_CANDIDATE_CAP, SEARCH_CAN
 pub use retriever::{
     RetrievalOptions, RetrievalQuery, RetrievedMemory, Retriever, MAX_QUERY_BYTES, MAX_RESULTS_CAP,
 };
+pub use search_hint::{search_hint, SearchHint, SEPARATION_RATIO, STRONG_RELEVANCE};
 pub use strategies::{
     AbstainConfig, AbstainingRetriever, HybridConfig, HybridRetriever, KeywordIndex,
     KeywordRetriever, SemanticRetriever,

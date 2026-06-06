@@ -121,11 +121,16 @@ async fn tool_search_success_records_audit_and_returns_results() {
         .await
         .expect("SuccessAdapter::search returns one hit; tool_search must succeed");
 
-    // (1) Wire-shape pin — array of RetrievedMemory.
+    // (1) Wire-shape pin — ADR-071 Option B: a JSON object wrapping the
+    //     reordered `results` array with the additive recall-safe hint
+    //     (`top_relevance` + `weak_match`).
     let body = extract_success_json(result);
     let arr = body
-        .as_array()
-        .unwrap_or_else(|| panic!("memory_search success body must be a JSON array; got {body}"));
+        .get("results")
+        .and_then(|v| v.as_array())
+        .unwrap_or_else(|| {
+            panic!("memory_search success body must have a `results` array; got {body}")
+        });
     assert_eq!(arr.len(), 1, "SuccessAdapter returns exactly one hit");
     assert!(
         arr[0].get("memory").is_some(),
@@ -134,6 +139,14 @@ async fn tool_search_success_records_audit_and_returns_results() {
     assert!(
         arr[0].get("score").is_some(),
         "RetrievedMemory must serialise with `score` field; got {body}"
+    );
+    assert!(
+        body.get("top_relevance").is_some(),
+        "response must carry a `top_relevance` hint; got {body}"
+    );
+    assert!(
+        body.get("weak_match").is_some(),
+        "response must carry a `weak_match` hint; got {body}"
     );
 
     // (2) Audit-row pin — one row, correct shape.
