@@ -2,11 +2,145 @@
 
 **Current version:** V0.2 Closed Beta (BRD §6.2 — sleep consolidator, boundaries hardening, cross-device sync, 30 beta users)
 
-**Last updated:** 2026-06-05 (**LAZY RERANKER (ADR-070) — DoD-GREEN + live-verified, COMMITTING THIS SESSION.** Deferred the 1.2 GB Qwen3 reranker load OFF the MCP `initialize` handshake via a new `LazyQwen3Reranker` (zero-I/O construction; `relevance_floor()` returns its constant WITHOUT loading) + a background warm-up spawned right after the stdio transport binds. **Live Claude Desktop: handshake ~40s → ~9s** (Kimi's <40s connect window + Claude's 60s init both now safe), background warm-up confirmed (server process settled at ~1.6 GB = BGE + reranker both resident; forced `memory_read "what instrument…"` returned the cello fact at rank 1, `error=None`, `duration_ms=17657` = warm inference, NOT a cold load). **HONEST CAVEAT: the prior plan's "<1s" was NOT hit — measurement showed BGE load + keyword-index build are a SECOND eager ~9s cost the plan hadn't accounted for (the reranker was the biggest blocker at ~40s, not the only one). Both CONCRETE goals (Kimi connect, Claude 60s) ARE resolved; the BGE/index residual is logged as a follow-up, not chased (BGE is used by read+search+write → wider blast radius, low payoff at V0.2).** Gates: fmt ✅ · clippy --workspace --all-targets -D warnings ✅ 0 · build --workspace ✅ · test -p vault-embedding ✅ (4 new lazy tests) · test -p vault-app ✅ 58. Prior this-session commit: ADR-069 read recall-union (`a2cee13`, CI-pending). **NEXT (after this commit + CI green): re-run the Kimi independent validation — the handshake now fits its connect window.** Prior openers HISTORICAL.)
+**Last updated:** 2026-06-06 (**ADR-071 RERANKED + recall-safe `memory_search` SHIPPED — all 5 DoD gates GREEN (fresh from `cargo clean`), 3-model live-dogfood validated in Antigravity, committed this session.** `RerankedRetriever` brings the cross-encoder + ADR-069 recall-union to `memory_search` as REORDER-ONLY (never false-empty); sigmoid logit→[0,1] score; tool descriptions steer question-answering to `memory_read` (the primary answer path, returns structured `abstain`). Live-validated: Flash one-shots `memory_read` (cello + blood-type abstain, no 4-min spin); Opus 4.6 `memory_search` reorders cello #4→#1, never `[]`. **NEXT: Option B — additive `weak_match`/`top_relevance` hint on `memory_search` so weak agents can judge no-signal results WITHOUT reintroducing a drop-floor. See the 2026-06-06 opener below.** Prior openers HISTORICAL.)
 
 ---
 
-## 🟦 NEXT SESSION OPENER (2026-06-05 #2) — **LAZY RERANKER (ADR-070): MCP handshake ~40s → ~9s, live-verified. DoD-GREEN, committing. Next: verify CI green → re-run Kimi.** — READ THIS FIRST
+## 🟢 NEXT SESSION OPENER (2026-06-06) — **ADR-071 RERANKED + recall-safe `memory_search` SHIPPED. All 5 DoD gates GREEN, 3-model live-validated, committed. NEXT: Option B — additive `weak_match` hint on `memory_search` (recall-safe relevance signal, NO floor).** — READ THIS FIRST
+
+> Picked up opener #4 (code written, unverified, uncommitted). Reclaimed 102 GB of stale `target/` (`cargo clean`), ran every gate fresh, then Shahbaz live-dogfooded in Antigravity across 3 model tiers. All green → committed ADR-071. Now moving to Option B (the known no-signal-judgment limitation).
+
+### ✅ DONE THIS SESSION (ADR-071)
+**All 5 DoD gates green, fresh from `cargo clean` (reclaimed 102 GB; disk 42 GB → 133 GB free):**
+- `cargo fmt --all --check` ✅
+- `cargo clippy --workspace -- -D warnings` ✅ (15m28s, 0 warnings)
+- `cargo build --workspace` ✅ (21m31s, 0 warnings)
+- `cargo test` ✅ — vault-retrieval / vault-mcp / vault-app all pass (8 new reorder-only unit tests incl. `never_returns_false_empty_even_when_all_score_negative`, `recall_union_rescues_a_base_missed_semantic_match`, `explicit_score_threshold_filters_on_relevance_scale`)
+
+**3-model live dogfood (Antigravity, live `testeval` vault) — the validation that matters:**
+| Model | Tool chosen | Query | Result |
+|---|---|---|---|
+| Gemini Flash (small) | `memory_read` | "what instrument do I play" | ✅ cello, `abstain:false`, conf 0.9 |
+| Gemini Flash (small) | `memory_read` | "what is my blood type" | ✅ `[]`, `abstain:true` — **NO 4-min spin (the headline fix)** |
+| Opus 4.6 | `memory_search` | instrument | ✅ cello reordered to **#1** (was #4), score +0.047 (sigmoid), **never `[]`** |
+| Opus 4.6 | `memory_search` | blood type (no-signal) | ✅ returns ranked list (no false-empty), all scores ~0.0002 — recall-safe |
+
+**Both catastrophic failures from opener #4's dogfood are fixed:** false-empty→abandon-vault, and no-signal→4-min-spin. Weak models now self-route to `memory_read` (description-steering works); `memory_search` is reorder-only recall-safe. Commit hash to be referenced in the next admin ride-along (per admin-rides-with-code).
+
+### ADR-071 — reranked + recall-safe `memory_search`; `memory_read` is the primary answer path
+**Context.** `memory_search` shipped as the raw `HybridRetriever` (BGE ∪ BM25 via RRF, no reranker) — our weakest ranking path, and the one agents reach for unpredictably. Live dogfood: correct answer ranked #4/10; at 100+ facts it falls out of the returned window entirely. An earlier in-session fix added the reranker WITH a drop-below-floor (so search could honestly return "nothing found"), but the 4-model dogfood proved a **false-empty is the WORST failure for a memory product**: a bare empty list is ambiguous ("wrong query" vs "not in vault"), so weak agents either ABANDON the vault for competing memory (Opus 4.6 went hunting the IDE's own brain) or SPIN re-querying for minutes (Flash on a no-signal query).
+
+**Decision.**
+1. **`memory_read` is THE primary answer path** — returns a structured DECISION (facts, or `abstain:true` + "do not fabricate"): unambiguous + actionable. Tool descriptions steer question-answering there.
+2. **`memory_search` = reranked, recall-safe browse path** via new `RerankedRetriever` (wraps hybrid base → ADR-069 semantic recall-union → cross-encoder rerank → **REORDER-ONLY** → top-K). NEVER drops candidates → never a false-empty; empty ONLY when the base pool is genuinely empty. Reuses the warm reranker `Arc` from the read path (no second model load).
+3. **Score domain:** reranker logit → `[0,1]` via sigmoid (`relevance_score`), strictly monotonic (rank order preserved), bounded so a returned result never reads as a negative/irrelevant score (the earlier `tanh` showed the correct cello as −0.95). Raw logit kept in `explanation`. Alpha-permitted wire change (V0.x; frozen at V1.0).
+4. **Graceful fallback:** no reranker model configured → raw hybrid wired directly (recall-first preserved for lightweight deployments).
+
+**Not chosen:** making search bulletproof (the reranker is brittle on terse keyword queries — adding "music" to "play" pushed the cello below any floor; only literal "cello" scored positive); removing search (weak models still reach for it, so it must be safe).
+
+**Consequence / known limit (→ Option B):** on a true no-signal query, `memory_search` returns ranked-but-irrelevant facts with uniformly near-zero scores — the calling agent must judge. The clean "not in vault" signal lives in `memory_read.abstain`. Option B adds an additive hint to help agents judge search output without reintroducing a floor.
+
+**Files (this commit):** `crates/vault-retrieval/src/reranked_retriever.rs` (NEW, +8 unit tests), `crates/vault-retrieval/src/lib.rs` (exports), `crates/vault-app/src/application.rs` (step 7b builds the reranker once, shared by search+read; step 8 wires search; step 9 reuses it), `crates/vault-mcp/src/server.rs` (tool descriptions: search de-cosine'd + "prefer `memory_read`" + "thin/empty = not in vault, don't rephrase"; read marked PRIMARY), `HANDOFF.md`.
+
+### ▶️ NEXT: Option B — additive `weak_match` hint on `memory_search`
+**Goal:** give `memory_search` a recall-safe relevance signal so weak agents can tell "strong match" from "nothing really matched" — WITHOUT ever dropping or false-emptying (the floor we deliberately removed in ADR-071).
+
+**Shape (proposed — confirm with Shahbaz before code):** wrap the search response with additive top-level metadata, e.g. `top_relevance: f32` (the #1 result's `[0,1]` score) and/or `weak_match: bool` (true when the best score is below a *display* threshold, ~0.1). The results array is UNCHANGED — still all reordered candidates, never empty; the hint is metadata only. Tool description tells agents: "if `weak_match` is true / `top_relevance` is low, treat as 'likely not in your vault' — don't keep rephrasing." NOTE: this changes the `memory_search` MCP output shape from a bare array to a `{results, top_relevance, weak_match}` object — confirm that wire change is wanted (alpha-permitted, but it touches every search caller's parsing).
+
+**Why additive, not a floor:** a floor drops results → false-empty → the exact failure ADR-071 fixed. A hint preserves full recall (every candidate still returned) while restoring the judgment aid weak agents need. Belt-and-braces with the read-primary steering. **Watch:** never let the hint threshold creep into a drop — the contract stays "never empty when candidates exist."
+
+**Touches:** `reranked_retriever.rs` (compute/attach the hint; ALSO fix the stale line-105 struct doc comment "drop-below-floor → top-K" → "reorder-only → top-K" while re-gating this file), the search response type + `application.rs`/`server.rs` wiring, `server.rs` tool description, unit tests (hint true on all-negative, false on a strong match). Re-gate fmt→clippy→build→test + 3-model live re-dogfood.
+
+### 🅿️ Carried follow-ups (not blockers)
+- **REPORT_MISSING on `personal` boundary** — `memory_read`/`memory_search` return `health.status: degraded` with `no REPORT artifact exists for boundary 'personal'`. Cosmetic (facts still returned correctly). Clear with `vault-cli consolidate run` on `personal`. Offered this session; not yet run.
+- **Stale doc comment** `reranked_retriever.rs:105` ("drop-below-floor → top-K") — fold the fix into Option B (it re-gates this file anyway; avoids a wasted ~35-min standalone re-gate).
+- **Antigravity `instructions.md` rewrite** (Shahbaz's local file, NOT in repo) — list BOTH tools, "prefer `memory_read`, empty = not in vault, don't rephrase forever."
+- **`max_results` 10→5** — proven safe by the scorecard (10/10 @top-5) but kept at 10 (one change at a time). Revisit as its own change.
+
+---
+
+## 🟦 NEXT SESSION OPENER (2026-06-05 #4) [SUPERSEDED by the 2026-06-06 opener above — ADR-071 SHIPPED, all gates green, 3-model live-validated, committed; retained for the design-pivot detail] — **ADR-071 RERANKED `memory_search` (reorder-only, recall-safe) + `memory_read`-primary strategy. CODE WRITTEN, UNVERIFIED. NEXT: run gates → live-validate → commit.** — READ THIS FIRST
+
+> Long session. We removed the flaky Kimi MCP server, ran a consolidation experiment (ruled out consolidation as the search-ranking fix), built the reranked-search fix, validated it on the real-model scorecard (green) — and then a **4-model live dogfood in Antigravity reversed a key design choice.** Code is revised to the new design but **the DoD gates have NOT been run and nothing is committed.** Pick up by running the gates.
+
+### ⚠️ STATE: code written, UNVERIFIED, UNCOMMITTED
+The working tree has uncommitted changes (below). **Gates fmt/clippy/build/test have NOT run on the final reorder-only code.** Do NOT assume green — run them first.
+
+**Changed files (all uncommitted):**
+- `crates/vault-retrieval/src/reranked_retriever.rs` — **NEW** `RerankedRetriever`: base hybrid → ADR-069 recall-union → cross-encoder rerank → **reorder-only (NEVER drops, never false-empty)** → top-K. Sigmoid `relevance_score()` maps logit → [0,1] (replaced tanh, which showed the correct cello as −0.95). 7 unit tests (reorder-only semantics incl. `never_returns_false_empty_even_when_all_score_negative` + explicit-threshold test).
+- `crates/vault-retrieval/src/lib.rs` — exports `RerankedRetriever`, `SEARCH_CANDIDATE_FANOUT`, `RERANK_CANDIDATE_CAP`.
+- `crates/vault-app/src/application.rs` — step 7b builds the reranker ONCE (shared by search+read); step 8 wires `memory_search` to `RerankedRetriever` (fallback = raw hybrid if no model); step 9 read pipeline reuses the shared reranker. (This wiring compiled green earlier; the reorder-only change is internal to the retriever so application.rs is unaffected.)
+- `crates/vault-mcp/src/server.rs` — tool descriptions (the cross-platform steering lever): `memory_search` no longer claims "cosine" (now "0-1 relevance, reranked"), tells agents to PREFER `memory_read` for questions, query in natural-language phrases not keywords, and treat thin/empty results as "not in vault — don't keep rephrasing"; `memory_read` marked "THE PRIMARY TOOL"; `SearchToolParams` param docs de-cosine'd. (No existing test pins search/read descriptions — only write/update/delete are pinned in `initialize_smoke.rs`.)
+- `HANDOFF.md` — this opener (admin, rides with the next code commit).
+
+### ▶️ NEXT STEPS (in order)
+1. **Run the gates** (laptop: confirm before `cargo build`, check disk; run BACKGROUND + serial fmt→clippy→build→test per [[no-parallel-cargo-invocations]] + [[cargo-on-windows-use-powershell]]). Test crates: **`-p vault-retrieval` (7 new tests), `-p vault-mcp` (descriptions changed — initialize_smoke), `-p vault-app`.** Note: tests use the tee-to-file pattern (`Tee-Object` + `Out-Null`) — read the tee file for results, the task output only keeps the exit line.
+2. **Live-validate in Antigravity again** (Shahbaz drives; binary rebuilt by the build gate). Re-run the exact failing cases: terse `"instrument"` / `"music"` (must now return the cello reordered, **NOT `[]`**); `"blood type"` (must return a list, NOT empty → no 4-min spin). Confirm the score reads ~0.x (positive), not −0.95.
+3. **If green: write ADR-071, commit** (confirm with Shahbaz per [[feedback-confirm-before-commit-push]]) + CI-green check.
+4. **Write Shahbaz a better `instructions.md`** for Antigravity (his local file, NOT in repo): list BOTH tools incl. `memory_read`, "search the vault before answering questions about the user, prefer `memory_read`, empty = not in vault." The bare 2-liner he had omitted `memory_read` entirely.
+
+### 🔑 WHY THE DESIGN CHANGED — the 4-model live dogfood (the load-bearing finding)
+The real-model scorecard used FULL-SENTENCE queries ("what instrument does the user play") and was green. But real agents send TERSE keywords, and that exposed a fatal flaw in the first design (drop-below-floor = "honest nothing found"):
+
+| Model | Tool chosen | Query style | Result |
+|---|---|---|---|
+| Gemini **Pro** (high) | `memory_read` | full question | ✅ **flawless, one-shot** (cello, abstain:false, structured) |
+| Gemini **Flash** (small) | `memory_search` | terse keywords | `"instrument"`→`[]`, `"music"`→`[]`, `"play"`→cello, `"orchestra"`→cello |
+| **Opus 4.6** | `memory_search` | `"instrument play music"`→`[]` → **ABANDONED the vault, went hunting the IDE's own brain**; only found cello when literal `"cello"` was in the query (logit +0.38) |
+| Flash on `"blood type"` (true no-signal) | `memory_search` | **spun ~4 min, ~20 keyword variations, all `[]`** — force-stopped |
+
+**Insights (durable — see memory [[project_memory_read_primary_search_recall_safe]]):**
+1. **A false-empty from `memory_search` is the WORST failure for a memory product.** Its empty result is AMBIGUOUS — a weak agent can't tell "wrong query" from "not in vault", so it either abandons the vault for competing memory OR spins re-querying forever. It teaches the agent the vault is unreliable → it routes around us.
+2. **The reranker is reliable on full-sentence queries but BRITTLE on terse keywords** — adding "music" to "play" pushed the cello BELOW the floor; only literal "cello" scored positive. It rewards literal token overlap, which the user's query rarely has. Our scorecard's full-sentence queries hid this.
+3. **Tool choice tracks model capability:** stronger model → `memory_read` (great); weaker → `memory_search` (struggles).
+4. **`memory_read` is the well-designed interface:** it returns a DECISION (structured facts OR `abstain:true` + "do NOT fabricate") — unambiguous + actionable. `memory_search` hands back raw results and makes the agent judge (weak agents fail at this).
+
+**→ LOCKED (Shahbaz, this session): `memory_read` is THE primary retrieval tool (steer agents there via descriptions); `memory_search` stays as a recall-safe browse fallback (reorder-only — never false-empty). NOT chosen: making search bulletproof (reranker too brittle on terse queries), and NOT removing search (weak models still reach for it, so it must be safe).**
+
+### 🧪 Consolidation experiment result (ruled out, this session)
+Ran `vault-cli consolidate run` on the live `testeval` vault: **0 merges / 0 dedups / 0 contradictions / 0 archived** (already consolidated last session) but it DID write a fresh `testeval.report.json` (clears `REPORT_MISSING`). Confirmed: consolidation does NOT touch query-time ranking → the `memory_search` weakness is structural/upstream, exactly as predicted. (Note: `memory_read` on cross-boundary still warns `REPORT_MISSING` for `personal` — that boundary has no REPORT; run consolidate on `personal` too if we want it clean.)
+
+### 🅿️ Deferred / follow-ups (not blockers)
+- **`max_results` 10→5:** proven safe by the scorecard's 10/10 @top-5, but Shahbaz chose to KEEP 10 for now (one change at a time). Revisit as its own change.
+- **Reranker brittleness on terse queries:** mitigated by reorder-only + steering to read, NOT solved. Live as a known limitation.
+- **The green scorecard was on the OLD drop-floor code** — its search-recall numbers (10/10) reflect ranking, but the reorder-only revision changes abstain behavior; re-run it next session if we want fresh numbers (it now exercises reorder-only via `Application::new`).
+- **Kimi MCP removed** this session (it kept breaking on its old client — protocol + DuckDB single-writer). `kimi mcp list` = empty. Not our bug; re-add only if old-client support becomes a goal.
+
+---
+
+## 🟦 NEXT SESSION OPENER (2026-06-05 #3) [SUPERSEDED by #4 above — its "search-recall design" task is now DONE (ADR-071); retained for the cross-agent dogfood detail] — **CROSS-AGENT DOGFOOD: Claude+Cursor+Antigravity all read the vault correctly; Kimi blocked by its OLD MCP client. NEW TOP PRIORITY: `memory_search` recall quality (agents use it + it ranks the right answer #4/10). NEXT: search-recall design.** — READ THIS FIRST
+
+> Big hands-on dogfood session (Shahbaz drove four MCP clients). **Two fixes shipped + committed this session, BOTH CI-GREEN:** ADR-069 read recall-union (`a2cee13`, CI ✅ run 27007426640) + ADR-070 lazy reranker (`a3c938b`, CI ✅ run 27013044496, 48m). Then cross-agent dogfooded the live ~15-fact `testeval` vault.
+
+### ✅ Cross-agent result (the product thesis, proven on real third parties)
+| Client | Connect | Reads correctly | Tool used | Notes |
+|---|---|---|---|---|
+| Claude Desktop | ✅ | ✅ | **`memory_read` mostly + `memory_search` sometimes** | needs nudging to use vault |
+| Cursor | ✅ | ✅ 5/5 | `memory_search` | auto-discovers from natural Qs |
+| Antigravity (Google) | ✅ | ✅ | `memory_search` | auto-discovers; **shows raw tool I/O** |
+| Kimi CLI | ⚠️ connects | ❌ | — | old MCP client rejects protocol `2025-11-25` + DuckDB single-writer |
+
+Full detail + config paths + the corrected tool-choice analysis: **[[project_cross_agent_proven_on_cursor]]** (memory). ADR-070 lazy-reranker also live-validated here (handshake ~40s→~9s on every client; servers spawned at ~1.6 GB = BGE + reranker, warm-up confirmed).
+
+### 🎯 THE REFRAMED TOP PRIORITY — `memory_search` recall quality
+Antigravity surfaced the RAW `memory_search` output for query "instrument": the correct answer **"Plays the cello…" ranked #4 of 10**, BEHIND "vintage mechanical keyboards" (#1), "structural engineer" (#2), "fluent in Mandarin/English" (#3); RRF scores barely separated (0.0164→0.0156); no keyword match. The answer was still correct ONLY because the agent (recall-first design) picked cello from the list. **Why this is now #1:** agents pick BOTH tools unpredictably (per-agent AND per-query — Claude leans read, Cursor/Antigravity lean search); we do NOT control the choice; `memory_search` has our WEAKEST ranking (no reranker, no ADR-069 recall-union — those are `memory_read`-only). So whenever an agent picks search (constantly), they hit weak ranking. On the 15-fact vault the answer stays in the top-K window so it works; at 100+ facts it could fall OUT of the window → wrong/empty answer. **Decision B is no longer shelved "browse polish" — it's the top correctness item for the scale arc.** This is the [[project_bge_small_cannot_separate_relevant]] weakness, on the path agents actually use.
+
+### ▶️ NEXT STEPS (search-recall arc)
+1. ~~Verify CI green~~ — DONE: both `a2cee13` + `a3c938b` CI-green (verified session end). Working tree has only this HANDOFF opener uncommitted (rides with next code commit).
+2. **Cheap experiment FIRST — does the consolidator move the ranking?** Run `vault-cli consolidate run` on the live vault, then re-run the Antigravity "instrument" query and compare the ranked list. **Prediction (Claude): NO change to relative ranking** — consolidation does dedup/contradiction/topics/REPORT, none of which touch query-time BGE/RRF ranking; the cello stays ~#4. Worth measuring to rule it out cheaply (Shahbaz's instinct) + it clears the `REPORT_MISSING` health warning. If prediction holds, ranking weakness is confirmed upstream of consolidation → needs a real fix.
+3. **Design the search-recall fix** (has a real speed-vs-quality tension — search's value is being fast ~70-240ms vs read's ~17s reranked). Options to weigh: (a) bring the reranker + ADR-069 recall-union to `memory_search` (slow), (b) a lighter/faster reranker on the search path, (c) a stronger base embedder than BGE-small, (d) steer agents toward `memory_read` via MCP tool DESCRIPTIONS (cheap, untested, partial — fights speed). Likely a combination. Bring Shahbaz a short plan before code (contract-establishing, new arc → one plan iteration).
+4. **Use Antigravity as the inspection window** — it's the only client that shows the raw `.md` instructions it reads + the raw `output.txt` it receives, so drive search-recall measurements through it to SEE the actual ranked list the agent gets (not just the final answer). Cursor/Claude hide the raw tool I/O.
+
+### 🅿️ De-prioritized (confirmed not blockers)
+- **Kimi / old-MCP-client support** — protocol-`2025-11-25` down-negotiation (rmcp) + DuckDB single-writer multi-connection. Every CURRENT client (Claude/Cursor/Antigravity) works, so this only buys laggard clients. Revisit only if old-client support becomes a goal. NOT our server's bug.
+- Latency (#2) — agents lean on the fast search path; reranker latency (~17s on `memory_read`) bites less than feared. Still deferred.
+
+### 🧾 Admin note
+This opener (HANDOFF.md edit) is admin-only and is UNCOMMITTED — it rides with next session's first code commit per [[feedback_admin_changes_ride_with_code]]. Cross-agent MCP configs were written OUTSIDE the repo (`~/.cursor/mcp.json`, `~/.gemini/config/mcp_config.json`, Kimi `~/.kimi/mcp.json`) — not part of the repo, left in place for next session's continued testing.
+
+---
+
+## 🟦 NEXT SESSION OPENER (2026-06-05 #2) — **LAZY RERANKER (ADR-070): MCP handshake ~40s → ~9s, live-verified. DoD-GREEN, committed (`a3c938b`). [SUPERSEDED by the #3 opener above; retained for ADR-070 detail.]** — READ THIS FIRST
 
 > Deferred the 1.2 GB reranker load off the MCP `initialize` handshake so MCP clients — Kimi CLI especially — connect without timing out. **Live Claude Desktop: handshake dropped ~40s → ~9s**; the background warm-up loads the model AFTER the transport binds (process settled at ~1.6 GB; first warm read returned the cello fact at rank 1 in 17.7s, `error=None`). **Honest scope note: the prior plan's "<1s" was NOT met** — measurement showed BGE + the keyword-index build are a *second* eager ~9s cost the plan didn't account for (the reranker was the biggest blocker at ~40s, not the only one). Both concrete goals (Kimi <40s connect, Claude 60s timeout) ARE resolved. **FIRST THING NEXT SESSION: confirm CI green for THIS commit AND the prior `a2cee13` (ADR-069), then re-run the Kimi independent validation** (it should connect now — see the 2026-06-04 evening opener below for the re-add command + the known DuckDB single-writer multi-client quirk).
 

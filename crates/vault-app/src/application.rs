@@ -53,8 +53,8 @@ use vault_embedding::{
 use vault_llm::{LlmProvider, Phi4MiniConfig, Phi4MiniProvider};
 use vault_mcp::{Adapter, StdioServer};
 use vault_retrieval::{
-    FilesystemReportLoader, HybridRetriever, KeywordIndex, KeywordRetriever, Retriever,
-    SemanticRetriever, StructuredReadPipeline,
+    FilesystemReportLoader, HybridRetriever, KeywordIndex, KeywordRetriever, RerankedRetriever,
+    Retriever, SemanticRetriever, StructuredReadPipeline,
 };
 use vault_storage::{MemoryFilter, MetadataStore, RetryWorker, StorageBackend};
 
@@ -270,23 +270,80 @@ impl Application {
         //    handle to retain.
         let hybrid: Arc<dyn Retriever> = Arc::new(HybridRetriever::new(semantic.clone(), keyword));
 
-        // 8. `memory_search` retriever = the RAW hybrid (recall-first, ADR-067,
-        //    2026-06-04). Previously the search path wrapped `hybrid` in an
-        //    `AbstainingRetriever` whose top-1 BM25 gate returned an empty
-        //    result whenever the lexical channel scored below 1.0. On a
-        //    single-token or no-lexical-overlap query that short-circuited in
-        //    ~0ms BEFORE the semantic channel ran, dropping semantically-
-        //    findable facts (live dogfood 2026-06-02: `memory_search "amber"`
-        //    and `"C7UNI"` returned [] in ~2ms while `memory_read` surfaced the
-        //    same facts). This mirrors the read recall-first stance (ADR-066):
-        //    return the semantic-backed ranked candidates and let the calling
-        //    agent judge relevance. The BM25 leg still contributes to the
-        //    hybrid RRF ranking — it is just no longer a hard gate.
-        //
-        //    `AbstainingRetriever` is now production-unreferenced (still public
-        //    + unit-tested in vault-retrieval); logged as tech debt rather than
-        //    removed drive-by.
-        let retriever: Arc<dyn Retriever> = hybrid.clone();
+        // 7b. The cross-encoder reranker — built ONCE here, shared by BOTH the
+        //    `memory_search` retriever (step 8, ADR-071) and the `memory_read`
+        //    pipeline (step 9). ADR-070 (2026-06-05): wrapped in
+        //    `LazyQwen3Reranker` so its ~1.2 GB model load is deferred OFF the
+        //    MCP `initialize` handshake (eager loading cost ~40 s before the
+        //    server could answer — timed out Kimi, sat close to Claude Desktop's
+        //    60 s window). Construction does NO disk I/O; the model loads on
+        //    first use, warmed in the background by `start_with_mcp`'s
+        //    `spawn_warmup`. `relevance_floor()` returns its constant without a
+        //    load, so nothing on the handshake path can trigger it. One
+        //    allocation, two views: the concrete `LazyQwen3Reranker` handle is
+        //    kept on `reranker_warmup` for the serve-path warm-up; the
+        //    `dyn RerankProvider` clone(s) drive search + read. All share the
+        //    same `OnceCell`.
+        let mut reranker_warmup: Option<Arc<LazyQwen3Reranker>> = None;
+        let reranker_opt: Option<Arc<dyn RerankProvider>> = match (
+            &config.rerank_model_path,
+            &config.rerank_tokenizer_path,
+        ) {
+            (Some(rerank_model), Some(rerank_tokenizer)) => {
+                let lazy = Arc::new(LazyQwen3Reranker::new(
+                    rerank_model,
+                    rerank_tokenizer,
+                    &config.ort_lib_path,
+                ));
+                let reranker: Arc<dyn RerankProvider> = lazy.clone();
+                reranker_warmup = Some(lazy);
+                tracing::info!(
+                    target: "vault_app::startup",
+                    "reranker configured: Qwen3-Reranker-0.6B (ADR-057 amendment; lazy-loaded per ADR-070; shared by search + read)"
+                );
+                Some(reranker)
+            }
+            _ => {
+                tracing::info!(
+                    target: "vault_app::startup",
+                    "no reranker model configured — search stays raw hybrid, read falls back to the cosine gate (graceful degradation)"
+                );
+                None
+            }
+        };
+
+        // 8. `memory_search` retriever. PRODUCTION (ADR-071, 2026-06-05): the raw
+        //    hybrid wrapped in a `RerankedRetriever` — base hybrid → ADR-069
+        //    recall-union (semantic top-N) → cross-encoder rerank → drop
+        //    below-no-signal-floor junk → top-K. This brings search up to the
+        //    same relevance quality `memory_read` has (BRD §5.5: "Reranked. No
+        //    single-strategy weakness."). Cross-agent dogfood (2026-06-05) showed
+        //    the raw hybrid ranked the correct "instrument" answer #4/10 behind
+        //    keyword-overlap distractors; the reranker promotes it to #1 and the
+        //    floor lets search honestly return "nothing found" (empty) on a
+        //    no-signal query instead of dumping the K nearest irrelevant facts.
+        //    FALLBACK: with no reranker model configured, search stays the raw
+        //    hybrid (recall-first, ADR-067) — mirrors the read cosine fallback.
+        let retriever: Arc<dyn Retriever> = match &reranker_opt {
+            Some(reranker) => {
+                tracing::info!(
+                    target: "vault_app::startup",
+                    "memory_search: reranked retriever (hybrid ∪ semantic → rerank → floor, ADR-071)"
+                );
+                Arc::new(RerankedRetriever::new(
+                    hybrid.clone(),
+                    Some(semantic.clone()),
+                    reranker.clone(),
+                ))
+            }
+            None => {
+                tracing::info!(
+                    target: "vault_app::startup",
+                    "memory_search: raw hybrid (recall-first, ADR-067 — no reranker configured)"
+                );
+                hybrid.clone()
+            }
+        };
 
         // 9. StructuredReadPipeline — deterministic filter+pack for the
         //    `memory_read` MCP tool per ADR-052 + ADR-054 (Commit 6 of
@@ -324,51 +381,19 @@ impl Application {
         // ADR-067 (2026-06-04) `memory_search` (step 8) is also wired to the raw
         // `hybrid`, so neither read nor search runs a hard BM25 gate.
         let base_pipeline = StructuredReadPipeline::new(hybrid, report_loader);
-        // ADR-070 (2026-06-05): the reranker is wrapped in `LazyQwen3Reranker`
-        // so its ~1.2 GB model load is deferred OFF the MCP `initialize`
-        // handshake path. Eager loading here cost ~40 s BEFORE the server could
-        // answer the handshake — that timed out Kimi CLI's connect retries and
-        // sat dangerously close to Claude Desktop's 60 s init window.
-        // Construction does NO disk I/O; the model loads on first read, warmed
-        // in the background by `start_with_mcp`'s `spawn_warmup`.
-        // `relevance_floor()` returns its constant without a load, so nothing on
-        // the handshake path can trigger the load.
-        let mut reranker_warmup: Option<Arc<LazyQwen3Reranker>> = None;
-        let read_pipeline = match (&config.rerank_model_path, &config.rerank_tokenizer_path) {
-            (Some(rerank_model), Some(rerank_tokenizer)) => {
-                let lazy = Arc::new(LazyQwen3Reranker::new(
-                    rerank_model,
-                    rerank_tokenizer,
-                    &config.ort_lib_path,
-                ));
-                // One allocation, two views: the pipeline holds it as the
-                // `dyn RerankProvider` gate; the concrete handle is kept for the
-                // serve path's background warm-up. Both share the same OnceCell.
-                let reranker: Arc<dyn RerankProvider> = lazy.clone();
-                reranker_warmup = Some(lazy);
-                tracing::info!(
-                    target: "vault_app::startup",
-                    "read relevance gate: cross-encoder reranker (Qwen3-Reranker-0.6B, ADR-057 amendment; lazy-loaded per ADR-070)"
-                );
-                // ADR-069 recall-union: also hand the pipeline the semantic
-                // channel. The reranker SUPERSEDES the cosine relevance GATE,
-                // but the same semantic channel is reused as the recall-union
-                // source — it widens the rerank pool with strong pure-semantic
-                // matches that the hybrid's RRF fusion starves on a populated
-                // vault (scale finding 2026-06-04: a subject-less fact ranked
-                // pure-BGE #6/100 but hybrid > 20/100, so the reranker never
-                // saw it). Without it the read mis-abstains on findable facts.
-                base_pipeline
-                    .with_reranker(reranker)
-                    .with_relevance_gate(semantic.clone())
-            }
-            _ => {
-                tracing::info!(
-                    target: "vault_app::startup",
-                    "read relevance gate: cosine floor (no reranker model configured — graceful fallback)"
-                );
-                base_pipeline.with_relevance_gate(semantic)
-            }
+        // Reuse the shared `reranker_opt` built at step 7b (ADR-070 lazy load).
+        // The reranker SUPERSEDES the cosine relevance GATE in production; the
+        // ADR-069 recall-union still hands the pipeline the semantic channel to
+        // widen the rerank pool with strong pure-semantic matches the hybrid's
+        // RRF fusion starves on a populated vault (scale finding 2026-06-04: a
+        // subject-less fact ranked pure-BGE #6/100 but hybrid > 20/100, so the
+        // reranker never saw it). Fallback (no model): the cosine floor owns
+        // abstention so a no-signal read still abstains (graceful degradation).
+        let read_pipeline = match &reranker_opt {
+            Some(reranker) => base_pipeline
+                .with_reranker(reranker.clone())
+                .with_relevance_gate(semantic.clone()),
+            None => base_pipeline.with_relevance_gate(semantic),
         };
         tracing::info!(
             target: "vault_app::startup",

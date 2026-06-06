@@ -25,6 +25,7 @@
 #![forbid(unsafe_code)]
 
 pub mod report_io;
+pub mod reranked_retriever;
 pub mod retriever;
 pub mod strategies;
 pub mod structured_read_pipeline;
@@ -35,6 +36,7 @@ pub mod structured_read_pipeline;
 // replaces it with structured `relevant_facts` + `abstain` +
 // `health.warnings` per ADR-054 Contract 2. No LLM in the read path.
 pub use report_io::{FilesystemReportLoader, LoadedReport, LoadedReportFact, ReportLoader};
+pub use reranked_retriever::{RerankedRetriever, RERANK_CANDIDATE_CAP, SEARCH_CANDIDATE_FANOUT};
 pub use retriever::{
     RetrievalOptions, RetrievalQuery, RetrievedMemory, Retriever, MAX_QUERY_BYTES, MAX_RESULTS_CAP,
 };

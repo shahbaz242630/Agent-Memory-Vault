@@ -59,15 +59,18 @@ use crate::Adapter;
 /// Verified at runtime by `examples/macro_spike.rs`.
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SearchToolParams {
-    /// Free-text query — embedded by the model and matched via cosine
-    /// k-NN over the boundary-filtered vector store.
+    /// Free-text query. Best results come from a natural-language phrase
+    /// describing what you want (e.g. "what instrument does the user play"),
+    /// NOT bare keywords — the query is semantically matched and reranked.
     pub query: String,
     /// Maximum number of results to return. Defaults to 10 (server side)
     /// if omitted; capped at `vault_retrieval::MAX_RESULTS_CAP` (200).
     #[serde(default)]
     pub max_results: Option<usize>,
-    /// Drop results whose cosine similarity is below this threshold.
-    /// Defaults to no threshold (return up-to-`max_results` regardless).
+    /// Optional relevance floor in [0, 1] — drop results whose reranker
+    /// relevance score is below this. Defaults to no threshold (the search
+    /// never abstains on its own; it returns the reranked candidates and
+    /// lets you judge). Use `memory_read` for a definitive abstain signal.
     #[serde(default)]
     pub score_threshold: Option<f32>,
     /// Whether to include archived (superseded) memories. Defaults to
@@ -468,10 +471,18 @@ impl StdioServer {
     /// audit chain is the authoritative record, tracing is operational.
     #[tool(
         name = "memory_search",
-        description = "Search the user's memory vault by free-text query. \
-                       Returns relevant memories ranked by cosine similarity. \
-                       Authorization is mediated by the host application, \
-                       not by this tool's parameters."
+        description = "Browse the user's memory vault by free-text query. Returns \
+                       candidate memories ranked by relevance (a cross-encoder \
+                       reranker), best first, each with a 0-1 relevance score. \
+                       For answering a specific question about the user \
+                       (what/who/when/does…), PREFER `memory_read` — it returns a \
+                       definitive answer or a clear 'not found', which is more \
+                       reliable than judging a raw list. Query in a natural-language \
+                       phrase, not bare keywords. If the top results look unrelated, \
+                       the vault most likely does not hold it — do NOT keep \
+                       rephrasing the query; confirm with `memory_read`. \
+                       Authorization is mediated by the host application, not by \
+                       this tool's parameters."
     )]
     pub async fn tool_search(
         &self,
@@ -561,7 +572,10 @@ impl StdioServer {
     /// `StructuredReadResponse`) / `0` on error.
     #[tool(
         name = "memory_read",
-        description = "Read the user's memory vault as structured facts. \
+        description = "THE PRIMARY TOOL for retrieving what the vault knows about \
+                       the user — prefer this over `memory_search` for any \
+                       question (what/who/when/does…). Read the user's memory \
+                       vault as structured facts. \
                        Returns a JSON object with five fields: \
                        \n\
                        - `boundary`: the boundary in scope (null for \
