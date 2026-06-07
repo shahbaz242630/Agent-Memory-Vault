@@ -388,9 +388,21 @@ impl ObjectStore for SealedObjectStore {
         // range OR head-only, fetch full body anyway and slice/strip
         // from the unsealed plaintext below. V1.0 mitigation: store
         // unsealed_size in the framing or a sidecar.
+        //
+        // We force a full-body read from the inner store even when Lance
+        // asked for metadata only (`head: true`): we must decrypt the
+        // whole envelope to learn the plaintext size, and — load-bearing
+        // (ADR-072) — the returned body MUST be as long as the size/range
+        // we report. The previous head-only branch streamed an empty body
+        // while still reporting `meta.size = plaintext_len`; Lance then
+        // sliced the empty body to the declared size and panicked
+        // `range end out of bounds: N <= 0` (the T0.3.x 10k-scale
+        // tokio-rt-worker crash). See the
+        // `get_opts_head_only_body_matches_declared_size_and_range`
+        // regression test. A head caller that only reads metadata is
+        // unaffected; we simply over-deliver the (already-decrypted) body.
         let mut full_options = options;
         let requested_range = full_options.range.take();
-        let was_head_only = full_options.head;
         full_options.head = false;
 
         let sealed_get = self.inner.get_opts(location, full_options).await?;
@@ -407,13 +419,54 @@ impl ObjectStore for SealedObjectStore {
         })?;
 
         let plaintext_len = plaintext.len();
+
         let (range, body): (std::ops::Range<u64>, Vec<u8>) = match requested_range {
             None => (0..plaintext_len as u64, plaintext),
             Some(object_store::GetRange::Bounded(r)) => {
-                let start = (r.start as usize).min(plaintext_len);
-                let end = (r.end as usize).min(plaintext_len);
-                let slice = plaintext[start..end].to_vec();
-                (start as u64..end as u64, slice)
+                // ADR-072 — the 10k-scale `tokio-rt-worker` panic
+                // `range end out of bounds: N <= 0`.
+                //
+                // Lance's I/O scheduler asks us for a byte range, then slices
+                // the returned buffer to the requested length
+                // (`bytes_vec[i].slice(start..end)` in lance-io
+                // scheduler.rs). If we return FEWER bytes than `r.end`, that
+                // slice over-runs the short buffer and panics. This happens
+                // under heavy write load at scale: Lance caches a file's size
+                // (via our `head` = disk − overhead), then a tail read asks
+                // for `begin..cached_size`, but by read time the unsealed
+                // content is shorter than the cached size (a transient
+                // time-of-check/time-of-use race; data is NOT lost — the
+                // cascade write that hit it simply needs a retry).
+                //
+                // Fix: NEVER hand Lance a short buffer for a bounded range. If
+                // we cannot satisfy `r.end`, return a retryable error instead.
+                // Lance's get-retry (`do_get_with_outer_retry`, 3×) and our
+                // cascade retry-queue both re-fetch with a fresh size and
+                // self-heal — no over-slice, no panic. In normal operation
+                // `r.end == plaintext_len` exactly, so this guard never fires.
+                if r.end as usize > plaintext_len {
+                    tracing::warn!(
+                        target: "vault_storage::sealed_store",
+                        path = %location,
+                        requested_end = r.end,
+                        plaintext_len,
+                        sealed_on_disk_len = sealed_bytes.len(),
+                        "sealed get_opts: requested range end exceeds unsealed content \
+                         (stale cached size under load); returning retryable error to \
+                         avoid Lance over-slice panic (ADR-072)"
+                    );
+                    return Err(ObjectStoreError::Generic {
+                        store: "SealedObjectStore",
+                        source: format!(
+                            "requested range end {} exceeds unsealed content length {} \
+                             (stale cached size; retryable)",
+                            r.end, plaintext_len
+                        )
+                        .into(),
+                    });
+                }
+                let slice = plaintext[r.start as usize..r.end as usize].to_vec();
+                (r.start..r.end, slice)
             }
             Some(object_store::GetRange::Offset(o)) => {
                 let start = (o as usize).min(plaintext_len);
@@ -427,11 +480,11 @@ impl ObjectStore for SealedObjectStore {
             }
         };
 
-        let body_bytes = if was_head_only {
-            Bytes::new()
-        } else {
-            Bytes::from(body)
-        };
+        // Stream the full unsealed body unconditionally — its length now
+        // matches `range` and `meta.size` for every request shape,
+        // including `head: true` (ADR-072; see the head-only branch
+        // removal above).
+        let body_bytes = Bytes::from(body);
         let payload_stream: BoxStream<'static, object_store::Result<Bytes>> =
             stream::once(async move { Ok(body_bytes) }).boxed();
 
@@ -610,6 +663,149 @@ impl ObjectStoreProvider for SealedFileStoreProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use tempfile::TempDir;
+
+    /// Build a sealed store backed by a real `LocalFileSystem` rooted at
+    /// `tmp` (so writes land in the tempdir, not the CWD). `base_path` is
+    /// empty — round-trip AAD is computed identically on put + get within
+    /// the same store, so the empty base is fine for these I/O tests.
+    fn make_io_store(tmp: &TempDir) -> SealedObjectStore {
+        let inner: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(tmp.path()).expect("local fs prefix"));
+        SealedObjectStore {
+            inner,
+            key: Arc::new(Zeroizing::new([0xcd_u8; 32])),
+            base_path: ObjectPath::from(""),
+        }
+    }
+
+    /// Regression for the T0.3.x 10k-scale `tokio-rt-worker` panic
+    /// `range end out of bounds: N <= 0` (ADR-072).
+    ///
+    /// Lance reads a small metadata/manifest file with `head: true`, then
+    /// slices the result to the size the response declares. The previous
+    /// `get_opts` head-only branch streamed an EMPTY body while still
+    /// reporting `meta.size = plaintext_len` and `range = 0..plaintext_len`.
+    /// Lance slices the empty body to the declared size → `Bytes` panics
+    /// `range end out of bounds: <plaintext_len> <= 0`. Surfaced only at
+    /// 10k because the head-then-read pattern fires for file types that
+    /// appear once the table has thousands of fragments.
+    ///
+    /// Invariant pinned here: the streamed body length MUST equal both the
+    /// declared `meta.size` and the `range` span. A head request may report
+    /// the true size (that's its point), but it must not under-deliver the
+    /// body it claims.
+    #[tokio::test]
+    async fn get_opts_head_only_body_matches_declared_size_and_range() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_io_store(&tmp);
+
+        // Distinctive length, mirroring a small Lance manifest — the kind
+        // read via head at scale (the live panic cited 2385 bytes).
+        let plaintext = vec![0x42_u8; 2385];
+        let location = ObjectPath::from("memories.lance/_versions/1.manifest");
+        store
+            .put_opts(&location, plaintext.clone().into(), PutOptions::default())
+            .await
+            .expect("seal + write");
+
+        let result = store
+            .get_opts(
+                &location,
+                GetOptions {
+                    head: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("head get_opts");
+
+        let declared_size = result.meta.size;
+        let range = result.range.clone();
+        let body = result.bytes().await.expect("collect body");
+
+        assert_eq!(
+            declared_size,
+            plaintext.len() as u64,
+            "head must report the true unsealed size"
+        );
+        assert_eq!(
+            body.len(),
+            declared_size as usize,
+            "streamed body length must match the declared size — a 0-length \
+             body with a non-zero declared size is the 10k-scale panic \
+             (Lance slices the body to the declared size → range end OOB)"
+        );
+        assert_eq!(
+            (range.end - range.start) as usize,
+            body.len(),
+            "range span must match the streamed body length"
+        );
+        assert_eq!(&body[..], &plaintext[..], "round-trip plaintext intact");
+    }
+
+    /// ADR-072 — the real fix for the 10k `range end out of bounds: N <= 0`
+    /// panic. A bounded range whose `end` exceeds the unsealed content MUST
+    /// return a (retryable) error, NOT a short buffer.
+    ///
+    /// At scale, Lance caches a file's size then issues a tail read for
+    /// `begin..cached_size`; under heavy write load the unsealed content can be
+    /// momentarily shorter than that cached size (a transient TOCTOU race). If
+    /// we answered with a short buffer, Lance's scheduler would slice it to the
+    /// requested length and panic. Returning an error routes Lance into its
+    /// get-retry (3×) + our cascade retry-queue, which self-heal — data is
+    /// never lost. This test reproduces the precondition DETERMINISTICALLY (ask
+    /// for more bytes than exist), so it pins the fix without a flaky 40-min
+    /// scale run. The in-bounds half guards against over-correction.
+    #[tokio::test]
+    async fn get_opts_bounded_range_beyond_content_errors_not_short_read() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_io_store(&tmp);
+
+        let plaintext = vec![0x37_u8; 100];
+        let location = ObjectPath::from("memories.lance/data/frag.lance");
+        store
+            .put_opts(&location, plaintext.clone().into(), PutOptions::default())
+            .await
+            .expect("seal + write");
+
+        // Ask for 0..500 when only 100 bytes exist (mirrors a stale cached size).
+        let result = store
+            .get_opts(
+                &location,
+                GetOptions {
+                    range: Some(object_store::GetRange::Bounded(0..500)),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "a bounded range beyond the content MUST error (retryable), never return a short \
+             buffer — the short buffer is what Lance over-slices into the 10k panic (ADR-072)"
+        );
+
+        // Over-correction guard: an in-bounds bounded range still returns
+        // exactly the requested slice.
+        let ok = store
+            .get_opts(
+                &location,
+                GetOptions {
+                    range: Some(object_store::GetRange::Bounded(10..60)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("in-bounds bounded range must succeed");
+        let body = ok.bytes().await.expect("collect body");
+        assert_eq!(
+            body.len(),
+            50,
+            "in-bounds bounded range returns exactly end-start bytes"
+        );
+        assert_eq!(&body[..], &plaintext[10..60], "in-bounds slice is correct");
+    }
 
     fn make_store(base: ObjectPath) -> SealedObjectStore {
         SealedObjectStore {

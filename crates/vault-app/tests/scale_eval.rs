@@ -398,7 +398,13 @@ async fn scale_correctness_eval() {
     let value: Value = serde_json::from_slice(&bytes).expect("parse scale_eval.json");
     let planted = parse_planted(&value);
     let queries = parse_queries(&value);
-    let scale = value.get("scale").and_then(Value::as_u64).unwrap_or(100) as usize;
+    // Scale is the fixture default, overridable via `SCALE_EVAL_N` so the same
+    // harness runs the 100 → 1k → 10k → 100k ladder without mutating the
+    // committed fixture.
+    let scale = std::env::var("SCALE_EVAL_N")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or_else(|| value.get("scale").and_then(Value::as_u64).unwrap_or(100) as usize);
     let authorized: Vec<Boundary> = value
         .get("authorized_boundaries")
         .and_then(Value::as_array)
@@ -460,8 +466,12 @@ async fn scale_correctness_eval() {
         .get("drive-rivian")
         .cloned()
         .expect("drive-rivian planted");
+    // Cascade drains async; the larger the seed, the longer the drain. Scale the
+    // poll window with `scale` (2s ticks): ~120s floor, +2s per 10 facts. Breaks
+    // early as soon as the planted Rivian fact is searchable.
+    let max_attempts = (scale / 10).max(60);
     let mut ready = false;
-    for attempt in 0..60 {
+    for attempt in 0..max_attempts {
         let hits = adapter
             .search(RetrievalQuery {
                 query_text: "Rivian R1T".into(),
@@ -483,7 +493,8 @@ async fn scale_correctness_eval() {
     }
     assert!(
         ready,
-        "cascade did not drain the planted Rivian fact into the searchable index within 120s"
+        "cascade did not drain the planted Rivian fact into the searchable index within {}s",
+        max_attempts * 2
     );
 
     // ---- per-query scoring ----

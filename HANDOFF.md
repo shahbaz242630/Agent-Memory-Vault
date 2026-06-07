@@ -2,11 +2,101 @@
 
 **Current version:** V0.2 Closed Beta (BRD §6.2 — sleep consolidator, boundaries hardening, cross-device sync, 30 beta users)
 
-**Last updated:** 2026-06-06 (**ADR-071 RERANKED + recall-safe `memory_search` SHIPPED — all 5 DoD gates GREEN (fresh from `cargo clean`), 3-model live-dogfood validated in Antigravity, committed this session.** `RerankedRetriever` brings the cross-encoder + ADR-069 recall-union to `memory_search` as REORDER-ONLY (never false-empty); sigmoid logit→[0,1] score; tool descriptions steer question-answering to `memory_read` (the primary answer path, returns structured `abstain`). Live-validated: Flash one-shots `memory_read` (cello + blood-type abstain, no 4-min spin); Opus 4.6 `memory_search` reorders cello #4→#1, never `[]`. **Option B (additive `weak_match`/`top_relevance` hint on `memory_search`) ALSO shipped + 2-case live-validated this session** (instrument → `weak_match:false`; blood-type → `weak_match:true`; separation-based, survives the reranker's terse-query brittleness). ADR-071 committed `661d391` (CI ✅ run 27064305259, 53m30s); Option B rides the next commit. **NEXT: carried follow-ups — clear `REPORT_MISSING` on `personal` (`vault-cli consolidate run`), rewrite Shahbaz's Antigravity `instructions.md`, revisit `max_results` 10→5. See the 2026-06-06 opener below.** Prior openers HISTORICAL.)
+**Last updated:** 2026-06-07 (**ADR-072 — Thread 1 storage-worker panic FIXED (real fix; the first theory was falsified). DoD-gating in progress.** The 10k `tokio-rt-worker` panic `range end out of bounds: 2385 <= 0` turned out to be a **flaky, data-safe, self-healing race**, NOT a hard crash: two 10k runs with identical code — one panicked twice, one ran totally clean — and BOTH produced an identical perfect scorecard (recall 10/10, 0 false-abstain). Lance wraps the read in `catch_unwind`, so when it fires it surfaces as a transient error → the affected cascade write reschedules in our retry-queue → retried → succeeds. **Real root cause (confirmed via full backtrace + Lance source-read): a TOCTOU in `SealedObjectStore::get_opts`'s bounded-range path.** Lance caches a fragment's size (our `head` = disk − overhead), then `read_tail` requests `begin..cached_size`; under heavy write load the unsealed content is momentarily shorter than the cached size, so we returned a SHORT buffer, and Lance's scheduler (`scheduler.rs:984 bytes_vec[i].slice(start..end)`) over-sliced it → panic. **Fix: never hand Lance a short buffer for a bounded range — if `r.end > plaintext_len`, return a retryable `ObjectStoreError` instead. Lance's get-retry (3×) + our cascade retry-queue re-fetch with a fresh size and self-heal — no over-slice, no panic.** Pinned DETERMINISTICALLY (`get_opts_bounded_range_beyond_content_errors_not_short_read` — ask for more bytes than exist → error, not short read; no flaky 40-min run needed to prove the mechanism is gone). The FIRST theory (head-only empty-body) was WRONG — a 10k run with it still panicked; that change was kept as a minor, separately-tested consistency improvement (head body now matches declared size) but is NOT the panic fix. **Severity reframed: rare + data-safe + self-healing — an ugly internal hiccup under heavy write load at thousands of memories, never a user-facing crash or data loss.** Thread 2 (read precision) still deliberately separate (own measured pass; likely a recall-safe `memory_read` "weak match" hint per Shahbaz). NEXT: DoD-gate the real fix → commit → CI green. Prior "ADR-071 SHIPPED" line below HISTORICAL.)
+
+<details><summary>Prior Last-updated (2026-06-06, ADR-071) — HISTORICAL</summary>
+
+**2026-06-06:** **ADR-071 RERANKED + recall-safe `memory_search` SHIPPED — all 5 DoD gates GREEN (fresh from `cargo clean`), 3-model live-dogfood validated in Antigravity, committed this session.** `RerankedRetriever` brings the cross-encoder + ADR-069 recall-union to `memory_search` as REORDER-ONLY (never false-empty); sigmoid logit→[0,1] score; tool descriptions steer question-answering to `memory_read` (the primary answer path, returns structured `abstain`). Live-validated: Flash one-shots `memory_read` (cello + blood-type abstain, no 4-min spin); Opus 4.6 `memory_search` reorders cello #4→#1, never `[]`. **Option B (additive `weak_match`/`top_relevance` hint on `memory_search`) ALSO shipped + 2-case live-validated this session** (instrument → `weak_match:false`; blood-type → `weak_match:true`; separation-based, survives the reranker's terse-query brittleness). ADR-071 committed `661d391` (CI ✅ 27064305259); Option B committed `a1e4dac` (CI ✅ 27067515185). **THEN ran the scale-correctness ladder 100→1k→10k: correctness is SCALE-INVARIANT (identical scorecard at 100× scale), but the 10k run surfaced (1) a storage-worker PANIC (bytes range-OOB in the write path) and (2) a measured read-precision gap (false-answers + near-miss leaks). NEXT: fix the panic FIRST, then the precision gate, then build the live-vault seeder + seed 100→1k→10k for the Antigravity multi-agent live test. See the 2026-06-06 #2 opener below.** Prior openers HISTORICAL.)
+
+</details>
 
 ---
 
-## 🟢 NEXT SESSION OPENER (2026-06-06) — **ADR-071 RERANKED + recall-safe `memory_search` SHIPPED & CI-GREEN (`661d391`). Option B (additive `weak_match` hint) BUILT + live-validated, gates green, READY TO COMMIT (awaiting commit at session end). NEXT: carried follow-ups (REPORT_MISSING cleanup, Antigravity `instructions.md`, `max_results` revisit).** — READ THIS FIRST
+## 🟢 NEXT SESSION OPENER (2026-06-07) — **THREAD 1 (storage-worker panic) — REAL FIX in place (ADR-072), DoD-gating. Flaky/data-safe/self-healing race, not a hard crash. NEXT: gate → commit → CI. Then (A) Thread 2 read-precision pass, or (B) live-vault seeder — Shahbaz's call.** — READ THIS FIRST
+
+> The 10k panic was chased to ground the hard way: first theory (head-only empty body) was FALSIFIED by a 10k run that still panicked. Captured the full backtrace (`RUST_BACKTRACE=full`) + read Lance's source: the crash is a TOCTOU in `get_opts`'s bounded-range path — Lance caches a fragment size, then under load the unsealed content is momentarily shorter, we returned a short buffer, Lance's scheduler over-sliced it. **It's a flaky, data-safe, self-healing race** (two 10k runs: one panicked, one clean; identical perfect scorecard both times; Lance `catch_unwind`s it → cascade retry-queue self-heals). Real fix: return a retryable error instead of a short buffer. Deterministic unit-test pin (no flaky 10k needed). **Confirm before commit+push per the standing rule.**
+
+### ✅ DONE THIS SESSION (ADR-072 — the REAL fix)
+- **The journey (honest record):** first hypothesis — `head: true` returned an empty body while reporting a non-zero size — was a real *consistency* gap but NOT the panic: a 10k run WITH that fix still panicked twice. Kept that change as a minor, separately-tested improvement (`get_opts_head_only_body_matches_declared_size_and_range`), it is not load-bearing for the panic.
+- **Real root cause (full backtrace + Lance source-read):** backtrace = `bytes::slice` ← `lance_io::scheduler::submit_request` (scheduler.rs:984 `bytes_vec[i].slice(start..end)`) ← `lance_file::reader::read_tail` (reader.rs:437) ← `get_file_metadata`. `read_tail` requests `begin..file_size` where `file_size = reader.size()` = our `head` (disk − `SEAL_OVERHEAD`), cached once via `get_or_try_init`. Under heavy write load at scale the unsealed content for that path is momentarily SHORTER than the cached size, so our `get_opts` bounded-range arm returned a clamped SHORT buffer; Lance's scheduler trusts the requested length and slices the short buffer → `range end out of bounds: N <= 0`. A TOCTOU (time-of-check `size()` vs time-of-use `get`).
+- **Why flaky + low-severity:** two 10k `scale_eval` runs, identical code — run A panicked ×2, run B totally clean (`finished in 2286s`, `test result: ok`). BOTH: recall 10/10, 0 false-abstain, identical scorecard → **no data loss / no corruption**. Lance wraps the metadata read in `catch_unwind`, so a hit becomes a transient error → the cascade write reschedules in our retry-queue → retried → succeeds. User impact = an ugly internal hiccup + a silent retry under heavy write load at thousands of memories; never a user-facing crash or lost memory.
+- **Real fix (`get_opts` bounded-range arm):** if `r.end > plaintext_len`, return a retryable `ObjectStoreError::Generic` instead of a short slice. Lance's get-retry (`do_get_with_outer_retry`, 3×) and our cascade retry-queue both re-fetch with a fresh size and self-heal — the over-slice mechanism is removed by construction. In normal operation `r.end == plaintext_len` exactly, so the guard never fires. (Bounded is the only path the backtrace exercises; Offset/Suffix clamping left as-is.)
+- **Pin (deterministic, no flaky 10k):** `get_opts_bounded_range_beyond_content_errors_not_short_read` — seal 100 bytes, request `0..500` → asserts `Err` (not a short `Ok`); plus an in-bounds `10..60` over-correction guard that must still return exactly 50 bytes. The mechanism is provably gone regardless of whether the flaky race triggers.
+- **No crypto change** (seal/unseal/AAD/key untouched; zero-knowledge property intact).
+- **Rides this commit:** `crates/vault-app/tests/scale_eval.rs` (the `SCALE_EVAL_N` env override + scale-aware readiness poll — the harness that surfaced the panic; ships with the fix it supports). The diagnostic `eprintln` + the slow `sealed_concurrent_stress.rs` repro attempt were REMOVED (the stress harness couldn't reach trip-scale: single-row writes are O(n²), it crawled to ~1k in ~30 min; the deterministic unit test supersedes it).
+- **Gates:** the earlier full DoD sweep (fmt/clippy/build/test) was green on the head-only change; the real fix needs a RE-GATE before commit (in progress).
+
+### ADR-072 — sealed-store `get_opts` never returns a short buffer for a bounded range (fixes the 10k TOCTOU panic)
+**Context.** 10k-scale `tokio-rt-worker` panic `range end out of bounds: N <= 0`, in Lance's scheduler slicing a buffer our sealed store returned for a `read_tail` bounded-range request. Flaky (race), data-safe (identical scorecards across a panicking and a clean run), self-healing (Lance `catch_unwind` → cascade retry-queue). Root cause: Lance caches `size()` (our `head` = disk − `SEAL_OVERHEAD`); under load the unsealed content is momentarily shorter than the cached size; our bounded-range arm clamped and returned a short buffer; the scheduler over-sliced it.
+
+**Decision.** In `get_opts`, a bounded range whose `end` exceeds the current unsealed `plaintext_len` returns a retryable `ObjectStoreError` rather than a clamped short buffer. Lance's get-retry + our cascade retry-queue re-fetch with a fresh size and self-heal. Removes the over-slice mechanism by construction; pinned by a deterministic unit test.
+
+**Not chosen:** (a) trying to fully eliminate the underlying TOCTOU race (deep Lance-interaction change, flaky to repro/confirm, and unnecessary — the data is safe and the retry self-heals); (b) re-reading the file inside `get_opts` on short-read (more code + extra I/O; the retry layers already exist). **Secondary, separate change kept in this commit:** `head: true` now streams the full already-decrypted body so body-len == range-span == meta.size (a consistency improvement found while chasing the first wrong theory; pinned by its own test; NOT the panic fix). Frozen `examples/at_rest_spike.rs` untouched.
+
+**Security:** no crypto-path change — seal/unseal/AAD/key untouched; the returned plaintext is what the local Lance reader already receives on every normal read.
+
+### 🟠 THREAD 2 — read precision (false-answers + near-miss leaks) — STILL OPEN, own pass
+NOT a crash; bounded; scale-invariant. The read path is recall-first by lock (ADR-066): it returns everything above a coarse no-signal floor and trusts the agent. Cost: it sometimes returns a confident wrong-but-adjacent fact instead of abstaining ("salary" → catering "$6,500 annual"; "cat breed" → the dog; "instrument" → cello-correct + mechanical-keyboards leaked). **Why not a quick fix:** tightening to catch these also hides real low-scoring answers (cello scored 0.047 and was CORRECT) → false-abstain, the cardinal sin. **Likely recall-safe direction (Shahbaz's instinct, 2026-06-07):** mirror Option B — attach a "weak match / may not really answer this" hint to `memory_read` facts and let the agent say "I don't have it," NEVER drop a fact. Needs: measure exact reranker scores for these adjacent cases, design the hint, validate on `scale_eval.rs` (real BGE+reranker — no cheap unit test proves it).
+
+### 🌱 THREAD 3 — live-seeder + Antigravity multi-agent test — NOW UNBLOCKED
+Thread 1 (the panic) was the gate; it's fixed. Seeder design is locked in the 2026-06-06 #2 opener below (a new `#[ignore]` test in `scale_eval.rs` writing a REAL vault with the production keychain derivation + bge-small vectors, seeded 100→1k→10k). **Need from Shahbaz:** his current Antigravity `vault-cli mcp …` launch command (to copy model paths + hand back an edited version pointing at the new vault). Note: a clean 10k `scale_eval` run does NOT *prove* the panic is gone (the race is flaky — it ran clean once with the bug still present); the deterministic unit test proves the over-slice mechanism is removed. Seeding 10k live is safe regardless — even if the race fires it's data-safe + self-heals via the cascade retry-queue.
+
+---
+
+## 🔴 NEXT SESSION OPENER (2026-06-06 #2) [SUPERSEDED by 2026-06-07 — Thread 1 FIXED; Threads 2+3 carried forward above] — **SCALE LADDER DONE (100→1k→10k: correctness scale-INVARIANT). TWO OPEN THREADS: (1) storage-worker PANIC at 10k (bytes range-OOB in the write path) — a CRASH, fix FIRST; (2) read precision gate (false-answers + near-miss leaks) — bounded, not scale-driven. THEN: build live-vault seeder, seed 100→1k→10k, repoint Antigravity, multi-agent LIVE test at 10k.** — READ THIS FIRST
+
+> Shipped ADR-071 (`661d391`, CI ✅) + Option B (`a1e4dac`, CI ✅ 27067515185). Then ran the scale-correctness ladder 100 → 1k → 10k via `scale_eval.rs` (new `SCALE_EVAL_N` env override). **Correctness is identical across 100× scale.** The 10k run surfaced a background-worker panic in the storage write path, and the read precision gap (the keyboards-for-instrument family Shahbaz caught live) is now measured + bounded. Next session: fix the panic, then the precision gate, then live-seed + Antigravity.
+
+### 📊 Scale ladder results (`scale_eval.rs`, real BGE + Qwen3-reranker, own temp vault)
+| metric | 100 | 1k | 10k |
+|---|---|---|---|
+| correct-answer | 10 | 10 | 10 |
+| correct-abstain | 3 | 3 | 3 |
+| **FALSE-ABSTAIN (the cliff)** | 0 | 0 | 0 |
+| FALSE-ANSWER (precision) | 2 | 2 | 2 |
+| read recall (targets / rank-1) | 10/10 (9@1) | 10/10 (9@1) | 10/10 (9@1) |
+| search recall @5 / @20 | 10/10 | 10/10 | 10/10 |
+| near-miss leaks (diagnostic) | 6 | 6 | 6 |
+
+**Takeaway: core retrieval is scale-invariant.** 100× the distractors changed *nothing* — recall never degrades, the right answer ranks #1, false-abstain stays 0. Precision issues are a FIXED, bounded set (specific adjacent-content confusions), NOT growing with scale. Runtimes: 100 ≈ 18min (ran both file tests), 1k ≈ 12min, 10k ≈ 38min (main test only, filtered). **100k DEFERRED until Thread 1 is fixed** (would just crash harder + waste a ~hours-long run).
+
+### 🔴 THREAD 1 (do FIRST) — storage-worker PANIC at 10k
+```
+thread 'tokio-rt-worker' panicked at bytes-1.11.1/src/bytes.rs:392:9:
+range end out of bounds: 2385 <= 0
+```
+- Surfaced ONLY at 10k (1k was clean) → scale/timing-dependent (likely a race or buffer edge under heavy concurrent writes).
+- `bytes` underlies Arrow/LanceDB → almost certainly the **vector-store write path**, on the cascade write-drain worker spawned by `app.start()`.
+- Detached worker thread → did NOT fail the test (assertions passed, recall 10/10), but in production **a write-drain worker can die under load**. **Blocks the live seeder** (it writes 10k through this same path → same crash).
+- Investigate: (a) source-read `crates/vault-storage/src/vector_store.rs` write / record-batch path for a slice/advance where an Arrow/embedding buffer can be empty (FixedSizeList construction, batch sizing); (b) if not pinned, re-run 10k with `RUST_BACKTRACE=full` for the exact frame — **no backtrace was captured this run**.
+
+### 🟠 THREAD 2 — read precision gate (false-answers + near-miss leaks)
+The read path OVER-INCLUDES adjacent content. Measured, bounded, scale-invariant:
+- **2 FALSE-ANSWERS** (answered when it should abstain): *"what is the user's salary?"* → catering bookings (*"…rate approximately $6,500 annual"*); *"what breed is the user's cat?"* → *"golden retriever named Biscuit"* (the dog; user may not even have a cat).
+- **6 NEAR-MISS LEAKS** (extra wrong-but-similar facts riding with correct answers): the **keyboards-for-"instrument"** case (cello #1 correct, *"vintage mechanical keyboards"* leaked at rank 2) — the one Shahbaz caught live.
+- Root: the read abstain/precision gate (reranker relevance floor, ADR-059/066) is too loose on **adjacent** no-signal/near-miss content. The reranker scores UNRELATED distractors low (so leaks don't grow with scale) but is fooled by genuinely-adjacent facts (keyboard=instrument polysemy, $-amount=salary, dog≈cat-pet).
+- Note: the SEARCH path scored these correctly low (keyboards 0.0027) — so the gap is the **read path's inclusion rule**, not the reranker's raw scores.
+- Fix direction (TBD): tighten read precision on adjacent content **WITHOUT re-introducing false-abstains** — recall stays sacrosanct (a false-abstain is the worse failure).
+
+### 🌱 THREAD 3 — LIVE-SEEDING TEST PLAN (the Antigravity multi-agent step)
+Goal: populate a REAL vault Antigravity can open, with KNOWN planted answers, to watch real agents behave at scale. Seed in steps **100 → 1k → 10k**; live multi-agent test at 10k (Shahbaz's call).
+- **Seeder design (locked this session):** a new `#[ignore]` test in `scale_eval.rs` (reuses `generate_distractors` + planted facts directly — zero refactor) that writes to a REAL vault (env: paths + `SEED_N`) using the SAME Credential-Manager key derivation the MCP server uses (`vault_app::keychain::read_or_init_master_key(PRODUCTION_NAMESPACE, VAULT_ID)` → `derive_sqlcipher_passphrase` + `derive_at_rest_key`) — so Antigravity opens it natively. Embed with the SAME bge-small model the MCP server uses (vectors must match). Seed into the `personal` boundary (Antigravity default). Exit without running queries.
+- **Approach:** seed a FRESH vault at NEW paths + repoint Antigravity (current vault untouched, reversible). **Need from Shahbaz:** his current Antigravity `vault-cli mcp …` launch command (to copy the `--bge-model`/`--rerank-model`/etc. paths + hand back an edited version pointing at the new vault).
+- **Sequence:** seed 100 → quick agent spot-check → seed 1k → spot-check → seed 10k → full multi-agent live test.
+- **BLOCKER:** Thread 1 (the panic) gates this — seeding 10k hits the same write path. Fix the panic first.
+
+### ⚙️ Uncommitted working-tree state (rides with the next code commit, per admin-rides-with-code)
+- `crates/vault-app/tests/scale_eval.rs` — test-infra: `SCALE_EVAL_N` env override + scale-aware readiness poll (`max_attempts = scale/10`, floor 60). Used to run the ladder. NOT yet committed.
+- `HANDOFF.md` — this opener.
+
+### 🅿️ Carried follow-ups (not blockers)
+- REPORT_MISSING on `personal` (run `vault-cli consolidate run`); REPORT_STALE_INFO on `testeval` (25h band, refresh).
+- Antigravity `instructions.md` rewrite (list BOTH tools, prefer `memory_read`, empty = not in vault).
+- `max_results` 10→5 (proven safe @top-5; one change at a time).
+
+---
+
+## 🟢 NEXT SESSION OPENER (2026-06-06) [SUPERSEDED by the 2026-06-06 #2 opener above — ADR-071 + Option B both SHIPPED & CI-GREEN (`661d391` / `a1e4dac`); retained for the ADR-071/Option B detail] — **ADR-071 RERANKED + recall-safe `memory_search` SHIPPED & CI-GREEN (`661d391`). Option B (additive `weak_match` hint) SHIPPED (`a1e4dac`, CI ✅). NEXT: carried follow-ups (REPORT_MISSING cleanup, Antigravity `instructions.md`, `max_results` revisit).** — READ THIS FIRST
 
 > Picked up opener #4 (code written, unverified, uncommitted). Reclaimed 102 GB of stale `target/` (`cargo clean`), ran every gate fresh, then Shahbaz live-dogfooded in Antigravity across 3 model tiers. All green → committed ADR-071 (`661d391`, CI ✅ run 27064305259). Then built **Option B** (the additive `weak_match` hint that closes ADR-071's known no-signal-judgment limitation), gated it green, and live-re-validated both cases. Option B rides this commit.
 
