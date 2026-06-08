@@ -610,7 +610,7 @@ impl StdioServer {
                        the user — prefer this over `memory_search` for any \
                        question (what/who/when/does…). Read the user's memory \
                        vault as structured facts. \
-                       Returns a JSON object with five fields: \
+                       Returns a JSON object with six fields: \
                        \n\
                        - `boundary`: the boundary in scope (null for \
                        cross-boundary reads) \
@@ -618,10 +618,17 @@ impl StdioServer {
                        - `query`: echo of your query (post-trim) \
                        \n\
                        - `relevant_facts`: array of \
-                       `{fact, topic, memory_id, as_of, confidence, source_agent}` \
+                       `{fact, topic, memory_id, as_of, confidence, source_agent}`, \
+                       best-match first. May be populated EVEN WHEN `abstain=true` \
+                       (the closest low-confidence candidates) — always inspect it. \
                        \n\
-                       - `abstain`: true when the vault has no relevant \
-                       content for this query \
+                       - `abstain`: true when the vault has no CONFIDENT match. \
+                       This is NOT an empty-list signal — `relevant_facts` may \
+                       still carry the closest candidates for you to judge. \
+                       \n\
+                       - `top_relevance`: rank-1 match strength in [0,1] (0.0 when \
+                       no facts). A low value with `abstain=true` means weak/no \
+                       match; a high value means a confident hit. \
                        \n\
                        - `health`: `{status: ok|degraded|critical, warnings: [...]}` \
                        \n\n\
@@ -656,8 +663,12 @@ impl StdioServer {
                        vault hasn't been consolidated recently and results \
                        may be incomplete. \
                        \n\n\
-                       CRITICAL — when `abstain=true`: tell the user the \
-                       vault has nothing matching. Do NOT fabricate. \
+                       CRITICAL — when `abstain=true`: the vault has no \
+                       confident answer. INSPECT any `relevant_facts` shown — if \
+                       one genuinely answers the question, use it; otherwise tell \
+                       the user the vault has nothing matching (e.g. \"I don't have \
+                       your cat's breed, but you have a dog named Biscuit\"). NEVER \
+                       fabricate beyond what the returned facts actually support. \
                        \n\n\
                        Authorization is mediated by the host application, \
                        not by this tool's parameters."

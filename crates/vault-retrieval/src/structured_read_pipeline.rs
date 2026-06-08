@@ -70,7 +70,9 @@ use vault_core::{Boundary, MemoryId, VaultError, VaultResult};
 use vault_embedding::RerankProvider;
 
 use crate::report_io::{LoadedReport, ReportLoader};
+use crate::reranked_retriever::relevance_score;
 use crate::retriever::{RetrievalOptions, RetrievalQuery, RetrievedMemory, Retriever};
+use crate::search_hint::search_hint;
 
 // =============================================================================
 // Constants — locked by ADR-054 (Commit 6)
@@ -132,6 +134,20 @@ const RERANK_CANDIDATE_CAP: usize = 2 * DEFAULT_MAX_CANDIDATES;
 /// deferred to a non-LLM cross-encoder reranker at V1.0+.
 const RELEVANCE_COSINE_FLOOR: f32 = 0.66;
 
+/// No-signal floor on the rank-1 reranked relevance score (`[0,1]` sigmoid),
+/// for the `abstain` HINT only (ADR-073, 2026-06-08). A top below this marks
+/// the read `weak_match`/`abstain` — it catches the lone/few no-signal fact that
+/// `search_hint`'s separation test reads as "separated" (a single candidate, or
+/// the cat→dog / Lisbon-guard class: one adjacent-but-wrong fact). Combined with
+/// `search_hint`'s separation test (which catches flat distractor clusters like
+/// the salary trap), the two cover both no-signal shapes. **This floor governs
+/// only the hint — it NEVER drops a fact** (reorder-only `apply_reranker` returns
+/// every candidate), so a mis-placed floor can never hide a real answer; recall
+/// is safe by construction. Calibrated from the 1k live dogfood (2026-06-08):
+/// lowest real answer relevance 0.0388 (stay-fit), highest no-signal 0.004
+/// (Lisbon-guard) — 0.01 sits in that ~10× gap. See [[project_1k_live_read_false_abstain]].
+const READ_NO_SIGNAL_FLOOR: f32 = 0.01;
+
 /// Staleness tier thresholds. Age = `now() - generated_at`.
 ///
 /// - `0 ≤ age < INFO`: status `ok` (no staleness warning).
@@ -181,13 +197,27 @@ pub struct StructuredReadResponse {
     /// Echo of `query.query_text` post-trim. Aids agent-side diagnosis
     /// and audit trails.
     pub query: String,
-    /// Ordered facts most relevant to the query. Empty when `abstain=true`.
+    /// Ordered facts most relevant to the query (reranker-relevance DESC).
+    /// **Populated even when `abstain=true`** (ADR-073) — the closest candidates
+    /// are always returned so the agent can judge / be helpful; empty ONLY when
+    /// retrieval genuinely returned nothing or zero boundaries were authorised.
     pub relevant_facts: Vec<RelevantFact>,
-    /// `true` when the pipeline returned no facts — either retrieval was
-    /// empty, the abstain gate fired, or zero boundaries were authorised.
-    /// The calling agent MUST tell the user the vault has nothing matching;
-    /// fabricating an answer is a contract violation.
+    /// `true` when the vault holds no *confident* match for the query — read's
+    /// recall-safe weak-match signal (ADR-073). `abstain=true` no longer means
+    /// "no facts": `relevant_facts` may still carry the closest low-confidence
+    /// candidates (see `top_relevance`). A weak agent can trust `abstain` and say
+    /// "I don't have that"; a capable agent can inspect the facts and decide
+    /// (e.g. "no cat, but you have a dog"). Fabricating an answer the facts don't
+    /// support is still a contract violation. Set when retrieval was empty, zero
+    /// boundaries were authorised, or the rank-1 relevance is below the no-signal
+    /// floor / not separated from the pool.
     pub abstain: bool,
+    /// Rank-1 reranked relevance on the `[0,1]` sigmoid scale (`0.0` when no
+    /// candidates). Agent-facing transparency into match strength — mirrors
+    /// `memory_search`'s `top_relevance` hint (ADR-073). On the no-reranker
+    /// cosine fallback this is a BGE cosine rather than a reranker score
+    /// (best-effort; the reranked path is the production default).
+    pub top_relevance: f32,
     /// Health of the vault state behind this response.
     pub health: HealthInfo,
 }
@@ -449,6 +479,7 @@ impl StructuredReadPipeline {
                 query: query_echo,
                 relevant_facts: Vec::new(),
                 abstain: true,
+                top_relevance: 0.0,
                 health: HealthInfo {
                     status: HealthStatus::Ok,
                     warnings: Vec::new(),
@@ -612,9 +643,32 @@ impl StructuredReadPipeline {
             self.retriever.retrieve(retrieval_query).await?
         };
 
-        // Stage 2 — pack into RelevantFacts. Empty retrieval is the only
-        // abstain trigger after the zero-boundary short-circuit above.
-        let abstain = candidates.is_empty();
+        // Stage 2 — recall-safe abstain HINT + pack (ADR-073).
+        //
+        // `top_relevance` = the rank-1 score for agent transparency (sigmoid
+        // reranker-relevance on the production path; best-effort cosine/RRF on a
+        // fallback path).
+        //
+        // On the RERANKER path (production) `apply_reranker` is reorder-only — it
+        // drops nothing, so `candidates` holds every retrieved fact and `abstain`
+        // is a HINT computed by combining `search_hint`'s separation test (catches
+        // flat distractor clusters, e.g. the salary trap) with the no-signal floor
+        // (catches the lone/few no-signal fact `search_hint` reads as "separated",
+        // e.g. the cat→dog / Lisbon-guard class). The hint NEVER removes a fact —
+        // facts are always packed below — so recall is safe regardless of where
+        // the floor sits.
+        //
+        // On the no-reranker FALLBACK paths (cosine gate / plain) the prior
+        // semantics are preserved exactly: `abstain = candidates.is_empty()` (the
+        // cosine gate already returns an empty pool when it fires). Per ADR-073 (d)
+        // the fallback paths are out of scope for the hint.
+        let top_relevance = candidates.first().map(|c| c.score).unwrap_or(0.0);
+        let abstain = if self.reranker.is_some() {
+            let hint = search_hint(&candidates);
+            candidates.is_empty() || hint.weak_match || hint.top_relevance < READ_NO_SIGNAL_FLOOR
+        } else {
+            candidates.is_empty()
+        };
         let relevant_facts: Vec<RelevantFact> = candidates
             .into_iter()
             .map(|c| {
@@ -637,6 +691,7 @@ impl StructuredReadPipeline {
             query: query_echo,
             relevant_facts,
             abstain,
+            top_relevance,
             health: HealthInfo { status, warnings },
         })
     }
@@ -683,26 +738,30 @@ impl StructuredReadPipeline {
         Ok(hits)
     }
 
-    /// Rerank the top [`RERANK_CANDIDATE_CAP`] retrieved candidates with the
-    /// cross-encoder, keep those at/above the reranker's floor, and re-sort by
-    /// reranker score (DESC). An empty result → the read abstains.
+    /// Rerank the candidate pool with the cross-encoder and re-sort by relevance
+    /// DESC. **Reorder-only (ADR-073, 2026-06-08): nothing is dropped.** Every
+    /// retrieved candidate is mapped from its logit to a `[0,1]` relevance via
+    /// [`relevance_score`] (the same sigmoid `memory_search` uses) and returned;
+    /// the reranker's job here is purely to pull the right answer to the top. The
+    /// abstain decision is a HINT computed downstream in [`Self::read`]
+    /// (separation via [`search_hint`] + the [`READ_NO_SIGNAL_FLOOR`]) and by the
+    /// calling agent — never a drop here.
+    ///
+    /// **Why never drop (ADR-073).** This previously hard-dropped candidates
+    /// below `reranker.relevance_floor()` and the read abstained when all were
+    /// dropped. The 1k live dogfood proved that false-abstains on stored facts: a
+    /// real answer ("runs 10km" for "how do I stay fit") scored logit −3.21, fell
+    /// below the −2.5 floor, and was discarded → the vault hid a memory it held —
+    /// the cardinal sin ([[project_1k_live_read_false_abstain]]). The drop is
+    /// removed; read now mirrors [`crate::RerankedRetriever`]'s reorder-only
+    /// `rerank_pool`, and abstain is a separation/no-signal HINT that keeps the
+    /// facts.
     ///
     /// The input pool may be a hybrid ∪ semantic union (see
-    /// [`Self::union_semantic_recall`]); [`RERANK_CANDIDATE_CAP`] is sized to
-    /// that union (`2 × DEFAULT_MAX_CANDIDATES`) so the truncate below never
-    /// drops a unioned-in semantic match before it is scored.
-    ///
-    /// **Recall-first (ADR-066, 2026-06-02).** The reranker's floor is now a
-    /// coarse NO-SIGNAL cut (`RERANK_NO_SIGNAL_FLOOR`, ~−2.5), NOT a precision
-    /// gate. Its job here is (1) re-ordering and (2) dropping only deep no-signal
-    /// junk; every plausibly-relevant candidate (including synonym/paraphrase
-    /// matches the 0.6B scores slightly negative) flows through to the calling
-    /// agent, which makes the fine relevance call. This replaced the precision
-    /// floor (logit 0) that over-abstained by discarding real facts — measured
-    /// 2026-06-02: the 0.6B cannot separate hard synonym leaps from ambiguous
-    /// guards by any single floor, so we stop trying and trust the agent.
-    /// Candidates are assumed sorted by retriever score DESC (the [`Retriever`]
-    /// trait invariant), so truncating to the cap keeps the strongest.
+    /// [`Self::union_semantic_recall`]); [`RERANK_CANDIDATE_CAP`] bounds the
+    /// reranker batch (cost, not recall) — candidates are assumed sorted by
+    /// retriever score DESC (the [`Retriever`] invariant) so truncating keeps the
+    /// strongest before the reranker re-sorts.
     async fn apply_reranker(
         &self,
         query: &str,
@@ -729,23 +788,20 @@ impl StructuredReadPipeline {
             )));
         }
 
-        let floor = reranker.relevance_floor();
-        let mut kept: Vec<RetrievedMemory> = candidates
+        // Reorder-only: map every logit to [0,1] and KEEP all candidates.
+        let mut reordered: Vec<RetrievedMemory> = candidates
             .into_iter()
             .zip(scores)
-            .filter_map(|(mut c, score)| {
-                if score >= floor {
-                    c.score = score;
-                    c.explanation = format!("reranked: score={score:.4} (floor {floor:.4})");
-                    Some(c)
-                } else {
-                    None
-                }
+            .map(|(mut c, logit)| {
+                c.score = relevance_score(logit);
+                c.explanation = format!("reranked: logit={logit:.4} → relevance={:.4}", c.score);
+                c
             })
             .collect();
-        // Re-sort by reranker score DESC (the reranker, not the retriever, now
-        // decides ordering). NaN scores sort last via the unwrap_or fallback.
-        kept.sort_by(|a, b| {
+        // Re-sort by relevance DESC (the reranker, not the retriever, owns
+        // ordering now). `relevance_score` is strictly monotonic + NaN-free, so
+        // this preserves the logit order.
+        reordered.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -753,11 +809,11 @@ impl StructuredReadPipeline {
 
         tracing::info!(
             target: "vault_retrieval::reranker",
-            kept = kept.len(),
-            no_signal_floor = floor,
-            "recall-first rerank: re-ordered + dropped only below-no-signal-floor candidates"
+            returned = reordered.len(),
+            top_relevance = reordered.first().map(|c| c.score).unwrap_or(0.0),
+            "recall-first rerank: reorder-only (no drop); abstain decided downstream as a hint"
         );
-        Ok(kept)
+        Ok(reordered)
     }
 }
 
@@ -877,6 +933,7 @@ mod tests {
     use super::*;
     use crate::report_io::{LoadedReport, LoadedReportFact, ReportLoader};
     use crate::retriever::{RetrievalQuery, RetrievedMemory};
+    use crate::search_hint::STRONG_RELEVANCE;
     use async_trait::async_trait;
     use chrono::TimeZone;
     use std::collections::{BTreeMap, HashMap};
@@ -1518,9 +1575,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reranker_filters_candidates_below_floor() {
-        // Two retrieved candidates; the reranker scores one above the floor and
-        // one below. Only the above-floor fact survives; abstain=false.
+    async fn reranker_reorders_lower_candidate_instead_of_dropping_it() {
+        // ADR-073 (was `reranker_filters_candidates_below_floor`): the read path
+        // is now REORDER-ONLY. A lower-scoring candidate is KEPT and ranked below
+        // the strong one — never dropped. The old floor-drop false-abstained on
+        // real facts (see [[project_1k_live_read_false_abstain]]); recall is now
+        // unconditional and the agent judges relevance.
         let now = read_clock_now();
         let keep = fake_memory(
             1,
@@ -1530,7 +1590,7 @@ mod tests {
             0.9,
             None,
         );
-        let drop = fake_memory(
+        let lower = fake_memory(
             2,
             "the user collects vintage keyboards",
             "personal",
@@ -1540,15 +1600,14 @@ mod tests {
         );
         let reranker = MockReranker::new(
             vec![
-                ("the user finds light themes straining", 4.2),
-                ("the user collects vintage keyboards", -3.1),
+                ("the user finds light themes straining", 4.2), // sigmoid ≈ 0.985
+                ("the user collects vintage keyboards", -3.1),  // sigmoid ≈ 0.043
             ],
             -10.0,
             0.0,
         );
         let pipeline = StructuredReadPipeline::new(
-            // retriever order: keep first, drop second (both returned).
-            MockRetriever::new(vec![retrieved(keep, 0.5), retrieved(drop, 0.4)]),
+            MockRetriever::new(vec![retrieved(keep, 0.5), retrieved(lower, 0.4)]),
             MockReportLoader::empty(),
         )
         .with_clock(FixedClock::arc(now))
@@ -1560,22 +1619,34 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(!resp.abstain, "an above-floor candidate MUST proceed");
-        assert_eq!(
-            resp.relevant_facts.len(),
-            1,
-            "below-floor candidate MUST be dropped"
+        assert!(
+            !resp.abstain,
+            "a strong, separated match present MUST NOT abstain"
         );
         assert_eq!(
-            resp.relevant_facts[0].fact,
-            "the user finds light themes straining"
+            resp.relevant_facts.len(),
+            2,
+            "reorder-only: both candidates kept, none dropped"
+        );
+        assert_eq!(
+            resp.relevant_facts[0].fact, "the user finds light themes straining",
+            "the strong match ranks first"
+        );
+        assert_eq!(
+            resp.relevant_facts[1].fact, "the user collects vintage keyboards",
+            "the weaker fact is kept + ranked below, NOT dropped (recall-safe)"
         );
     }
 
     #[tokio::test]
-    async fn reranker_abstains_when_all_candidates_below_floor() {
-        // The A7-guard case: a topically-adjacent but non-answering fact scores
-        // below the floor → abstain, even though retrieval returned it.
+    async fn reranker_abstains_via_no_signal_floor_but_still_returns_the_fact() {
+        // ADR-073 (was `reranker_abstains_when_all_candidates_below_floor`): the
+        // A7-guard case — a lone adjacent-but-wrong fact scoring deep no-signal
+        // (logit −5.4 → relevance ≈ 0.0045, below READ_NO_SIGNAL_FLOOR) sets
+        // `abstain=true`. But the fact is STILL returned (recall-safe): the honest
+        // "not in vault" signal is the `abstain` flag + the low `top_relevance`,
+        // NOT an empty list. A capable agent inspects the fact and declines (the
+        // live cat→dog behaviour); a weak agent trusts `abstain`.
         let now = read_clock_now();
         let guard = fake_memory(
             1,
@@ -1601,9 +1672,18 @@ mod tests {
             .unwrap();
         assert!(
             resp.abstain,
-            "all-below-floor MUST abstain (adjacent-but-wrong guard)"
+            "deep no-signal (top < READ_NO_SIGNAL_FLOOR) MUST set abstain=true"
         );
-        assert!(resp.relevant_facts.is_empty());
+        assert_eq!(
+            resp.relevant_facts.len(),
+            1,
+            "recall-safe: the candidate is STILL returned even when abstaining (ADR-073)"
+        );
+        assert!(
+            resp.top_relevance < READ_NO_SIGNAL_FLOOR,
+            "top_relevance ({}) MUST be below the no-signal floor here",
+            resp.top_relevance
+        );
     }
 
     #[tokio::test]
@@ -1750,12 +1830,12 @@ mod tests {
         );
         assert_eq!(
             resp.relevant_facts.len(),
-            1,
-            "only the cello is above floor"
+            2,
+            "reorder-only (ADR-073): the unioned-in cello AND the distractor are both kept"
         );
         assert_eq!(
-            resp.relevant_facts[0].fact,
-            "plays the cello in a community orchestra"
+            resp.relevant_facts[0].fact, "plays the cello in a community orchestra",
+            "the recall-union match reranks to #1"
         );
     }
 
@@ -1783,6 +1863,186 @@ mod tests {
             resp.relevant_facts.len(),
             1,
             "a fact in both channels must appear once, not twice"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Group C.7 — ADR-073 recall-safe abstain hint (1k live-dogfood regressions)
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn low_but_separated_top_proceeds_and_returns_the_fact() {
+        // THE Gap-1 bug, pinned. "how do I stay fit" → "runs 10km" scored logit
+        // −3.21 (relevance ≈ 0.039) live and was DROPPED by the old floor →
+        // false-abstain. Now: low absolute score but clearly separated from the
+        // pool ⇒ abstain=false, the real fact is returned.
+        let now = read_clock_now();
+        let answer = fake_memory(
+            1,
+            "the user runs ten kilometres three times a week",
+            "personal",
+            now,
+            0.93,
+            None,
+        );
+        let filler = fake_memory(
+            2,
+            "the user keeps a detailed food diary",
+            "personal",
+            now,
+            0.9,
+            None,
+        );
+        let reranker = MockReranker::new(
+            vec![
+                ("the user runs ten kilometres three times a week", -3.2), // ≈ 0.0392
+                ("the user keeps a detailed food diary", -5.5),            // ≈ 0.0041
+            ],
+            -10.0,
+            0.0,
+        );
+        let pipeline = StructuredReadPipeline::new(
+            MockRetriever::new(vec![retrieved(answer, 0.5), retrieved(filler, 0.4)]),
+            MockReportLoader::empty(),
+        )
+        .with_clock(FixedClock::arc(now))
+        .with_reranker(reranker);
+        let resp = pipeline
+            .read(ReadQuery {
+                query_text: "how do i stay fit".into(),
+                authorized_boundaries: vec![boundary("personal")],
+            })
+            .await
+            .unwrap();
+        assert!(
+            !resp.abstain,
+            "a low-but-separated top (0.039 vs 0.004, ≈9×) MUST proceed — the Gap-1 false-abstain fix"
+        );
+        assert_eq!(
+            resp.relevant_facts[0].fact,
+            "the user runs ten kilometres three times a week"
+        );
+        assert!(
+            resp.top_relevance > READ_NO_SIGNAL_FLOOR && resp.top_relevance < STRONG_RELEVANCE,
+            "top_relevance ({}) is the low-but-real band",
+            resp.top_relevance
+        );
+    }
+
+    #[tokio::test]
+    async fn flat_distractor_cluster_abstains_but_keeps_facts() {
+        // The salary-trap class: query has no real answer, but several adjacent
+        // distractors score similarly (a FLAT cluster, e.g. vendor "$6,500
+        // annual" rows ≈ 0.025/0.023/0.022 live). No separation ⇒ weak_match ⇒
+        // abstain=true; but the facts are STILL returned so the agent can say
+        // "those are vendor rates, not a salary".
+        let now = read_clock_now();
+        let a = fake_memory(
+            1,
+            "booked Mercury Logistics, rate approximately 6500 annual",
+            "personal",
+            now,
+            0.9,
+            None,
+        );
+        let b = fake_memory(
+            2,
+            "booked Vertex Furniture, rate approximately 6500 annual",
+            "personal",
+            now,
+            0.9,
+            None,
+        );
+        let c = fake_memory(
+            3,
+            "booked Cascade Cleaning, rate approximately 6500 annual",
+            "personal",
+            now,
+            0.9,
+            None,
+        );
+        let reranker = MockReranker::new(
+            vec![
+                (
+                    "booked Mercury Logistics, rate approximately 6500 annual",
+                    -3.66,
+                ), // ≈ 0.0251
+                (
+                    "booked Vertex Furniture, rate approximately 6500 annual",
+                    -3.76,
+                ), // ≈ 0.0228
+                (
+                    "booked Cascade Cleaning, rate approximately 6500 annual",
+                    -3.79,
+                ), // ≈ 0.0221
+            ],
+            -10.0,
+            0.0,
+        );
+        let pipeline = StructuredReadPipeline::new(
+            MockRetriever::new(vec![
+                retrieved(a, 0.5),
+                retrieved(b, 0.49),
+                retrieved(c, 0.48),
+            ]),
+            MockReportLoader::empty(),
+        )
+        .with_clock(FixedClock::arc(now))
+        .with_reranker(reranker);
+        let resp = pipeline
+            .read(ReadQuery {
+                query_text: "what is the user's annual salary".into(),
+                authorized_boundaries: vec![boundary("personal")],
+            })
+            .await
+            .unwrap();
+        assert!(
+            resp.abstain,
+            "a flat cluster (no separation, all ≈0.022-0.025) MUST abstain — the salary-trap class"
+        );
+        assert_eq!(
+            resp.relevant_facts.len(),
+            3,
+            "recall-safe: the closest facts are STILL returned for the agent to judge"
+        );
+    }
+
+    #[tokio::test]
+    async fn strong_match_sets_high_top_relevance_and_no_abstain() {
+        // Field-population pin: a confidently-relevant fact yields abstain=false
+        // and a top_relevance well above STRONG_RELEVANCE.
+        let now = read_clock_now();
+        let m = fake_memory(
+            1,
+            "plays the cello in a community orchestra",
+            "personal",
+            now,
+            0.93,
+            None,
+        );
+        let reranker = MockReranker::new(
+            vec![("plays the cello in a community orchestra", 6.5)],
+            -10.0,
+            0.0,
+        );
+        let pipeline = StructuredReadPipeline::new(
+            MockRetriever::new(vec![retrieved(m, 0.5)]),
+            MockReportLoader::empty(),
+        )
+        .with_clock(FixedClock::arc(now))
+        .with_reranker(reranker);
+        let resp = pipeline
+            .read(ReadQuery {
+                query_text: "what instrument does the user play".into(),
+                authorized_boundaries: vec![boundary("personal")],
+            })
+            .await
+            .unwrap();
+        assert!(!resp.abstain);
+        assert!(
+            resp.top_relevance > STRONG_RELEVANCE,
+            "a +6.5 logit maps near 1.0 (got {})",
+            resp.top_relevance
         );
     }
 

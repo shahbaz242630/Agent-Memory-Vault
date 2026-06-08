@@ -781,3 +781,231 @@ async fn subject_frame_depth_probe() {
 
     assert_eq!(total, 10, "expected 10 recall targets in the fixture");
 }
+
+// ===========================================================================
+// LIVE-VAULT SEEDER (Thread 3) — writes a REAL, Antigravity-openable vault.
+//
+// Unlike `scale_correctness_eval` (which seeds an ephemeral TempDir with a test
+// key), this seeds a PERSISTENT vault at caller-chosen paths, keyed by the SAME
+// production OS-keychain master key the MCP server uses
+// (`read_or_init_master_key(PRODUCTION_NAMESPACE, VAULT_ID)` → derive sqlcipher
+// passphrase + at-rest key). So `vault-cli mcp serve` (and therefore Antigravity)
+// opens it natively. Vectors are produced by bge-small-en-v1.5 (same weights as
+// production), so query embeddings match.
+//
+// It seeds the planted facts (known answers) + deterministic distractors into ONE
+// boundary (default `personal`), drains the cascade fully, then prints a TEST
+// SCRIPT: the exact questions to ask Antigravity and the correct planted answers.
+//
+// ## Running (Windows — keychain is Windows-only at V0.2)
+//
+// ```text
+// $env:SEED_N='100'                       # 100 → 1k → 10k ladder
+// $env:SEED_VAULT_DIR='C:\path\to\seeded-vault'   # fresh dir; repoint Antigravity here
+// # optional (default = the bge-small test fixture, same weights as prod):
+// #   $env:SEED_BGE_MODEL / $env:SEED_BGE_TOKENIZER / $env:SEED_ORT_LIB
+// #   $env:SEED_BOUNDARY (default 'personal')
+// cargo test -p vault-app --test scale_eval seed_live_vault -- --ignored --nocapture
+// ```
+//
+// Then point `vault-cli mcp serve` at the printed paths and test live.
+//
+// NOTE: single-row cascade drain is O(n) per write, so 10k takes tens of minutes
+// (inherent — same path the app uses). 100 and 1k are quick. Start with 100.
+// ===========================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live-vault seeder — writes a real Antigravity-openable vault; run with --ignored --nocapture + SEED_* env"]
+async fn seed_live_vault() {
+    fn env_required(key: &str) -> String {
+        std::env::var(key)
+            .unwrap_or_else(|_| panic!("{key} env var is required for the live seeder"))
+    }
+    fn env_path_or_fixture(key: &str, fixture_name: &str) -> PathBuf {
+        match std::env::var(key) {
+            Ok(p) => PathBuf::from(p),
+            Err(_) => fixture(BGE_FIXTURE_REL, fixture_name),
+        }
+    }
+
+    let seed_n: usize = env_required("SEED_N")
+        .parse()
+        .expect("SEED_N must be a positive integer");
+    let vault_dir = PathBuf::from(env_required("SEED_VAULT_DIR"));
+    let boundary_name = std::env::var("SEED_BOUNDARY").unwrap_or_else(|_| "personal".to_string());
+
+    // Conventional sub-paths (mirrors vault-cli's vault_db / vector_dir / graph_db).
+    let metadata_path = vault_dir.join("vault.db");
+    let vector_dir = vault_dir.join("lance");
+    let graph_path = vault_dir.join("graph.duckdb");
+    std::fs::create_dir_all(&vault_dir).expect("create SEED_VAULT_DIR");
+
+    // PRODUCTION key derivation — the load-bearing bit that makes the vault
+    // openable by `vault-cli mcp serve` / Antigravity (Windows-only at V0.2).
+    let master_key = vault_app::keychain::read_or_init_master_key(
+        vault_app::keychain::PRODUCTION_NAMESPACE,
+        vault_app::keychain::VAULT_ID,
+    )
+    .expect("read_or_init_master_key (production keychain) — Windows only");
+    let sqlcipher_passphrase = vault_app::keychain::derive_sqlcipher_passphrase(&master_key);
+    let at_rest_key = vault_app::keychain::derive_at_rest_key(&master_key);
+
+    let config = AppConfig {
+        metadata_path: metadata_path.clone(),
+        vector_dir: vector_dir.clone(),
+        graph_path: graph_path.clone(),
+        key: sqlcipher_passphrase,
+        model_path: env_path_or_fixture("SEED_BGE_MODEL", "model.onnx"),
+        tokenizer_path: env_path_or_fixture("SEED_BGE_TOKENIZER", "tokenizer.json"),
+        ort_lib_path: match std::env::var("SEED_ORT_LIB") {
+            Ok(p) => PathBuf::from(p),
+            Err(_) => ort_lib(),
+        },
+        at_rest_key,
+        // Seeding only writes; the read-side models (rerank/qwen) + consolidator
+        // (phi4) are not needed to embed + persist.
+        qwen_model_path: None,
+        phi4_model_path: None,
+        rerank_model_path: None,
+        rerank_tokenizer_path: None,
+    };
+
+    let app = Application::new(&config)
+        .await
+        .expect("Application::new (production-keyed live vault)");
+    let _shutdown = app.start(); // spawn the cascading retry worker
+    let adapter = app.adapter();
+
+    // ---- load planted facts + queries ----
+    let bytes = std::fs::read(scale_fixture_path()).expect("read scale_eval.json");
+    let value: Value = serde_json::from_slice(&bytes).expect("parse scale_eval.json");
+    let planted = parse_planted(&value);
+    let queries = parse_queries(&value);
+
+    let boundary = Boundary::new(boundary_name.as_str()).expect("SEED_BOUNDARY must be valid");
+
+    println!("\n================ LIVE-VAULT SEEDER ================");
+    println!("vault dir : {}", vault_dir.display());
+    println!("boundary  : {boundary_name}");
+    println!(
+        "target N  : {seed_n}  ({} planted + distractors)",
+        planted.len()
+    );
+    println!("(single-row cascade drain — 10k takes tens of minutes; 100/1k quick)\n");
+
+    // ---- seed planted facts (override boundary so all live in SEED_BOUNDARY) ----
+    let mut id_map: BTreeMap<String, String> = BTreeMap::new();
+    for pf in &planted {
+        let nm = NewMemory {
+            content: pf.content.clone(),
+            memory_type: MemoryType::Semantic,
+            boundary: boundary.clone(),
+            source_agent: pf.source_agent.clone(),
+            confidence: pf.confidence,
+            valid_from: None,
+            valid_until: None,
+            metadata: serde_json::json!({}),
+        };
+        let uuid = adapter
+            .write(nm)
+            .await
+            .expect("seed planted write")
+            .to_string();
+        id_map.insert(pf.id.clone(), uuid);
+    }
+
+    // ---- pad to N with deterministic distractors (also into SEED_BOUNDARY) ----
+    let distractor_count = seed_n.saturating_sub(planted.len());
+    for d in generate_distractors(distractor_count, DISTRACTOR_SEED) {
+        let nm = NewMemory {
+            content: d.content,
+            memory_type: MemoryType::Semantic,
+            boundary: boundary.clone(),
+            source_agent: Some("seed-distractor".into()),
+            confidence: 0.9,
+            valid_from: None,
+            valid_until: None,
+            metadata: serde_json::json!({}),
+        };
+        adapter.write(nm).await.expect("seed distractor write");
+    }
+
+    let total = planted.len() + distractor_count;
+    println!(
+        "enqueued {total} writes ({} planted + {distractor_count} distractors); draining vectors into LanceDB...",
+        planted.len()
+    );
+
+    // ---- drain poll: wait until EVERY vector has landed in LanceDB ----
+    // Searching for a fact is NOT a reliable drain signal — the keyword (BM25)
+    // channel finds a fact from SQLite before its VECTOR is written to LanceDB,
+    // so a search hit can fire while the vector store is still nearly empty
+    // (the first seeder attempt shipped a 1-of-101 vault for exactly this
+    // reason). The only ground truth is the vector-store row count. Poll it via
+    // a FRESH read-only handle each tick — re-open to read the latest LanceDB
+    // version (a held handle pins the version it opened at and would never see
+    // the worker's progress). LanceDB tolerates concurrent read while the
+    // cascade worker writes.
+    use vault_storage::{LanceVectorStore, VectorStore};
+    let mut drained = false;
+    for attempt in 0..100_000usize {
+        let probe_key = vault_app::keychain::derive_at_rest_key(&master_key);
+        let probe = LanceVectorStore::open_with_at_rest_key(&vector_dir, 384, &probe_key)
+            .await
+            .expect("open vector count probe");
+        let n = probe.count(None).await.expect("vector count probe");
+        drop(probe);
+        if n >= total {
+            println!(
+                "all {n}/{total} vectors drained into LanceDB after ~{}s\n",
+                attempt * 2
+            );
+            drained = true;
+            break;
+        }
+        if attempt % 15 == 0 {
+            println!(
+                "  draining... {n}/{total} vectors (~{}s elapsed)",
+                attempt * 2
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    assert!(
+        drained,
+        "vectors did not fully drain into LanceDB within the poll window"
+    );
+
+    // ---- print the TEST SCRIPT for Antigravity ----
+    println!("================ ANTIGRAVITY TEST SCRIPT ================");
+    println!("Point `vault-cli mcp serve` at this vault:");
+    println!("  --vault-db   {}", metadata_path.display());
+    println!("  --vector-dir {}", vector_dir.display());
+    println!("  --graph-db   {}", graph_path.display());
+    println!("  (authorize boundary: {boundary_name})\n");
+    println!("Ask Antigravity each question; check the answer against 'EXPECT':\n");
+    for q in &queries {
+        if q.abstain {
+            println!("  Q: {:?}", q.query_text);
+            println!("     EXPECT: vault has NO such fact → agent should say it doesn't have it (abstain)\n");
+        } else {
+            println!("  Q: {:?}", q.query_text);
+            for key in &q.must_surface {
+                if let Some(pf) = planted.iter().find(|p| &p.id == key) {
+                    println!("     EXPECT (answer): {:?}", pf.content);
+                }
+            }
+            for key in &q.must_exclude {
+                if let Some(pf) = planted.iter().find(|p| &p.id == key) {
+                    println!(
+                        "     NEAR-MISS (should NOT be the answer): {:?}",
+                        pf.content
+                    );
+                }
+            }
+            println!();
+        }
+    }
+    println!("========================================================\n");
+    let _ = id_map; // planted-id → uuid map retained for future scripted assertions
+}

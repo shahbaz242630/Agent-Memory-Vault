@@ -164,6 +164,7 @@ impl Adapter for MockAdapter {
             query: String::new(),
             relevant_facts: Vec::new(),
             abstain: true,
+            top_relevance: 0.0,
             health: HealthInfo {
                 status: HealthStatus::Ok,
                 warnings: Vec::new(),

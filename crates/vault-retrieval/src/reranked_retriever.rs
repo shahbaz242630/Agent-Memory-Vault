@@ -233,7 +233,7 @@ impl RerankedRetriever {
 /// as `-0.95` (live dogfood, 2026-06-05). Sigmoid handles ±∞ correctly
 /// (→ 1.0 / 0.0); a NaN logit (should never occur) maps to 0.0 to keep the
 /// score finite and in range (`Retriever` invariant #4).
-fn relevance_score(logit: f32) -> f32 {
+pub(crate) fn relevance_score(logit: f32) -> f32 {
     if logit.is_nan() {
         return 0.0;
     }

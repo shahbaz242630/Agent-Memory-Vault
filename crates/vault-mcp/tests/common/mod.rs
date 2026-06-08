@@ -282,6 +282,7 @@ impl Adapter for SuccessAdapter {
             query: "deterministic test query".to_string(),
             relevant_facts: Vec::new(),
             abstain: true,
+            top_relevance: 0.0,
             health: HealthInfo {
                 status: HealthStatus::Ok,
                 warnings: Vec::new(),
