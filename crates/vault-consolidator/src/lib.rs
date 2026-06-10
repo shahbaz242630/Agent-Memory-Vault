@@ -47,7 +47,9 @@ pub mod report;
 mod summary;
 pub mod topics;
 
-pub use consolidator::{ConflictReview, ConsolidationReport, Consolidator, ConsolidatorConfig};
+pub use consolidator::{
+    ConflictReview, ConsolidationReport, Consolidator, ConsolidatorConfig, EnrichmentReport,
+};
 pub use phases::cluster::{find_candidate_clusters, Cluster};
 pub use phases::merge::{apply_merge, decide_merge, AppliedMerge, MergeOutcome};
 pub use report::{generate_report, write_report_atomic, Report, ReportFact};

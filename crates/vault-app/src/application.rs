@@ -685,12 +685,26 @@ impl Application {
         // re-embed, so both belong under the same cancellation budget. We
         // .clone() the Arc<Consolidator> so the future is 'static-friendly
         // (no borrow on self threaded through tokio::timeout's internal
-        // future polling). generate_reports runs AFTER run_consolidation so
-        // the topics + facts reflect the post-merge / post-invalidate state
-        // (ADR-058).
+        // future polling). enrich_facts + generate_reports run AFTER
+        // run_consolidation so they reflect the post-merge / post-invalidate
+        // active set (ADR-058 / ADR-074). All three call the LLM and/or
+        // re-embed, so all three belong under the same cancellation budget.
         let consolidator = consolidator.clone();
         let inner = async move {
             let report = consolidator.run_consolidation().await?;
+            // ADR-074: document-side alias enrichment of the post-merge active
+            // set (Gap-2 vocabulary-gap fix). Per-fact failures are counted
+            // inside enrich_facts and never abort the run; only the initial
+            // enumeration can error here.
+            let enrichment = consolidator.enrich_facts().await?;
+            tracing::info!(
+                target: "vault_app::consolidator",
+                run_id = %run_id,
+                enriched = enrichment.facts_enriched,
+                skipped = enrichment.facts_skipped,
+                failed = enrichment.facts_failed,
+                "alias enrichment pass complete"
+            );
             let reports = consolidator.generate_reports(run_id).await?;
             Ok::<_, VaultError>((report, reports))
         };

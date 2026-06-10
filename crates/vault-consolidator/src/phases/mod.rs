@@ -28,4 +28,5 @@ pub mod candidates;
 pub mod cluster;
 pub mod contradiction;
 pub mod dedup;
+pub mod enrich;
 pub mod merge;

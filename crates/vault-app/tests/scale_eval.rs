@@ -117,6 +117,10 @@ struct PlantedFact {
 struct EvalQuery {
     id: String,
     kind: String,
+    /// `_phrasing` tag (natural / plain / idiom / keyword) — buckets recall by
+    /// how the question is worded, so the scorecard exposes phrasing-sensitive
+    /// recall (Thread-2 Gap 2: "call home" misses, "live" hits). Absent → "natural".
+    phrasing: String,
     query_text: String,
     must_surface: Vec<String>,
     must_exclude: Vec<String>,
@@ -172,6 +176,11 @@ fn parse_queries(v: &Value) -> Vec<EvalQuery> {
                     .get("_kind")
                     .and_then(Value::as_str)
                     .unwrap_or("")
+                    .to_string(),
+                phrasing: q
+                    .get("_phrasing")
+                    .and_then(Value::as_str)
+                    .unwrap_or("natural")
                     .to_string(),
                 query_text: q["query_text"]
                     .as_str()
@@ -459,41 +468,48 @@ async fn scale_correctness_eval() {
         scale
     );
 
-    // ---- readiness poll: wait until a distinctive planted fact is searchable ----
-    // The cascade worker drains writes into LanceDB + the keyword index async;
-    // poll search() for the Rivian fact rather than guessing a sleep duration.
-    let rivian_uuid = id_map
-        .get("drive-rivian")
-        .cloned()
-        .expect("drive-rivian planted");
-    // Cascade drains async; the larger the seed, the longer the drain. Scale the
-    // poll window with `scale` (2s ticks): ~120s floor, +2s per 10 facts. Breaks
-    // early as soon as the planted Rivian fact is searchable.
-    let max_attempts = (scale / 10).max(60);
-    let mut ready = false;
+    // ---- drain poll: wait until EVERY vector has landed in LanceDB ----
+    // CRITICAL — this was a greenwash bug (fixed 2026-06-09, Thread-2 Gap 2).
+    // The OLD poll broke as soon as the planted Rivian fact was *searchable*, but
+    // the keyword (BM25) channel finds a fact from SQLite BEFORE its vector is
+    // written to LanceDB (the same trap §1 documents for the live seeder). At 1k
+    // the cascade takes ~17 min to drain, so "Rivian searchable" fired at ~0s
+    // while the 978 distractor VECTORS were still absent — the query pass then ran
+    // against a near-empty vector store with almost no semantic competition, and
+    // phrasing-sensitive recall (Porto vs travel-noise) looked artificially
+    // perfect. The only ground truth is the vector-store row count. Poll it via a
+    // FRESH read-only handle each tick (a held handle pins the version it opened
+    // at and never sees the worker's progress). Mirrors seed_live_vault's drain.
+    use vault_storage::{LanceVectorStore, VectorStore};
+    let mut drained = false;
+    // 2s ticks; generous scaled cap (1k drain ≈ 17 min ≈ 510 ticks).
+    let max_attempts = (scale * 4).max(600);
     for attempt in 0..max_attempts {
-        let hits = adapter
-            .search(RetrievalQuery {
-                query_text: "Rivian R1T".into(),
-                authorized_boundaries: authorized.clone(),
-                max_results: 5,
-                options: RetrievalOptions::default(),
-            })
-            .await
-            .expect("readiness search must not error");
-        if hits
-            .iter()
-            .any(|h| h.memory.id.0.to_string() == rivian_uuid)
-        {
-            println!("vault ready after {}s (cascade drained)\n", attempt * 2);
-            ready = true;
+        let probe =
+            LanceVectorStore::open_with_at_rest_key(&config.vector_dir, 384, &config.at_rest_key)
+                .await
+                .expect("open vector count probe");
+        let n = probe.count(None).await.expect("vector count probe");
+        drop(probe);
+        if n >= total {
+            println!(
+                "all {n}/{total} vectors drained into LanceDB after ~{}s\n",
+                attempt * 2
+            );
+            drained = true;
             break;
+        }
+        if attempt % 15 == 0 {
+            println!(
+                "  draining... {n}/{total} vectors (~{}s elapsed)",
+                attempt * 2
+            );
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
     assert!(
-        ready,
-        "cascade did not drain the planted Rivian fact into the searchable index within {}s",
+        drained,
+        "vectors did not fully drain into LanceDB within {}s",
         max_attempts * 2
     );
 
@@ -510,6 +526,11 @@ async fn scale_correctness_eval() {
     let mut search_top5 = 0usize;
     let mut search_top20 = 0usize;
     let mut near_miss_leaks = 0usize;
+    // Per-phrasing recall breakdown (Thread-2 Gap 2): phrasing tag ->
+    // (read-surfaced, search-top20, total targets). The headline number for
+    // phrasing-sensitive recall — "idiom 4/10 vs plain 10/10" is the bug made
+    // visible; later it grades the query-expansion fix.
+    let mut by_phrasing: BTreeMap<String, (usize, usize, usize)> = BTreeMap::new();
 
     println!("---------------- PER-QUERY ----------------");
 
@@ -558,11 +579,14 @@ async fn scale_correctness_eval() {
         let mut detail = String::new();
         for key in &q.must_surface {
             read_surface_total += 1;
+            let bucket = by_phrasing.entry(q.phrasing.clone()).or_insert((0, 0, 0));
+            bucket.2 += 1;
             if let Some(uuid) = resolve(key) {
                 let rr = read_rank(&uuid);
                 let sr = search_rank(&uuid);
                 if rr.is_some() {
                     read_surface_pass += 1;
+                    bucket.0 += 1;
                 }
                 if rr == Some(1) {
                     read_target_top1 += 1;
@@ -573,6 +597,7 @@ async fn scale_correctness_eval() {
                     }
                     if r <= 20 {
                         search_top20 += 1;
+                        bucket.1 += 1;
                     }
                 }
                 detail.push_str(&format!(
@@ -633,6 +658,13 @@ async fn scale_correctness_eval() {
     println!("READ recall  : {read_surface_pass}/{read_surface_total} targets surfaced; {read_target_top1}/{read_surface_total} at read rank 1");
     println!("SEARCH recall: {search_top5}/{read_surface_total} @top-5 ; {search_top20}/{read_surface_total} @top-20");
     println!("near-miss leaks into read: {near_miss_leaks} (diagnostic, not a gate)");
+    println!("\nRECALL BY PHRASING (Thread-2 Gap 2 — phrasing-sensitive recall):");
+    for (phrasing, (read_surf, search20, total)) in &by_phrasing {
+        println!(
+            "  {phrasing:8}: read {read_surf}/{total} surfaced ; search {search20}/{total} @top-20"
+        );
+    }
+    println!("  (a gap between phrasings = recall depends on wording → query-expansion territory)");
     println!("===========================================\n");
 
     // Characterization assert — every query scored exactly once. Threshold
@@ -741,8 +773,15 @@ async fn subject_frame_depth_probe() {
     let mut raw_in_cap = 0usize;
     let mut framed_in_cap = 0usize;
     let mut total = 0usize;
+    // Dedupe by target key — the same recall target now appears under several
+    // phrasing variants (Gap-2 ruler), but the depth probe characterizes each
+    // unique planted target's BGE rank once.
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for q in &queries {
         for key in &q.must_surface {
+            if !seen.insert(key.clone()) {
+                continue;
+            }
             let Some(content) = planted.iter().find(|p| p.id == *key).map(|p| &p.content) else {
                 continue;
             };
@@ -1008,4 +1047,809 @@ async fn seed_live_vault() {
     }
     println!("========================================================\n");
     let _ = id_map; // planted-id → uuid map retained for future scripted assertions
+}
+
+// ===========================================================================
+// LIVE-VAULT QUERY PROBE (Thread-2 Gap 2 diagnosis, 2026-06-09).
+//
+// Opens an EXISTING production-keyed vault (no seeding, no drain) and runs the
+// exact live-dogfood queries through the real read + search paths, printing the
+// FULL ranked list + per-result score so we can see WHERE the target fact lands
+// (or that it is genuinely absent from the candidate pool). This is the faithful
+// reproduction the in-process scale harness cannot be: it queries the very vault
+// the live Antigravity session hit (same content, same production key, same
+// code). It settles whether Gap 2 is query-string-sensitive recall (BGE/fanout)
+// or a harness-vs-live artifact.
+//
+// Point it at a COPY of the live vault (don't mutate the evidence; Application
+// may run migrations / spawn the cascade worker):
+//
+//   $env:PROBE_VAULT_DIR='C:\Projects\seeded-vault-1k-probe'
+//   cargo test -p vault-app --test scale_eval probe_live_vault -- --ignored --nocapture
+//
+// Windows-only (production keychain). Needs the BGE + reranker fixtures.
+// ===========================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live-vault query probe; opens an existing production-keyed vault; run with --ignored --nocapture + PROBE_VAULT_DIR"]
+async fn probe_live_vault() {
+    let vault_dir =
+        PathBuf::from(std::env::var("PROBE_VAULT_DIR").expect("PROBE_VAULT_DIR env var required"));
+    let metadata_path = vault_dir.join("vault.db");
+    let vector_dir = vault_dir.join("lance");
+    let graph_path = vault_dir.join("graph.duckdb");
+
+    // PRODUCTION key derivation — the live vault was seeded with this same key,
+    // so the same derivation opens it (mirrors seed_live_vault).
+    let master_key = vault_app::keychain::read_or_init_master_key(
+        vault_app::keychain::PRODUCTION_NAMESPACE,
+        vault_app::keychain::VAULT_ID,
+    )
+    .expect("read_or_init_master_key (production keychain) — Windows only");
+    let sqlcipher_passphrase = vault_app::keychain::derive_sqlcipher_passphrase(&master_key);
+    let at_rest_key = vault_app::keychain::derive_at_rest_key(&master_key);
+
+    let config = AppConfig {
+        metadata_path,
+        vector_dir,
+        graph_path,
+        key: sqlcipher_passphrase,
+        model_path: fixture(BGE_FIXTURE_REL, "model.onnx"),
+        tokenizer_path: fixture(BGE_FIXTURE_REL, "tokenizer.json"),
+        ort_lib_path: ort_lib(),
+        at_rest_key,
+        qwen_model_path: None,
+        phi4_model_path: None,
+        // The reranker is the read relevance authority — load it (same fixture =
+        // same weights as prod).
+        rerank_model_path: Some(fixture(RERANK_FIXTURE_REL, "model.onnx")),
+        rerank_tokenizer_path: Some(fixture(RERANK_FIXTURE_REL, "tokenizer.json")),
+    };
+
+    let app = Application::new(&config)
+        .await
+        .expect("Application::new over the live vault copy");
+    let _shutdown = app.start();
+    let adapter = app.adapter();
+
+    // The live vault seeded everything into `personal`.
+    let authorized = vec![Boundary::new("personal").expect("personal boundary")];
+
+    // The exact live-dogfood queries: the idiom that MISSED Porto live, the plain
+    // phrasing that FOUND it at rank 1, and the agent keyword-expansions.
+    let probes = [
+        "where does the user call home",
+        "where does the user live",
+        "what city does the user call home",
+        "home location city country lives residence",
+        "how do I stay fit",
+    ];
+
+    let porto_mark = |s: &str| -> &'static str {
+        if s.contains("Porto") {
+            "   <== PORTO (the target)"
+        } else {
+            ""
+        }
+    };
+
+    for qtext in probes {
+        println!("\n================ PROBE: {qtext:?} ================");
+
+        // SEARCH — max_results=10 to match the live MCP default (server.rs:305).
+        let hits = adapter
+            .search(RetrievalQuery {
+                query_text: qtext.to_string(),
+                authorized_boundaries: authorized.clone(),
+                max_results: 10,
+                options: RetrievalOptions::default(),
+            })
+            .await
+            .expect("search must not error");
+        let porto_in_search = hits.iter().any(|h| h.memory.content.contains("Porto"));
+        println!(
+            "-- SEARCH (max_results=10): {} results ; PORTO {} --",
+            hits.len(),
+            if porto_in_search { "PRESENT" } else { "ABSENT" }
+        );
+        for (i, h) in hits.iter().enumerate() {
+            println!(
+                "  [{:>2}] score={:.4}  {}{}",
+                i + 1,
+                h.score,
+                h.memory.content,
+                porto_mark(&h.memory.content)
+            );
+        }
+
+        // READ — the structured answer path (reranker + abstain hint).
+        let resp = adapter
+            .read(ReadQuery {
+                query_text: qtext.to_string(),
+                authorized_boundaries: authorized.clone(),
+            })
+            .await
+            .expect("read must not error");
+        let porto_in_read = resp.relevant_facts.iter().any(|f| f.fact.contains("Porto"));
+        println!(
+            "-- READ: abstain={} top_relevance={:.4} ; {} fact(s) ; PORTO {} --",
+            resp.abstain,
+            resp.top_relevance,
+            resp.relevant_facts.len(),
+            if porto_in_read { "PRESENT" } else { "ABSENT" }
+        );
+        for (i, f) in resp.relevant_facts.iter().enumerate() {
+            println!("  [{:>2}] {}{}", i + 1, f.fact, porto_mark(&f.fact));
+        }
+    }
+}
+
+// ===========================================================================
+// FAMILY-DOMAIN KEYWORD-SOUP PROBE (Thread-2 Gap 2, 2026-06-09).
+//
+// Replicates the Porto "keyword-soup misses, natural finds" pattern in a totally
+// different domain (relationships / family) to settle two questions:
+//   (1) Does the keyword-soup recall failure generalize beyond Porto?
+//   (2) Is it DISTRACTOR-DEPENDENT — i.e. does the keyword query only drift away
+//       from the target when matching-domain lexical noise exists to drift TO?
+//
+// It writes 3 USER target facts (natural phrasing, no overlap with the obvious
+// query keywords) + 8 other-people family DISTRACTORS (the competing lexical
+// noise), drains them, then probes each sub-domain NATURAL vs KEYWORD-SOUP.
+//
+// Run against a FRESH copy of the live vault (it WRITES — re-copy before each run
+// so it starts from the clean 1000-fact baseline):
+//
+//   Copy-Item C:\Projects\seeded-vault-1k C:\Projects\seeded-vault-1k-probe -Recurse -Force
+//   $env:PROBE_VAULT_DIR='C:\Projects\seeded-vault-1k-probe'
+//   cargo test -p vault-app --test scale_eval probe_family_domain -- --ignored --nocapture
+// ===========================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "family-domain keyword-soup probe; writes to an existing vault copy; run with --ignored --nocapture + PROBE_VAULT_DIR"]
+async fn probe_family_domain() {
+    use vault_storage::{LanceVectorStore, VectorStore};
+
+    let vault_dir =
+        PathBuf::from(std::env::var("PROBE_VAULT_DIR").expect("PROBE_VAULT_DIR env var required"));
+
+    let master_key = vault_app::keychain::read_or_init_master_key(
+        vault_app::keychain::PRODUCTION_NAMESPACE,
+        vault_app::keychain::VAULT_ID,
+    )
+    .expect("read_or_init_master_key (production keychain) — Windows only");
+    let config = AppConfig {
+        metadata_path: vault_dir.join("vault.db"),
+        vector_dir: vault_dir.join("lance"),
+        graph_path: vault_dir.join("graph.duckdb"),
+        key: vault_app::keychain::derive_sqlcipher_passphrase(&master_key),
+        model_path: fixture(BGE_FIXTURE_REL, "model.onnx"),
+        tokenizer_path: fixture(BGE_FIXTURE_REL, "tokenizer.json"),
+        ort_lib_path: ort_lib(),
+        at_rest_key: vault_app::keychain::derive_at_rest_key(&master_key),
+        qwen_model_path: None,
+        phi4_model_path: None,
+        rerank_model_path: Some(fixture(RERANK_FIXTURE_REL, "model.onnx")),
+        rerank_tokenizer_path: Some(fixture(RERANK_FIXTURE_REL, "tokenizer.json")),
+    };
+
+    let app = Application::new(&config)
+        .await
+        .expect("Application::new over the live vault copy");
+    let _shutdown = app.start();
+    let adapter = app.adapter();
+    let boundary = Boundary::new("personal").expect("personal boundary");
+    let authorized = vec![boundary.clone()];
+
+    // ---- baseline vector count (so we drain-poll only the new writes) ----
+    let baseline = {
+        let probe =
+            LanceVectorStore::open_with_at_rest_key(&config.vector_dir, 384, &config.at_rest_key)
+                .await
+                .expect("open baseline count probe");
+        let n = probe.count(None).await.expect("baseline count");
+        drop(probe);
+        n
+    };
+
+    // 3 USER targets (natural phrasing, NO overlap with the query keywords) +
+    // 8 other-people family DISTRACTORS (the competing lexical noise).
+    let targets = [
+        "The user tied the knot with Elena last spring.",
+        "The user is raising twins who just started primary school.",
+        "The user and Elena have been inseparable since their university days.",
+    ];
+    let distractors = [
+        "Marcus celebrated his wedding anniversary with a trip to the coast.",
+        "Diego got engaged to his long-term partner over the holidays.",
+        "Sarah is busy planning her sister's wedding for next June.",
+        "Priya's two sons are starting secondary school this autumn.",
+        "Felix and his wife just welcomed their third child.",
+        "Olivia's daughter is applying to universities this year.",
+        "Tom's partner runs a small bakery in the old town.",
+        "Lena's wedding photos from last month finally arrived.",
+    ];
+    let new_facts: Vec<&str> = targets.iter().chain(distractors.iter()).copied().collect();
+
+    for content in &new_facts {
+        let nm = NewMemory {
+            content: (*content).to_string(),
+            memory_type: MemoryType::Semantic,
+            boundary: boundary.clone(),
+            source_agent: Some("family-probe".into()),
+            confidence: 0.93,
+            valid_from: None,
+            valid_until: None,
+            metadata: serde_json::json!({}),
+        };
+        adapter.write(nm).await.expect("write family fact");
+    }
+    let want = baseline + new_facts.len();
+    println!(
+        "\nwrote {} family facts ({} targets + {} distractors); draining {} -> {} vectors...",
+        new_facts.len(),
+        targets.len(),
+        distractors.len(),
+        baseline,
+        want
+    );
+
+    // ---- drain-poll the new vectors ----
+    let mut drained = false;
+    for attempt in 0..600usize {
+        let probe =
+            LanceVectorStore::open_with_at_rest_key(&config.vector_dir, 384, &config.at_rest_key)
+                .await
+                .expect("open drain count probe");
+        let n = probe.count(None).await.expect("drain count");
+        drop(probe);
+        if n >= want {
+            println!("drained to {n}/{want} after ~{}s\n", attempt * 2);
+            drained = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    assert!(drained, "family facts did not drain into LanceDB in time");
+
+    // (query, intended target substring, phrasing)
+    let probes: &[(&str, &str, &str)] = &[
+        ("is the user married?", "tied the knot", "natural"),
+        ("does the user have a spouse?", "tied the knot", "natural"),
+        (
+            "marriage spouse wife husband wedding married status",
+            "tied the knot",
+            "keyword",
+        ),
+        ("does the user have any kids?", "twins", "natural"),
+        ("is the user a parent?", "twins", "natural"),
+        (
+            "children kids son daughter offspring parenting family",
+            "twins",
+            "keyword",
+        ),
+        ("is the user seeing anyone?", "inseparable", "natural"),
+        ("does the user have a girlfriend?", "inseparable", "natural"),
+        (
+            "girlfriend partner relationship dating significant other romantic",
+            "inseparable",
+            "keyword",
+        ),
+    ];
+
+    let is_user_fact = |s: &str| targets.contains(&s);
+
+    for (qtext, target_sub, phrasing) in probes {
+        let hits = adapter
+            .search(RetrievalQuery {
+                query_text: (*qtext).to_string(),
+                authorized_boundaries: authorized.clone(),
+                max_results: 10,
+                options: RetrievalOptions::default(),
+            })
+            .await
+            .expect("search must not error");
+        let target_rank = hits
+            .iter()
+            .position(|h| h.memory.content.contains(target_sub))
+            .map(|p| p + 1);
+        println!(
+            "================ [{phrasing}] {qtext:?}  (target: {target_sub:?}) ================"
+        );
+        println!(
+            "-- SEARCH(10): target {} --",
+            target_rank
+                .map(|r| format!("PRESENT rank {r}"))
+                .unwrap_or_else(|| "ABSENT".into())
+        );
+        for (i, h) in hits.iter().enumerate() {
+            let mark = if h.memory.content.contains(target_sub) {
+                "   <== TARGET"
+            } else if is_user_fact(&h.memory.content) {
+                "   (other user-family fact)"
+            } else {
+                ""
+            };
+            println!(
+                "  [{:>2}] score={:.4}  {}{}",
+                i + 1,
+                h.score,
+                h.memory.content,
+                mark
+            );
+        }
+        println!();
+    }
+}
+
+// ===========================================================================
+// ENRICHMENT + THIRD-DOMAIN PROBE (Thread-2 Gap 2, 2026-06-09).
+//
+// One run, three questions:
+//   §1 THIRD DOMAIN (health/allergy) — does the "natural finds / keyword-soup is
+//      unreliable" pattern hold in a brand-new domain, or surface another bug?
+//      Includes an adversarial near-miss distractor (someone else + shellfish).
+//   §2 ENRICHMENT A/B (kids) — the bare "raising twins" fact ranked #4 (behind a
+//      distractor that used the literal word "child"). Write a DOCUMENT-SIDE
+//      enriched twin ("… Topics: children, kids, parent, son, daughter, family")
+//      alongside it and re-probe: does enrichment lift the rank? (This is the
+//      proposed fix, tested cheaply.)
+//   §3 ENRICHMENT ON THE HARD CASE (home) — the bare Porto fact (already in the
+//      vault) was the ONE outright recall MISS: it vanished on the keyword-soup
+//      "home location city country lives residence". Add an enriched Porto and
+//      fire that exact killer query: does the enriched fact survive where the
+//      bare one died? If yes, document-side enrichment fixes the worst case.
+//
+// Run against a FRESH copy (it WRITES — re-copy before each run):
+//   Copy-Item C:\Projects\seeded-vault-1k C:\Projects\seeded-vault-1k-probe -Recurse -Force
+//   $env:PROBE_VAULT_DIR='C:\Projects\seeded-vault-1k-probe'
+//   cargo test -p vault-app --test scale_eval probe_enrichment -- --ignored --nocapture
+// ===========================================================================
+
+struct Foi {
+    label: &'static str,
+    must: &'static str,
+    must_not: Option<&'static str>,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "enrichment + third-domain probe; writes to an existing vault copy; run with --ignored --nocapture + PROBE_VAULT_DIR"]
+async fn probe_enrichment() {
+    use vault_storage::{LanceVectorStore, VectorStore};
+
+    let vault_dir =
+        PathBuf::from(std::env::var("PROBE_VAULT_DIR").expect("PROBE_VAULT_DIR env var required"));
+    let master_key = vault_app::keychain::read_or_init_master_key(
+        vault_app::keychain::PRODUCTION_NAMESPACE,
+        vault_app::keychain::VAULT_ID,
+    )
+    .expect("read_or_init_master_key (production keychain) — Windows only");
+    let config = AppConfig {
+        metadata_path: vault_dir.join("vault.db"),
+        vector_dir: vault_dir.join("lance"),
+        graph_path: vault_dir.join("graph.duckdb"),
+        key: vault_app::keychain::derive_sqlcipher_passphrase(&master_key),
+        model_path: fixture(BGE_FIXTURE_REL, "model.onnx"),
+        tokenizer_path: fixture(BGE_FIXTURE_REL, "tokenizer.json"),
+        ort_lib_path: ort_lib(),
+        at_rest_key: vault_app::keychain::derive_at_rest_key(&master_key),
+        qwen_model_path: None,
+        phi4_model_path: None,
+        rerank_model_path: Some(fixture(RERANK_FIXTURE_REL, "model.onnx")),
+        rerank_tokenizer_path: Some(fixture(RERANK_FIXTURE_REL, "tokenizer.json")),
+    };
+    let app = Application::new(&config)
+        .await
+        .expect("Application::new over the live vault copy");
+    let _shutdown = app.start();
+    let adapter = app.adapter();
+    let boundary = Boundary::new("personal").expect("personal boundary");
+    let authorized = vec![boundary.clone()];
+
+    let baseline = {
+        let probe =
+            LanceVectorStore::open_with_at_rest_key(&config.vector_dir, 384, &config.at_rest_key)
+                .await
+                .expect("open baseline count probe");
+        let n = probe.count(None).await.expect("baseline count");
+        drop(probe);
+        n
+    };
+
+    // §1 health/allergy (target avoids "allerg*"; last distractor is the
+    // adversarial near-miss — someone else + shellfish).
+    // §2 kids bare vs enriched. §3 home enriched (bare Porto already in vault).
+    let new_facts: &[&str] = &[
+        // §1
+        "The user comes out in hives whenever they eat shellfish.",
+        "Marcus carries an epipen for his peanut allergy.",
+        "Priya is lactose intolerant and avoids all dairy.",
+        "Diego developed a gluten sensitivity last year.",
+        "Sarah's son has a severe nut allergy at school.",
+        "Felix breaks out in a rash from certain laundry detergents.",
+        "Olivia gets terrible hay fever every spring.",
+        "Lena is on a strict low-sodium diet for her blood pressure.",
+        "Tom avoids shellfish after a bad reaction at a restaurant once.",
+        // §2
+        "The user is raising twins who just started primary school.",
+        "The user is raising twins who just started primary school. Topics: children, kids, parent, son, daughter, family.",
+        "Felix and his wife just welcomed their third child.",
+        "Olivia's daughter is applying to universities this year.",
+        // §3
+        "The user settled in Porto after years of moving around. Topics: home, lives, residence, city, country, location.",
+    ];
+    for content in new_facts {
+        adapter
+            .write(NewMemory {
+                content: (*content).to_string(),
+                memory_type: MemoryType::Semantic,
+                boundary: boundary.clone(),
+                source_agent: Some("enrichment-probe".into()),
+                confidence: 0.93,
+                valid_from: None,
+                valid_until: None,
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .expect("write probe fact");
+    }
+    let want = baseline + new_facts.len();
+    println!(
+        "\nwrote {} facts; draining {baseline} -> {want}...",
+        new_facts.len()
+    );
+    let mut drained = false;
+    for attempt in 0..600usize {
+        let probe =
+            LanceVectorStore::open_with_at_rest_key(&config.vector_dir, 384, &config.at_rest_key)
+                .await
+                .expect("open drain count probe");
+        let n = probe.count(None).await.expect("drain count");
+        drop(probe);
+        if n >= want {
+            println!("drained to {n}/{want} after ~{}s\n", attempt * 2);
+            drained = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    assert!(drained, "probe facts did not drain in time");
+
+    // (section, phrasing, query, facts-of-interest)
+    let bare_twins = Foi {
+        label: "bare-twins",
+        must: "raising twins",
+        must_not: Some("Topics"),
+    };
+    let enr_twins = Foi {
+        label: "ENRICHED-twins",
+        must: "Topics: children",
+        must_not: None,
+    };
+    let bare_porto = Foi {
+        label: "bare-Porto",
+        must: "settled in Porto",
+        must_not: Some("Topics"),
+    };
+    let enr_porto = Foi {
+        label: "ENRICHED-Porto",
+        must: "Topics: home",
+        must_not: None,
+    };
+    let allergy = Foi {
+        label: "user-allergy",
+        must: "hives",
+        must_not: None,
+    };
+
+    let probes: Vec<(&str, &str, &str, Vec<&Foi>)> = vec![
+        (
+            "§1 health",
+            "natural",
+            "is the user allergic to anything?",
+            vec![&allergy],
+        ),
+        (
+            "§1 health",
+            "natural",
+            "does the user have any food allergies?",
+            vec![&allergy],
+        ),
+        (
+            "§1 health",
+            "keyword",
+            "allergy allergic reaction intolerance sensitivity food",
+            vec![&allergy],
+        ),
+        (
+            "§2 kids A/B",
+            "natural",
+            "does the user have any kids?",
+            vec![&bare_twins, &enr_twins],
+        ),
+        (
+            "§2 kids A/B",
+            "keyword",
+            "children kids son daughter offspring family",
+            vec![&bare_twins, &enr_twins],
+        ),
+        (
+            "§3 home FIX",
+            "keyword",
+            "home location city country lives residence",
+            vec![&bare_porto, &enr_porto],
+        ),
+        (
+            "§3 home FIX",
+            "natural",
+            "where does the user live",
+            vec![&bare_porto, &enr_porto],
+        ),
+    ];
+
+    for (section, phrasing, qtext, fois) in &probes {
+        let hits = adapter
+            .search(RetrievalQuery {
+                query_text: (*qtext).to_string(),
+                authorized_boundaries: authorized.clone(),
+                max_results: 10,
+                options: RetrievalOptions::default(),
+            })
+            .await
+            .expect("search must not error");
+        let rank_of = |foi: &Foi| -> Option<usize> {
+            hits.iter()
+                .position(|h| {
+                    h.memory.content.contains(foi.must)
+                        && foi.must_not.is_none_or(|mn| !h.memory.content.contains(mn))
+                })
+                .map(|p| p + 1)
+        };
+        let resp = adapter
+            .read(ReadQuery {
+                query_text: (*qtext).to_string(),
+                authorized_boundaries: authorized.clone(),
+            })
+            .await
+            .expect("read must not error");
+
+        println!("================ [{section}][{phrasing}] {qtext:?} ================");
+        for foi in fois {
+            println!(
+                "  {:<16} SEARCH: {}",
+                foi.label,
+                rank_of(foi)
+                    .map(|r| format!("rank {r}"))
+                    .unwrap_or_else(|| "ABSENT (not in top-10)".into())
+            );
+        }
+        println!(
+            "  READ: abstain={} top_relevance={:.4}",
+            resp.abstain, resp.top_relevance
+        );
+        for (i, h) in hits.iter().enumerate() {
+            let mark = fois
+                .iter()
+                .find(|f| {
+                    h.memory.content.contains(f.must)
+                        && f.must_not.is_none_or(|mn| !h.memory.content.contains(mn))
+                })
+                .map(|f| format!("   <== {}", f.label))
+                .unwrap_or_default();
+            println!(
+                "  [{:>2}] score={:.4}  {}{}",
+                i + 1,
+                h.score,
+                h.memory.content,
+                mark
+            );
+        }
+        println!();
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// probe_real_enrichment_1k — REAL Phi-4 end-to-end rank-lift on a 1k vault
+// (ADR-074 live validation).
+//
+// The mock-LLM tests prove the enrichment *logic*; `real_phi4_alias_quality`
+// (vault-consolidator) proves the real model produces good alias *words*; this
+// probe closes the loop: it takes the three Gap-2 killer facts (phrased WITHOUT
+// the obvious keyword), drops them into the real `seeded-vault-1k` distractor
+// field, records each one's BARE rank on its killer keyword query, enriches ONLY
+// those three via the real Phi-4 `enrich_one` path, and re-measures. The 1k
+// distractors stay bare — they are what bury the bare killer — so enriching just
+// the three is the faithful + fast (~2-3 min) A/B (no full-vault enrichment, no
+// merge/contradiction cost, deterministic worker drain).
+//
+// Rank is measured by a direct LanceDB vector search (cosine), which isolates
+// the enrichment's effect on the embedding (no BM25/rerank confounds). It writes
+// to the vault copy — point PROBE_VAULT_DIR at a THROWAWAY copy of
+// seeded-vault-1k, never the evidence vault.
+//
+// Run:
+//   $env:PROBE_VAULT_DIR='C:\Projects\seeded-vault-1k-probe'
+//   $env:PHI4_MODEL_DIR='C:\Users\shahb\AppData\Roaming\com.shahbaz242630.memory-vault\models'
+//   cargo test -p vault-app --test scale_eval probe_real_enrichment_1k -- --ignored --nocapture
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "REAL Phi-4 end-to-end rank-lift on a 1k vault copy; needs PROBE_VAULT_DIR (throwaway) + PHI4_MODEL_DIR; --ignored --nocapture"]
+async fn probe_real_enrichment_1k() {
+    use vault_consolidator::phases::enrich::enrich_one;
+    use vault_llm::{Phi4MiniConfig, Phi4MiniProvider};
+    use vault_storage::StorageBackend;
+
+    const DIM: usize = 384;
+
+    let vault_dir = PathBuf::from(
+        std::env::var("PROBE_VAULT_DIR").expect("PROBE_VAULT_DIR (throwaway 1k copy) required"),
+    );
+    let phi4_dir = std::env::var("PHI4_MODEL_DIR").unwrap_or_else(|_| {
+        r"C:\Users\shahb\AppData\Roaming\com.shahbaz242630.memory-vault\models".to_string()
+    });
+
+    let master_key = vault_app::keychain::read_or_init_master_key(
+        vault_app::keychain::PRODUCTION_NAMESPACE,
+        vault_app::keychain::VAULT_ID,
+    )
+    .expect("read master key (Windows keychain)");
+    let sql_key = vault_app::keychain::derive_sqlcipher_passphrase(&master_key);
+    let at_rest = vault_app::keychain::derive_at_rest_key(&master_key);
+
+    println!("\nloading BGE + Phi-4 (real)...");
+    let bge = BgeSmallProvider::open(
+        &fixture(BGE_FIXTURE_REL, "model.onnx"),
+        &fixture(BGE_FIXTURE_REL, "tokenizer.json"),
+        &ort_lib(),
+    )
+    .expect("open BGE");
+    let phi4 = Phi4MiniProvider::new(Phi4MiniConfig::v0_2_default(phi4_dir.into()))
+        .await
+        .expect("load Phi-4");
+
+    let storage = StorageBackend::open_with_at_rest_key(
+        &vault_dir.join("vault.db"),
+        &vault_dir.join("lance"),
+        &vault_dir.join("graph.duckdb"),
+        sql_key,
+        DIM,
+        &at_rest,
+    )
+    .await
+    .expect("open vault copy");
+
+    let boundary = Boundary::new("personal").expect("personal boundary");
+
+    // Drain the cascade queue to Idle so re-embeds actually land in LanceDB.
+    async fn drain(storage: &StorageBackend) {
+        let mut worker = vault_storage::RetryWorker::new(storage.clone());
+        let drain_at = chrono::Utc::now() + chrono::Duration::seconds(120);
+        for _ in 0..100_000 {
+            match worker.step_at(drain_at).await.expect("worker step") {
+                vault_storage::StepResult::Idle => break,
+                _ => continue,
+            }
+        }
+    }
+
+    // Fresh-open a LanceVectorStore (sees the latest committed version), embed
+    // the query, return the target fact's 1-based rank (or None if not in top-N).
+    async fn rank_of(
+        vault_dir: &std::path::Path,
+        at_rest: &[u8; 32],
+        bge: &BgeSmallProvider,
+        boundary: &vault_core::Boundary,
+        query: &str,
+        target: vault_core::MemoryId,
+    ) -> Option<usize> {
+        use vault_storage::VectorStore;
+        let lance = vault_storage::LanceVectorStore::open_with_at_rest_key(
+            &vault_dir.join("lance"),
+            384,
+            at_rest,
+        )
+        .await
+        .expect("open lance for search");
+        let qe = bge.embed(query).await.expect("embed query");
+        let hits = lance
+            .search(&qe, 50, std::slice::from_ref(boundary))
+            .await
+            .expect("vector search");
+        hits.iter().position(|(id, _)| *id == target).map(|p| p + 1)
+    }
+
+    struct Killer {
+        label: &'static str,
+        content: &'static str,
+        query: &'static str,
+    }
+    let killers = [
+        Killer {
+            label: "Porto",
+            content: "The user settled in Porto after years of moving around.",
+            query: "home location city country lives residence",
+        },
+        Killer {
+            label: "twins",
+            content: "The user is raising twins who just started primary school.",
+            query: "children kids son daughter offspring family",
+        },
+        Killer {
+            label: "hives",
+            content: "The user comes out in hives whenever they eat shellfish.",
+            query: "is the user allergic to anything",
+        },
+    ];
+
+    // Write the bare killers into the 1k field, capture their rows, drain.
+    let mut rows = Vec::new();
+    for k in &killers {
+        let m = vault_core::Memory::try_new(NewMemory {
+            content: k.content.to_string(),
+            memory_type: MemoryType::Semantic,
+            boundary: boundary.clone(),
+            source_agent: Some("enrich-1k-probe".into()),
+            confidence: 0.93,
+            valid_from: None,
+            valid_until: None,
+            metadata: serde_json::json!({}),
+        })
+        .expect("valid memory");
+        let emb = bge.embed(&m.content).await.expect("embed killer");
+        storage.write_memory(&m, &emb).await.expect("write killer");
+        rows.push(m);
+    }
+    drain(&storage).await;
+
+    println!("\n================ BASELINE (bare killers in the 1k field) ================");
+    let mut baseline = Vec::new();
+    for (k, m) in killers.iter().zip(&rows) {
+        let r = rank_of(&vault_dir, &at_rest, &bge, &boundary, k.query, m.id).await;
+        baseline.push(r);
+        println!(
+            "  {:<6} {:?} -> {}",
+            k.label,
+            k.query,
+            r.map(|r| format!("rank {r}"))
+                .unwrap_or_else(|| "ABSENT (not in top-50)".into())
+        );
+    }
+
+    println!("\nenriching ONLY the killers with real Phi-4...");
+    for m in &rows {
+        match enrich_one(m, &phi4, &bge).await.expect("enrich_one") {
+            Some(ef) => {
+                let aliases = ef
+                    .memory
+                    .metadata
+                    .get("enrichment")
+                    .and_then(|e| e.get("aliases"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                println!("  {:?}\n     aliases: {aliases}", m.content);
+                storage
+                    .update_memory(&ef.memory, &ef.embedding)
+                    .await
+                    .expect("update_memory");
+            }
+            None => println!("  {:?} -> SKIP (unexpectedly already enriched)", m.content),
+        }
+    }
+    drain(&storage).await;
+
+    println!("\n================ RESULT (bare -> enriched) ================");
+    for ((k, m), b) in killers.iter().zip(&rows).zip(&baseline) {
+        let after = rank_of(&vault_dir, &at_rest, &bge, &boundary, k.query, m.id).await;
+        let fmt = |r: Option<usize>| {
+            r.map(|r| format!("rank {r}"))
+                .unwrap_or_else(|| "ABSENT".into())
+        };
+        println!(
+            "  {:<6} {:?}\n           bare: {:<18} ->   enriched: {}",
+            k.label,
+            k.query,
+            fmt(*b),
+            fmt(after)
+        );
+    }
+    println!();
 }

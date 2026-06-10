@@ -44,6 +44,7 @@ use crate::phases::candidates::nearest_neighbor_candidate_pairs;
 use crate::phases::cluster::{find_candidate_clusters, Cluster};
 use crate::phases::contradiction::judge_candidate_pairs;
 use crate::phases::dedup;
+use crate::phases::enrich::{enrich_one, EnrichedFact};
 use crate::phases::merge::{apply_merge, decide_merge, AppliedMerge, MergeOutcome};
 use crate::report::{generate_report, Report};
 use crate::summary::generate_summary_markdown;
@@ -715,6 +716,94 @@ impl Consolidator {
         Ok(reports)
     }
 
+    /// Document-side alias enrichment (ADR-074, T0.3.x Thread-2 Gap-2 fix).
+    ///
+    /// For each active (non-superseded, non-invalidated) fact whose aliases are
+    /// not already current, ask Phi-4 for 4–8 alternative search keywords, store
+    /// them on `metadata.enrichment`, and re-embed `content + " Topics: " +
+    /// aliases` into the vector store via
+    /// [`StorageBackend::update_memory`] — an in-place, by-id metadata + vector
+    /// update. The display `content` is never modified, so the alias line cannot
+    /// leak into the read response. See [`crate::phases::enrich`] for the full
+    /// rationale + the proven `probe_enrichment` evidence.
+    ///
+    /// **Idempotent.** A fact already enriched for its current content
+    /// ([`enrich::is_enriched_for_current_content`]) is skipped, so the first
+    /// run backfills the whole vault and steady-state runs only re-embed facts
+    /// whose content was newly written or changed. This bounds the per-night
+    /// re-embed cost to what actually changed.
+    ///
+    /// **Failure semantics (locked-next-arc Step 4).** A per-fact LLM or
+    /// embedding failure, or a failed `update_memory`, is logged-and-counted
+    /// (`facts_failed`) and the loop continues — one bad fact never aborts the
+    /// run, and the fact is retried next cycle (no fingerprint was written).
+    ///
+    /// Intended to be called by the app-layer safety wrapper immediately AFTER
+    /// [`Self::run_consolidation`] (so it enriches the post-merge / post-
+    /// invalidate active set) and BEFORE [`Self::generate_reports`].
+    ///
+    /// # Errors
+    ///
+    /// [`vault_core::VaultError`] propagated only from the initial
+    /// `list_memories` enumeration. Per-fact failures do NOT propagate — they
+    /// are counted into [`EnrichmentReport::facts_failed`].
+    ///
+    /// [`enrich::is_enriched_for_current_content`]: crate::phases::enrich::is_enriched_for_current_content
+    #[instrument(skip(self))]
+    pub async fn enrich_facts(&self) -> VaultResult<EnrichmentReport> {
+        // Active set only: default filter drops superseded rows; the
+        // `valid_until` filter drops invalidated rows (retired facts are never
+        // returned at read, so enriching them is wasted re-embed work). Mirrors
+        // the Phase 2b active-set definition.
+        let active: Vec<Memory> = self
+            .storage
+            .list_memories(MemoryFilter::default(), None)
+            .await?
+            .into_iter()
+            .filter(|m| m.valid_until.is_none())
+            .collect();
+
+        let mut report = EnrichmentReport::default();
+        for memory in &active {
+            match enrich_one(memory, self.llm.as_ref(), self.embeddings.as_ref()).await {
+                Ok(None) => report.facts_skipped += 1,
+                Ok(Some(EnrichedFact {
+                    memory: enriched,
+                    embedding,
+                })) => match self.storage.update_memory(&enriched, &embedding).await {
+                    Ok(_) => report.facts_enriched += 1,
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "vault_consolidator::enrich",
+                            memory_id = %enriched.id,
+                            error = %e,
+                            "enrichment update_memory failed; skipping (next cycle retries)"
+                        );
+                        report.facts_failed += 1;
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        target: "vault_consolidator::enrich",
+                        memory_id = %memory.id,
+                        error = %e,
+                        "alias generation failed for fact; skipping (next cycle retries)"
+                    );
+                    report.facts_failed += 1;
+                }
+            }
+        }
+        tracing::info!(
+            target: "vault_consolidator::enrich",
+            active = active.len(),
+            enriched = report.facts_enriched,
+            skipped = report.facts_skipped,
+            failed = report.facts_failed,
+            "alias enrichment pass complete"
+        );
+        Ok(report)
+    }
+
     /// Schedule the consolidator to run at the configured `run_at` time.
     ///
     /// **Body lands at T0.2.6 per BRD §6.2 line 1453** ("vault-consolidator:
@@ -761,6 +850,23 @@ pub struct ConsolidationReport {
     ///
     /// Generated at T0.2.3 commit 3 (`generate_summary_markdown`).
     pub summary_markdown: String,
+}
+
+/// Outcome counts of one [`Consolidator::enrich_facts`] pass (ADR-074).
+///
+/// `facts_enriched` + `facts_skipped` + `facts_failed` sum to the number of
+/// active facts the pass examined. `facts_skipped` is the steady-state majority
+/// (already enriched for current content); `facts_enriched` is the first-run
+/// backfill + newly-written/changed facts; `facts_failed` is per-fact LLM /
+/// embed / write failures that will be retried next cycle.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnrichmentReport {
+    /// Facts that were (re-)enriched and written back this pass.
+    pub facts_enriched: usize,
+    /// Facts already enriched for their current content (no work).
+    pub facts_skipped: usize,
+    /// Facts whose enrichment failed (LLM / embed / write) — retried next cycle.
+    pub facts_failed: usize,
 }
 
 /// One contradiction flagged by Phase 2 for user review per BRD §5.6
@@ -955,5 +1061,147 @@ mod tests {
             StaleResolution::Nothing
         );
         assert_eq!(resolve_stale_ids(&[], &group), StaleResolution::Nothing);
+    }
+
+    // ─── enrich_facts — end-to-end idempotency (ADR-074) ─────────────────────
+
+    use vault_core::{MemoryType, NewMemory};
+    use vault_embedding::EMBEDDING_DIM;
+    use vault_llm::MockLlmProvider;
+    use vault_storage::SqlCipherKey;
+
+    const TEST_AT_REST_KEY: [u8; 32] = [0xcd; 32];
+
+    /// Stub embedder returning a fixed unit-norm vector (enrich_facts only
+    /// needs a valid embedding; rank quality is validated by the live
+    /// `probe_enrichment` harness, not here).
+    struct FixedEmbedder;
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for FixedEmbedder {
+        async fn embed(&self, _text: &str) -> VaultResult<Vec<f32>> {
+            Ok(vec![1.0_f32 / (EMBEDDING_DIM as f32).sqrt(); EMBEDDING_DIM])
+        }
+    }
+
+    async fn open_test_storage() -> (Arc<StorageBackend>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = SqlCipherKey::new("enrich-facts-test");
+        let storage = StorageBackend::open_with_at_rest_key(
+            &dir.path().join("metadata.db"),
+            &dir.path().join("vectors"),
+            &dir.path().join("graph.duckdb"),
+            key,
+            EMBEDDING_DIM,
+            &TEST_AT_REST_KEY,
+        )
+        .await
+        .expect("open StorageBackend");
+        (Arc::new(storage), dir)
+    }
+
+    fn consolidator_with(storage: Arc<StorageBackend>, llm_response: &str) -> Consolidator {
+        Consolidator::new(
+            storage,
+            Arc::new(MockLlmProvider::new("mock", llm_response)),
+            Arc::new(FixedEmbedder),
+            ConsolidatorConfig::default(),
+        )
+    }
+
+    async fn write_fact(storage: &StorageBackend, content: &str) -> MemoryId {
+        let m = Memory::try_new(NewMemory {
+            content: content.into(),
+            memory_type: MemoryType::Semantic,
+            boundary: Boundary::new("personal").unwrap(),
+            source_agent: None,
+            confidence: 0.9,
+            valid_from: None,
+            valid_until: None,
+            metadata: serde_json::json!({}),
+        })
+        .expect("valid memory");
+        let embedding = vec![1.0_f32 / (EMBEDDING_DIM as f32).sqrt(); EMBEDDING_DIM];
+        storage
+            .write_memory(&m, &embedding)
+            .await
+            .expect("write_memory");
+        m.id
+    }
+
+    #[tokio::test]
+    async fn enrich_facts_backfills_then_is_idempotent_on_second_run() {
+        let (storage, _dir) = open_test_storage().await;
+        write_fact(&storage, "The user settled in Porto after years of moving.").await;
+        write_fact(&storage, "The user is raising twins in primary school.").await;
+
+        let consolidator =
+            consolidator_with(storage.clone(), r#"{"aliases":["home","lives","kids"]}"#);
+
+        // First run: both facts are fresh → both enriched.
+        let r1 = consolidator.enrich_facts().await.expect("enrich pass 1");
+        assert_eq!(r1.facts_enriched, 2, "first run backfills every fact");
+        assert_eq!(r1.facts_skipped, 0);
+        assert_eq!(r1.facts_failed, 0);
+
+        // Metadata persisted: each fact carries an enrichment object.
+        let after = storage
+            .list_memories(MemoryFilter::default(), None)
+            .await
+            .expect("list");
+        assert_eq!(after.len(), 2);
+        for m in &after {
+            let enr = m
+                .metadata
+                .get(crate::phases::enrich::ENRICHMENT_METADATA_KEY)
+                .unwrap_or_else(|| panic!("fact {} missing enrichment metadata", m.id));
+            assert_eq!(
+                enr.get("aliases").and_then(|v| v.as_str()),
+                Some("home, lives, kids")
+            );
+            assert!(
+                crate::phases::enrich::is_enriched_for_current_content(m),
+                "fact {} should be recognised as enriched for its content",
+                m.id
+            );
+        }
+
+        // Second run over unchanged content: every fact skipped (no re-embed).
+        let r2 = consolidator.enrich_facts().await.expect("enrich pass 2");
+        assert_eq!(r2.facts_enriched, 0, "no fact should be re-enriched");
+        assert_eq!(r2.facts_skipped, 2, "all facts already current → skipped");
+        assert_eq!(r2.facts_failed, 0);
+    }
+
+    #[tokio::test]
+    async fn enrich_facts_counts_llm_failure_without_aborting_run() {
+        let (storage, _dir) = open_test_storage().await;
+        write_fact(&storage, "The user settled in Porto.").await;
+        write_fact(&storage, "The user is raising twins.").await;
+
+        // Mock returns non-JSON → every fact's alias generation fails.
+        let consolidator = consolidator_with(storage.clone(), "not json at all");
+
+        let r = consolidator
+            .enrich_facts()
+            .await
+            .expect("pass must not abort");
+        assert_eq!(r.facts_failed, 2, "both facts fail but the run completes");
+        assert_eq!(r.facts_enriched, 0);
+        assert_eq!(r.facts_skipped, 0);
+
+        // No enrichment metadata was written → both retry next cycle.
+        let after = storage
+            .list_memories(MemoryFilter::default(), None)
+            .await
+            .expect("list");
+        for m in &after {
+            assert!(
+                m.metadata
+                    .get(crate::phases::enrich::ENRICHMENT_METADATA_KEY)
+                    .is_none(),
+                "failed enrichment must not write a fingerprint (so it retries)"
+            );
+        }
     }
 }
