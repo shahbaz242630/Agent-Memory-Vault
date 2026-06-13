@@ -135,6 +135,20 @@ pub enum AuditEventType {
     ///
     /// [`StorageBackend::apply_dedup`]: crate::cascading::StorageBackend::apply_dedup
     MemoryDeduped,
+
+    /// Recorded when the sleep consolidator's Phase 4 decays a cold fact's
+    /// `confidence` ([`StorageBackend::apply_decay`], BRD §5.6 line 994).
+    /// Distinct from [`Self::MemoryUpdate`] (user content edit) and
+    /// [`Self::MemoryDeduped`] (merge roll-up): a decay is a system-driven,
+    /// metadata-only confidence multiply (×0.9) on an untouched fact — content
+    /// and vector are unchanged. The audit viewer (T0.2.15) surfaces these in
+    /// the run's Decay section.
+    ///
+    /// `details_json` shape: `{"old_confidence":<f32>,"new_confidence":<f32>}`
+    /// — `resource_id` carries the decayed MemoryId.
+    ///
+    /// [`StorageBackend::apply_decay`]: crate::cascading::StorageBackend::apply_decay
+    MemoryDecayed,
 }
 
 impl AuditEventType {
@@ -156,6 +170,7 @@ impl AuditEventType {
             Self::MemorySuperseded => "memory.superseded",
             Self::MemoryInvalidated => "memory.invalidated",
             Self::MemoryDeduped => "memory.deduped",
+            Self::MemoryDecayed => "memory.decayed",
         }
     }
 
@@ -182,6 +197,7 @@ impl AuditEventType {
             "memory.superseded" => Some(Self::MemorySuperseded),
             "memory.invalidated" => Some(Self::MemoryInvalidated),
             "memory.deduped" => Some(Self::MemoryDeduped),
+            "memory.decayed" => Some(Self::MemoryDecayed),
             _ => None,
         }
     }
@@ -542,6 +558,7 @@ mod tests {
             AuditEventType::MemorySuperseded,
             AuditEventType::MemoryInvalidated,
             AuditEventType::MemoryDeduped,
+            AuditEventType::MemoryDecayed,
         ] {
             assert_eq!(AuditEventType::parse(et.as_str()), Some(et));
         }
@@ -562,6 +579,10 @@ mod tests {
         // for the audit-viewer filter (distinguishes dedup roll-ups from
         // user-driven memory.update edits and from memory.superseded losers).
         assert_eq!(AuditEventType::MemoryDeduped.as_str(), "memory.deduped");
+        // Pin the memory.decayed wire-format string per T0.2.4 — load-bearing
+        // for the audit-viewer Decay-section filter (distinguishes Phase-4
+        // confidence decays from user-driven memory.update edits).
+        assert_eq!(AuditEventType::MemoryDecayed.as_str(), "memory.decayed");
         // Confirm the old v1.2 retrieval wire-format string no longer
         // round-trips — T0.1.9 §6.2 rule 1 specifies non-backward-compat.
         assert_eq!(AuditEventType::parse("retrieval.query"), None);

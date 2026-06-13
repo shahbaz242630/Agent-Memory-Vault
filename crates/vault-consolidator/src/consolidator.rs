@@ -27,7 +27,7 @@
 //! [`ConsolidationReport`] carries per-boundary sub-sections inside
 //! `summary_markdown`, not separate runs per boundary.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,6 +43,7 @@ use vault_storage::{MemoryFilter, StorageBackend};
 use crate::phases::candidates::nearest_neighbor_candidate_pairs;
 use crate::phases::cluster::{find_candidate_clusters, Cluster};
 use crate::phases::contradiction::judge_candidate_pairs;
+use crate::phases::decay::{self, plan_decay};
 use crate::phases::dedup;
 use crate::phases::enrich::{enrich_one, EnrichedFact};
 use crate::phases::merge::{apply_merge, decide_merge, AppliedMerge, MergeOutcome};
@@ -223,6 +224,7 @@ impl Consolidator {
             started_at,
             duration: Duration::ZERO, // populated after the loop completes.
             memories_processed: 0,
+            memories_decayed: 0, // populated by Phase 4 below.
             per_boundary: BTreeMap::new(),
         };
         for (boundary, memories) in by_boundary {
@@ -539,6 +541,17 @@ impl Consolidator {
             }
         }
 
+        // ── Phase 4: confidence decay (BRD §5.6 line 994; T0.2.4) ──
+        //
+        // The sleep cycle's final pass: a fact left untouched for
+        // `decay_after_days` has its confidence multiplied by 0.9, quietly
+        // demoting stale knowledge without deleting it. Metadata-only (never
+        // re-embeds — preserves the ADR-074 enriched vector) and idempotent (a
+        // per-fact marker stops a second back-to-back run re-decaying, so the
+        // run converges per BRD §5.6 line 1022). Cold archive (BRD §5.6 lines
+        // 995-996) is the other half of Phase 4 and lands in a follow-up batch.
+        run_state.memories_decayed = self.decay_memories().await;
+
         // Step 4: build the report. Populate RunState.duration first so
         // generate_summary_markdown can render the header from it.
         let duration = Utc::now()
@@ -591,7 +604,8 @@ impl Consolidator {
             memories_processed: run_state.memories_processed,
             memories_merged,
             contradictions_resolved,
-            memories_archived: 0, // Phase 4 ships at T0.2.4.
+            memories_archived: 0, // Cold archive lands in a follow-up batch.
+            memories_decayed: run_state.memories_decayed,
             clusters_deduped,
             memories_deduped,
             clusters_skipped,
@@ -599,6 +613,77 @@ impl Consolidator {
             conflicts_for_user_review,
             summary_markdown,
         })
+    }
+
+    /// Phase 4 (T0.2.4): decay the confidence of cold facts.
+    ///
+    /// Enumerates the active set, plans which facts are past the
+    /// `decay_after_days` idle threshold (and not already decayed this period —
+    /// see [`plan_decay`]), and applies each via the metadata-only
+    /// [`StorageBackend::apply_decay`] primitive, stamping the idempotency
+    /// marker so a second back-to-back run converges. Returns the number of
+    /// facts decayed.
+    ///
+    /// Failure semantics (locked-next-arc Step 4): a failed enumeration returns
+    /// 0 (the run's merge/contradiction work already committed durably); a
+    /// per-fact `apply_decay` failure is logged-and-counted and the loop
+    /// continues — one bad fact never aborts the pass, and it retries next cycle
+    /// (its marker was never written).
+    ///
+    /// [`StorageBackend::apply_decay`]: vault_storage::StorageBackend::apply_decay
+    async fn decay_memories(&self) -> usize {
+        let now = Utc::now();
+        let memories = match self
+            .storage
+            .list_memories(MemoryFilter::default(), None)
+            .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    target: "vault_consolidator::decay",
+                    error = %e,
+                    "Phase 4 decay: failed to enumerate active set; skipping (next cycle retries)"
+                );
+                return 0;
+            }
+        };
+        let plan = plan_decay(&memories, self.config.decay_after_days, now);
+        if plan.is_empty() {
+            return 0;
+        }
+        let by_id: HashMap<MemoryId, &Memory> = memories.iter().map(|m| (m.id, m)).collect();
+        let mut decayed = 0;
+        for pd in plan {
+            // The id came from `plan_decay(&memories, …)`, so it is always present.
+            let Some(mem) = by_id.get(&pd.id) else {
+                continue;
+            };
+            let mut new_metadata = mem.metadata.clone();
+            decay::set_decay_marker(&mut new_metadata, now);
+            match self
+                .storage
+                .apply_decay(pd.id, pd.new_confidence, new_metadata)
+                .await
+            {
+                Ok(_) => decayed += 1,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "vault_consolidator::decay",
+                        memory = %pd.id,
+                        error = %e,
+                        "Phase 4 decay: apply_decay failed for fact; skipping (next cycle retries)"
+                    );
+                }
+            }
+        }
+        tracing::info!(
+            target: "vault_consolidator::decay",
+            decayed,
+            examined = memories.len(),
+            "Phase 4 decay pass complete"
+        );
+        decayed
     }
 
     /// Phase 2-pre (ADR-063): attempt deterministic dedup of one cluster.
@@ -827,6 +912,11 @@ pub struct ConsolidationReport {
     pub memories_merged: usize,
     pub contradictions_resolved: usize,
     pub memories_archived: usize,
+    /// Phase 4 (T0.2.4): facts whose confidence was decayed this run. Additive
+    /// to the BRD §5.6 baseline shape; `#[serde(default)]` keeps reports
+    /// serialised before T0.2.4 loadable.
+    #[serde(default)]
+    pub memories_decayed: usize,
     /// ADR-063: clusters resolved by deterministic dedup (near-identical,
     /// no LLM). Distinct from `memories_merged` (LLM-driven merges).
     #[serde(default)]
@@ -920,6 +1010,10 @@ pub(crate) struct RunState {
     pub started_at: DateTime<Utc>,
     pub duration: Duration,
     pub memories_processed: usize,
+    /// Phase 4 (T0.2.4): count of facts whose confidence was decayed this run.
+    /// Aggregate per BRD §5.6 line 968 ("no per-memory detail"); drives the
+    /// summary's Decay section.
+    pub memories_decayed: usize,
     pub per_boundary: BTreeMap<Boundary, BoundarySummary>,
 }
 

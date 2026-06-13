@@ -90,7 +90,7 @@ lance-core = "=4.0.0"
 object_store = "=0.12.5"
 bytes = "=1.11.1"
 url = "=2.5.8"
-duckdb = { version = "=1.2.2", features = ["bundled"] }
+duckdb = { version = "=1.10503.1", features = ["bundled"] }
 # rusqlite uses bundled-sqlcipher-vendored-openssl instead of bundled-sqlcipher
 # (deviation from BRD §4.2 — see HANDOFF.md ADR-006). Vendoring OpenSSL avoids
 # requiring a system OpenSSL install on Windows/Mac/Linux dev machines.

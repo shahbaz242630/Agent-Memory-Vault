@@ -31,21 +31,20 @@
 //! restarts the app frequently, and on-startup checks (lighter shape,
 //! also deferred to V0.2) will cover the daemon-mode gap.
 //!
-//! ## `pending_sync` sweep
+//! ## `pending_sync` sweep (T0.2.4 sync ship-gate — implemented)
 //!
-//! Phase A intent: drain `pending_sync` (oldest first), re-enqueueing
-//! into `retry_queue` while capacity is available. The current
-//! `pending_sync` schema only carries `(memory_id, operation, queued_at)`
-//! — it lacks the cascade payload (embedding + boundary) needed to
-//! reconstruct a `NewRetry`. The orchestrator's overflow path drops the
-//! payload because Phase B's schema didn't reserve room for it.
+//! Tier-0 of every run drains `pending_sync` (oldest first), re-enqueueing
+//! into `retry_queue` while capacity is available, via
+//! [`StorageBackend::drain_pending_sync`]. Migration 0003 extended
+//! `pending_sync` with the `sequence_id` + `payload` columns the cascade
+//! needs, and the orchestrator's overflow path now persists them — so the
+//! sweep hands the stored bytes straight to the `retry_queue` insert and
+//! removes the drained row atomically. A pre-0003 legacy row (no payload —
+//! never produced at V0.1 scale) is skipped, not re-enqueued.
 //!
-//! For V0.1 the sweep is a **stub that returns 0**. Real implementation
-//! lands at T0.2.x via schema migration 0003 that extends `pending_sync`
-//! with `embedding BLOB` + `boundary TEXT` columns; the orchestrator's
-//! overflow path then writes the full payload. Tracked as a tech-debt
-//! entry. Cap-overflow is unrealistic for V0.1's expected scale (V0.1
-//! founder dogfood handfuls of memories), so the stub is acceptable.
+//! This was a V0.1 stub-that-returns-0; it is the cross-device data-recovery
+//! ship-gate for V0.2 sync (cross-device churn makes a silently-dropped
+//! overflow entry a real loss), closed here.
 
 #![allow(dead_code)] // Detector is consumed by vault-cli's divergence-check subcommand.
 
@@ -72,6 +71,13 @@ pub const RECENT_WINDOW: Duration = Duration::days(30);
 /// over time.
 const DAILY_SEED_MASK: u64 = 0xDEAD_BEEF;
 
+/// Max `pending_sync` rows the Tier-0 sweep examines per run. Bounds the
+/// per-run work; the per-entry capacity check stops draining once
+/// `retry_queue` refills, and any remainder is picked up on the next sweep.
+/// Generous relative to V0.2 alpha scale (cap-overflow needs a 10k-deep
+/// queue, essentially never reached in dogfood).
+const PENDING_SYNC_SWEEP_LIMIT: usize = 1_000;
+
 /// Result of a single `DivergenceDetector::run` invocation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DivergenceReport {
@@ -86,8 +92,9 @@ pub struct DivergenceReport {
     /// Non-empty = divergence finding.
     pub missing_in_vector: Vec<MemoryId>,
     /// Number of `pending_sync` rows successfully drained back into
-    /// `retry_queue`. **Always 0 for V0.1** — the sweep is a stub
-    /// (see module docs); real impl lands at T0.2.x.
+    /// `retry_queue` this run (T0.2.4 sync ship-gate — see module docs).
+    /// `0` when `pending_sync` is empty (the common case) or already at
+    /// `retry_queue` capacity.
     pub pending_sync_resync_count: usize,
 }
 
@@ -193,24 +200,26 @@ impl DivergenceDetector {
         })
     }
 
-    /// V0.1 stub — see module docs. Returns 0 unconditionally; the real
-    /// implementation lands at T0.2.x once `pending_sync` carries the
-    /// cascade payload.
+    /// Tier-0 sweep: drain `pending_sync` back into `retry_queue` when capacity
+    /// has returned (T0.2.4 sync ship-gate). Delegates to
+    /// [`StorageBackend::drain_pending_sync`], which atomically re-enqueues each
+    /// stored cascade (its `sequence_id` + `payload` per migration 0003) and
+    /// removes the drained row. Returns the number of entries re-enqueued this
+    /// run.
+    ///
+    /// [`StorageBackend::drain_pending_sync`]: crate::cascading::StorageBackend::drain_pending_sync
     async fn sweep_pending_sync(&self) -> VaultResult<usize> {
-        // Sanity log — if the operator sees a pending_sync row from a
-        // historical cap-overflow event, it won't be drained yet. They
-        // see the count via `pending_sync.len()` once that's surfaced;
-        // for now we just log.
-        let pending = self.backend.pending_sync().len().await?;
-        if pending > 0 {
-            warn!(
-                pending,
-                "pending_sync has rows but the V0.1 sweep is a stub — \
-                 real drain ships at T0.2.x via schema migration 0003 \
-                 (see HANDOFF tech debt)"
+        let drained = self
+            .backend
+            .drain_pending_sync(PENDING_SYNC_SWEEP_LIMIT)
+            .await?;
+        if drained > 0 {
+            info!(
+                drained,
+                "pending_sync sweep re-enqueued cascade entries into retry_queue"
             );
         }
-        Ok(0)
+        Ok(drained)
     }
 
     /// Total memory rows. No filter — every SQLite row should have a
@@ -611,33 +620,86 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // pending_sync sweep is a stub for V0.1
+    // pending_sync sweep — T0.2.4 sync ship-gate (drains into retry_queue)
     // ------------------------------------------------------------------
 
     #[tokio::test]
-    async fn pending_sync_sweep_is_stub_for_v0_1() {
+    async fn pending_sync_sweep_drains_payload_and_recovers_dropped_vector() {
+        use crate::cascading::CascadePayloadV1;
         use crate::retry_queue::CascadeOperation;
 
         let tmp = TempDir::new().unwrap();
         let backend = make_backend(tmp.path()).await;
 
-        // Plant a pending_sync row directly. The V0.1 stub MUST NOT
-        // drain it; T0.2.x will.
-        let mem = MemoryId::new();
+        // A memory that lives in SQLite + LanceDB.
+        let m = sample_memory("work", "fact whose cascade once overflowed");
+        backend.write_memory(&m, &embedding(0.2)).await.unwrap();
+        drain_cascades(&backend).await;
+        assert!(backend.vector_store().contains(&m.id).await.unwrap());
+
+        // Simulate the overflow aftermath: the vector cascade never landed
+        // (drop the row), and the memory sits in pending_sync carrying its
+        // full Write payload (embedding + boundary) per migration 0003.
+        backend.vector_store().delete(&m.id).await.unwrap();
+        let payload = serde_json::to_vec(&CascadePayloadV1 {
+            embedding: embedding(0.2),
+            boundary: "work".to_string(),
+        })
+        .unwrap();
         backend
             .pending_sync()
-            .upsert(mem, CascadeOperation::Write, Utc::now())
+            .upsert_with_payload(m.id, CascadeOperation::Write, Utc::now(), 7, payload)
             .await
             .unwrap();
         assert_eq!(backend.pending_sync().len().await.unwrap(), 1);
 
+        // The sweep re-enqueues it into retry_queue and clears pending_sync.
         let det = DivergenceDetector::new(backend.clone());
         let report = det.run().await.unwrap();
-        assert_eq!(report.pending_sync_resync_count, 0);
+        assert_eq!(
+            report.pending_sync_resync_count, 1,
+            "sweep must re-enqueue the payload-carrying pending_sync row"
+        );
+        assert_eq!(
+            backend.pending_sync().len().await.unwrap(),
+            0,
+            "the drained row must be removed from pending_sync"
+        );
+
+        // Draining the retry_queue applies the recovered Write → vector restored.
+        drain_cascades(&backend).await;
+        assert!(
+            backend.vector_store().contains(&m.id).await.unwrap(),
+            "the re-enqueued cascade must restore the dropped vector"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_sync_sweep_skips_payloadless_legacy_row() {
+        use crate::retry_queue::CascadeOperation;
+
+        let tmp = TempDir::new().unwrap();
+        let backend = make_backend(tmp.path()).await;
+
+        // A pre-0003 legacy row carries no payload (planted via the plain
+        // `upsert`). The sweep must NOT re-enqueue a broken cascade — it skips
+        // and leaves the row in place for operator reconciliation.
+        backend
+            .pending_sync()
+            .upsert(MemoryId::new(), CascadeOperation::Write, Utc::now())
+            .await
+            .unwrap();
+
+        let det = DivergenceDetector::new(backend.clone());
+        let report = det.run().await.unwrap();
+        assert_eq!(
+            report.pending_sync_resync_count, 0,
+            "a payload-less legacy row must not be drained"
+        );
         assert_eq!(
             backend.pending_sync().len().await.unwrap(),
             1,
-            "V0.1 stub must leave pending_sync untouched"
+            "the payload-less legacy row is left in place"
         );
     }
 

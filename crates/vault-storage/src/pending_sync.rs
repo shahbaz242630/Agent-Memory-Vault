@@ -47,6 +47,16 @@ pub struct PendingSyncEntry {
     pub memory_id: MemoryId,
     pub operation: CascadeOperation,
     pub queued_at: DateTime<Utc>,
+    /// Audit-chain sequence anchor captured when the cascade overflowed
+    /// (migration 0003). The cascade-ordering invariant (plan Q1) reuses it
+    /// when the sweep re-enqueues into `retry_queue`. `0` for legacy/payload-
+    /// less rows.
+    pub sequence_id: i64,
+    /// The cascade `payload` bytes (a serialised `CascadePayloadV1` carrying the
+    /// embedding and boundary), captured at overflow so the sweep can re-enqueue
+    /// a faithful `retry_queue` row (migration 0003). `None` for pre-0003 legacy
+    /// rows; the sweep skips those rather than re-enqueueing a broken cascade.
+    pub payload: Option<Vec<u8>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -102,6 +112,48 @@ impl PendingSync {
         Ok(())
     }
 
+    /// Like [`Self::upsert`] but also persists the cascade `sequence_id` +
+    /// `payload` (migration 0003) so the divergence sweep can re-enqueue a
+    /// faithful `retry_queue` row. The orchestrator's overflow path uses the
+    /// in-transaction equivalent (`tx_upsert_pending_sync`); this async form is
+    /// for out-of-transaction callers + tests. ON CONFLICT, the latest state
+    /// (operation / queued_at / sequence_id / payload) wins — matching the
+    /// "downstream converges to SQLite's latest state" invariant.
+    #[instrument(skip(self, payload), fields(memory_id = %memory_id, op = operation.as_str()))]
+    pub async fn upsert_with_payload(
+        &self,
+        memory_id: MemoryId,
+        operation: CascadeOperation,
+        queued_at: DateTime<Utc>,
+        sequence_id: i64,
+        payload: Vec<u8>,
+    ) -> VaultResult<()> {
+        self.store
+            .with_conn_blocking(move |conn| {
+                conn.execute(
+                    "INSERT INTO pending_sync (memory_id, operation, queued_at, sequence_id, payload)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(memory_id) DO UPDATE SET
+                        operation = excluded.operation,
+                        queued_at = excluded.queued_at,
+                        sequence_id = excluded.sequence_id,
+                        payload = excluded.payload",
+                    params![
+                        memory_id.0.as_bytes().to_vec(),
+                        operation.as_str(),
+                        queued_at.to_rfc3339(),
+                        sequence_id,
+                        payload,
+                    ],
+                )
+                .map_err(|e| VaultError::Storage(format!("upsert pending_sync (payload): {e}")))?;
+                Ok(())
+            })
+            .await?;
+        debug!("pending_sync upserted with payload");
+        Ok(())
+    }
+
     /// Drain candidates oldest-first by `queued_at`. The divergence detector
     /// uses this to refill `retry_queue` when capacity returns; entries are
     /// removed by [`Self::remove`] after successful re-enqueue.
@@ -110,7 +162,7 @@ impl PendingSync {
             .with_conn_blocking(move |conn| {
                 let mut stmt = conn
                     .prepare(
-                        "SELECT memory_id, operation, queued_at
+                        "SELECT memory_id, operation, queued_at, sequence_id, payload
                            FROM pending_sync
                           ORDER BY queued_at ASC, memory_id ASC
                           LIMIT ?1",
@@ -155,7 +207,7 @@ impl PendingSync {
         self.store
             .with_conn_blocking(move |conn| {
                 conn.query_row(
-                    "SELECT memory_id, operation, queued_at
+                    "SELECT memory_id, operation, queued_at, sequence_id, payload
                        FROM pending_sync WHERE memory_id = ?1",
                     params![memory_id.0.as_bytes().to_vec()],
                     row_to_pending_sync,
@@ -200,11 +252,15 @@ fn row_to_pending_sync(row: &rusqlite::Row<'_>) -> rusqlite::Result<PendingSyncE
     })?;
 
     let queued_at: DateTime<Utc> = row.get(2)?;
+    let sequence_id: i64 = row.get(3)?;
+    let payload: Option<Vec<u8>> = row.get(4)?;
 
     Ok(PendingSyncEntry {
         memory_id,
         operation,
         queued_at,
+        sequence_id,
+        payload,
     })
 }
 
@@ -294,6 +350,45 @@ mod tests {
     async fn get_missing_returns_none() {
         let (_tmp, p) = make_pending().await;
         assert!(p.get(MemoryId::new()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn upsert_with_payload_round_trips_sequence_id_and_payload() {
+        // Migration 0003: the sweep needs sequence_id + payload to reconstruct
+        // a faithful retry_queue row. Verify they persist + read back.
+        let (_tmp, p) = make_pending().await;
+        let mem = MemoryId::new();
+        let payload = vec![9u8, 8, 7, 6];
+        p.upsert_with_payload(
+            mem,
+            CascadeOperation::Write,
+            Utc::now(),
+            42,
+            payload.clone(),
+        )
+        .await
+        .unwrap();
+
+        let entry = p.get(mem).await.unwrap().unwrap();
+        assert_eq!(entry.sequence_id, 42);
+        assert_eq!(entry.payload.as_deref(), Some(payload.as_slice()));
+        assert_eq!(entry.operation, CascadeOperation::Write);
+    }
+
+    #[tokio::test]
+    async fn plain_upsert_leaves_payload_null() {
+        // A plain upsert (no payload) — the pre-0003 shape — must read back
+        // with sequence_id 0 (column default) and a NULL payload, which the
+        // sweep treats as "skip, can't reconstruct."
+        let (_tmp, p) = make_pending().await;
+        let mem = MemoryId::new();
+        p.upsert(mem, CascadeOperation::Write, Utc::now())
+            .await
+            .unwrap();
+
+        let entry = p.get(mem).await.unwrap().unwrap();
+        assert_eq!(entry.sequence_id, 0);
+        assert!(entry.payload.is_none());
     }
 
     // ---------- oldest_first ordering ----------

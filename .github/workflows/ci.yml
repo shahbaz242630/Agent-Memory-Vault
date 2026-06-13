@@ -699,4 +699,9 @@ jobs:
       # Run `#[ignore]`'d tests in vault-llm (the real-model smoke suite).
       # `--nocapture` surfaces stdout from the spike-style stage logs so CI
       # artifacts include the SHA-256 verification + per-call latency data.
-      - run: cargo test -p vault-llm -- --ignored --nocapture
+      # `--test-threads=1` serialises the smoke tests (tech-debt #6): they
+      # share a single `.partial` download path (`model_loader.rs`), so a
+      # concurrent run lets the winner's rename vanish the losers' `.partial`
+      # → `Io NotFound`. The tests' own doc assumes serial execution; this
+      # re-lights the weekly cron that was red since 2026-05-18.
+      - run: cargo test -p vault-llm -- --ignored --nocapture --test-threads=1

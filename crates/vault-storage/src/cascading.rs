@@ -426,6 +426,8 @@ impl StorageBackend {
                                     id_for_closure,
                                     CascadeOperation::Delete,
                                     committed_at,
+                                    audit_seq,
+                                    &payload_bytes,
                                 )?;
                                 // Transition into overflow: emit one audit event.
                                 if !in_cap.swap(true, Ordering::AcqRel) {
@@ -778,6 +780,123 @@ impl StorageBackend {
         })
     }
 
+    /// Decay one cold fact's `confidence` — the sleep consolidator's Phase 4
+    /// primitive (BRD §5.6 line 994; T0.2.4).
+    ///
+    /// Sets `confidence = new_confidence` and replaces `metadata` with
+    /// `new_metadata` (which the caller composes as the fact's existing
+    /// metadata plus the decay idempotency marker — so no metadata key is
+    /// lost). **Metadata-only** — the fact's CONTENT and stored vector are
+    /// untouched, so the (possibly ADR-074-enriched) embedding is preserved and
+    /// there is no LanceDB/DuckDB cascade and no re-embed. Mirrors the
+    /// `invalidate` / `apply_dedup` metadata-only contract.
+    ///
+    /// Emits exactly one [`AuditEventType::MemoryDecayed`] event with
+    /// `details_json` = `{"old_confidence":<f32>,"new_confidence":<f32>}`.
+    ///
+    /// **Boundary check is the caller's responsibility** — the consolidator
+    /// decays within the active set it enumerated, same convention as
+    /// `invalidate` / `apply_dedup`.
+    ///
+    /// **Errors:**
+    /// - [`VaultError::NotFound`] if `memory_id` does not exist.
+    /// - [`VaultError::InvalidInput`] if `new_confidence` violates the
+    ///   [`vault_core::Memory`] invariant (finite, in `[0.0, 1.0]`).
+    /// - [`VaultError::Storage`] on transaction-side failure.
+    #[instrument(skip(self, new_metadata), fields(memory = %memory_id))]
+    pub async fn apply_decay(
+        &self,
+        memory_id: MemoryId,
+        new_confidence: f32,
+        new_metadata: serde_json::Value,
+    ) -> VaultResult<Ack> {
+        let store = self.metadata.clone();
+        let committed_at: DateTime<Utc> = store
+            .with_transaction(move |tx| {
+                let memory = tx_get_memory(tx, &memory_id)?.ok_or_else(|| {
+                    VaultError::NotFound(format!("memory {memory_id} does not exist"))
+                })?;
+
+                let old_confidence = memory.confidence;
+                let boundary_for_audit = memory.boundary.clone();
+                let mut updated = memory;
+                updated.confidence = new_confidence;
+                updated.metadata = new_metadata;
+                updated.validate()?;
+                tx_update_memory(tx, &updated)?;
+
+                let mut pending =
+                    PendingAuditEvent::success(AuditEventType::MemoryDecayed, ActorKind::System)
+                        .with_resource("memory", memory_id.to_string())
+                        .with_boundary(boundary_for_audit);
+                pending.details_json = format!(
+                    r#"{{"old_confidence":{old_confidence},"new_confidence":{new_confidence}}}"#
+                );
+                let event = tx_append_audit(tx, pending)?;
+
+                Ok::<_, VaultError>(event.timestamp)
+            })
+            .await?;
+
+        Ok(Ack {
+            memory_id,
+            sqlite_committed_at: committed_at,
+        })
+    }
+
+    /// Drain `pending_sync` back into `retry_queue` (the cap-overflow recovery
+    /// path; migration 0003 + T0.2.4 sync ship-gate). Oldest-first, atomically
+    /// per entry: while `retry_queue` has capacity, re-enqueue the stored
+    /// cascade (its `sequence_id` + `payload`) and remove the `pending_sync`
+    /// row in the same transaction. Stops when the queue refills to
+    /// [`MAX_RETRY_QUEUE_DEPTH`] or after `limit` rows have been examined.
+    /// Returns the number of entries re-enqueued.
+    ///
+    /// A row with no stored payload (a pre-0003 legacy row — not expected at
+    /// V0.1 scale, where cap-overflow never fired) is logged and skipped:
+    /// re-enqueueing without the embedding would write a broken cascade. The
+    /// [`crate::DivergenceDetector`] calls this as its Tier-0 sweep.
+    ///
+    /// # Errors
+    /// - [`VaultError::Storage`] on a transaction-side failure.
+    #[instrument(skip(self), fields(limit))]
+    pub async fn drain_pending_sync(&self, limit: usize) -> VaultResult<usize> {
+        let entries = self.pending_sync.oldest_first(limit).await?;
+        let mut drained = 0usize;
+        for entry in entries {
+            let Some(payload_bytes) = entry.payload else {
+                tracing::warn!(
+                    memory_id = %entry.memory_id,
+                    "pending_sync row has no cascade payload (pre-0003 legacy?) — skipping; \
+                     operator must reconcile this entry"
+                );
+                continue;
+            };
+            let memory_id = entry.memory_id;
+            let operation = entry.operation;
+            let sequence_id = entry.sequence_id;
+            let store = self.metadata.clone();
+            let reenqueued: bool = store
+                .with_transaction(move |tx| {
+                    if tx_count_retry_queue(tx)? >= MAX_RETRY_QUEUE_DEPTH {
+                        return Ok::<bool, VaultError>(false); // queue full — stop draining
+                    }
+                    tx_insert_retry_queue(tx, memory_id, operation, sequence_id, &payload_bytes)?;
+                    tx_delete_pending_sync(tx, memory_id)?;
+                    Ok::<bool, VaultError>(true)
+                })
+                .await?;
+            if !reenqueued {
+                break; // retry_queue is at cap; leave the rest for the next sweep
+            }
+            drained += 1;
+        }
+        if drained > 0 {
+            tracing::info!(drained, "pending_sync drained into retry_queue");
+        }
+        Ok(drained)
+    }
+
     /// List memories matching `filter`. The `limit` parameter accepts
     /// `None` (return ALL matching rows — no SQL `LIMIT` clause) or
     /// `Some(N)` (cap at `N`).
@@ -892,7 +1011,14 @@ impl StorageBackend {
                     tx_insert_retry_queue(tx, memory_id, op, audit_seq, &payload_bytes)?;
                     in_cap.store(false, Ordering::Release);
                 } else {
-                    tx_upsert_pending_sync(tx, memory_id, op, committed_at)?;
+                    tx_upsert_pending_sync(
+                        tx,
+                        memory_id,
+                        op,
+                        committed_at,
+                        audit_seq,
+                        &payload_bytes,
+                    )?;
                     if !in_cap.swap(true, Ordering::AcqRel) {
                         tx_append_audit(
                             tx,
@@ -970,20 +1096,38 @@ fn tx_upsert_pending_sync(
     memory_id: MemoryId,
     operation: CascadeOperation,
     queued_at: DateTime<Utc>,
+    sequence_id: i64,
+    payload_bytes: &[u8],
 ) -> VaultResult<()> {
+    // Carry the full cascade payload + sequence anchor (migration 0003) so the
+    // divergence sweep can re-enqueue a faithful retry_queue row when capacity
+    // returns. ON CONFLICT, the latest overflowing op's payload wins.
     tx.execute(
-        "INSERT INTO pending_sync (memory_id, operation, queued_at)
-         VALUES (?1, ?2, ?3)
+        "INSERT INTO pending_sync (memory_id, operation, queued_at, sequence_id, payload)
+         VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(memory_id) DO UPDATE SET
             operation = excluded.operation,
-            queued_at = excluded.queued_at",
+            queued_at = excluded.queued_at,
+            sequence_id = excluded.sequence_id,
+            payload = excluded.payload",
         params![
             memory_id.0.as_bytes().to_vec(),
             operation.as_str(),
             queued_at.to_rfc3339(),
+            sequence_id,
+            payload_bytes,
         ],
     )
     .map_err(|e| VaultError::Storage(format!("upsert pending_sync (in tx): {e}")))?;
+    Ok(())
+}
+
+fn tx_delete_pending_sync(tx: &rusqlite::Transaction<'_>, memory_id: MemoryId) -> VaultResult<()> {
+    tx.execute(
+        "DELETE FROM pending_sync WHERE memory_id = ?1",
+        params![memory_id.0.as_bytes().to_vec()],
+    )
+    .map_err(|e| VaultError::Storage(format!("delete pending_sync (in tx): {e}")))?;
     Ok(())
 }
 
@@ -1845,6 +1989,71 @@ mod tests {
         assert!(
             (stored - second).num_milliseconds().abs() < 1000,
             "stored {stored} must match second={second} (latest-wins per ADR-051)",
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // apply_decay — Phase 4 confidence decay (T0.2.4)
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn apply_decay_updates_confidence_and_marker_metadata_only() {
+        let (_tmp, backend) = make_backend().await;
+        let mut m = sample_memory("personal", "a fact that has gone cold");
+        m.confidence = 0.8;
+        backend.write_memory(&m, &embedding(0.3)).await.unwrap();
+
+        let decayed_at = Utc::now();
+        let new_metadata = serde_json::json!({
+            "decay": { "last_decay_at": decayed_at.to_rfc3339() }
+        });
+        let ack = backend.apply_decay(m.id, 0.72, new_metadata).await.unwrap();
+        assert_eq!(ack.memory_id, m.id);
+
+        let back = backend.metadata.get_memory(&m.id).await.unwrap().unwrap();
+        assert!(
+            (back.confidence - 0.72).abs() < 1e-6,
+            "confidence must be the decayed value, got {}",
+            back.confidence
+        );
+        assert_eq!(
+            back.metadata["decay"]["last_decay_at"],
+            serde_json::Value::String(decayed_at.to_rfc3339()),
+            "decay idempotency marker must be persisted"
+        );
+        // Metadata-only: content + bi-temporal fields are untouched.
+        assert_eq!(back.content, m.content, "decay must not change content");
+        assert_eq!(back.valid_until, None, "decay must not invalidate");
+        assert_eq!(back.superseded_by, None, "decay must not supersede");
+    }
+
+    #[tokio::test]
+    async fn apply_decay_returns_not_found_on_missing_memory() {
+        let (_tmp, backend) = make_backend().await;
+        let err = backend
+            .apply_decay(MemoryId::new(), 0.5, serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VaultError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn apply_decay_rejects_out_of_range_confidence() {
+        let (_tmp, backend) = make_backend().await;
+        let m = sample_memory("personal", "cold fact");
+        backend.write_memory(&m, &embedding(0.3)).await.unwrap();
+        // 1.5 violates the Memory invariant (confidence ∈ [0,1]); the in-tx
+        // validate() must reject and leave the row unchanged.
+        let err = backend
+            .apply_decay(m.id, 1.5, serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VaultError::InvalidInput(_)));
+
+        let back = backend.metadata.get_memory(&m.id).await.unwrap().unwrap();
+        assert_eq!(
+            back.confidence, m.confidence,
+            "a rejected decay must not mutate confidence"
         );
     }
 

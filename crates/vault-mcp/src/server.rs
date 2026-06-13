@@ -514,7 +514,9 @@ impl StdioServer {
                        (what/who/when/does…), PREFER `memory_read` — it returns a \
                        definitive answer or a clear 'not found', which is more \
                        reliable than judging a raw list. Query in a natural-language \
-                       phrase, not bare keywords. \
+                       phrase, not bare keywords, and search ONE topic per call — \
+                       for a multi-part need make separate calls, since a mashed \
+                       multi-topic query scores every result weak. \
                        Authorization is mediated by the host application, not by \
                        this tool's parameters."
     )]
@@ -610,6 +612,12 @@ impl StdioServer {
                        the user — prefer this over `memory_search` for any \
                        question (what/who/when/does…). Read the user's memory \
                        vault as structured facts. \
+                       Ask ONE thing per call, phrased as a natural-language \
+                       question, not bare keywords. For a multi-part question \
+                       (e.g. 'my languages, the teams I follow, and where I \
+                       holiday'), make a SEPARATE call per part — a single mashed \
+                       multi-topic query dilutes relevance and can bury a real \
+                       match below noise. \
                        Returns a JSON object with six fields: \
                        \n\
                        - `boundary`: the boundary in scope (null for \
@@ -644,7 +652,14 @@ impl StdioServer {
                        \n\
                        3. `as_of` is the fact-time anchor (when the fact \
                        became true in the world), NOT when it was added. \
-                       Newer `as_of` = more recent truth. \
+                       Newer `as_of` = more recent truth. If two facts conflict \
+                       on a SINGLE-VALUED attribute (the car they drive, where \
+                       they live, their job, marital status), treat the one with \
+                       the newer `as_of` — or an explicit replacement signal in \
+                       the text ('now drives', 'finally picked up', 'moved to') — \
+                       as current, and say which is current (you may note the \
+                       older as past). Do not assume a conflict when both can be \
+                       true at once (two hobbies, two languages). \
                        \n\
                        4. `confidence` is the user/agent's confidence in this \
                        fact's accuracy. \

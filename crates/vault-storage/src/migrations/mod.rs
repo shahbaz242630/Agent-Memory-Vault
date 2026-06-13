@@ -36,6 +36,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "T0.1.6 cascade infra: retry_queue, dead_letter, pending_sync",
         up: include_str!("0002_cascade_infra.sql"),
     },
+    Migration {
+        version: 3,
+        description: "T0.2.4 sync ship-gate: pending_sync cascade payload (sequence_id + payload)",
+        up: include_str!("0003_pending_sync_payload.sql"),
+    },
 ];
 
 /// Apply any pending migrations to the open connection. Uses the
@@ -236,6 +241,32 @@ mod tests {
             rusqlite::params![entry_b, memory_id, payload, now],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn migration_0003_adds_pending_sync_payload_columns() {
+        // T0.2.4 sync ship-gate: the sweep needs sequence_id + payload on
+        // pending_sync to reconstruct a retry_queue row. Verify the columns
+        // exist after migrating.
+        let mut conn = open_memory();
+        run(&mut conn).unwrap();
+
+        let cols: std::collections::HashSet<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('pending_sync')")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+
+        assert!(
+            cols.contains("sequence_id"),
+            "migration 0003 must add pending_sync.sequence_id; columns: {cols:?}"
+        );
+        assert!(
+            cols.contains("payload"),
+            "migration 0003 must add pending_sync.payload; columns: {cols:?}"
+        );
     }
 
     #[test]

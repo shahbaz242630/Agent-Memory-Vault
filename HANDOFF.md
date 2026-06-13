@@ -2,7 +2,7 @@
 
 **Current version:** V0.2 Closed Beta (BRD §6.2 — sleep consolidator, boundaries hardening, cross-device sync, 30 beta users)
 
-**Last updated:** 2026-06-10 — **Gap 2 FIX IMPLEMENTED (ADR-074), all 5 DoD gates green, NOT yet committed.** Document-side alias enrichment built: new `vault-consolidator/src/phases/enrich.rs` (Phi-4 generates a per-fact alias/topic line at consolidation; stored in `metadata.enrichment`; embedded as `"<content> Topics: <aliases>"`, display `content` untouched; idempotent via FNV-1a content fingerprint), `Consolidator::enrich_facts` orchestrator + `EnrichmentReport`, wired into `run_consolidation_with_safety` between consolidation and report-gen. Gates: fmt ✅ / build 0-warn ✅ / clippy 0-lint ✅ / `vault-consolidator` 113 tests (incl. 13 new `enrich`) ✅ / `vault-app` 58 tests ✅. Full ADR in §8.6. **NEXT: live rank-lift validation with the real Phi-4 model (§8.6 "Live validation"), then commit (admin rides with code).** Prior 2026-06-09 note: **Gap 2 RE-DIAGNOSED + fix PROVEN.** CI on `a3e426b` (ADR-073 Gap-1) confirmed **green** (push run 27150216167). A full ground-truth investigation (built a paraphrase-variant ruler, FIXED a greenwash bug in `scale_eval`, then probed the REAL `seeded-vault-1k` across 3 domains) **falsified the 2026-06-08 Gap-2 diagnosis**: it is NOT a BGE paraphrase limit and the fix is NOT query expansion. It's a **vocabulary gap**, and **document-side alias enrichment is the proven fix** (bare Porto ABSENT → enriched rank 1 @ 0.9965 on the killer query; twins rank 5 → 1; no regression). See §4.2. **NEXT SESSION: design + implement document-side alias enrichment in the consolidator (Phi-4 generates the alias/topic line) — open design Qs in §4.2.** Also surfaced: **tech-debt #6** (weekly real-model smoke chronically red since 2026-05-18 — concurrent-download race, CI-infra not a regression; §8). Engine is solid; Gap 2 now has a clear, measured path to closed.
+**Last updated:** 2026-06-13 (session close) — **4-front batch built, ALL 4 DoD gates green LOCALLY (fresh DuckDB-1.4 full-workspace build), pending commit + CI:** Phase-4 decay (ADR-075) · sync ship-gate / `pending_sync` payload (ADR-076, closes tech-debt #4) · CI `--test-threads=1` (tech-debt #6) · DuckDB 1.2.2→1.4 dep upgrade (ADR-077; encryption *code* still deferred). See §1 SESSION 2026-06-13 block. Prior: **CI GREEN on `d613614` (Gap-2/ADR-074, run `27277023260`).** Gap-2 **live-confirmed through the real MCP read path at 1k** (not just the vector probe): on a fresh `seeded-vault-1k` copy the buried killer goes **bare ABSENT → enriched rank 1** in `memory_search` AND becomes present in `memory_read` facts (Porto; twins/hives weren't buried). Honest nuance: on the *hardest* keyword-soup query enriched read still flags `abstain=True` (reranker scores the wording-mismatch pair low — enrichment fixes recall-into-pool, NOT the reranker score), but the never-empty rule (ADR-073) returns the fact anyway → recall-safe. **Then ran a FULL-ASPECT live test campaign on a NEW ~94-fact messy+clean dogfood vault (`seeded-vault-mixed`)** driven by a scripted MCP stdio client (`C:\Projects\mcp-probe\client.py`, NOT in repo) — Antigravity quota was hit (~10h reset) so I drove the MCP server directly. **Scorecard + gaps in §13 (NEW).** Headline: **all storage/retrieval/security/structural aspects PASS on messy data** (CRUD, search+recall-safety, access-control reject+accept, boundary isolation, vault.db encryption, merge/dedup, REPORT, enrichment); the gaps cluster into **3 known buckets** — (1) read precision (salary $-trap fires on messy data, wrong-neighbor #1 ordering, marginal blood/OS abstains), (2) contradiction/temporal resolution (Tesla/Rivian NOT auto-resolved even with `as_of` set), (3) unbuilt nightly features (decay/archive, T0.2.4). **NO code change this session** (all probe/test work); CI stays green on `d613614`. **NEXT SESSION: Wave 3 — live-agent test in Antigravity (Flash weak + Pro strong) on `seeded-vault-mixed` once quota resets**, grading against the 10-question key in `client.py::GRADE_QUERIES`; optionally enrich the messy vault first (surgical, like the 1k proof) for the Gap-2 case. This HANDOFF update is uncommitted admin — rides with the next code commit.
 
 > **How to read this file:** §1 is the only thing you must act on. §2–§5 are current ground truth (incl. the post-scale roadmap in §5). §6 onward is reference you pull from when planning. Deep detail (full ADR text, session-by-session history, tuning evidence) lives in the three archives — cross-linked by ADR number. **Do not paraphrase archived ADRs — quote them.**
 
@@ -10,22 +10,55 @@
 
 ## 1 · 🟢 ACTIVE TASK — scale-validate the retrieval core LIVE (1k → 10k), then lock it
 
+> **🆕 SESSION 2026-06-13 — 4-front batch SHIPPED-pending-commit (all 4 DoD gates green LOCALLY; NOT yet committed/pushed; CI unverified).** This session cleared a batch of pending build/wire items off the consolidator + sync + CI fronts:
+> 1. **Phase-4 confidence decay (T0.2.4 — ADR-075 §8.7)** — the consolidator's decay pass is live (cold archive is the deferred other half).
+> 2. **Sync ship-gate (ADR-076 §8.8)** — `pending_sync` cascade payload (migration 0003) + the real drain sweep; **closes tech-debt #4** (the V0.2-sync ship-gate blocker).
+> 3. **CI fix** — `--test-threads=1` on the weekly Phi-4 smoke (tech-debt #6).
+> 4. **DuckDB 1.2.2 → 1.10503.1 (libduckdb 1.4) dep upgrade (ADR-077 §8.9)** — adopted + verified on a **fresh full-workspace cold build** to unblock graph encryption later; the encryption *code* (`ATTACH ENCRYPTION_KEY` + ADR-SEC + §11 walk) remains its own deferred task.
+>
+> **Working tree (uncommitted, awaiting commit+push approval):** the 4 fronts + the pre-existing `vault-mcp/src/server.rs` gap-#7 agent-steer (staged last session, rides with this code commit per the original plan) + this HANDOFF. Gates green LOCALLY only — **CI must be verified green after push** (and the build is now a fresh DuckDB-1.4 compile, so CI's first run rebuilds everything cold).
+>
+> **NEXT SESSION:** (a) confirm this batch is CI-green; (b) then the open arcs — **graph-encryption code** (the dep upgrade is landed, so it's now pure code + ADR-SEC), **Pillar 2 cold archive** (Phase 4's other half), or the broader Pillar 2 (auto-run consolidator) / dogfood-first fork (§5 + §13.3 still stand).
+>
+> The original scale-validation opener below is historical context.
+
 **Goal:** prove correctness is scale-invariant on a REAL vault that Antigravity opens, at 1k then 10k facts. We already proved it on the internal `scale_eval` harness (100/1k/10k identical scorecard) and live in Antigravity at 100 facts. This is the live confirmation at scale + the close of the arc.
 
-### 🔚 NEXT SESSION OPENER (2026-06-10) — **GAP-2 FIX IMPLEMENTED + GATES GREEN; LIVE-VALIDATE WITH REAL PHI-4, THEN COMMIT** — READ THIS FIRST
+### 🔚 NEXT SESSION OPENER (2026-06-12 close) — **RUN GATES + COMMIT the staged gap-#7 steer (bundle with more code); then Pillar 2 path** — READ THIS FIRST
 
-**What's done (2026-06-10).** Built the Gap-2 fix — **document-side alias enrichment via Phi-4 at consolidation (ADR-074, §8.6).** New `phases/enrich.rs` (`generate_aliases` / `compose_embed_text` "`<content> Topics: <aliases>`" / `content_fingerprint` FNV-1a / `enrich_one`), `Consolidator::enrich_facts` + `EnrichmentReport`, wired into `run_consolidation_with_safety` (after consolidation, before report-gen). **All 5 DoD gates green** (fmt / build-0-warn / clippy-0-lint / `vault-consolidator` 113 incl. 13 new `enrich` / `vault-app` 58). **NOT yet committed.** Aliases live in `metadata.enrichment`; display `content` untouched (no read-side leak); idempotent (FNV-1a fingerprint skip → first run backfills, steady-state only touches new/changed facts). Confirmed enrichment is already in the real CLI path (`vault-cli consolidate run`).
+**▶️ PRIMARY ACTION next session: run the DoD gates + commit the UNCOMMITTED gap-#7 agent-steer code** (3 MCP tool-description edits in `crates/vault-mcp/src/server.rs`, staged this session, NOT yet built/gated — Shahbaz deferred gates to "tomorrow with more code" to avoid a CI cycle on a tiny change). The edits: `memory_read` gains a **decompose-multi-intent + natural-phrasing** steer AND a **single-valued-conflict** steer (the car — prefer newer `as_of`/explicit replacement signal, "say which is current", "don't assume conflict when both can be true"); `memory_search` gains the **one-topic-per-call** steer (it already had natural-phrasing). These encode today's findings ([[project_reranker_brittle_on_terse_queries]] + the car decision). Reach every agent via `tools/list`. **Gate (workspace build 0-warn → clippy → fmt → `vault-mcp` tests) then commit + CI-green-verify.** Bundle with whatever the next code task is.
 
-**The finding it fixes (Gap 2 — re-diagnosed 2026-06-09; see §4.2 for full evidence).** NOT a BGE paraphrase limit (natural idioms find the fact: "call home" → Porto rank 1). It's a **vocabulary gap** — facts phrased without the obvious keyword get outranked/buried; the agent's keyword-soup expansion is the TRIGGER, not the cure (query-side expansion SHELVED). Document-side enrichment PROVEN by `probe_enrichment`: bare Porto ABSENT → enriched rank 1 @ 0.9965; twins rank 5 → 1; no regression.
+**THEN — the sequencing Shahbaz + I agreed (2026-06-12):** **(1)** the gap-#7 steer above (knocks out #7 + the car steer #4). **(2) Pillar 2 — auto-run consolidator** (scheduling + decay/archive #6 + checkpoint) — BUT it has a hardware wall: the full nightly run does NOT finish at ~90 facts on this machine (contradiction phase ~20s/Phi-4 call blows the 30-min budget), so Pillar 2 = *"make the nightly run complete (latency/perf) THEN schedule it"*, not just schedule. **(3) real single-device dogfood** of the self-maintaining vault. **(4) Pillar 3 — cross-device sync** (biggest/most security-sensitive; fold gap #5 graph-crypto into its security review). Lean: dogfood-first before sync.
 
-**▶️ DO FIRST next session (in order):**
+**Wave 3 is COMPLETE — full results + vault-level replay in §13.1; Arc B (car/temporal) spiked + reverted in §13.2.** Both Flash (weak) and Opus 4.6 (strong) landed correct answers on essentially every trap. **KEY REFRAME (2026-06-12, Shahbaz):** since the agent produces CORRECT OUTPUT across every tested trap (incl. salary/allergy/wrong-neighbour), gaps **#1/#2 (read precision) are NOT confirmed-broken — they are agent-handled today**, same logic that closed the car. They drop from "must-fix" to **🟡 insurance** (build only if a correct fact gets truncated out of the agent's view at scale, or to harden Managed-mode where unknown weak agents connect). **No confirmed-broken output exists in the gap table.** Updated gap classification: §13.3 (NEW). **The PRIMARY ACTION further below (re-run Wave 3) is SUPERSEDED — Wave 3 is done.** Original Wave-3 instructions kept below for reference.
 
-1. ✅ **DONE 2026-06-10 — live rank-lift validation with the REAL Phi-4 on the real 1k vault.** All three Gap-2 killers now rank #1 end-to-end (Porto ABSENT→1, hives 4→1, twins 1→1). Required a prompt tweak (single-word generic keywords) caught precisely because we validated before committing. Full table + method in §8.6 "Live validation". The two validation probes (`real_phi4_alias_quality`, `probe_real_enrichment_1k`) ride with the commit.
-2. **Commit (admin rides with code).** One commit: `enrich.rs` (incl. tuned prompt + `pub enrich_one`) + consolidator/app wiring + the two real-Phi-4 `#[ignore]` probes + `scale_eval.rs` clippy fixes + the 2026-06-09 ruler + this HANDOFF admin. **Re-run `cargo fmt --all --check` LAST + `git status --short` before `git add`** (drift check). **Confirm with Shahbaz before commit + push.** Then verify CI green before any next commit.
-3. **Tech-debt #6** (cheap, optional bundle): `--test-threads=1` on `ci.yml:702` to re-light the weekly smoke.
-4. **After Gap 2 commits + CI-green:** re-seed 10k for the scale data point → declare the retrieval core "battle-tested."
+**What's done (2026-06-11).** (1) CI **green** on `d613614` (Gap-2, run `27277023260`). (2) Gap-2 **live-confirmed through the real MCP read path at 1k** — fresh `seeded-vault-1k` copy, bare vs enriched A/B both via `memory_read`/`memory_search`: buried Porto **ABSENT → rank 1** in search + present in read facts; twins/hives weren't buried. Nuance: hardest keyword-soup query enriched read still `abstain=True` (reranker scores the wording-mismatch low — enrichment fixes recall-into-pool, NOT the reranker score; never-empty returns the fact anyway → recall-safe). (3) **Full-aspect live test campaign on a NEW messy+clean dogfood vault** (`seeded-vault-mixed`, ~94 facts) via a scripted MCP stdio client — Antigravity quota hit (~10h reset) so I drove the MCP server directly. **Scorecard + failure root-causes in §13 (NEW).** No code change this session; CI stays green on `d613614`.
 
-> **🟢 The engine is solid.** Gap 1 shipped; Gap 2 fix is built + gate-green. The premium experience (Opus: rich answers, graceful abstains, no hallucinated traps) was excellent throughout. Closing Gap 2 is the last known quality gap before "battle-tested."
+**▶️ PRIMARY ACTION — Wave 3: live-agent test in Antigravity once quota resets.** Config ALREADY repointed to `seeded-vault-mixed`. Restart Antigravity, confirm via `Get-CimInstance Win32_Process -Filter "Name='vault-cli.exe'" | Select CommandLine`, then run the 10 planted-trap questions (verbatim in `C:\Projects\mcp-probe\client.py` → `GRADE_QUERIES`; grading key in `SEED_NOTES`) on **BOTH a weak model (Gemini Flash) and a strong model (Gemini Pro)**. The question: does each model compose a CORRECT answer from the structured output — esp. the wrong-neighbor cases where a distractor ranks #1 (live→Lisbon, kids→Marcus, allergy→Marcus's peanut, salary→$450, car→Tesla)? Strong agent expected to recover; weak agent at risk — that delta IS the read-precision evidence.
+
+**Optionally first:** enrich `seeded-vault-mixed` (surgical, like the 1k proof — extend `probe_real_enrichment_1k` to loop `enrich_one` over ALL active facts, no contradiction phase, no 30-min cap; one build) so Wave 3 also exercises the Gap-2 lift on messy data (Porto buried on keyword-soup). **Full `consolidate run` does NOT work on this hardware at ≥~90 facts** — the contradiction phase alone (~20s/Phi-4 call on the Intel UHD Vulkan GPU) blows the 30-min budget before enrichment runs (proven twice: the 100-probe + this session). The **TINY-vault path (≤~6 facts) DOES complete (27.6s)** — that's how merge/REPORT/enrichment were verified this session.
+
+**Then the open arcs.** The retrieval *plumbing* is proven correct on messy data; the work now is the *precision/abstain* layer. **The 6 non-pass items from §13, each → its fix/build + priority (so nothing is lost):**
+
+| # | Gap (§13) | Fix / build | Priority | Tracked |
+|---|---|---|---|---|
+| 1 | Salary $-trap (answers instead of abstaining on money-shaped noise) | read-precision: add a category/ownership veto + per-candidate filter so a confident wrong-*kind* match is rejected | 🔴 HIGH — but gate on Wave 3 first (see if a strong agent already recovers) | read-precision arc, roadmap §5 item 1; tech-debt #1 |
+| 2 | Wrong-neighbor #1 ordering (mother/Marcus/dog out-ranks the user's own fact) | read-precision: a subject/ownership signal so "about the user" beats "about an associate" | 🔴 HIGH — same arc as #1 | roadmap §5.1; relates [[project_reranker_subjectless_facts_framing]] |
+| 3 | Blood/OS marginal abstain (squeak over the no-signal floor) | read-precision: tune/curve the no-signal floor or per-candidate gate | 🟠 MED — same arc as #1 | roadmap §5.1 |
+| 4 | Contradiction not resolved (Tesla/Rivian both stay active) | temporal: fact-time `as_of` (date extraction or settable) + tune the Phi-4 contradiction judge | 🟠 MED — own arc | §4 carried follow-up; [[project_as_of_write_time_blocks_a5_temporal]] |
+| 5 | `graph.duckdb` plaintext | verify ADR-010 DuckDB-encryption status; wire it if truly unshipped | 🟢 LOW (graph empty in V0.2) | tech-debt #7 |
+| 6 | Decay / archive not built | BUILD Phase 4 (age-out + archive old memories) | 🟢 planned BUILD (not a bug) | roadmap §5 item 2; §6 "Not built"; T0.2.4 |
+
+**Honest sequencing:** #1–#3 are ONE arc (read precision, roadmap §5.1) and are the highest-value fix — but **run Wave 3 first**, because if the strong agent already composes correct answers despite the wrong-neighbor ordering, that re-prioritises how hard we push #2. #4 is its own (temporal) arc. #5 is low-pri tech-debt. #6 is a scheduled build, not a defect.
+
+### 🧰 Scratch state (NOT in repo — clean up when done)
+- **MCP probe client:** `C:\Projects\mcp-probe\client.py` — the scripted MCP stdio test harness built this session (modes: discover / inspect / measure / grade / crud_test / auth_test / search_test / isolation_test / seed_mixed / seed_tiny / car_check / write_killers). Run: `$env:PROBE_VAULT=<vaultdir>; $env:BOUNDARIES='personal,testeval'; python client.py <mode>`.
+- **Scratch vaults (all throwaway dogfood):** `seeded-vault-mixed` (~94 messy+clean, Wave-3 target), `seeded-vault-tiny` (6-fact consolidation demo — MERGED + REPORT written), `seeded-vault-1k-probe` (3 killers enriched), `seeded-vault-1k-bare` (3 killers bare), `seeded-vault-100-probe`. Real evidence vaults `seeded-vault-{100,1k,10k}` untouched.
+- **Antigravity config** points at `seeded-vault-mixed`. Backups: `mcp_config.json.bak-1k` (was 1k), `mcp_config.json.bak-realvault` (real production vault). **Restore real vault when fully done:** set the 3 paths back to `C:\Users\shahb\AppData\Roaming\com.shahbaz242630.memory-vault\{vault.db,lance,graph.duckdb}`, restart.
+
+**Tech-debt #6** (cheap, ride with the next code commit): `--test-threads=1` on `ci.yml:702` to re-light the weekly smoke. **Tech-debt #7 (NEW):** verify `graph.duckdb` encryption — ADR-010 scoped it for T0.2.0 but the store still opens PLAINTEXT (`DUCK` magic bytes confirmed) and the runtime still WARNs "ships in T0.2.0"; low risk (graph empty in V0.2) but claim/reality diverge.
+
+> **🟢 Plumbing solid on messy data.** Storage / retrieval / security / structural aspects all PASS (§13). Remaining work is the precision/abstain layer + temporal resolution — known, scoped, the 85→100 arc. Founder thesis is *correct output*, so Wave 3 (does a real agent land the right answer from the structured output) is the next acceptance.
 
 ### 📌 Reference — seed / verify / repoint commands (1k is DONE + live; reuse these for the 10k re-seed in step 4 above)
 1. **Seed** (swap `SEED_N`/`SEED_VAULT_DIR` for 10k): `$env:SEED_N='1000'; $env:SEED_VAULT_DIR='C:\Projects\seeded-vault-1k'; cargo test -p vault-app --test scale_eval seed_live_vault -- --ignored --nocapture` — 1k ≈ 17 min; 10k = multi-hour/overnight (drain rate degrades). Waits for full VECTOR-count drain, then prints the test script.
@@ -36,8 +69,9 @@
 6. **If 1k AND 10k both pass live →** (a) commit the seeder (`crates/vault-app/tests/scale_eval.rs` `seed_live_vault` + the vector-count-drain probe) with full DoD gates → CI green; (b) declare the retrieval core "battle-tested at scale," close this arc. Thread 2 (read precision) becomes the next arc.
 
 ### ⚙️ Working-tree state
-- **Last SHIPPED: `a3e426b`** (Gap-1 / ADR-073), CI green (push run 27150216167).
-- **Gap-2 fix IMPLEMENTED, all 5 DoD gates green, NOT yet committed** (one commit, admin rides with code). Files:
+- **Last SHIPPED: `d613614`** (Gap-2 / ADR-074), pushed to `main`; **CI `27277023260` was `in_progress` at session close — verify `success` first thing next session.** Prior green: `a3e426b` (ADR-073, run 27150216167).
+- **Uncommitted: HANDOFF.md ONLY** (this session-close opener rewrite + "Last updated") — admin-only, rides with the next code commit per admin-rides-with-code. The working tree is otherwise clean (the fix below is committed in `d613614`).
+- **Shipped in `d613614`** (one commit, admin rode with code):
   - **NEW `crates/vault-consolidator/src/phases/enrich.rs`** — `generate_aliases` (Phi-4, JSON `{"aliases":[...]}`, tuned to single-word generic keywords), `compose_embed_text` (`"<content> Topics: <aliases>"`), `content_fingerprint` (FNV-1a), `set_enrichment_metadata`, **`pub enrich_one`** (exposed for the live probe) + 11 mock-LLM unit tests + `real_phi4_alias_quality` `#[ignore]` probe.
   - **`crates/vault-consolidator/src/consolidator.rs`** — `Consolidator::enrich_facts` + `EnrichmentReport` + 2 idempotency tests; `phases/mod.rs` (+`pub mod enrich`); `lib.rs` (export `EnrichmentReport`).
   - **`crates/vault-app/src/application.rs`** — `enrich_facts` wired into `run_consolidation_with_safety` (after consolidation, before `generate_reports`, under the 30-min budget).
@@ -213,9 +247,9 @@ Full narrative for each in PART2 archive ("Tech debt — open items"). File poin
 1. **Read-relevance: per-candidate cosine filter + carry-cosine-through-fusion + retire vestigial BM25 gate.** Carry raw semantic cosine through `HybridRetriever` fusion onto `RetrievedMemory` (today `hybrid.rs:221-247` discards it), then filter per-candidate → removes double-embed, enables per-candidate precision filtering, lets the BM25 gate be retired. Closely related to Thread 2. Files: `vault-retrieval/src/strategies/hybrid.rs:221-247`, `structured_read_pipeline.rs`, `strategies/abstain.rs`. (Surfaced ADR-057)
 2. **Entity-extraction-at-consolidation + `GraphStore::rewrite_relationships_for_memory(old, new)`.** BRD §5.6 line 950 ("update graph on merge") presupposes entity extraction from `Memory.content` + a relationship-rewrite primitive — neither exists. `apply_merge` skips graph-update with a `tracing::warn!` no-op (honest: graph is empty in V0.2). Files: `cascading.rs:37-50`, `phases/merge.rs::apply_merge`. Do NOT amend the BRD until closed.
 3. **`VaultError::Storage(String)` grab-bag → structured variants.** `retry_queue.rs::is_permanent` substring-matches lance error wording (fragile; lance 4.0 wording is inconsistent). Add `SchemaMismatch`/`IoFailure`/etc., re-categorise ~30 call sites, rewrite `is_permanent` as exhaustive `match` + tripwire test. Files: `retry_queue.rs:240-275`, `vault-core/src/error.rs:139`, the ~30 `Storage(format!(...))` sites.
-4. **`pending_sync` sweep + migration 0003 cascade payload.** `DivergenceDetector::sweep_pending_sync` is a V0.1 stub (returns 0). Migration 0002 schema lacks the `embedding`+`boundary` payload to reconstruct a `NewRetry`. **SHIP GATE: must land before V0.2 sync beta opens** (cross-device churn makes the stub a silent data-recovery gap). ~80 LoC. Files: `divergence.rs:38-48,200-214`, `vault-cli/src/main.rs:205`, new `migrations/0003_*.sql`, `retry_queue.rs` overflow path.
+4. **✅ CLOSED 2026-06-13 (ADR-076, §8.8).** `pending_sync` sweep + migration 0003 cascade payload. Migration 0003 added `sequence_id` + `payload`; the overflow path persists the full cascade and `StorageBackend::drain_pending_sync` re-enqueues it (the `DivergenceDetector` Tier-0 sweep). The V0.2-sync ship-gate is met. (Note: stored the raw cascade `payload` rather than the sketched `embedding`/`boundary` columns — more faithful + version-agnostic.)
 5. **Cosine NaN-vector lance upstream issue (LOW — community citizenship).** lance 4.0 filters NaN-distance rows from Cosine search (zero-magnitude vectors). Production unaffected (BGE vectors are L2-normalised, never zero). File a minimal-repro issue against `lancedb/lance`. File: `vector_store.rs:1248-1263`.
-6. **Weekly real-model smoke red since 2026-05-18 — concurrent-download race (CI-infra, NOT a code regression).** The `real-model-smoke` weekly cron job (`ci.yml:702`, `cargo test -p vault-llm -- --ignored`) has failed every Monday across 4 unrelated commits (`4ae8dbd`/`93d1410`/`2302842`/`a3e426b`). Root cause (source-confirmed): all 3 smoke tests run concurrently (no `--test-threads=1`) and `model_loader.rs::download_with_verify` writes to a **single shared** `.partial` path (`model_loader.rs:131`) then renames to final (`:156`); the winner's rename leaves the losers' rename hitting a vanished `.partial` → `Io NotFound code 2`. The test's own doc (`phi4_mini_smoke.rs:47-48`) assumes serial execution. **Min fix (CI-only):** add `--test-threads=1` to `ci.yml:702` — verifiable only via next Monday cron or a `run-llm-smoke`-labelled PR. **Deeper latent bug (LOW, prod single-writer + pre-download mitigates):** the shared `.partial` path means two cold-starting agent processes could corrupt each other's download — make `.partial` unique per download + treat "final already present after our stream" as success. Matters because this job is the ONLY CI coverage of the real Phi-4 consolidator path (dark for a month); re-light before leaning on the consolidator (roadmap §5 item 2). Files: `ci.yml:702`, `model_loader.rs:95-160`.
+6. **🟡 Min-fix LANDED 2026-06-13 (`--test-threads=1` added to `ci.yml:702`); verify on the next Monday cron. Deeper unique-`.partial` fix still open (LOW).** Weekly real-model smoke red since 2026-05-18 — concurrent-download race (CI-infra, NOT a code regression). The `real-model-smoke` weekly cron job (`ci.yml:702`, `cargo test -p vault-llm -- --ignored`) has failed every Monday across 4 unrelated commits (`4ae8dbd`/`93d1410`/`2302842`/`a3e426b`). Root cause (source-confirmed): all 3 smoke tests run concurrently (no `--test-threads=1`) and `model_loader.rs::download_with_verify` writes to a **single shared** `.partial` path (`model_loader.rs:131`) then renames to final (`:156`); the winner's rename leaves the losers' rename hitting a vanished `.partial` → `Io NotFound code 2`. The test's own doc (`phi4_mini_smoke.rs:47-48`) assumes serial execution. **Min fix (CI-only):** add `--test-threads=1` to `ci.yml:702` — verifiable only via next Monday cron or a `run-llm-smoke`-labelled PR. **Deeper latent bug (LOW, prod single-writer + pre-download mitigates):** the shared `.partial` path means two cold-starting agent processes could corrupt each other's download — make `.partial` unique per download + treat "final already present after our stream" as success. Matters because this job is the ONLY CI coverage of the real Phi-4 consolidator path (dark for a month); re-light before leaning on the consolidator (roadmap §5 item 2). Files: `ci.yml:702`, `model_loader.rs:95-160`.
 
 Also tracked as SHIPPED-design-record in PART2 archive: `bulk_upsert` promotion to the `VectorStore` trait (730× faster bulk insert, shipped `c091281`).
 
@@ -275,11 +309,64 @@ Also tracked as SHIPPED-design-record in PART2 archive: `bulk_upsert` promotion 
 
 ---
 
+## 8.7 · 🆕 ADR-075 (IN FLIGHT) — Phase 4 confidence decay (T0.2.4)
+
+**Status:** SHIPPED 2026-06-13; all 4 DoD gates green (fresh DuckDB-1.4 build 0-warn / `vault-storage` + `vault-consolidator` tests 0-fail / clippy 0-lint / fmt). Implements BRD §5.6 Phase 4 line 994 (the *decay* half; cold archive deferred). Honours [[project_architectural_lock_llm_out_of_read_path]] (no LLM in decay).
+
+**Context.** Phase 4 was unbuilt (`memories_archived` hardcoded 0; no decay pass). The sleep consolidator must fade stale knowledge so retrieval (which weights by confidence) demotes it over time without ever deleting it.
+
+**Decision.**
+1. **Policy (`phases/decay.rs::plan_decay`)** — a fact not accessed in `decay_after_days` (180) has `confidence ×= 0.9` (BRD line 994 verbatim). Pure planner over the active set; skips superseded / invalidated facts and 0.0-confidence no-ops.
+2. **Metadata-only application (`StorageBackend::apply_decay`)** — sets confidence + an idempotency marker (`metadata.decay.last_decay_at`); **never re-embeds** (re-embedding from raw `content` would clobber the ADR-074 enriched vector). New `memory.decayed` audit event distinguishes a decay from a user edit.
+3. **Idempotency (BRD line 1022)** — the marker means a back-to-back run does not re-decay; a fact re-decays only after a full decay period elapses.
+4. **Wiring** — runs as Phase 4 in `run_consolidation` (after contradiction, before report); `ConsolidationReport.memories_decayed` + the summary Decay section carry the count.
+
+**Cold archive (BRD lines 995-996) DEFERRED** — a first-class `Memory` state change (schema + retrieval-filter reach) far larger than decay; its own batch keeps this one debuggable. `memories_archived` stays 0.
+
+**Tests:** 10 planner + 3 `apply_decay` + 2 summary + 1 real-BGE end-to-end (`cold_fact_decays_through_consolidation_and_is_never_lost`). The "no memory ever lost" property holds — decay only mutates confidence.
+
+---
+
+## 8.8 · 🆕 ADR-076 (IN FLIGHT) — sync ship-gate: `pending_sync` cascade payload (migration 0003)
+
+**Status:** SHIPPED 2026-06-13; 4 gates green. **Closes tech-debt #4** (V0.2 sync ship-gate).
+
+**Context.** `DivergenceDetector::sweep_pending_sync` was a V0.1 stub returning 0 — the cap-overflow catch-up table carried only `(memory_id, operation, queued_at)`, not enough to reconstruct a `retry_queue` row. Cross-device churn (V0.2 sync) makes a silently-dropped overflow entry a real data-recovery gap.
+
+**Decision.**
+1. **Migration 0003** adds `sequence_id INTEGER` + `payload BLOB` to `pending_sync` (nullable / defaulted — legacy rows read NULL payload and are *skipped*, never re-enqueued broken).
+2. **Overflow path persists the full cascade** — both overflow call sites pass the in-scope `audit_seq` + `payload_bytes` to `tx_upsert_pending_sync`.
+3. **Real sweep (`StorageBackend::drain_pending_sync`)** — oldest-first, atomically per entry: while `retry_queue` < cap, re-insert the stored cascade + delete the pending row in one tx. Stops at cap; payload-less rows skipped. `DivergenceDetector` calls it as Tier-0.
+
+**Deviation from the handoff sketch:** stored the cascade **payload (+ `sequence_id`)** rather than separate `embedding`/`boundary` columns — more faithful (the stored bytes hand straight back to the retry insert) and schema-version-agnostic.
+
+**Security:** payload lives in the SQLCipher-encrypted `vault.db` — encrypted at rest, no new plaintext surface, no crypto-path change.
+
+**Tests:** full overflow → drop-vector → sweep → worker-reapply → vector-restored loop; payload-less legacy skip; payload round-trip; migration-columns check.
+
+---
+
+## 8.9 · 🆕 ADR-077 (IN FLIGHT) — DuckDB 1.2.2 → 1.10503.1 (libduckdb 1.4 LTS) upgrade
+
+**Status:** SHIPPED 2026-06-13; 4 gates green on a **fresh full-workspace cold build** (`cargo clean` first).
+
+**Context.** DuckDB 1.4 LTS (Sept 2025) adds native database encryption (`ATTACH … (ENCRYPTION_KEY …)`, AES-256-GCM over the main file + WAL + temp files) — the clean path to closing the V0.2 graph-encryption gap (`graph_store.rs:41-42`), which pinned 1.2.2 could not do.
+
+**Decision.** Adopt the dependency upgrade **now** (de-risked on a clean rebuild of the whole workspace), but **DEFER the encryption wiring** (the `ATTACH ENCRYPTION_KEY` in `graph_store.rs` + ADR-SEC + §11 threat-model review + security tests) to its own task. Lands the heavy/risky dep bump on a verified clean tree so the later encryption work is pure code, not a dep gamble.
+
+**Verification.** Spike built `vault-storage` clean (17m36s, exit 0). Then a full `cargo clean` + fresh `cargo build --workspace -D warnings` compiled **all 12 crates** against 1.4 (29m57s, 0 warnings); tests + clippy green.
+
+**Cost accepted (`Cargo.lock` churn):** arrow 54→58 (workspace now carries arrow 57 **and** 58 — lance stays on 57; they don't cross paths), strum 0.25→0.27, + new crossterm / zip / zopfli / zlib-rs. The Cargo.toml CRT-conflict note (esaxx-rs `/MT` vs duckdb-sys `/MD`) is unaffected — `esaxx_fast` is already dropped.
+
+**Next task (graph encryption — still deferred):** wire `ATTACH 'graph.duckdb' (ENCRYPTION_KEY <derived from master key>)` + ADR-SEC entry + §11 threat-model walk + security tests.
+
+---
+
 ## 9 · 📇 ADR index
 
 Full text of every ADR lives in an archive — cross-link by number, **quote don't paraphrase** ([[feedback_quote_locked_artefacts_dont_paraphrase]]).
 
-**In-flight (full text in HANDOFF, not yet archived):** **ADR-074** (document-side alias enrichment at consolidation, §8.6 — IMPLEMENTED, gates green, pending commit) · **ADR-073** (recall-safe `memory_read`, §8.5 — SHIPPED `a3e426b`).
+**In-flight (full text in HANDOFF, not yet archived):** **ADR-077** (DuckDB 1.4 upgrade, §8.9) · **ADR-076** (sync ship-gate `pending_sync` payload, §8.8) · **ADR-075** (Phase 4 confidence decay, §8.7) · **ADR-074** (document-side alias enrichment at consolidation, §8.6) · **ADR-073** (recall-safe `memory_read`, §8.5 — SHIPPED `a3e426b`).
 
 **Most relevant to current/next work (full text in `HANDOFF_V0.2_PART2_ARCHIVE.md`):**
 | ADR | Title | Status |
@@ -363,3 +450,83 @@ $env:LANCE_MEM_POOL_SIZE = '268435456'   # matters for heavy concurrent WRITES, 
 **Scale harness:** `cargo test -p vault-app --test scale_eval` (set `SCALE_EVAL_N` to size; real BGE + Qwen3-reranker, own temp vault). Live seeder: the `seed_live_vault` `#[ignore]` test (env `SEED_N` + `SEED_VAULT_DIR`).
 
 **Disk note:** C: runs tight (~20 GB free at this session; `target/` ≈ 129 GB). Always check before a build. Surgical `cargo clean -p <crate>` first; full `cargo clean` is escalation.
+
+---
+
+## 13 · 🧪 Full-aspect live test campaign — scorecard + failure root-causes (2026-06-11)
+
+Driven via a scripted MCP **stdio** client (`C:\Projects\mcp-probe\client.py`, NOT in repo) against `seeded-vault-mixed` (~94 messy+clean dogfood facts) + `seeded-vault-tiny` (6-fact consolidation demo). Antigravity quota was down so I acted as the MCP client directly (the structured contract the agent receives). **No production code changed.**
+
+| Aspect | Verdict | Evidence |
+|---|---|---|
+| Write / Read / Update / Delete | ✅ | CRUD round-trip: write→read→update(content replaced)→delete(gone) |
+| Search + recall-safety + `weak_match` | ✅ | never empty (even nonsense query → n=5, `weak_match=true`); `weak_match=false` only on real hits |
+| Access control — reject unauthorized | ✅ | write to `secret` → `{-32001, "access denied"}` |
+| Access control — accept authorized | ✅ | write to `testeval` → id returned |
+| Boundary isolation | ✅ | `testeval` marker visible w/ testeval authorized, invisible w/ personal-only (n=10) |
+| Encryption at rest — `vault.db` | ✅ | header = random bytes, not `SQLite format 3` (SQLCipher) |
+| Graph encryption — `graph.duckdb` | ❌/⚠️ | `DUCK` magic = PLAINTEXT (tech-debt #7) |
+| Merge / dedup | ✅ | tiny vault: 2 near-dup run-facts → 1, both originals superseded |
+| REPORT (structured knowledge state) | ✅ | `personal.report.json` 4 auto-named topics, dates captured |
+| Enrichment (Gap-2 recall lift) | ✅ | 1k MCP A/B (Porto ABSENT→1) + tiny-vault consolidate (4 enriched, 0 failed) |
+| Abstain — clear absence (cat) | ✅ | `abstain=true`, surfaces dog Biscuit, invents no cat |
+| Abstain — salary | ❌ | `abstain=false`, surfaces "$450 room booking" (conf 0.41) |
+| Abstain — blood type / OS | ⚠️ | `abstain=false` but top_rel ~0.01–0.02 (marginal) |
+| Wrong-neighbor precision | ⚠️ | distractor ranks #1: live→"mother in Lisbon", kids→"Marcus's kids", allergy→"Marcus's peanut" |
+| Contradiction **resolution** | ⚠️ | Tesla/Rivian both stay active (0 resolved, 0 queued) even with `as_of` set |
+| Decay / archive | ❌ | not built (T0.2.4) |
+
+**One-line root-cause per non-pass item:**
+- **Graph plaintext** — ADR-010's DuckDB encryption layer (scoped T0.2.0) never actually shipped; the store still opens plaintext (runtime still WARNs). Low risk only because the graph is empty in V0.2 (entity extraction unbuilt, tech-debt #2).
+- **Salary $-trap** — the reranker scores money-shaped facts ("$450 booking", "rent 1200") as relevant to "salary" and there is no per-candidate category/precision filter to veto a confident wrong-category match; the abstain gate is purely reranker-score-driven and the score cleared the no-signal floor.
+- **Blood/OS marginal abstain** — the no-signal floor (~0.01) sits just below where a couple of barely-related distractors score (0.011–0.019), so they squeak over and `abstain` stays false even though nothing relevant exists.
+- **Wrong-neighbor #1 ordering** — the reranker ranks a semantically-adjacent fact about *someone/something else* (the mother, Marcus, the dog) above the user's own fact; there is no subject/ownership signal distinguishing "about the user" from "about an associate."
+- **Contradiction not resolved** — NN-pair + Phi-4 judge did not flag Tesla vs Rivian as a contradiction (two cars can coexist / pair not surfaced), and `as_of` is write-time so there is no fact-time recency signal to force supersession; both remain active.
+- **Decay/archive** — simply not implemented yet (Phase 4 / T0.2.4 never started; `memories_archived` returns 0).
+
+**Verdict:** storage / retrieval / security / structural plumbing is **correct on messy data**; every gap is in the **precision/abstain** layer (read-precision arc, roadmap §5 item 1) or **temporal resolution** (`as_of`/A5) or **unbuilt nightly features** (decay/archive). Wave 3 (live Flash vs Pro on `seeded-vault-mixed`) is the remaining acceptance — does a real agent land the right answer from this structured output.
+
+## 13.1 · 🧪 Wave 3 — DONE (live Flash + Opus 4.6 in Antigravity, 2026-06-12)
+
+Live-agent run on `seeded-vault-mixed` (un-enriched). **Both models landed correct answers on essentially every trap** — the agent layer rescues a genuinely messy vault ranking. No code changed; CI stays green on `d613614`.
+
+- **Gemini Flash (weak):** 14/15 atomic clean + 1 expected temporal partial (car: listed Tesla+Rivian, didn't resolve). On a multi-intent *sentence* Flash **mashed all 4 intents into one query** (`"languages sports teams reading holiday"`, top_relevance 0.040) → McLaren + The Expanse **buried out of the result window** → answer complete but **partly papered over with lucky-correct guesses**.
+- **Claude Opus 4.6 (strong):** **decomposed** the same sentence into 4 focused `memory_search` calls → fully grounded, fully correct, both category traps held (Blade Runner out of "reading", Madrid framed as work not holiday), even synthesized accurate cross-links (Portuguese↔Porto, City↔Manchester from the wide recall pools).
+
+**Probe replay — vault-level ground truth (raw `memory_read`, natural-question GRADE_QUERIES, agent stripped away).** Only **2 of 10 traps are vault-clean** (cat→abstain=True@0.25; instrument→cello #1@0.98). The other 8 are messy at the source:
+- **Wrong-neighbour #1 at high confidence (0.88–0.99):** "where do you live" → **#1 = mother/Lisbon (0.99)**, Porto not even top-5; "have kids" → #1 = Marcus's kids (0.88), twins #3; "allergic" → #1 = Marcus's peanut (0.95), user's penicillin/shellfish #2/#3. The reranker confidently ranks an *associate's* fact above the user's own.
+- **Salary trap fires at vault level:** abstain=False, #1 = "$450 booking" (0.41). Flash/Opus both rescued by reasoning from self-describing content.
+- **Marginal abstain misses:** blood-type top 0.011, OS top 0.019 — both squeak over the `READ_NO_SIGNAL_FLOOR` 0.01, abstain stays False.
+- **Contradiction unresolved:** car → Tesla(0.997)+Rivian both active, no supersession (`as_of` is write-time).
+
+**Two findings (1 kept, 1 retracted):**
+1. **KEPT — reranker brittle on terse keyword queries.** Natural questions score 0.88–0.99; terse fragments collapse to noise (Opus's `"sports teams follow"` → top 0.0022, "supports manchester city" ranked **#8 below junk**). Two query-style failure modes both → noise: weak-agent *mash* (dilution, facts buried) + strong-agent *keyword-strip* (facts present, ranked below noise). Fix = steer agents to **decompose AND phrase as natural questions** (`instructions.md` follow-up, §4). Memory: [[project_reranker_brittle_on_terse_queries]].
+2. **RETRACTED — `search_hint.rs` weak_match is NOT buggy.** A mid-run hypothesis that `weak_match=false` on a noise-level separated top needed the ADR-073 no-signal floor was **falsified by a code read**: the separation-based (not magnitude) design is deliberate and documented (canonical example "cello 0.0469"), and `weak_match=false` is honest because matches genuinely exist in the pool. Do not change it.
+
+**Net:** outcomes are good on both model tiers, but the **vault's ranking is genuinely messy** — the agent rescue is a crutch (a model weaker than Flash would faceplant on salary/allergy). This is the strongest evidence yet for **roadmap §5 item 1 (read precision): a subject/ownership signal so "about the user" beats "about an associate" + a category veto for the salary-shape trap.** Recall-safety ([[project_memory_read_primary_search_recall_safe]]) is the hero that makes the messy ranking survivable. The Gap-2 enrichment lift was NOT exercised here (mixed vault un-enriched); optionally enrich it (surgical `enrich_one` loop) to also test Porto-in-soup.
+
+### 13.2 · Gap #4 (car/temporal) — ADR-075 fact-time SPIKED + REVERTED 2026-06-12; route to agent-steering, not vault resolution
+
+Attempted Arc B (gap #4): a consolidation-time Phi-4 **fact-time extractor** (Option B, vault-owned; new `phases/fact_time.rs` + `effective_fact_time` recency input + Phase-2b wiring) to break the write-time recency tie that leaves Tesla+Rivian both active. Scaffolded, compiled clean (0 warnings), and **gated on a real-Phi-4 end-to-end spike** (`real_phi4_car_resolution`) **before any commit**. Spike result (110s) — **the car does NOT cleanly auto-resolve, for two independent reasons:**
+1. **The conservative judge correctly refuses.** Real Phi-4 returned `contradiction=false` / `stale=[]` for "Drives a Tesla Model 3." + "Finally picked up my Rivian R1T last month." — owning two cars is genuinely possible; the judge only flags with an explicit replacement signal ("having sold the Tesla"), which the real content lacks. Making it more aggressive risks wrongly retiring coexisting facts (recall cardinal sin).
+2. **The date-less old fact inverts recency.** Phi-4 DID extract the Rivian's "last month" → 2026-05-11 correctly, but the Tesla (no date in its text) falls back to write-time (today) → it looks *newer* than the Rivian → recency would retire the **wrong** (Rivian) car. `effective_fact_time`'s write-time fallback is unreliable for mixed dated/undated pairs.
+
+**Decision (Shahbaz): reverted the scaffold; do NOT force vault-side car resolution.** This is the genuinely-ambiguous case the agent-decides lock ([[project_architectural_lock_llm_out_of_read_path]]) is *for* — both Flash & Opus presented both cars correctly above. **Re-route gap #4 to agent-steering** (the car steer, bundled with the gap-#7 terse-query steer — both landed this session as MCP tool-description edits, NOT an `instructions.md`: no such file exists; the tool descriptions are the cross-platform lever per [[project_mcp_descriptions_cross_platform_lever]]). Cheap, safe, no recall risk. The fact-time *extraction tech works* (Phi-4 nailed the relative date) — it's just the wrong lever for this case; the agent-settable `as_of` (2026-05-30 decision) remains the safe write-time path for explicit dates. Spiking caught this in 110s, before a build+commit+live-test cycle. Arc B code reverted (working tree back to CI-green `d613614` for the consolidator). Memory: [[project_as_of_write_time_blocks_a5_temporal]] (UPDATE 2026-06-12).
+
+### 13.3 · 🆕 Gap-table reclassification (2026-06-12, Shahbaz) — NO confirmed-broken output; #1/#2 are insurance, not must-fix
+
+**The reframe (Shahbaz caught the inconsistency):** Wave 3 showed the agent produces CORRECT OUTPUT on *every* tested trap — salary, allergy, wrong-neighbour, instrument, car. So the same logic that closed the car (#4 — "agent handles it, don't force a vault fix") applies to #1/#2/#3 too. They were over-stated as "must-fix." **By the founder thesis (correctness of OUTPUT is the product) there is NO confirmed-broken item in the gap table.** Distinction that survives: #4 (car) has *no single correct answer* (ambiguous → fixing is *wrong*); #1/#2 *have* a correct answer the vault mis-ranks (fixing is *safe* — reorder-only, no deletion — but *not urgent* since output is already correct).
+
+| # | Gap | Output correct today? | Status | Note |
+|---|---|---|---|---|
+| 1 | Wrong-neighbour #1 ranking | ✅ agent rescues | 🟡 **Insurance** | Build only if a correct fact gets truncated out of the agent's ~20-candidate view at scale, OR to harden Managed-mode (unknown weak agents). Measured at vault level §13.1. Roadmap §5.1. |
+| 2 | Salary $-trap | ✅ agent rescues | 🟡 **Insurance** | Same arc as #1. |
+| 3 | Blood/OS marginal abstain | ✅ agent handles | 🅿️ **Parked** | Tightening the floor risks killing real low-score answers; recall lock wins. |
+| 4 | Car / contradiction | ✅ agent shows both | ✅ **Decided — agent-steer** | Ambiguous; fact-time spiked + reverted (§13.2). Steer SHIPPED-pending-gates this session. |
+| 5 | `graph.duckdb` plaintext | n/a | 🟢 **Low-pri** | Fold into Pillar 3 (sync) security review; graph empty in V0.2. |
+| 6 | Decay / archive | n/a | 🟢 **Planned build** | Part of Pillar 2 (T0.2.4) — not separate work. |
+| 7 | Reranker brittle on terse queries | ✅ Opus decomposed | 🟠 **Steer SHIPPED-pending-gates** | MCP tool-description edits this session (staged uncommitted). |
+
+**Pillar reclassification:** Pillar 1 (read precision = #1/#2) **de-prioritised to insurance** — was "the #1 arc," downgraded today because output is already correct via the agent. Pillars 2 (consolidator auto-run — has the ~90-fact hardware wall), 3 (sync), 4 (beta/daily-use) unchanged. **Product call pending:** keep hardening (insurance) vs pivot to real daily dogfood (lean: dogfood-first, the core produces correct output and is ready to *use*).
+
+**Working-tree state at this close:** (a) `crates/vault-mcp/src/server.rs` — gap-#7 + car steer tool-description edits, **staged, NOT gated/committed** (Shahbaz: gates tomorrow bundled with more code). (b) `HANDOFF.md` — this update. (c) Consolidator Arc B fully reverted (matches `d613614`). (d) Out-of-repo: memory `project_as_of_write_time_blocks_a5_temporal` UPDATE + NEW `project_reranker_brittle_on_terse_queries` + MEMORY.md index line. CI still green on `d613614`; next commit must gate the server.rs change + CI-verify.
