@@ -2,7 +2,7 @@
 
 **Current version:** V0.2 Closed Beta (BRD §6.2 — sleep consolidator, boundaries hardening, cross-device sync, 30 beta users)
 
-**Last updated:** 2026-06-14 — **GRAPH-FILLING SHIPPED-pending-commit (ADR-078, closes tech-debt #2) · graph encryption DEFERRED (DuckDB can't securely write encrypted offline on any version) · DuckDB pin corrected `=1.10503.1`→`=1.4.4` LTS (the prior pin was DuckDB 1.5.3, off-LTS + fails the Windows CI compile — why `a1c0ff9` is RED) + a `rstrtmgr` linker fix.** All DoD gates green LOCALLY on a fresh `cargo clean` full-workspace rebuild (build `--all-targets` + workspace tests 0-fail + clippy `-D warnings` + fmt). The consolidator now extracts entities + relationships from each fact via the SAME Phi-4 enrichment call (no extra latency; live-probe-validated) and writes them boundary-scoped + idempotently into the graph. Full session detail + the new "deploy the worker" opener in §1. Prior CI green: `d613614`; `a1c0ff9` is CI-RED (DuckDB-1.5.3 Windows compile) — this commit's 1.4.4 move supersedes + should fix it. This HANDOFF rides with the graph-filling code commit.
+**Last updated:** 2026-06-14 (session 2) — **CI ROOT CAUSE FOUND + FIXED (ADR-079): the Windows red was NOT a DuckDB-version problem — the GHA `windows-2025` runner migrated to Visual Studio 2026 (MSVC 14.51) on 2026-06-08→06-15, which REMOVED `stdext::checked_array_iterator`; DuckDB's bundled fmt still references it → C2061.** Fix = a `/FI` forced-include shim (`.github/msvc_fmt_secure_scl_shim.h`) that undefs `_SECURE_SCL` so fmt uses its raw-pointer branch, wired into both Windows CI jobs via `CXXFLAGS_x86_64_pc_windows_msvc` (cc-rs only; llama/Vulkan build untouched). **Prior session's `=1.4.4` pin correction + graph-filling (ADR-078) were already committed as `d2b9b9b` and pushed — but its CI run `27484651556` was RED (same fmt/format.h compile), NOT the predicted green; the 1.4.4-fixes-CI claim was a misdiagnosis (1.4.4 AND 1.5.3 bundle the same ancient fmt — neither escapes the VS2026 break).** Last actually-green commit: `d613614` (2026-06-10, before the image migration). This CI fix is CI-only; per Shahbaz, committing+pushing without a local build (the failure is CI-image-specific and cannot be reproduced on the local older-MSVC machine — local builds stay green regardless). Graph-filling/encryption-deferred detail from session 1 retained in §1 below.
 
 > **How to read this file:** §1 is the only thing you must act on. §2–§5 are current ground truth (incl. the post-scale roadmap in §5). §6 onward is reference you pull from when planning. Deep detail (full ADR text, session-by-session history, tuning evidence) lives in the three archives — cross-linked by ADR number. **Do not paraphrase archived ADRs — quote them.**
 
@@ -22,7 +22,7 @@
 >
 > ### 🔚 NEXT SESSION OPENER — DEPLOY THE WORKER (Pillar 2)
 >
-> **STEP 0 — confirm THIS commit went CI-green** (`gh run list --workflow=ci.yml -L 1`); cold DuckDB-1.4.4 build. If the Windows compile still fails, it's the bundled-DuckDB story — fix-forward.
+> **STEP 0 — confirm the ADR-079 CI fix went GREEN** (`gh run list --workflow=ci.yml -L 1`). This is the FIRST thing to verify: `main` was RED for two commits (`a1c0ff9`, `d2b9b9b`) because the GHA `windows-2025` image migrated to VS 2026 (removed `stdext::checked_array_iterator`; ADR-079 §8.11). The fix is a `/FI` `_SECURE_SCL`-undef shim. **If the Windows leg is STILL red on the same `fmt/format.h` C2061:** the `<yvals.h>`-defines-`_SECURE_SCL` assumption was wrong — escalate to the heavier shim (include `<vector>` instead of `<yvals.h>`, or hand-provide the type gated on `_MSC_VER`). Do NOT start the worker task on a red `main`.
 >
 > **THE TASK — make the nightly consolidator run on its own AND actually finish.** Two halves (BRD §5.6 / roadmap §5 Pillar 2):
 > - **Scheduling (T0.2.6):** `Consolidator::schedule()` is still `todo!()` (`consolidator.rs` ~line 940) and nothing calls it at app startup (`vault-app::Application::start_with_mcp`). Wire a daily run-at-`run_at` trigger that calls `run_consolidation_with_safety` (already built: 30-min timeout + cross-process lockfile + tracing span — it runs `run_consolidation` → `enrich_facts` (now also graph-fills) → `generate_reports`).
@@ -265,6 +265,9 @@ Full narrative for each in PART2 archive ("Tech debt — open items"). File poin
 5. **Cosine NaN-vector lance upstream issue (LOW — community citizenship).** lance 4.0 filters NaN-distance rows from Cosine search (zero-magnitude vectors). Production unaffected (BGE vectors are L2-normalised, never zero). File a minimal-repro issue against `lancedb/lance`. File: `vector_store.rs:1248-1263`.
 6. **🟡 Min-fix LANDED 2026-06-13 (`--test-threads=1` added to `ci.yml:702`); verify on the next Monday cron. Deeper unique-`.partial` fix still open (LOW).** Weekly real-model smoke red since 2026-05-18 — concurrent-download race (CI-infra, NOT a code regression). The `real-model-smoke` weekly cron job (`ci.yml:702`, `cargo test -p vault-llm -- --ignored`) has failed every Monday across 4 unrelated commits (`4ae8dbd`/`93d1410`/`2302842`/`a3e426b`). Root cause (source-confirmed): all 3 smoke tests run concurrently (no `--test-threads=1`) and `model_loader.rs::download_with_verify` writes to a **single shared** `.partial` path (`model_loader.rs:131`) then renames to final (`:156`); the winner's rename leaves the losers' rename hitting a vanished `.partial` → `Io NotFound code 2`. The test's own doc (`phi4_mini_smoke.rs:47-48`) assumes serial execution. **Min fix (CI-only):** add `--test-threads=1` to `ci.yml:702` — verifiable only via next Monday cron or a `run-llm-smoke`-labelled PR. **Deeper latent bug (LOW, prod single-writer + pre-download mitigates):** the shared `.partial` path means two cold-starting agent processes could corrupt each other's download — make `.partial` unique per download + treat "final already present after our stream" as success. Matters because this job is the ONLY CI coverage of the real Phi-4 consolidator path (dark for a month); re-light before leaning on the consolidator (roadmap §5 item 2). Files: `ci.yml:702`, `model_loader.rs:95-160`.
 
+7. **`graph.duckdb` plaintext + native-encryption dead-end (LOW — graph empty in V0.2).** DuckDB native encryption can't write an encrypted DB offline on any bundled version (mbedtls is read-only; secure write needs the network `httpfs`/OpenSSL extension). Real path: bundle the httpfs/OpenSSL helper INSIDE the app and `LOAD` it from a local file. Fold into the Pillar-3 sync security review or whenever the graph first holds shippable data. (ADR-078 §8.10.)
+8. **Remove the VS2026 `_SECURE_SCL` `/FI` shim (LOW — CI-infra workaround).** `.github/msvc_fmt_secure_scl_shim.h` + the two Windows CI steps + `CXXFLAGS_x86_64_pc_windows_msvc` exist only because DuckDB's bundled fmt references the removed `stdext::checked_array_iterator` (ADR-079 §8.11). Delete once `libduckdb-sys` vendors a newer fmt (or drops the `stdext` usage). Files: `.github/msvc_fmt_secure_scl_shim.h`, `.github/workflows/ci.yml` (clippy + build jobs).
+
 Also tracked as SHIPPED-design-record in PART2 archive: `bulk_upsert` promotion to the `VectorStore` trait (730× faster bulk insert, shipped `c091281`).
 
 ---
@@ -400,11 +403,35 @@ Also tracked as SHIPPED-design-record in PART2 archive: `bulk_upsert` promotion 
 
 ---
 
+## 8.11 · 🆕 ADR-079 (IN FLIGHT) — Windows CI fix: VS2026 removed `stdext::checked_array_iterator` (bundled-DuckDB fmt break)
+
+**Status:** committing now; CI-only change, NOT locally testable (see below). Restores `main` to green after two consecutive RED commits (`a1c0ff9`, `d2b9b9b`). Corrects the ADR-078/§1 misdiagnosis that the DuckDB pin caused the Windows red.
+
+**Root cause (proven from CI run `27484651556` logs + cross-checked upstream).** GitHub's `windows-2025` runner image migrated to **Visual Studio 2026 (MSVC 14.51.36231)** during the 2026-06-08→06-15 rollout (the build log path is `Microsoft Visual Studio\18\Enterprise`). VS 2026 **removed** `stdext::checked_array_iterator` from the MSVC STL headers entirely (a long-deprecated non-Standard extension; confirmed removed, not merely deprecated — see o3de/o3de#19754: *"these functions literally do not exist anymore"*). DuckDB's bundled `fmt` (~v5.x, vendored in `libduckdb-sys`) still references it under a bare `#ifdef _SECURE_SCL`; VS 2026 **still defines** `_SECURE_SCL`, so the bundled C++ build takes that branch and fails:
+
+```text
+fmt/format.h(326): error C2061: syntax error: identifier 'checked_array_iterator'
+```
+
+This is independent of DuckDB version — `1.4.4` AND `1.5.3` bundle the same ancient fmt, so neither the `=1.10503.1→=1.4.4` correction nor any crate bump escapes it. The last green commit (`d613614`, 2026-06-10) predates the image migration; nothing in our code regressed. `_SILENCE_STDEXT_ARR_ITERS_DEPRECATION_WARNING` does NOT help (the type is gone, not deprecated; and the build already uses `-W0`).
+
+**Decision.** A forced-include (`/FI`) shim header (`.github/msvc_fmt_secure_scl_shim.h`) `#include`s `<yvals.h>` (which sets `_SECURE_SCL` and has an include guard) then `#undef _SECURE_SCL`; later STL includes are guard-no-ops, so the macro stays undefined and fmt falls back to its raw-pointer `checked_ptr = T*` branch — the exact path Linux/macOS already compile (known-good; DuckDB builds clean there). Wired into BOTH Windows CI jobs (clippy + build/test) via `CXXFLAGS_x86_64_pc_windows_msvc`, which **cc-rs (libduckdb-sys) reads but CMake (llama-cpp-sys-2's Vulkan build) does not** — so the llama/Vulkan build, the reason we are on `windows-2025` at all, is untouched.
+
+**Not chosen:** (a) the silence macro (type removed, not deprecated); (b) a DuckDB crate bump (same bundled fmt across versions); (c) reverting to `windows-2022` (re-breaks the llama `vulkan-shaders-gen` C1083 build — the documented reason for `windows-2025`); (d) pinning an older MSVC v143 toolset (re-introduces toolset/CMake interaction risk, larger blast radius); (e) hand-writing a `checked_array_iterator` replacement (error-prone vs. just disabling the dead branch).
+
+**Local-test relaxation (per Shahbaz, 2026-06-14 session 2).** The failure is specific to the CI runner's VS 2026 image and **cannot be reproduced on the founder's local machine** (older MSVC that still ships the type — local builds were green throughout). So local DoD gates verify nothing here; CI is the only meaningful verification. Committed + pushed without a local build run by explicit founder direction; CI-green is the gate. **Risk if wrong:** the `<yvals.h>`-defines-`_SECURE_SCL` assumption is the one empirical link not provable locally — if a different header defines it, CI fails the same way and we iterate.
+
+**Security:** none — build-time compiler flag only, no runtime/crypto/boundary surface.
+
+**Tech debt:** remove the shim + CI step once `libduckdb-sys` vendors a newer fmt (or drops the `stdext` usage). Tracked as tech-debt #8.
+
+---
+
 ## 9 · 📇 ADR index
 
 Full text of every ADR lives in an archive — cross-link by number, **quote don't paraphrase** ([[feedback_quote_locked_artefacts_dont_paraphrase]]).
 
-**In-flight (full text in HANDOFF, not yet archived):** **ADR-078** (graph-filling: entity + relationship extraction at consolidation, §8.10 — closes tech-debt #2; corrects ADR-077 to DuckDB 1.4.4 + defers encryption) · **ADR-077** (DuckDB dep upgrade — corrected to `=1.4.4` LTS, §8.9) · **ADR-076** (sync ship-gate `pending_sync` payload, §8.8) · **ADR-075** (Phase 4 confidence decay, §8.7) · **ADR-074** (document-side alias enrichment at consolidation, §8.6) · **ADR-073** (recall-safe `memory_read`, §8.5 — SHIPPED `a3e426b`).
+**In-flight (full text in HANDOFF, not yet archived):** **ADR-079** (Windows CI fix: VS2026 removed `stdext::checked_array_iterator` → `/FI` `_SECURE_SCL`-undef shim for bundled-DuckDB fmt, §8.11 — corrects the ADR-078/§1 "1.4.4 fixes CI" misdiagnosis) · **ADR-078** (graph-filling: entity + relationship extraction at consolidation, §8.10 — closes tech-debt #2; corrects ADR-077 to DuckDB 1.4.4 + defers encryption) · **ADR-077** (DuckDB dep upgrade — corrected to `=1.4.4` LTS, §8.9) · **ADR-076** (sync ship-gate `pending_sync` payload, §8.8) · **ADR-075** (Phase 4 confidence decay, §8.7) · **ADR-074** (document-side alias enrichment at consolidation, §8.6) · **ADR-073** (recall-safe `memory_read`, §8.5 — SHIPPED `a3e426b`).
 
 **Most relevant to current/next work (full text in `HANDOFF_V0.2_PART2_ARCHIVE.md`):**
 | ADR | Title | Status |

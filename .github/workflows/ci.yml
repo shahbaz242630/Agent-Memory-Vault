@@ -274,6 +274,21 @@ jobs:
       # bundle.macOS.resources / bundle.linux.resources via Tauri 2's per-
       # bundler syntax, eliminating the need for these cross-platform
       # placeholder hacks. (T0.1.11 Phase 5d fix-forward, 2026-05-06.)
+      - if: runner.os == 'Windows'
+        name: Work around VS2026 fmt/_SECURE_SCL break in bundled DuckDB (Windows)
+        shell: pwsh
+        # GHA windows-2025 migrated to Visual Studio 2026 (MSVC 14.51) in the
+        # 2026-06-08→06-15 image rollout. VS 2026 removed
+        # stdext::checked_array_iterator (still referenced by DuckDB's bundled
+        # ~v5.x fmt under `#ifdef _SECURE_SCL`) -> libduckdb-sys C++ build fails
+        # with C2061. A forced-include (/FI) header undefs _SECURE_SCL after the
+        # STL core header sets it, so fmt uses its raw-pointer branch (the same
+        # one Linux/macOS already compile). Target-suffixed CXXFLAGS_* is read by
+        # cc-rs (libduckdb-sys) ONLY, not by llama-cpp-sys-2's CMake build, so the
+        # Vulkan build is untouched. See .github/msvc_fmt_secure_scl_shim.h.
+        run: |
+          $shim = "$env:GITHUB_WORKSPACE\.github\msvc_fmt_secure_scl_shim.h"
+          Add-Content $env:GITHUB_ENV "CXXFLAGS_x86_64_pc_windows_msvc=/FI$shim"
       - name: Create test-fixture placeholders for tauri-build resource validation
         shell: bash
         run: |
@@ -576,6 +591,18 @@ jobs:
         name: Lower cargo build parallelism on Windows (peak-memory ceiling fix)
         shell: bash
         run: echo "CARGO_BUILD_JOBS=2" >> "$GITHUB_ENV"
+      - if: runner.os == 'Windows'
+        name: Work around VS2026 fmt/_SECURE_SCL break in bundled DuckDB (Windows)
+        shell: pwsh
+        # See the matching step in the clippy job + .github/msvc_fmt_secure_scl_shim.h.
+        # VS 2026 (MSVC 14.51, GHA windows-2025 2026-06 rollout) removed
+        # stdext::checked_array_iterator; DuckDB's bundled fmt still references it
+        # under `#ifdef _SECURE_SCL`. The /FI shim undefs _SECURE_SCL so fmt uses
+        # its raw-pointer branch. Target-suffixed CXXFLAGS_* hits cc-rs
+        # (libduckdb-sys) only, not llama-cpp-sys-2's CMake/Vulkan build.
+        run: |
+          $shim = "$env:GITHUB_WORKSPACE\.github\msvc_fmt_secure_scl_shim.h"
+          Add-Content $env:GITHUB_ENV "CXXFLAGS_x86_64_pc_windows_msvc=/FI$shim"
       - run: cargo build --workspace --all-targets
       - run: cargo test --workspace
 
