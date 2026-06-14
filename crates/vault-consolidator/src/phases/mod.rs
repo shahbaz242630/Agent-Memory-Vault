@@ -30,4 +30,5 @@ pub mod contradiction;
 pub mod decay;
 pub mod dedup;
 pub mod enrich;
+pub mod extract;
 pub mod merge;

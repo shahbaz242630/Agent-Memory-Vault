@@ -90,7 +90,18 @@ lance-core = "=4.0.0"
 object_store = "=0.12.5"
 bytes = "=1.11.1"
 url = "=2.5.8"
-duckdb = { version = "=1.10503.1", features = ["bundled"] }
+# DuckDB 1.4.4 LTS (the crate's pre-`1.105xx` simple scheme bundles libduckdb
+# 1.4.x). Corrects ADR-077, which pinned `=1.10503.1` believing it was "1.4
+# LTS" — that version is actually DuckDB 1.5.3, whose bundled C++ fails to
+# compile on the Windows CI runner (fmt/format.h) and is off the supported LTS
+# line. Native at-rest encryption (ADR-077's original goal) is deferred: NO
+# bundled DuckDB version can securely write an encrypted DB offline (the
+# built-in mbedtls crypto module is read-only; a secure write needs the
+# network-fetched httpfs/OpenSSL extension, which breaks our offline /
+# zero-knowledge posture — proven by spike on both 1.4.4 and 1.5.3). We sit on
+# the clean LTS until the graph holds real data and we bundle the helper
+# locally. The `rstrtmgr` link fix lives in crates/vault-storage/build.rs.
+duckdb = { version = "=1.4.4", features = ["bundled"] }
 # rusqlite uses bundled-sqlcipher-vendored-openssl instead of bundled-sqlcipher
 # (deviation from BRD §4.2 — see HANDOFF.md ADR-006). Vendoring OpenSSL avoids
 # requiring a system OpenSSL install on Windows/Mac/Linux dev machines.

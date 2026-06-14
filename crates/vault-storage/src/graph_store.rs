@@ -104,6 +104,24 @@ pub trait GraphStore: Send + Sync {
     /// Validates `entity` at the API boundary (BRD §11.7.1).
     async fn create_entity(&self, entity: &Entity) -> VaultResult<()>;
 
+    /// Look up an entity by its unique `(name, entity_type, boundary)` key.
+    /// Returns `Ok(None)` when no such entity exists.
+    ///
+    /// Used by the consolidator's extraction pass to **get-or-create**
+    /// entities: a `None` means "safe to create"; a `Some` returns the
+    /// existing [`EntityId`] so an extracted relationship can reference it
+    /// without a duplicate insert (the `(name, entity_type, boundary)` UNIQUE
+    /// constraint would otherwise reject the second insert on a nightly
+    /// re-run). Scoping mirrors [`create_entity`]: the same name with a
+    /// different `entity_type` or in a different `boundary` is a different
+    /// entity (ADR-015).
+    async fn get_entity(
+        &self,
+        name: &str,
+        entity_type: &EntityType,
+        boundary: &Boundary,
+    ) -> VaultResult<Option<Entity>>;
+
     /// Insert a relationship.
     ///
     /// Returns [`VaultError::AccessDenied`] (with a CRR-violation message)
@@ -401,6 +419,43 @@ impl GraphStore for DuckDbGraphStore {
 
             tx.commit()
                 .map_err(|e| VaultError::Storage(format!("commit: {e}")))
+        })
+        .await
+        .map_err(|e| VaultError::Storage(format!("spawn_blocking join: {e}")))?
+    }
+
+    #[instrument(skip(self, entity_type), fields(boundary = boundary.as_str()))]
+    async fn get_entity(
+        &self,
+        name: &str,
+        entity_type: &EntityType,
+        boundary: &Boundary,
+    ) -> VaultResult<Option<Entity>> {
+        let name = name.to_string();
+        let entity_type = entity_type.clone();
+        let boundary = boundary.clone();
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = inner.lock()?;
+            let entity_type_json = entity_type_to_text(&entity_type)?;
+            let raw = conn
+                .query_row(
+                    "SELECT id, name, entity_type, boundary, created_at FROM entities \
+                     WHERE name = ? AND entity_type = ? AND boundary = ?",
+                    params![&name, &entity_type_json, boundary.as_str()],
+                    |row| {
+                        Ok(RawEntity {
+                            id: row.get(0)?,
+                            name: row.get(1)?,
+                            entity_type: row.get(2)?,
+                            boundary: row.get(3)?,
+                            created_at: row.get(4)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(|e| VaultError::Storage(format!("get_entity: {e}")))?;
+            raw.map(RawEntity::try_into_entity).transpose()
         })
         .await
         .map_err(|e| VaultError::Storage(format!("spawn_blocking join: {e}")))?
@@ -1065,6 +1120,94 @@ mod tests {
         store.create_entity(&work_sara).await.unwrap();
         store.create_entity(&personal_sara).await.unwrap();
         // Both rows landed; both are reachable via their respective boundaries.
+    }
+
+    // -------- get_entity (get-or-create primitive) --------
+
+    #[tokio::test]
+    async fn get_entity_returns_none_for_absent() {
+        let (_dir, store) = open_tmp().await;
+        let got = store
+            .get_entity("Nobody", &EntityType::Person, &b("work"))
+            .await
+            .unwrap();
+        assert!(got.is_none(), "absent entity must return None, not error");
+    }
+
+    #[tokio::test]
+    async fn get_entity_finds_created_entity_with_full_fidelity() {
+        let (_dir, store) = open_tmp().await;
+        let e = ent("Acme Corp", EntityType::Organization, "work");
+        store.create_entity(&e).await.unwrap();
+
+        let got = store
+            .get_entity("Acme Corp", &EntityType::Organization, &b("work"))
+            .await
+            .unwrap()
+            .expect("entity should be found");
+        // Same id back (the whole point — relationships reference this id).
+        assert_eq!(got.id, e.id);
+        assert_eq!(got.name, "Acme Corp");
+        assert_eq!(got.entity_type, EntityType::Organization);
+        assert_eq!(got.boundary.as_str(), "work");
+    }
+
+    #[tokio::test]
+    async fn get_entity_is_scoped_by_type_and_boundary() {
+        let (_dir, store) = open_tmp().await;
+        store
+            .create_entity(&ent("Sara", EntityType::Person, "work"))
+            .await
+            .unwrap();
+
+        // Same name, different TYPE → not found.
+        assert!(store
+            .get_entity("Sara", &EntityType::Concept, &b("work"))
+            .await
+            .unwrap()
+            .is_none());
+        // Same name+type, different BOUNDARY → not found (ADR-015 scoping).
+        assert!(store
+            .get_entity("Sara", &EntityType::Person, &b("personal"))
+            .await
+            .unwrap()
+            .is_none());
+        // Exact unique key → found.
+        assert!(store
+            .get_entity("Sara", &EntityType::Person, &b("work"))
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn get_entity_enables_get_or_create_without_duplicates() {
+        // The exact idempotency the extraction pass relies on: probe first;
+        // create only when absent; on the next run the same id comes back so
+        // a relationship reuses it instead of a rejected duplicate insert.
+        let (_dir, store) = open_tmp().await;
+        let key = ("Porto", EntityType::Location, "personal");
+
+        assert!(
+            store
+                .get_entity(key.0, &key.1, &b(key.2))
+                .await
+                .unwrap()
+                .is_none(),
+            "first run: absent → caller creates"
+        );
+        let created = ent(key.0, key.1.clone(), key.2);
+        store.create_entity(&created).await.unwrap();
+
+        let found = store
+            .get_entity(key.0, &key.1, &b(key.2))
+            .await
+            .unwrap()
+            .expect("second run: present");
+        assert_eq!(
+            found.id, created.id,
+            "get-or-create must reuse the existing id, never mint a new one"
+        );
     }
 
     // -------- create_relationship --------

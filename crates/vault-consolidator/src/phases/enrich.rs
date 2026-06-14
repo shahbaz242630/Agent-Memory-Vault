@@ -51,30 +51,62 @@ use vault_core::{Memory, VaultError, VaultResult};
 use vault_embedding::EmbeddingProvider;
 use vault_llm::{CompletionParams, LlmProvider};
 
+use super::extract::{self, ExtractedGraph};
+
 /// Metadata key the enrichment object is stored under on [`Memory::metadata`].
 pub(crate) const ENRICHMENT_METADATA_KEY: &str = "enrichment";
 
-/// JSON schema the alias-generation LLM call is constrained to emit. GBNF-
-/// compiled in `Phi4MiniProvider`; ignored by `MockLlmProvider`. 5–8 aliases
-/// keeps the embedded line short enough not to dilute the original content's
-/// signal while covering the obvious synonym / category / type vocabulary.
-const ALIAS_SCHEMA: &str = r#"{"type":"object","properties":{"aliases":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":8}},"required":["aliases"],"additionalProperties":false}"#;
+/// JSON schema the combined enrichment call is constrained to emit. ONE call
+/// returns all three products: `aliases` (the ADR-074 vocabulary boost) plus
+/// `entities` + `relationships` (graph-filling, tech-debt #2). Combining them
+/// keeps the per-fact LLM cost at a single call — no second pass, no worse
+/// consolidator latency. GBNF-compiled in `Phi4MiniProvider`; ignored by
+/// `MockLlmProvider`. The entity `type` enum mirrors `vault_core::EntityType`'s
+/// snake_case names.
+const ENRICHMENT_SCHEMA: &str = r#"{"type":"object","properties":{"aliases":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":8},"entities":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"type":{"type":"string","enum":["person","organization","project","location","concept"]}},"required":["name","type"],"additionalProperties":false},"maxItems":8},"relationships":{"type":"array","items":{"type":"object","properties":{"from":{"type":"string"},"relation":{"type":"string"},"to":{"type":"string"}},"required":["from","relation","to"],"additionalProperties":false},"maxItems":8}},"required":["aliases","entities","relationships"],"additionalProperties":false}"#;
 
-/// System prompt for the alias-generation call. Mirrors the JSON-only framing
-/// `topics::label_one_cluster` uses for the Phi-4 cluster-naming call.
-const ALIAS_SYSTEM_PROMPT: &str =
-    "You expand a single memory with alternative search keywords. Respond with strict JSON only.";
+/// System prompt for the combined enrichment call. Mirrors the JSON-only
+/// framing `topics::label_one_cluster` uses for the Phi-4 cluster-naming call.
+const ENRICHMENT_SYSTEM_PROMPT: &str =
+    "You analyse a single memory about the user. Respond with strict JSON only.";
 
-/// Output-token budget for the alias call. 5–8 short keywords as a JSON array
-/// fits comfortably; the cluster-naming call uses 32 for a single label, so 64
-/// covers a small array with margin.
-const ALIAS_MAX_TOKENS: u32 = 64;
+/// Output-token budget for the combined call. Three small arrays fit in 384;
+/// verified live (the combined-extraction probe) with no truncation across
+/// entity-rich facts.
+const ENRICHMENT_MAX_TOKENS: u32 = 384;
 
-/// Stable seed so alias generation is deterministic across runs for the same
-/// content (mirrors `topics.rs`'s label-determinism seed). Idempotency already
-/// skips re-enrichment via the fingerprint; the seed keeps a forced re-embed
-/// (changed content) reproducible.
-const ALIAS_SEED: u32 = 0x0A11_A5E5;
+/// Stable seed so enrichment is deterministic across runs for the same content
+/// (mirrors `topics.rs`'s label-determinism seed). Idempotency already skips
+/// re-enrichment via the fingerprint; the seed keeps a forced re-embed (changed
+/// content) reproducible.
+const ENRICHMENT_SEED: u32 = 0x0A11_A5E5;
+
+/// Build the combined enrichment prompt for one memory. Tuned live (the
+/// combined-extraction probe): the SINGLE-WORD keyword wording is carried over
+/// verbatim from the alias-only call so search recall does not regress, and the
+/// entity-type guidance keeps products / vehicles / instruments as `concept`.
+fn enrichment_prompt(content: &str) -> String {
+    format!(
+        "A memory about the user is below. Return strict JSON with exactly three fields.\n\
+         1. \"aliases\": 5 to 8 SINGLE-WORD search keywords a person might type to find \
+         this fact. Cover the general CATEGORY and the TYPE of thing it is about, using \
+         common generic words — e.g. for a job: work, career, employer, occupation; for a \
+         pet: animal, pet, companion. Prefer generic single words over repeating specific \
+         names already in the text. Lowercase.\n\
+         2. \"entities\": the distinct people, organizations, places, projects, or concepts \
+         named. Each has a \"name\" and a \"type\". Types: person; organization (a company \
+         or institution like a hospital or employer); location (a place); project; concept \
+         (anything else — a product, vehicle, instrument, skill, subject, or medical \
+         condition). A car, a cello, or a school subject is a concept, NOT an organization. \
+         ALWAYS include \"the user\" as a person. List every name you use in a relationship.\n\
+         3. \"relationships\": how the entities connect. Each is {{\"from\":..., \
+         \"relation\":..., \"to\":...}} where BOTH \"from\" and \"to\" are names from your \
+         entities list, and \"relation\" is a short snake_case verb (works_at, lives_in, \
+         sibling_of, owns, drives, learning, allergic_to). Capture the user's most \
+         important link (e.g. the user to their employer).\n\n\
+         Memory: {content}"
+    )
+}
 
 /// One fact ready to be written back by the orchestrator: the cloned [`Memory`]
 /// with its `metadata.enrichment` set, plus the embedding of the composed
@@ -90,6 +122,13 @@ const ALIAS_SEED: u32 = 0x0A11_A5E5;
 pub struct EnrichedFact {
     pub memory: Memory,
     pub embedding: Vec<f32>,
+    /// The knowledge graph this fact implies (entities + relationships),
+    /// extracted by the SAME combined LLM call that produced the aliases. The
+    /// orchestrator writes it via [`super::extract::write_extracted_to_graph`]
+    /// AFTER persisting the vector. Empty when the model found nothing to
+    /// extract — best-effort, never blocks the (recall-critical) vector
+    /// enrichment.
+    pub graph: ExtractedGraph,
 }
 
 /// Compose the text that gets *embedded* for an enriched fact: the original
@@ -144,45 +183,18 @@ fn set_enrichment_metadata(metadata: &mut Value, aliases: &str, content_fp: &str
     }
 }
 
-/// Ask the LLM for 5–8 alternative search keywords for one fact. Mirrors
-/// `topics::label_one_cluster`'s single-call shape (temp 0, fixed seed, tiny
-/// schema). Keywords are normalised to trimmed lowercase and de-blanked.
-///
-/// # Errors
-///
-/// - [`VaultError::Llm`] if the LLM call fails, the response is not valid JSON,
-///   or it yields no usable aliases. The caller treats this as a skip-and-retry
-///   (the fact is left un-enriched and re-attempted next cycle), never a run
-///   abort.
-async fn generate_aliases(content: &str, llm: &dyn LlmProvider) -> VaultResult<Vec<String>> {
-    let prompt = format!(
-        "A memory about the user is below. List 5 to 8 SINGLE-WORD search keywords a \
-         person might type to find this fact. Cover the general CATEGORY and the TYPE \
-         of thing it is about, using common generic words — e.g. for a fact about \
-         someone's job: work, career, employer, occupation; for a fact about a pet: \
-         animal, pet, companion. Prefer generic single words over repeating specific \
-         names already in the text. Lowercase. Respond with JSON: \
-         {{\"aliases\": [\"...\", \"...\"]}}.\n\nMemory: {content}"
-    );
-    let params = CompletionParams {
-        max_tokens: ALIAS_MAX_TOKENS,
-        temperature: 0.0,
-        top_p: 1.0,
-        seed: Some(ALIAS_SEED),
-        system_prompt: Some(ALIAS_SYSTEM_PROMPT.to_string()),
-    };
-    let raw = llm
-        .complete_json(&prompt, ALIAS_SCHEMA, &params)
-        .await
-        .map_err(|e| VaultError::Llm(format!("alias generation call: {e}")))?;
+/// The two products of one combined enrichment call: the search-alias list
+/// (recall boost) and the extracted knowledge graph (graph-filling).
+struct Enrichment {
+    aliases: Vec<String>,
+    graph: ExtractedGraph,
+}
 
-    let parsed: Value = serde_json::from_str(&raw).map_err(|e| {
-        warn!(raw_response = %raw, "alias generation returned malformed JSON");
-        VaultError::Llm(format!(
-            "alias generation response failed to parse: {e} (raw: {raw})"
-        ))
-    })?;
-    let aliases: Vec<String> = parsed
+/// Parse + normalise the alias array from the combined response: trimmed,
+/// lowercased, de-blanked. Factored out so the alias-quality contract stays
+/// independent of the entity/relationship parse ([`super::extract`]).
+fn parse_aliases(parsed: &Value) -> Vec<String> {
+    parsed
         .get("aliases")
         .and_then(Value::as_array)
         .map(|arr| {
@@ -192,13 +204,47 @@ async fn generate_aliases(content: &str, llm: &dyn LlmProvider) -> VaultResult<V
                 .filter(|s| !s.is_empty())
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+/// One combined Phi-4 call per fact → aliases + extracted graph. Mirrors
+/// `topics::label_one_cluster`'s single-call shape (temp 0, fixed seed).
+///
+/// # Errors
+///
+/// [`VaultError::Llm`] if the call fails, the response is not valid JSON, or it
+/// yields NO usable aliases. Aliases are the recall-critical product, so an
+/// empty alias list is a failed enrichment (skip-and-retry next cycle, never a
+/// run abort). The extracted graph is best-effort: a fact with good aliases but
+/// nothing extractable returns an empty [`ExtractedGraph`], not an error.
+async fn generate_enrichment(content: &str, llm: &dyn LlmProvider) -> VaultResult<Enrichment> {
+    let params = CompletionParams {
+        max_tokens: ENRICHMENT_MAX_TOKENS,
+        temperature: 0.0,
+        top_p: 1.0,
+        seed: Some(ENRICHMENT_SEED),
+        system_prompt: Some(ENRICHMENT_SYSTEM_PROMPT.to_string()),
+    };
+    let raw = llm
+        .complete_json(&enrichment_prompt(content), ENRICHMENT_SCHEMA, &params)
+        .await
+        .map_err(|e| VaultError::Llm(format!("enrichment call: {e}")))?;
+
+    let parsed: Value = serde_json::from_str(&raw).map_err(|e| {
+        warn!(raw_response = %raw, "enrichment returned malformed JSON");
+        VaultError::Llm(format!(
+            "enrichment response failed to parse: {e} (raw: {raw})"
+        ))
+    })?;
+
+    let aliases = parse_aliases(&parsed);
     if aliases.is_empty() {
         return Err(VaultError::Llm(
-            "alias generation returned no usable aliases".into(),
+            "enrichment returned no usable aliases".into(),
         ));
     }
-    Ok(aliases)
+    let graph = extract::parse_extracted(&parsed);
+    Ok(Enrichment { aliases, graph })
 }
 
 /// Enrich one fact, or decide it needs no work.
@@ -225,7 +271,7 @@ pub async fn enrich_one(
     if is_enriched_for_current_content(memory) {
         return Ok(None);
     }
-    let aliases = generate_aliases(&memory.content, llm).await?;
+    let Enrichment { aliases, graph } = generate_enrichment(&memory.content, llm).await?;
     let alias_line = aliases.join(", ");
     let embed_text = compose_embed_text(&memory.content, &alias_line);
     let embedding = embeddings.embed(&embed_text).await?;
@@ -236,6 +282,7 @@ pub async fn enrich_one(
     Ok(Some(EnrichedFact {
         memory: enriched,
         embedding,
+        graph,
     }))
 }
 
@@ -557,17 +604,108 @@ mod tests {
         ];
         println!("\n================ REAL Phi-4 aliases ================");
         for fact in facts {
-            match generate_aliases(fact, &provider).await {
-                Ok(aliases) => {
+            match generate_enrichment(fact, &provider).await {
+                Ok(enr) => {
                     println!("  FACT: {fact}");
                     println!(
                         "    -> embed text: {}",
-                        compose_embed_text(fact, &aliases.join(", "))
+                        compose_embed_text(fact, &enr.aliases.join(", "))
                     );
                 }
                 Err(e) => println!("  FACT: {fact}\n    -> ERROR: {e}"),
             }
         }
         println!("====================================================\n");
+    }
+
+    // ─── SPIKE: combined extraction quality (graph-filling feature) ──────────
+    //
+    // Question this answers BEFORE we wire any production code: can Phi-4-mini,
+    // in ONE call, produce good aliases AND extract entities (people / places /
+    // things) AND their relationships? If yes, the graph fills "for free" on
+    // top of the alias call we already make per fact (no second per-fact LLM
+    // pass → no worse latency wall). If the small model degrades when juggling
+    // all three, we fall back to a separate extraction call or a local NER.
+    //
+    // This prints the RAW Phi-4 JSON for a human to judge: are the entities
+    // real + typed correctly, are the relationships sensible, and did the
+    // aliases stay as good as the alias-only probe above?
+    //
+    // Ignored (needs the real GGUF). Run:
+    //   $env:PHI4_MODEL_DIR='C:\Users\shahb\AppData\Roaming\com.shahbaz242630.memory-vault\models'
+    //   cargo test -p vault-consolidator --lib real_phi4_combined_extraction_quality -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "loads the real Phi-4 GGUF; set PHI4_MODEL_DIR; run with --ignored --nocapture"]
+    async fn real_phi4_combined_extraction_quality() {
+        use vault_llm::{Phi4MiniConfig, Phi4MiniProvider};
+
+        // Draft combined schema: aliases (as today) + entities (name + typed by
+        // the EntityType enum) + relationships (from -> relation -> to). The
+        // entity `type` enum mirrors vault_core::EntityType's snake_case names.
+        const COMBINED_SCHEMA: &str = r#"{"type":"object","properties":{"aliases":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":8},"entities":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"type":{"type":"string","enum":["person","organization","project","location","concept"]}},"required":["name","type"],"additionalProperties":false},"maxItems":8},"relationships":{"type":"array","items":{"type":"object","properties":{"from":{"type":"string"},"relation":{"type":"string"},"to":{"type":"string"}},"required":["from","relation","to"],"additionalProperties":false},"maxItems":8}},"required":["aliases","entities","relationships"],"additionalProperties":false}"#;
+        const COMBINED_SYSTEM_PROMPT: &str =
+            "You analyse a single memory about the user. Respond with strict JSON only.";
+
+        let model_dir = std::env::var("PHI4_MODEL_DIR").unwrap_or_else(|_| {
+            r"C:\Users\shahb\AppData\Roaming\com.shahbaz242630.memory-vault\models".to_string()
+        });
+        println!("\nloading Phi-4-mini from {model_dir} (model load + SHA verify)...");
+        let provider = Phi4MiniProvider::new(Phi4MiniConfig::v0_2_default(model_dir.into()))
+            .await
+            .expect("load real Phi-4-mini");
+
+        // Entity/relationship-rich facts + the Gap-2 keyword-poor killers (to
+        // confirm aliases stay good in the combined call).
+        let facts = [
+            "The user works at Acme Corp as a senior engineer.",
+            "The user's sister Maria lives in Lisbon and works for a hospital.",
+            "The user settled in Porto after years of moving around.",
+            "The user is raising twins who just started primary school.",
+            "The user drives a Tesla Model 3 and is learning to play the cello.",
+            "The user comes out in hives whenever they eat shellfish.",
+        ];
+
+        let params = CompletionParams {
+            max_tokens: 384,
+            temperature: 0.0,
+            top_p: 1.0,
+            seed: Some(ENRICHMENT_SEED),
+            system_prompt: Some(COMBINED_SYSTEM_PROMPT.to_string()),
+        };
+
+        println!("\n============ REAL Phi-4 combined extraction ============");
+        for fact in facts {
+            let prompt = format!(
+                "A memory about the user is below. Return strict JSON with exactly three fields.\n\
+                 1. \"aliases\": 5 to 8 SINGLE-WORD search keywords a person might type to find \
+                 this fact. Cover the general CATEGORY and the TYPE of thing it is about, using \
+                 common generic words — e.g. for a job: work, career, employer, occupation; for a \
+                 pet: animal, pet, companion. Prefer generic single words over repeating specific \
+                 names already in the text. Lowercase.\n\
+                 2. \"entities\": the distinct people, organizations, places, projects, or concepts \
+                 named. Each has a \"name\" and a \"type\". Types: person; organization (a company \
+                 or institution like a hospital or employer); location (a place); project; concept \
+                 (anything else — a product, vehicle, instrument, skill, subject, or medical \
+                 condition). A car, a cello, or a school subject is a concept, NOT an organization. \
+                 ALWAYS include \"the user\" as a person. List every name you use in a relationship.\n\
+                 3. \"relationships\": how the entities connect. Each is {{\"from\":..., \
+                 \"relation\":..., \"to\":...}} where BOTH \"from\" and \"to\" are names from your \
+                 entities list, and \"relation\" is a short snake_case verb (works_at, lives_in, \
+                 sibling_of, owns, drives, learning, allergic_to). Capture the user's most \
+                 important link (e.g. the user to their employer).\n\n\
+                 Memory: {fact}"
+            );
+            match provider
+                .complete_json(&prompt, COMBINED_SCHEMA, &params)
+                .await
+            {
+                Ok(raw) => {
+                    println!("\n  FACT: {fact}");
+                    println!("  RAW : {raw}");
+                }
+                Err(e) => println!("\n  FACT: {fact}\n  ERROR: {e}"),
+            }
+        }
+        println!("\n========================================================\n");
     }
 }

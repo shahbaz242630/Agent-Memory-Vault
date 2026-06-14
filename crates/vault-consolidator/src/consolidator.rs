@@ -46,6 +46,7 @@ use crate::phases::contradiction::judge_candidate_pairs;
 use crate::phases::decay::{self, plan_decay};
 use crate::phases::dedup;
 use crate::phases::enrich::{enrich_one, EnrichedFact};
+use crate::phases::extract;
 use crate::phases::merge::{apply_merge, decide_merge, AppliedMerge, MergeOutcome};
 use crate::report::{generate_report, Report};
 use crate::summary::generate_summary_markdown;
@@ -855,8 +856,41 @@ impl Consolidator {
                 Ok(Some(EnrichedFact {
                     memory: enriched,
                     embedding,
+                    graph,
                 })) => match self.storage.update_memory(&enriched, &embedding).await {
-                    Ok(_) => report.facts_enriched += 1,
+                    Ok(_) => {
+                        report.facts_enriched += 1;
+                        // Graph-fill AFTER the vector is persisted: the
+                        // content_fp is now written, so a transient graph
+                        // failure is never re-extracted into duplicate edges on
+                        // the next run (see extract.rs idempotency note).
+                        if !graph.is_empty() {
+                            match extract::write_extracted_to_graph(
+                                self.storage.graph_store().as_ref(),
+                                &enriched.boundary,
+                                &graph,
+                                enriched.confidence,
+                            )
+                            .await
+                            {
+                                Ok(stats) => {
+                                    report.entities_created += stats.entities_created;
+                                    report.entities_reused += stats.entities_reused;
+                                    report.relationships_created += stats.relationships_created;
+                                    report.relationships_failed += stats.relationships_failed;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        target: "vault_consolidator::enrich",
+                                        memory_id = %enriched.id,
+                                        error = %e,
+                                        "graph extraction write failed; aliases still enriched"
+                                    );
+                                    report.graph_write_failures += 1;
+                                }
+                            }
+                        }
+                    }
                     Err(e) => {
                         tracing::warn!(
                             target: "vault_consolidator::enrich",
@@ -872,7 +906,7 @@ impl Consolidator {
                         target: "vault_consolidator::enrich",
                         memory_id = %memory.id,
                         error = %e,
-                        "alias generation failed for fact; skipping (next cycle retries)"
+                        "enrichment failed for fact; skipping (next cycle retries)"
                     );
                     report.facts_failed += 1;
                 }
@@ -957,6 +991,22 @@ pub struct EnrichmentReport {
     pub facts_skipped: usize,
     /// Facts whose enrichment failed (LLM / embed / write) — retried next cycle.
     pub facts_failed: usize,
+    /// Graph-fill (tech-debt #2): distinct entities created this pass.
+    #[serde(default)]
+    pub entities_created: usize,
+    /// Graph-fill: entities already present, reused by id (idempotent).
+    #[serde(default)]
+    pub entities_reused: usize,
+    /// Graph-fill: relationships written this pass.
+    #[serde(default)]
+    pub relationships_created: usize,
+    /// Graph-fill: relationships dropped at write (validation / store error).
+    #[serde(default)]
+    pub relationships_failed: usize,
+    /// Facts whose graph write failed wholesale (storage error) though their
+    /// aliases were still enriched.
+    #[serde(default)]
+    pub graph_write_failures: usize,
 }
 
 /// One contradiction flagged by Phase 2 for user review per BRD §5.6
@@ -1297,5 +1347,68 @@ mod tests {
                 "failed enrichment must not write a fingerprint (so it retries)"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn enrich_facts_fills_graph_with_entities_and_relationships() {
+        use vault_core::EntityType;
+        use vault_storage::TraversalOptions;
+
+        let (storage, _dir) = open_test_storage().await;
+        write_fact(&storage, "The user works at Acme Corp.").await;
+
+        // The combined enrichment response shape: aliases + entities +
+        // relationships (the same JSON the production Phi-4 call emits).
+        let combined = r#"{"aliases":["work","career","job"],"entities":[{"name":"the user","type":"person"},{"name":"Acme Corp","type":"organization"}],"relationships":[{"from":"the user","relation":"works_at","to":"Acme Corp"}]}"#;
+        let consolidator = consolidator_with(storage.clone(), combined);
+
+        // First run: fact enriched AND graph filled in the same pass.
+        let r = consolidator.enrich_facts().await.expect("enrich pass");
+        assert_eq!(r.facts_enriched, 1);
+        assert_eq!(r.entities_created, 2, "the user + Acme Corp");
+        assert_eq!(r.relationships_created, 1);
+        assert_eq!(r.relationships_failed, 0);
+
+        // The entities landed under the fact's own boundary...
+        let graph = storage.graph_store();
+        let personal = Boundary::new("personal").unwrap();
+        let user = graph
+            .get_entity("the user", &EntityType::Person, &personal)
+            .await
+            .unwrap()
+            .expect("user entity present");
+        let acme = graph
+            .get_entity("Acme Corp", &EntityType::Organization, &personal)
+            .await
+            .unwrap()
+            .expect("Acme entity present");
+
+        // ...and are linked (user --works_at--> Acme), reachable in one hop.
+        let reached = graph
+            .traverse(
+                &user.id,
+                std::slice::from_ref(&personal),
+                TraversalOptions {
+                    max_hops: 1,
+                    relation_filter: None,
+                    follow_aliases: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            reached.iter().any(|(e, _)| e.id == acme.id),
+            "the user should be linked to Acme Corp via the extracted relationship"
+        );
+
+        // Idempotent: the second run skips the unchanged fact → NO duplicate
+        // entities or relationships written.
+        let r2 = consolidator.enrich_facts().await.expect("enrich pass 2");
+        assert_eq!(r2.facts_skipped, 1);
+        assert_eq!(r2.entities_created, 0, "no duplicate entities on re-run");
+        assert_eq!(
+            r2.relationships_created, 0,
+            "no duplicate relationships on re-run"
+        );
     }
 }
