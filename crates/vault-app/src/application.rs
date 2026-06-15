@@ -573,6 +573,7 @@ impl Application {
     pub async fn start_with_mcp(
         &self,
         authorized_boundaries: Vec<Boundary>,
+        consolidation_run_at: Option<chrono::NaiveTime>,
     ) -> VaultResult<ApplicationHandle> {
         use rmcp::ServiceExt;
 
@@ -623,11 +624,42 @@ impl Application {
         let signal_impl: Arc<dyn SignalSource> = Arc::new(LiveSignalSource);
         let signal_handle = tokio::spawn(handle_signals(signal_tx, exit_impl, signal_impl));
 
+        // 5. Spawn the nightly consolidator scheduler (T0.2.6) — only when a
+        //    consolidator is configured. It sleeps until the configured local
+        //    `run_at`, runs the full safe pipeline (lockfile + 30-min timeout +
+        //    merge/contradiction/decay + enrichment + REPORT), then repeats.
+        //    The sleep is cancellable via the shared shutdown signal so Ctrl-C
+        //    exits promptly instead of waiting hours for the next run window.
+        let consolidator_handle = self.consolidator.as_ref().map(|consolidator| {
+            let consolidator = consolidator.clone();
+            let vault_root = self.vault_root.clone();
+            // The configured-time default lives in `ConsolidatorConfig`
+            // (BRD §5.6 default 03:00); a caller-supplied override
+            // (`vault-cli mcp --run-at HH:MM`) takes precedence — primarily
+            // an ops/testing affordance to point the run window a minute
+            // ahead and watch the scheduler fire end-to-end.
+            let run_at = consolidation_run_at.unwrap_or_else(|| consolidator.run_at());
+            let cancel = shutdown_signal.subscribe();
+            tracing::info!(
+                target: "vault_app::consolidator",
+                run_at = %run_at,
+                overridden = consolidation_run_at.is_some(),
+                "nightly consolidation scheduler started"
+            );
+            tokio::spawn(run_consolidator_schedule(
+                consolidator,
+                vault_root,
+                run_at,
+                cancel,
+            ))
+        });
+
         Ok(ApplicationHandle {
             shutdown_signal,
             worker_handle,
             server_handle,
             signal_handle,
+            consolidator_handle,
         })
     }
 
@@ -660,97 +692,164 @@ impl Application {
     ///   [`vault_consolidator::Consolidator::run_consolidation`].
     #[tracing::instrument(skip_all)]
     pub async fn run_consolidation_with_safety(&self) -> VaultResult<ConsolidationReport> {
-        let consolidator = self.consolidator.as_ref().ok_or_else(|| {
-            VaultError::Config(
-                "consolidator not configured (AppConfig.phi4_model_path was None at \
-                 Application::new); set phi4_model_path to enable nightly consolidation"
-                    .into(),
-            )
-        })?;
+        let consolidator = self
+            .consolidator
+            .as_ref()
+            .ok_or_else(|| {
+                VaultError::Config(
+                    "consolidator not configured (AppConfig.phi4_model_path was None at \
+                     Application::new); set phi4_model_path to enable nightly consolidation"
+                        .into(),
+                )
+            })?
+            .clone();
+        run_consolidation_under_safety(consolidator, &self.vault_root).await
+    }
+}
 
-        let run_id = Uuid::new_v4();
+/// Core of [`Application::run_consolidation_with_safety`], factored out so the
+/// nightly scheduler task can run the identical safe pipeline.
+///
+/// The scheduler task owns an `Arc<Consolidator>` plus the vault root (both
+/// cheaply cloned from the `Application` at startup) rather than the whole
+/// `Application`, so this free function takes exactly those two. Guarantees are
+/// identical to the method: cross-process lockfile (RAII guard), 30-minute hard
+/// timeout, `run_consolidation` → `enrich_facts` → `generate_reports` under one
+/// cancellation budget, then best-effort per-boundary REPORT persistence.
+#[tracing::instrument(skip_all)]
+async fn run_consolidation_under_safety(
+    consolidator: Arc<Consolidator>,
+    vault_root: &std::path::Path,
+) -> VaultResult<ConsolidationReport> {
+    let run_id = Uuid::new_v4();
+    tracing::info!(
+        target: "vault_app::consolidator",
+        run_id = %run_id,
+        "consolidation run starting under safety wrapper"
+    );
+
+    // Acquire the cross-process lockfile. The guard is held for the
+    // entire run; dropped on function exit (success / error / panic
+    // unwind) which removes the lockfile.
+    let _lock = ConsolidatorLock::try_acquire(vault_root)?;
+
+    // Wrap the consolidator's run_consolidation + per-boundary REPORT
+    // generation in one hard timeout — both phases call the LLM and
+    // re-embed, so both belong under the same cancellation budget. We
+    // .clone() the Arc<Consolidator> so the future is 'static-friendly
+    // (no borrow on self threaded through tokio::timeout's internal
+    // future polling). enrich_facts + generate_reports run AFTER
+    // run_consolidation so they reflect the post-merge / post-invalidate
+    // active set (ADR-058 / ADR-074). All three call the LLM and/or
+    // re-embed, so all three belong under the same cancellation budget.
+    let inner = async move {
+        let report = consolidator.run_consolidation().await?;
+        // ADR-074: document-side alias enrichment of the post-merge active
+        // set (Gap-2 vocabulary-gap fix). Per-fact failures are counted
+        // inside enrich_facts and never abort the run; only the initial
+        // enumeration can error here.
+        let enrichment = consolidator.enrich_facts().await?;
         tracing::info!(
             target: "vault_app::consolidator",
             run_id = %run_id,
-            "consolidation run starting under safety wrapper"
+            enriched = enrichment.facts_enriched,
+            skipped = enrichment.facts_skipped,
+            failed = enrichment.facts_failed,
+            "alias enrichment pass complete"
         );
+        let reports = consolidator.generate_reports(run_id).await?;
+        Ok::<_, VaultError>((report, reports))
+    };
+    let (report, reports) =
+        timeout_or_consolidator_timeout(CONSOLIDATOR_HARD_TIMEOUT, inner).await?;
 
-        // Acquire the cross-process lockfile. The guard is held for the
-        // entire run; dropped on function exit (success / error / panic
-        // unwind) which removes the lockfile.
-        let _lock = ConsolidatorLock::try_acquire(&self.vault_root)?;
-
-        // Wrap the consolidator's run_consolidation + per-boundary REPORT
-        // generation in one hard timeout — both phases call the LLM and
-        // re-embed, so both belong under the same cancellation budget. We
-        // .clone() the Arc<Consolidator> so the future is 'static-friendly
-        // (no borrow on self threaded through tokio::timeout's internal
-        // future polling). enrich_facts + generate_reports run AFTER
-        // run_consolidation so they reflect the post-merge / post-invalidate
-        // active set (ADR-058 / ADR-074). All three call the LLM and/or
-        // re-embed, so all three belong under the same cancellation budget.
-        let consolidator = consolidator.clone();
-        let inner = async move {
-            let report = consolidator.run_consolidation().await?;
-            // ADR-074: document-side alias enrichment of the post-merge active
-            // set (Gap-2 vocabulary-gap fix). Per-fact failures are counted
-            // inside enrich_facts and never abort the run; only the initial
-            // enumeration can error here.
-            let enrichment = consolidator.enrich_facts().await?;
-            tracing::info!(
+    // Persist each per-boundary REPORT atomically to the vault root.
+    // The filesystem write lives in this app layer (it owns
+    // `vault_root`); the consolidator stays filesystem-agnostic. A
+    // single REPORT write failure is logged-and-continued rather than
+    // aborting the whole run — mirrors the contradiction-invalidate
+    // philosophy (a transient failure is retried next cycle, and a
+    // missing REPORT surfaces as REPORT_MISSING at read time, which is
+    // the correct degraded signal). The merge work already committed to
+    // storage above is durable regardless.
+    for report_artifact in &reports {
+        match write_report_atomic(report_artifact, vault_root) {
+            Ok(path) => tracing::info!(
                 target: "vault_app::consolidator",
                 run_id = %run_id,
-                enriched = enrichment.facts_enriched,
-                skipped = enrichment.facts_skipped,
-                failed = enrichment.facts_failed,
-                "alias enrichment pass complete"
-            );
-            let reports = consolidator.generate_reports(run_id).await?;
-            Ok::<_, VaultError>((report, reports))
-        };
-        let (report, reports) =
-            timeout_or_consolidator_timeout(CONSOLIDATOR_HARD_TIMEOUT, inner).await?;
-
-        // Persist each per-boundary REPORT atomically to the vault root.
-        // The filesystem write lives in this app layer (it owns
-        // `vault_root`); the consolidator stays filesystem-agnostic. A
-        // single REPORT write failure is logged-and-continued rather than
-        // aborting the whole run — mirrors the contradiction-invalidate
-        // philosophy (a transient failure is retried next cycle, and a
-        // missing REPORT surfaces as REPORT_MISSING at read time, which is
-        // the correct degraded signal). The merge work already committed to
-        // storage above is durable regardless.
-        for report_artifact in &reports {
-            match write_report_atomic(report_artifact, &self.vault_root) {
-                Ok(path) => tracing::info!(
-                    target: "vault_app::consolidator",
-                    run_id = %run_id,
-                    boundary = %report_artifact.boundary.as_str(),
-                    topics = report_artifact.facts_by_topic.len(),
-                    path = %path.display(),
-                    "per-boundary REPORT written"
-                ),
-                Err(e) => tracing::warn!(
-                    target: "vault_app::consolidator",
-                    run_id = %run_id,
-                    boundary = %report_artifact.boundary.as_str(),
-                    error = %e,
-                    "REPORT write failed; REPORT_MISSING will surface at read until the next run succeeds"
-                ),
-            }
+                boundary = %report_artifact.boundary.as_str(),
+                topics = report_artifact.facts_by_topic.len(),
+                path = %path.display(),
+                "per-boundary REPORT written"
+            ),
+            Err(e) => tracing::warn!(
+                target: "vault_app::consolidator",
+                run_id = %run_id,
+                boundary = %report_artifact.boundary.as_str(),
+                error = %e,
+                "REPORT write failed; REPORT_MISSING will surface at read until the next run succeeds"
+            ),
         }
+    }
 
+    tracing::info!(
+        target: "vault_app::consolidator",
+        run_id = %run_id,
+        memories_processed = report.memories_processed,
+        memories_merged = report.memories_merged,
+        contradictions_resolved = report.contradictions_resolved,
+        reports_written = reports.len(),
+        "consolidation run completed under safety wrapper"
+    );
+
+    Ok(report)
+}
+
+/// Nightly consolidator scheduler loop (T0.2.6, production path).
+///
+/// Sleeps until the next local `run_at`, runs the full safe pipeline via
+/// [`run_consolidation_under_safety`], then repeats. Mirrors the retry worker's
+/// shutdown-aware loop: the `select!` lets `cancel.changed()` interrupt the
+/// sleep so shutdown is prompt instead of blocking for the next run window. A
+/// failed or timed-out run is logged and the loop just waits for the next
+/// `run_at` — one bad night never tears the scheduler down, and the
+/// consolidator's idempotent passes self-heal on the following cycle.
+async fn run_consolidator_schedule(
+    consolidator: Arc<Consolidator>,
+    vault_root: PathBuf,
+    run_at: chrono::NaiveTime,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        if *cancel.borrow() {
+            break;
+        }
+        let wait =
+            vault_consolidator::scheduler::duration_until_next_run(chrono::Local::now(), run_at);
         tracing::info!(
             target: "vault_app::consolidator",
-            run_id = %run_id,
-            memories_processed = report.memories_processed,
-            memories_merged = report.memories_merged,
-            contradictions_resolved = report.contradictions_resolved,
-            reports_written = reports.len(),
-            "consolidation run completed under safety wrapper"
+            run_at = %run_at,
+            wait_secs = wait.as_secs(),
+            "next nightly consolidation scheduled"
         );
-
-        Ok(report)
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {
+                match run_consolidation_under_safety(consolidator.clone(), &vault_root).await {
+                    Ok(report) => tracing::info!(
+                        target: "vault_app::consolidator",
+                        memories_processed = report.memories_processed,
+                        memories_merged = report.memories_merged,
+                        "nightly consolidation complete"
+                    ),
+                    Err(e) => tracing::error!(
+                        target: "vault_app::consolidator",
+                        error = %e,
+                        "nightly consolidation failed; retrying at next run_at"
+                    ),
+                }
+            }
+            _ = cancel.changed() => break,
+        }
     }
 }
 
@@ -782,6 +881,11 @@ pub struct ApplicationHandle {
     worker_handle: tokio::task::JoinHandle<()>,
     server_handle: tokio::task::JoinHandle<()>,
     signal_handle: tokio::task::JoinHandle<()>,
+    /// Nightly consolidator scheduler task (T0.2.6). `None` when no
+    /// consolidator is configured (`AppConfig.phi4_model_path` was unset), in
+    /// which case the vault still serves reads/writes — it just never
+    /// self-consolidates.
+    consolidator_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ApplicationHandle {
@@ -805,6 +909,10 @@ impl ApplicationHandle {
             worker_handle,
             server_handle,
             signal_handle,
+            // Lifecycle tests exercise worker/server/signal shutdown only; the
+            // scheduler task is covered by its own pure-timing tests + the
+            // app-layer scheduler test, so for_test omits it.
+            consolidator_handle: None,
         }
     }
 
@@ -885,6 +993,15 @@ impl ApplicationHandle {
         // 3. Abort the MCP server task (see V0.1 known limitation above).
         self.server_handle.abort();
 
+        // 3b. Stop the nightly consolidator scheduler. It honors the shutdown
+        //     signal (its sleep is `select!`'d against `cancel.changed()`), so
+        //     `send(true)` above already nudges it; abort covers the rare case
+        //     where it's mid-run (a consolidation in flight is dropped — the
+        //     idempotent passes self-heal next launch).
+        if let Some(handle) = &self.consolidator_handle {
+            handle.abort();
+        }
+
         // 4. Await the worker — graceful drain. JoinError = panic;
         //    log but don't return an error (shutdown is best-effort
         //    cleanup; a panicked worker is a correctness bug surfaced
@@ -911,6 +1028,11 @@ impl ApplicationHandle {
         }
         if !self.signal_handle.is_finished() {
             let _ = self.signal_handle.await;
+        }
+        if let Some(handle) = self.consolidator_handle {
+            if !handle.is_finished() {
+                let _ = handle.await;
+            }
         }
 
         Ok(())

@@ -16,10 +16,12 @@
 //! }
 //! ```
 //!
-//! T0.2.3 commit 1 ships the struct materialisation + [`Consolidator::
-//! schedule`] `todo!()` stub. [`Consolidator::run_consolidation`] body
-//! lands at commit 2 (Phase 3 `apply_merge` primitive + orchestrator loop).
-//! Summary markdown generation lands at commit 3.
+//! T0.2.3 commit 1 shipped the struct materialisation; commit 2 added the
+//! [`Consolidator::run_consolidation`] body (Phase 3 `apply_merge` primitive and
+//! the orchestrator loop); commit 3 added summary-markdown generation.
+//! [`Consolidator::schedule`] (the headless nightly loop, T0.2.6) is now
+//! implemented atop [`crate::scheduler`]; the production scheduler lives in
+//! `vault-app`, which also owns the lockfile, timeout, and REPORT persistence.
 //!
 //! Per BRD §5.6 lines 971-972 and T0.2.3 iteration 2 boundary-model
 //! correction: **one `run_consolidation` call processes ALL boundaries the
@@ -163,6 +165,13 @@ impl Consolidator {
             embeddings,
             config,
         }
+    }
+
+    /// The configured local time-of-day for the nightly run (BRD §5.6
+    /// `run_at`). Exposed so the application-layer scheduler can compute the
+    /// next run instant without reaching into the private [`ConsolidatorConfig`].
+    pub fn run_at(&self) -> NaiveTime {
+        self.config.run_at
     }
 
     /// Run a full consolidation cycle per BRD §5.6 lines 933-955.
@@ -923,15 +932,61 @@ impl Consolidator {
         Ok(report)
     }
 
-    /// Schedule the consolidator to run at the configured `run_at` time.
+    /// Headless scheduling loop (T0.2.6) — sleep until the configured local
+    /// `run_at`, run the consolidator pipeline, repeat forever.
     ///
-    /// **Body lands at T0.2.6 per BRD §6.2 line 1453** ("vault-consolidator:
-    /// Scheduling"). The method signature is present from T0.2.3 commit 1
-    /// so the `impl Consolidator` block matches BRD §5.6 line 912 verbatim;
-    /// calling `schedule()` before T0.2.6 panics loudly.
-    #[allow(clippy::todo)]
+    /// Each cycle runs [`Self::run_consolidation`] (merge / contradiction /
+    /// decay) then [`Self::enrich_facts`] (ADR-074 vocabulary-gap enrichment,
+    /// load-bearing for correct recall). A failing run is logged and the loop
+    /// waits for the next `run_at` — one bad night never tears down the
+    /// schedule (mirrors the retry worker's "log and keep going" lifecycle).
+    ///
+    /// **Production note.** `vault-app` does NOT call this method; it runs its
+    /// own scheduler ([`Application::start_with_mcp`]) on the same
+    /// [`scheduler::duration_until_next_run`] timer, because the full
+    /// production cycle also needs the app-layer cross-process lockfile, the
+    /// 30-minute hard timeout, and per-boundary REPORT persistence to disk —
+    /// none of which the consolidator can own (it is filesystem-agnostic by
+    /// architecture lock). This method is the library/headless equivalent for
+    /// embedders that drive the consolidator without the application wrapper.
+    /// It never returns under normal operation (the loop is infinite); the
+    /// `VaultResult` return exists to match the BRD §5.6 line 953 signature.
+    #[instrument(skip(self))]
     pub async fn schedule(&self) -> VaultResult<()> {
-        todo!("T0.2.6 — vault-consolidator: Scheduling")
+        loop {
+            let wait =
+                crate::scheduler::duration_until_next_run(chrono::Local::now(), self.config.run_at);
+            tracing::info!(
+                target: "vault_consolidator::scheduler",
+                run_at = %self.config.run_at,
+                wait_secs = wait.as_secs(),
+                "next consolidation scheduled"
+            );
+            tokio::time::sleep(wait).await;
+
+            match self.run_consolidation().await {
+                Ok(report) => {
+                    if let Err(e) = self.enrich_facts().await {
+                        tracing::warn!(
+                            target: "vault_consolidator::scheduler",
+                            error = %e,
+                            "post-run enrichment failed; next cycle retries"
+                        );
+                    }
+                    tracing::info!(
+                        target: "vault_consolidator::scheduler",
+                        processed = report.memories_processed,
+                        merged = report.memories_merged,
+                        "scheduled consolidation cycle complete"
+                    );
+                }
+                Err(e) => tracing::error!(
+                    target: "vault_consolidator::scheduler",
+                    error = %e,
+                    "scheduled consolidation failed; retrying at next run_at"
+                ),
+            }
+        }
     }
 }
 

@@ -44,6 +44,7 @@
 pub mod consolidator;
 pub mod phases;
 pub mod report;
+pub mod scheduler;
 mod summary;
 pub mod topics;
 

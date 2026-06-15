@@ -167,6 +167,14 @@ enum Command {
         /// boundaries (BRD §11.4.3).
         #[arg(long, value_name = "NAME", default_values_t = vec!["personal".to_string()])]
         boundary: Vec<String>,
+        /// Local time of day (24-hour `HH:MM`) at which the in-process
+        /// nightly consolidator should run. Defaults to `03:00` (BRD §5.6)
+        /// when omitted. Only meaningful when `--phi4-model` is also
+        /// supplied (otherwise no consolidator is wired). Primarily an
+        /// ops/testing convenience — point it a minute ahead to watch the
+        /// scheduler fire the full pipeline end-to-end.
+        #[arg(long, value_name = "HH:MM")]
+        run_at: Option<String>,
 
         #[command(subcommand)]
         action: McpAction,
@@ -317,6 +325,7 @@ async fn real_main() -> Result<()> {
             rerank_model,
             rerank_tokenizer,
             boundary,
+            run_at,
             action,
         } => {
             // Same rationale as Consolidate above — `Application::new`
@@ -333,6 +342,7 @@ async fn real_main() -> Result<()> {
                 rerank_model,
                 rerank_tokenizer,
                 boundary,
+                run_at,
                 action,
             )
             .await
@@ -467,6 +477,7 @@ async fn dispatch_mcp(
     rerank_model: Option<PathBuf>,
     rerank_tokenizer: Option<PathBuf>,
     boundary: Vec<String>,
+    run_at: Option<String>,
     action: McpAction,
 ) -> Result<()> {
     // Map raw boundary strings to typed Boundary values up front so any
@@ -483,6 +494,17 @@ async fn dispatch_mcp(
         })
         .collect::<Result<Vec<_>>>()?;
 
+    // Parse the optional --run-at override up front (cheap, fail-fast)
+    // before the expensive keychain/backend/model work. `None` leaves the
+    // BRD §5.6 default (03:00) in force inside `start_with_mcp`.
+    let consolidation_run_at = run_at
+        .as_deref()
+        .map(|s| {
+            chrono::NaiveTime::parse_from_str(s, "%H:%M")
+                .map_err(|e| anyhow!("invalid --run-at value {s:?} (expected 24-hour HH:MM): {e}"))
+        })
+        .transpose()?;
+
     let app = build_application(
         vault_db,
         vector_dir,
@@ -497,11 +519,15 @@ async fn dispatch_mcp(
     .await?;
 
     match action {
-        McpAction::Serve => run_mcp_serve(app, authorized_boundaries).await,
+        McpAction::Serve => run_mcp_serve(app, authorized_boundaries, consolidation_run_at).await,
     }
 }
 
-async fn run_mcp_serve(app: Application, authorized_boundaries: Vec<Boundary>) -> Result<()> {
+async fn run_mcp_serve(
+    app: Application,
+    authorized_boundaries: Vec<Boundary>,
+    consolidation_run_at: Option<chrono::NaiveTime>,
+) -> Result<()> {
     eprintln!(
         "vault-cli mcp serve: ready ({} authorized boundary{})",
         authorized_boundaries.len(),
@@ -512,7 +538,7 @@ async fn run_mcp_serve(app: Application, authorized_boundaries: Vec<Boundary>) -
         },
     );
     let handle = app
-        .start_with_mcp(authorized_boundaries)
+        .start_with_mcp(authorized_boundaries, consolidation_run_at)
         .await
         .context("MCP transport bind failed")?;
     handle
@@ -1192,11 +1218,16 @@ mod tests {
                 rerank_model,
                 rerank_tokenizer,
                 boundary,
+                run_at,
                 action,
             } => {
                 assert_eq!(bge_model, PathBuf::from("/tmp/bge.onnx"));
                 assert_eq!(bge_tokenizer, PathBuf::from("/tmp/tokenizer.json"));
                 assert_eq!(ort_lib, PathBuf::from("/tmp/libonnxruntime.so"));
+                assert!(
+                    run_at.is_none(),
+                    "mcp-serve without --run-at MUST yield None (defaults to 03:00 at start_with_mcp)"
+                );
                 assert!(
                     phi4_model.is_none() || std::env::var("VAULT_PHI4_MODEL_PATH").is_ok(),
                     "mcp-serve without --phi4-model MUST yield None unless env var supplies it"
