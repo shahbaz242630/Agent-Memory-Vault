@@ -27,6 +27,19 @@ on:
 # If commit 9 still red on `windows-2025`, candidates B (Ninja generator),
 # C (downgrade llama-cpp-2 to v0.1.139), D (accept Windows-CI-Vulkan gap +
 # document scope in ADR) are documented in HANDOFF.md next-session opener.
+#
+# 2026-06-15 update: GitHub's 06-08→06-15 migration swapped the `windows-2025`
+# image's compiler from VS2022 to Visual Studio 2026 (MSVC 14.51), which broke
+# BOTH the bundled-DuckDB fmt (`stdext::checked_array_iterator` removed) AND
+# llama.cpp's ggml (`std::hardware_destructive_interference_size`). The last
+# green CI (d613614, 2026-06-10) ran on the pre-migration VS2022 compiler. Rather
+# than switch off the carefully-tuned windows-2025 image (Ninja + lld-link +
+# D:\t + disk cleanup), each Windows job now pins the MSVC toolset to v143
+# (14.44, VS2022-era) — still shipped on the image "for compatibility" — via
+# `ilammy/msvc-dev-cmd`, restoring the exact green compiler. This SUPERSEDES the
+# dead-end /FI _SECURE_SCL shim (ADR-079, commit 669b8a5), which only reached
+# cc-rs and leaked a feature macro into ggml. Remove the pin once libduckdb-sys
+# vendors a newer fmt and llama-cpp-sys-2 supports VS2026 (HANDOFF tech-debt #8).
 
 env:
   CARGO_TERM_COLOR: always
@@ -275,20 +288,23 @@ jobs:
       # bundler syntax, eliminating the need for these cross-platform
       # placeholder hacks. (T0.1.11 Phase 5d fix-forward, 2026-05-06.)
       - if: runner.os == 'Windows'
-        name: Work around VS2026 fmt/_SECURE_SCL break in bundled DuckDB (Windows)
-        shell: pwsh
+        name: Pin MSVC toolset to v143 (14.44) — VS2026 default breaks DuckDB fmt + llama ggml
         # GHA windows-2025 migrated to Visual Studio 2026 (MSVC 14.51) in the
-        # 2026-06-08→06-15 image rollout. VS 2026 removed
-        # stdext::checked_array_iterator (still referenced by DuckDB's bundled
-        # ~v5.x fmt under `#ifdef _SECURE_SCL`) -> libduckdb-sys C++ build fails
-        # with C2061. A forced-include (/FI) header undefs _SECURE_SCL after the
-        # STL core header sets it, so fmt uses its raw-pointer branch (the same
-        # one Linux/macOS already compile). Target-suffixed CXXFLAGS_* is read by
-        # cc-rs (libduckdb-sys) ONLY, not by llama-cpp-sys-2's CMake build, so the
-        # Vulkan build is untouched. See .github/msvc_fmt_secure_scl_shim.h.
-        run: |
-          $shim = "$env:GITHUB_WORKSPACE\.github\msvc_fmt_secure_scl_shim.h"
-          Add-Content $env:GITHUB_ENV "CXXFLAGS_x86_64_pc_windows_msvc=/FI$shim"
+        # 2026-06-08→06-15 rollout. VS2026 removed stdext::checked_array_iterator
+        # (breaks DuckDB's bundled fmt under `#ifdef _SECURE_SCL` -> C2061) AND
+        # broke llama.cpp's ggml (std::hardware_destructive_interference_size).
+        # The image still ships the v143 (VS2022-era) MSVC 14.44 toolset "for
+        # compatibility" — the exact compiler that produced the last green CI
+        # (d613614, 2026-06-10). Pinning vcvars to it sets cl.exe + INCLUDE/LIB
+        # for BOTH cc-rs (DuckDB) and the Ninja/CMake build (llama), fixing both
+        # breaks at the root with no per-build-system shim. The superseded
+        # /FI _SECURE_SCL shim (ADR-079, commit 669b8a5) only reached cc-rs and
+        # leaked into ggml, so it was a dead end. Drop this pin once libduckdb-sys
+        # vendors a newer fmt and llama-cpp-sys-2 supports VS2026 (tech-debt #8).
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          toolset: '14.44'
       - name: Create test-fixture placeholders for tauri-build resource validation
         shell: bash
         run: |
@@ -592,17 +608,17 @@ jobs:
         shell: bash
         run: echo "CARGO_BUILD_JOBS=2" >> "$GITHUB_ENV"
       - if: runner.os == 'Windows'
-        name: Work around VS2026 fmt/_SECURE_SCL break in bundled DuckDB (Windows)
-        shell: pwsh
-        # See the matching step in the clippy job + .github/msvc_fmt_secure_scl_shim.h.
-        # VS 2026 (MSVC 14.51, GHA windows-2025 2026-06 rollout) removed
-        # stdext::checked_array_iterator; DuckDB's bundled fmt still references it
-        # under `#ifdef _SECURE_SCL`. The /FI shim undefs _SECURE_SCL so fmt uses
-        # its raw-pointer branch. Target-suffixed CXXFLAGS_* hits cc-rs
-        # (libduckdb-sys) only, not llama-cpp-sys-2's CMake/Vulkan build.
-        run: |
-          $shim = "$env:GITHUB_WORKSPACE\.github\msvc_fmt_secure_scl_shim.h"
-          Add-Content $env:GITHUB_ENV "CXXFLAGS_x86_64_pc_windows_msvc=/FI$shim"
+        name: Pin MSVC toolset to v143 (14.44) — VS2026 default breaks DuckDB fmt + llama ggml
+        # See the matching step in the clippy job for full rationale. v143
+        # (MSVC 14.44, VS2022-era) is the compatibility toolset still shipped on
+        # the windows-2025/VS2026 image and the compiler that produced the last
+        # green CI (d613614). Pinning vcvars to it fixes BOTH the DuckDB fmt and
+        # llama ggml VS2026 breaks for cc-rs AND the Ninja/CMake build. Replaces
+        # the dead-end /FI _SECURE_SCL shim (ADR-079).
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          toolset: '14.44'
       - run: cargo build --workspace --all-targets
       - run: cargo test --workspace
 
@@ -723,6 +739,16 @@ jobs:
           Add-Content $env:GITHUB_ENV "RUSTFLAGS=-D warnings -C debuginfo=line-tables-only -C linker=lld-link"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Pin MSVC toolset to v143 (14.44) — VS2026 default breaks llama ggml
+        # This job builds vault-llm with the Vulkan/Ninja/CMake llama-cpp-sys-2
+        # path, which VS2026 broke (std::hardware_destructive_interference_size).
+        # It never carried the DuckDB /FI shim (vault-llm doesn't link DuckDB),
+        # so VS2026 would break this job's ggml compile outright. Pin to the
+        # v143 (14.44) compatibility toolset — same fix as the clippy/build jobs.
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          toolset: '14.44'
       # Run `#[ignore]`'d tests in vault-llm (the real-model smoke suite).
       # `--nocapture` surfaces stdout from the spike-style stage logs so CI
       # artifacts include the SHA-256 verification + per-call latency data.
