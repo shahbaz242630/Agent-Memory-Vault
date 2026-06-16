@@ -52,8 +52,8 @@ use vault_app::{AppConfig, Application};
 use vault_consolidator::ConsolidationReport;
 use vault_core::{Boundary, MemoryId};
 use vault_storage::{
-    CascadeOperation, DeadLetterEntry, DivergenceDetector, DivergenceReport, Resolution,
-    StorageBackend,
+    CascadeOperation, CheckpointId, CheckpointStatus, DeadLetterEntry, DivergenceDetector,
+    DivergenceReport, Resolution, StorageBackend,
 };
 
 #[derive(Parser, Debug)]
@@ -96,6 +96,13 @@ enum Command {
     /// vector store. Reports tier-1 count comparison + tier-2 sampled
     /// existence findings. Per Phase A Q3 / ADR-018.
     DivergenceCheck,
+    /// Checkpoint & rollback (T0.2.5) — list retained consolidation
+    /// checkpoints or undo a run by id. Storage-only: needs no models, so
+    /// none of the `--bge-*` / `--phi4-model` flags are required.
+    Checkpoint {
+        #[command(subcommand)]
+        action: CheckpointAction,
+    },
     /// Sleep-cycle consolidation per BRD §5.6 — merge near-duplicates,
     /// surface contradictions, emit a run summary. Locked-next-arc Step 4
     /// (T0.3.x Batch A, 2026-05-26): Phi-4-mini drives the merge
@@ -189,6 +196,20 @@ enum ConsolidateAction {
     /// timeout 30 min — past this, the run is cancelled and the previous
     /// nightly summary remains the latest artifact on disk.
     Run,
+}
+
+#[derive(Subcommand, Debug)]
+enum CheckpointAction {
+    /// List retained consolidation checkpoints, newest first.
+    List,
+    /// Undo a consolidation run: restore every memory it changed to its
+    /// pre-run state and delete every memory it created. Idempotent guard —
+    /// a checkpoint can only be rolled back once.
+    Rollback {
+        /// Checkpoint id (UUID) to roll back. Find it via
+        /// `vault-cli checkpoint list` or a run summary's footer.
+        id: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -291,6 +312,10 @@ async fn real_main() -> Result<()> {
         Command::DivergenceCheck => {
             let backend = open_and_warn(&vault_db, &vector_dir, &graph_db, dimension).await?;
             run_divergence_check(&backend).await
+        }
+        Command::Checkpoint { action } => {
+            let backend = open_and_warn(&vault_db, &vector_dir, &graph_db, dimension).await?;
+            dispatch_checkpoint(&backend, action).await
         }
         Command::Consolidate {
             bge_model,
@@ -414,6 +439,54 @@ fn print_divergence_report(r: &DivergenceReport) {
     } else {
         println!("\nno findings.");
     }
+}
+
+/// Dispatch the `checkpoint` subcommand (T0.2.5). Storage-only — operates on
+/// the already-open [`StorageBackend`]; no models are loaded.
+async fn dispatch_checkpoint(backend: &StorageBackend, action: CheckpointAction) -> Result<()> {
+    match action {
+        CheckpointAction::List => list_checkpoints(backend).await,
+        CheckpointAction::Rollback { id } => rollback_checkpoint(backend, &id).await,
+    }
+}
+
+/// Print all retained consolidation checkpoints, newest first.
+async fn list_checkpoints(backend: &StorageBackend) -> Result<()> {
+    let checkpoints = backend.list_checkpoints().await?;
+    if checkpoints.is_empty() {
+        println!("No consolidation checkpoints retained.");
+        return Ok(());
+    }
+    println!("{} checkpoint(s), newest first:", checkpoints.len());
+    for cp in &checkpoints {
+        let status = match cp.status {
+            CheckpointStatus::Active => "active",
+            CheckpointStatus::RolledBack => "rolled back",
+        };
+        println!(
+            "  {}  {}  {} change(s)  [{status}]",
+            cp.id,
+            cp.created_at.to_rfc3339(),
+            cp.entry_count,
+        );
+    }
+    Ok(())
+}
+
+/// Undo one consolidation run by checkpoint id.
+async fn rollback_checkpoint(backend: &StorageBackend, id: &str) -> Result<()> {
+    let checkpoint_id: CheckpointId = id
+        .parse()
+        .map_err(|e| anyhow!("invalid checkpoint id {id:?}: {e}"))?;
+    let report = backend
+        .rollback_checkpoint(checkpoint_id)
+        .await
+        .with_context(|| format!("rollback of checkpoint {id} failed"))?;
+    println!(
+        "Rolled back checkpoint {}: restored {} memory(ies), deleted {} created memory(ies).",
+        report.checkpoint_id, report.restored, report.deleted,
+    );
+    Ok(())
 }
 
 /// Dispatch the `consolidate` subcommand. Constructs a full [`Application`]
@@ -1091,6 +1164,56 @@ mod tests {
         ])
         .unwrap();
         assert!(matches!(cli.command, Command::DivergenceCheck));
+    }
+
+    #[test]
+    fn cli_parses_checkpoint_list_with_no_model_flags() {
+        // `checkpoint` is storage-only — it must parse WITHOUT any --bge-* /
+        // --phi4-model flags (the whole point of making it a top-level command).
+        let cli = Cli::try_parse_from([
+            "vault-cli",
+            "--vault-db",
+            "/tmp/v.db",
+            "--vector-dir",
+            "/tmp/lance",
+            "--graph-db",
+            "/tmp/g.duckdb",
+            "checkpoint",
+            "list",
+        ])
+        .expect("checkpoint-list should parse with no model flags");
+        match cli.command {
+            Command::Checkpoint { action } => {
+                assert!(
+                    matches!(action, CheckpointAction::List),
+                    "expected CheckpointAction::List; got {action:?}"
+                );
+            }
+            other => panic!("expected Command::Checkpoint, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_checkpoint_rollback_with_id() {
+        let cli = Cli::try_parse_from([
+            "vault-cli",
+            "--vault-db",
+            "/tmp/v.db",
+            "--vector-dir",
+            "/tmp/lance",
+            "--graph-db",
+            "/tmp/g.duckdb",
+            "checkpoint",
+            "rollback",
+            "0190a0c1-2b3c-7d4e-8f90-1a2b3c4d5e6f",
+        ])
+        .expect("checkpoint-rollback should parse with an id");
+        match cli.command {
+            Command::Checkpoint {
+                action: CheckpointAction::Rollback { id },
+            } => assert_eq!(id, "0190a0c1-2b3c-7d4e-8f90-1a2b3c4d5e6f"),
+            other => panic!("expected Command::Checkpoint rollback, got: {other:?}"),
+        }
     }
 
     #[test]

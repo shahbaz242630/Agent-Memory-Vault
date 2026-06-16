@@ -15,6 +15,7 @@
 
 pub mod audit;
 pub mod cascading;
+pub mod checkpoint;
 pub mod dead_letter;
 pub mod divergence;
 #[cfg(test)]
@@ -35,6 +36,10 @@ pub use audit::{
     AUDIT_GENESIS_HASH,
 };
 pub use cascading::{Ack, DegradedMode, StorageBackend, MAX_RETRY_QUEUE_DEPTH};
+pub use checkpoint::{
+    ChangeType, CheckpointEntry, CheckpointId, CheckpointStatus, CheckpointSummary, RollbackReport,
+    CHECKPOINT_PAYLOAD_FORMAT_VERSION, CHECKPOINT_RETENTION,
+};
 pub use dead_letter::{
     DeadLetter, DeadLetterEntry, NewDeadLetter, Resolution, FAILURE_REASON_MAX_BYTES,
 };

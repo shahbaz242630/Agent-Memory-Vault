@@ -41,6 +41,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "T0.2.4 sync ship-gate: pending_sync cascade payload (sequence_id + payload)",
         up: include_str!("0003_pending_sync_payload.sql"),
     },
+    Migration {
+        version: 4,
+        description: "T0.2.5 checkpoint & rollback: consolidation_checkpoints + checkpoint_entries",
+        up: include_str!("0004_consolidation_checkpoints.sql"),
+    },
 ];
 
 /// Apply any pending migrations to the open connection. Uses the
@@ -267,6 +272,40 @@ mod tests {
             cols.contains("payload"),
             "migration 0003 must add pending_sync.payload; columns: {cols:?}"
         );
+    }
+
+    #[test]
+    fn migration_0004_creates_checkpoint_tables() {
+        // T0.2.5 checkpoint & rollback: the rollback path needs a per-run
+        // checkpoint table + a per-changed-memory pre-image table. Verify both
+        // tables + their hot-path indexes exist after migrating.
+        let mut conn = open_memory();
+        run(&mut conn).unwrap();
+
+        for table in ["consolidation_checkpoints", "checkpoint_entries"] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "expected table {table} to exist");
+        }
+
+        for index in [
+            "idx_checkpoint_entries_cp",
+            "idx_consolidation_checkpoints_created",
+        ] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                    [index],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "expected index {index} to exist");
+        }
     }
 
     #[test]

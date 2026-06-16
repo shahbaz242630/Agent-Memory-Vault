@@ -35,12 +35,13 @@
 //!     cluster.rs                 — Phase 1 (T0.2.2; moved here at T0.2.3 commit 1)
 //!     merge.rs                   — Phase 2 + 3 (T0.2.3)
 //!     decay.rs                   — Phase 4 (T0.2.4; not yet created)
-//!   checkpoint.rs                — Checkpoint & Rollback (T0.2.5; not yet created)
+//!   checkpoint.rs                — Checkpoint capture: run-diff → CheckpointEntry (T0.2.5)
 //!   scheduler.rs                 — Scheduling (T0.2.6; not yet created)
 //! ```
 
 #![forbid(unsafe_code)]
 
+pub(crate) mod checkpoint;
 pub mod consolidator;
 pub mod phases;
 pub mod report;

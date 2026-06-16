@@ -23,11 +23,11 @@ use crate::consolidator::{AppliedMergeWithContext, BoundarySummary, ConflictRevi
 /// line 973 (~500-2000 words total, < 2-minute read).
 const SNIPPET_MAX_CHARS: usize = 80;
 
-/// Literal footer phrase pinned by
-/// `footer_emits_checkpoint_placeholder_with_t025_rollback_note`. T0.2.5
-/// (Checkpoint & Rollback) updates the wording in lockstep with the actual
-/// rollback wiring; the pinning test catches accidental drift.
-const FOOTER_ROLLBACK_PLACEHOLDER: &str = "rollback ships at T0.2.5";
+/// Literal footer phrase pinned by `footer_emits_checkpoint_id_and_rollback_hint`.
+/// T0.2.5 (Checkpoint & Rollback) shipped, so the footer now points at the real
+/// rollback command; the pinning test catches accidental drift.
+const FOOTER_ROLLBACK_HINT: &str =
+    "roll it back with `vault-cli checkpoint rollback <checkpoint-id>`";
 
 /// Generate the human-readable Markdown summary for one consolidation run.
 ///
@@ -36,9 +36,9 @@ const FOOTER_ROLLBACK_PLACEHOLDER: &str = "rollback ships at T0.2.5";
 /// this once at the end of [`Consolidator::run_consolidation`] and stores
 /// the result on [`ConsolidationReport::summary_markdown`].
 ///
-/// **`checkpoint_id`:** at T0.2.3 this is a placeholder string (T0.2.5
-/// wires actual checkpoints). The footer renders it verbatim alongside the
-/// pinned `"rollback ships at T0.2.5"` phrase.
+/// **`checkpoint_id`:** the real checkpoint id (or `"none (no changes this
+/// run)"`) the caller captured this run (T0.2.5). The footer renders it
+/// verbatim alongside the `vault-cli checkpoint rollback` command hint.
 ///
 /// [`Consolidator::run_consolidation`]: crate::consolidator::Consolidator::run_consolidation
 /// [`ConsolidationReport::summary_markdown`]: crate::consolidator::ConsolidationReport::summary_markdown
@@ -192,11 +192,8 @@ fn write_footer(out: &mut String, checkpoint_id: &str) {
     writeln!(out, "## Footer").expect("writing to String never fails");
     writeln!(out).expect("writing to String never fails");
     writeln!(out, "**Checkpoint ID:** {checkpoint_id}").expect("writing to String never fails");
-    writeln!(
-        out,
-        "If this run looks wrong, {FOOTER_ROLLBACK_PLACEHOLDER}."
-    )
-    .expect("writing to String never fails");
+    writeln!(out, "If this run looks wrong, {FOOTER_ROLLBACK_HINT}.")
+        .expect("writing to String never fails");
 }
 
 #[cfg(test)]
@@ -474,26 +471,26 @@ mod tests {
         );
     }
 
-    /// Test 5: Footer emits **both** the checkpoint-ID placeholder format
-    /// (reflecting the `checkpoint_id` input) **and** the literal phrase
-    /// "rollback ships at T0.2.5". Two distinct floor-pin assertions in one
-    /// `#[test] fn` so T0.2.5 wiring consciously updates BOTH simultaneously.
+    /// Test 5: Footer emits **both** the checkpoint-ID line (reflecting the
+    /// `checkpoint_id` input verbatim) **and** the shipped rollback command
+    /// hint. Two distinct floor-pin assertions in one `#[test] fn` so any
+    /// rephrasing consciously updates BOTH simultaneously.
     #[test]
-    fn footer_emits_checkpoint_placeholder_with_t025_rollback_note() {
+    fn footer_emits_checkpoint_id_and_rollback_hint() {
         let state = empty_run_state();
         let md = generate_summary_markdown(&state, "test-cp-005");
 
-        // Assertion #1: checkpoint-ID placeholder reflects the input verbatim.
+        // Assertion #1: checkpoint-ID line reflects the input verbatim.
         assert!(
             md.contains("**Checkpoint ID:** test-cp-005"),
-            "checkpoint-ID placeholder format missing or malformed:\n{md}"
+            "checkpoint-ID line missing or malformed:\n{md}"
         );
 
-        // Assertion #2: exact literal phrase "rollback ships at T0.2.5". T0.2.5
-        // must update this in lockstep with the actual rollback wiring.
+        // Assertion #2: the shipped rollback command hint (T0.2.5). Update this
+        // in lockstep with FOOTER_ROLLBACK_HINT.
         assert!(
-            md.contains("rollback ships at T0.2.5"),
-            "T0.2.5 rollback literal phrase missing — see FOOTER_ROLLBACK_PLACEHOLDER"
+            md.contains("vault-cli checkpoint rollback"),
+            "rollback command hint missing — see FOOTER_ROLLBACK_HINT"
         );
     }
 

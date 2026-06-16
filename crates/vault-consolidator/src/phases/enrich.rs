@@ -165,6 +165,32 @@ pub(crate) fn is_enriched_for_current_content(memory: &Memory) -> bool {
         .is_some_and(|stored| stored == content_fingerprint(&memory.content))
 }
 
+/// The exact text whose embedding is `memory`'s CURRENT stored LanceDB vector.
+///
+/// An enriched fact's stored vector is `embed(compose_embed_text(content,
+/// alias_line))` ([`enrich_one`]); a never-enriched fact's stored vector is
+/// `embed(content)` (the write / merge path embeds content directly). The
+/// `alias_line` is persisted verbatim under `metadata.enrichment.aliases`, so
+/// re-embedding this text reproduces the stored vector EXACTLY (deterministic
+/// embedder).
+///
+/// Used by the checkpoint recorder ([`crate::checkpoint`]) to capture a
+/// pre-image's embedding faithfully — `vault-storage` cannot re-embed, so the
+/// consolidator (which holds the embedder) reconstructs the vector here.
+pub(crate) fn stored_embed_text(memory: &Memory) -> String {
+    if is_enriched_for_current_content(memory) {
+        let alias_line = memory
+            .metadata
+            .get(ENRICHMENT_METADATA_KEY)
+            .and_then(|e| e.get("aliases"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        compose_embed_text(&memory.content, alias_line)
+    } else {
+        memory.content.clone()
+    }
+}
+
 /// Write the enrichment object onto `metadata`, preserving any existing keys.
 /// If `metadata` is not a JSON object (it conventionally is — `json!({})` at
 /// write time), it is replaced with a fresh object carrying only the

@@ -40,7 +40,7 @@ use uuid::Uuid;
 use vault_core::{Boundary, Memory, MemoryId, VaultResult};
 use vault_embedding::EmbeddingProvider;
 use vault_llm::LlmProvider;
-use vault_storage::{MemoryFilter, StorageBackend};
+use vault_storage::{CheckpointId, MemoryFilter, StorageBackend};
 
 use crate::phases::candidates::nearest_neighbor_candidate_pairs;
 use crate::phases::cluster::{find_candidate_clusters, Cluster};
@@ -208,14 +208,32 @@ impl Consolidator {
     pub async fn run_consolidation(&self) -> VaultResult<ConsolidationReport> {
         let started_at = Utc::now();
 
-        // Step 1: enumerate all non-superseded memories. Default filter
-        // excludes already-superseded rows so Phase 1 clustering never sees
-        // them (prevents re-supersession at this layer per ADR-046's
-        // single-supersession assumption).
-        let all_memories = self
+        // Step 1: snapshot the full memory set (incl. superseded) up-front —
+        // this is the pre-run baseline the T0.2.5 checkpoint diffs against at
+        // the end of the run (see `capture_checkpoint`). Including superseded
+        // rows means a row that was already superseded before this run is NOT
+        // mis-classified as "created" by the diff.
+        let pre_snapshot = self
             .storage
-            .list_memories(MemoryFilter::default(), None)
+            .list_memories(
+                MemoryFilter {
+                    include_superseded: true,
+                    ..MemoryFilter::default()
+                },
+                None,
+            )
             .await?;
+
+        // The run's own logic operates on the active (non-superseded) subset —
+        // identical to the previous `MemoryFilter::default()` enumeration, so
+        // Phase 1 clustering never sees superseded rows (ADR-046's
+        // single-supersession assumption). Derived in-process to avoid a second
+        // DB scan.
+        let all_memories: Vec<Memory> = pre_snapshot
+            .iter()
+            .filter(|m| m.superseded_by.is_none())
+            .cloned()
+            .collect();
 
         // Step 2: group by boundary. BTreeMap gives deterministic
         // alphabetical iteration (Boundary derives Ord) which downstream
@@ -603,12 +621,27 @@ impl Consolidator {
             .map(|b| b.skipped_clusters)
             .sum();
 
-        // T0.2.5 wires the real checkpoint identifier here; at T0.2.3 we
-        // pass a stable placeholder string so the footer renders the
-        // forward-pointer pinned by summary.rs's
-        // `footer_emits_checkpoint_placeholder_with_t025_rollback_note`.
-        let checkpoint_placeholder = "pending-T0.2.5";
-        let summary_markdown = generate_summary_markdown(&run_state, checkpoint_placeholder);
+        // T0.2.5 / A2: capture a rollback checkpoint of everything this run
+        // changed (diff of the pre-run snapshot vs the post-run state). A
+        // capture failure is logged-and-continued — the run's mutations are
+        // already durably committed; the only loss is this run's undo-ability,
+        // and the next cycle creates a fresh checkpoint. Never aborts the run.
+        let checkpoint_id = match self.capture_checkpoint(&pre_snapshot).await {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!(
+                    target: "vault_consolidator::checkpoint",
+                    error = %e,
+                    "checkpoint capture failed; run committed but is NOT rollback-able \
+                     (next cycle creates a fresh checkpoint)"
+                );
+                None
+            }
+        };
+        let checkpoint_label = checkpoint_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "none (no changes this run)".to_string());
+        let summary_markdown = generate_summary_markdown(&run_state, &checkpoint_label);
 
         Ok(ConsolidationReport {
             memories_processed: run_state.memories_processed,
@@ -621,8 +654,52 @@ impl Consolidator {
             clusters_skipped,
             duration,
             conflicts_for_user_review,
+            checkpoint_id,
             summary_markdown,
         })
+    }
+
+    /// T0.2.5 / A2 — capture a rollback checkpoint for the run that just
+    /// mutated the vault.
+    ///
+    /// Re-enumerates the full memory set (incl. superseded), diffs it against
+    /// `pre_snapshot` to find every changed / created memory
+    /// ([`crate::checkpoint::diff_to_entries`]), and persists them via
+    /// [`StorageBackend::create_checkpoint`] (which prunes to the retention cap).
+    /// Returns the new [`CheckpointId`], or `Ok(None)` when the run changed
+    /// nothing (no checkpoint is created for a no-op run — schema invariant:
+    /// a checkpoint records a run that changed ≥ 1 memory).
+    async fn capture_checkpoint(
+        &self,
+        pre_snapshot: &[Memory],
+    ) -> VaultResult<Option<CheckpointId>> {
+        let post_snapshot = self
+            .storage
+            .list_memories(
+                MemoryFilter {
+                    include_superseded: true,
+                    ..MemoryFilter::default()
+                },
+                None,
+            )
+            .await?;
+        let entries = crate::checkpoint::diff_to_entries(
+            pre_snapshot,
+            &post_snapshot,
+            self.embeddings.as_ref(),
+        )
+        .await?;
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        let id = self.storage.create_checkpoint(&entries).await?;
+        tracing::info!(
+            target: "vault_consolidator::checkpoint",
+            checkpoint = %id,
+            entries = entries.len(),
+            "consolidation checkpoint created"
+        );
+        Ok(Some(id))
     }
 
     /// Phase 4 (T0.2.4): decay the confidence of cold facts.
@@ -1020,6 +1097,12 @@ pub struct ConsolidationReport {
     pub clusters_skipped: usize,
     pub duration: Duration,
     pub conflicts_for_user_review: Vec<ConflictReview>,
+    /// T0.2.5 / A2: the checkpoint capturing everything this run changed, or
+    /// `None` if the run changed nothing (or capture failed — see logs). Undo a
+    /// run with `vault-cli consolidate rollback <id>`. `#[serde(default)]` keeps
+    /// reports serialised before T0.2.5 loadable.
+    #[serde(default)]
+    pub checkpoint_id: Option<CheckpointId>,
     /// Human-readable Markdown summary per BRD §5.6 lines 959-973. Outer
     /// document is run-scoped (Run header + Footer with checkpoint ID);
     /// Merges + Contradictions sections contain per-boundary sub-sections

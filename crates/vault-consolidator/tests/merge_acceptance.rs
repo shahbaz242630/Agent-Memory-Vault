@@ -15,9 +15,12 @@
 //!    surfaced for user review, and `summary_markdown` contains all required
 //!    sections.
 //!
-//! 2. **`rollback_restores_pre_consolidation_state_exactly`** — `#[ignore]`
-//!    skeleton. T0.2.5 (Checkpoint & Rollback) ships the actual primitive;
-//!    this test gets ungated and implemented then.
+//! 2. **`rollback_restores_pre_consolidation_state_exactly`** +
+//!    **`rollback_reverts_combined_dedup_and_decay`** — T0.2.5 (Checkpoint &
+//!    Rollback) acceptance, every CI cycle. Real BGE + `MockLlmProvider`; the
+//!    deterministic dedup + Phase-4 decay paths exercise rollback end-to-end
+//!    (no real Phi-4). Snapshot pre-state → `run_consolidation` → rollback →
+//!    assert post-rollback state == pre-state EXACTLY.
 //!
 //! 3. **`summary_markdown_is_non_empty_and_contains_required_sections`** —
 //!    runs on every CI cycle (Linux + Windows, BGE-gated against macOS). Tiny
@@ -38,8 +41,9 @@
 use std::sync::Arc;
 
 use vault_consolidator::{Consolidator, ConsolidatorConfig};
-use vault_core::Boundary;
+use vault_core::{Boundary, Memory};
 use vault_llm::MockLlmProvider;
+use vault_storage::{MemoryFilter, StorageBackend};
 
 // Imports used only by the Windows-only real-Phi-4 test (#1) and its
 // classification-quality helper. Gated to keep non-Windows CI under
@@ -47,11 +51,9 @@ use vault_llm::MockLlmProvider;
 #[cfg(target_os = "windows")]
 use std::collections::HashMap;
 #[cfg(target_os = "windows")]
-use vault_core::{Memory, MemoryId};
+use vault_core::MemoryId;
 #[cfg(target_os = "windows")]
 use vault_embedding::EMBEDDING_DIM;
-#[cfg(target_os = "windows")]
-use vault_storage::MemoryFilter;
 
 mod common;
 use common::{
@@ -332,28 +334,187 @@ fn log_classification_quality(
 // Test 2 — rollback (T0.2.5 dependency stub)
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Skeleton for the BRD §6.2 line 1451 rollback acceptance test. T0.2.3
-/// does NOT ship the rollback primitive — that lands at T0.2.5 per the BRD
-/// task ordering. This test stays `#[ignore]`'d until T0.2.5 wires
-/// `Consolidator::rollback(checkpoint_id)` (or whatever the final API
-/// surface is); at that point the `#[ignore]` is removed and the body is
-/// fleshed out to:
-///   1. Open storage, write fixture memories, snapshot pre-state
-///   2. Run consolidation (produces merges + sets superseded_by links)
-///   3. Call `rollback(report.checkpoint_id)`
-///   4. Re-snapshot state and assert byte-for-byte equality with pre-state
+/// Full enumeration (incl. superseded) of the vault's memories, sorted by id
+/// so two snapshots are directly comparable. The rollback acceptance bar is
+/// `post == pre`, byte-for-byte across every row.
+async fn snapshot(storage: &StorageBackend) -> Vec<Memory> {
+    let mut all = storage
+        .list_memories(
+            MemoryFilter {
+                include_superseded: true,
+                ..MemoryFilter::default()
+            },
+            None,
+        )
+        .await
+        .expect("list_memories");
+    all.sort_by_key(|m| m.id);
+    all
+}
+
+/// **BRD §6.2 line 1451 acceptance — runs every CI cycle.** Real BGE +
+/// `MockLlmProvider`; the deterministic dedup pass (ADR-063) collapses a
+/// near-identical pair (no real Phi-4 needed), which is the supersession
+/// mutation rollback must reverse.
 ///
-/// Until then this test panics loudly so anyone removing the `#[ignore]`
-/// without implementing the body sees a clear pointer to BRD + HANDOFF.
-#[tokio::test]
-#[ignore = "T0.2.5 dependency: rollback primitive lands at T0.2.5 (BRD §6.2 line 1451). Ungate + implement when T0.2.5 ships."]
+/// Snapshot pre-state → `run_consolidation` (T0.2.5 captures a checkpoint) →
+/// `rollback_checkpoint` → assert the post-rollback state equals the pre-run
+/// state EXACTLY. Also pins "no memory ever lost" (every original id survives
+/// the run) and the double-rollback guard.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rollback_restores_pre_consolidation_state_exactly() {
-    panic!(
-        "T0.2.5 dependency — this test is intentionally a stub at T0.2.3. \
-         Rollback primitive ships at T0.2.5 per BRD §6.2 line 1451. \
-         Implementation pattern: snapshot pre-state → run_consolidation \
-         → rollback → assert post-rollback state == pre-state. See \
-         HANDOFF.md tech-debt + next-session-opener for status."
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+    let embedder = open_bge_provider();
+    let (storage, _dir) = open_sealed_storage_for_test("rollback-exact-passphrase").await;
+
+    // A near-identical pair (collapses via dedup) + an unrelated singleton.
+    // Same paraphrases the summary-sections test proves cluster at 0.92.
+    let work = Boundary::new("work").expect("valid boundary");
+    let memories = vec![
+        make_memory_with_content("Daily standup moved to 10am from 9am", &work),
+        make_memory_with_content("Standup moved to 10am from 9am", &work),
+        make_memory_with_content("Annual offsite scheduled for the week of June 12", &work),
+    ];
+    let mut pairs = Vec::with_capacity(memories.len());
+    for memory in &memories {
+        let embedding = embedder.embed(&memory.content).await.expect("embed");
+        pairs.push((memory.clone(), embedding));
+    }
+    insert_and_drain(&storage, pairs).await;
+
+    let storage = Arc::new(storage);
+    let pre = snapshot(storage.as_ref()).await;
+    assert_eq!(pre.len(), 3, "three memories written");
+
+    let llm = Arc::new(MockLlmProvider::new(
+        "mock-merge-canned",
+        load_canned_response_as_string("merge_size_2"),
+    ));
+    let consolidator = Consolidator::new(
+        storage.clone(),
+        llm,
+        embedder.clone(),
+        ConsolidatorConfig::default(),
+    );
+    let report = consolidator
+        .run_consolidation()
+        .await
+        .expect("run_consolidation");
+
+    // The dedup collapsed the pair → the run changed state → a checkpoint exists.
+    let checkpoint_id = report
+        .checkpoint_id
+        .expect("a state-changing run must produce a checkpoint");
+
+    // "No memory ever lost": every original id is still present after the run
+    // (the loser is superseded, not deleted).
+    let after_run = snapshot(storage.as_ref()).await;
+    for m in &pre {
+        assert!(
+            after_run.iter().any(|q| q.id == m.id),
+            "memory {} vanished during the run — consolidator must never hard-delete",
+            m.id
+        );
+    }
+    assert!(
+        after_run.iter().any(|m| m.superseded_by.is_some()),
+        "expected the dedup to supersede one of the pair"
+    );
+
+    // Roll back and assert EXACT restoration of the pre-run state.
+    let rb = storage
+        .rollback_checkpoint(checkpoint_id)
+        .await
+        .expect("rollback");
+    assert!(
+        rb.restored + rb.deleted >= 1,
+        "rollback must touch at least one memory; got {rb:?}"
+    );
+
+    let post = snapshot(storage.as_ref()).await;
+    assert_eq!(
+        post, pre,
+        "rollback must restore the pre-consolidation state EXACTLY"
+    );
+    assert!(
+        post.iter().all(|m| m.superseded_by.is_none()),
+        "every memory must be active again after rollback"
+    );
+
+    // Double-rollback is rejected (the checkpoint is spent).
+    assert!(
+        storage.rollback_checkpoint(checkpoint_id).await.is_err(),
+        "a second rollback of the same checkpoint must error"
+    );
+}
+
+/// **Adversarial combined-mutation rollback — runs every CI cycle.** One run
+/// that BOTH dedups a near-identical pair AND decays every active fact
+/// (`decay_after_days = 0` forces decay without waiting). Rollback must revert
+/// the supersession AND every confidence change AND remove the decay markers —
+/// i.e. restore the exact pre-run state across two different mutation kinds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rollback_reverts_combined_dedup_and_decay() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+    let embedder = open_bge_provider();
+    let (storage, _dir) = open_sealed_storage_for_test("rollback-combined-passphrase").await;
+
+    let work = Boundary::new("work").expect("valid boundary");
+    let memories = vec![
+        make_memory_with_content("Daily standup moved to 10am from 9am", &work),
+        make_memory_with_content("Standup moved to 10am from 9am", &work),
+        make_memory_with_content("Annual offsite scheduled for the week of June 12", &work),
+        make_memory_with_content("Quarterly reviews due by end of next month", &work),
+    ];
+    let mut pairs = Vec::with_capacity(memories.len());
+    for memory in &memories {
+        let embedding = embedder.embed(&memory.content).await.expect("embed");
+        pairs.push((memory.clone(), embedding));
+    }
+    insert_and_drain(&storage, pairs).await;
+
+    let storage = Arc::new(storage);
+    let pre = snapshot(storage.as_ref()).await;
+
+    let llm = Arc::new(MockLlmProvider::new(
+        "mock-merge-canned",
+        load_canned_response_as_string("merge_size_2"),
+    ));
+    // decay_after_days = 0 → every active fact decays this run.
+    let config = ConsolidatorConfig {
+        decay_after_days: 0,
+        ..ConsolidatorConfig::default()
+    };
+    let consolidator = Consolidator::new(storage.clone(), llm, embedder.clone(), config);
+    let report = consolidator
+        .run_consolidation()
+        .await
+        .expect("run_consolidation");
+    let checkpoint_id = report
+        .checkpoint_id
+        .expect("a state-changing run must produce a checkpoint");
+
+    // Sanity: the run actually decayed at least one fact (confidence dropped
+    // below the 0.9 it was written with) — so the test exercises decay-revert.
+    let after_run = snapshot(storage.as_ref()).await;
+    assert!(
+        after_run
+            .iter()
+            .any(|m| m.superseded_by.is_none() && m.confidence < 0.9),
+        "expected decay to lower at least one active fact's confidence"
+    );
+
+    storage
+        .rollback_checkpoint(checkpoint_id)
+        .await
+        .expect("rollback");
+
+    let post = snapshot(storage.as_ref()).await;
+    assert_eq!(
+        post, pre,
+        "rollback must revert BOTH the dedup supersession AND the decay exactly"
     );
 }
 
@@ -466,14 +627,21 @@ async fn summary_markdown_is_non_empty_and_contains_required_sections() {
         "Footer section header missing:\n{md}"
     );
 
-    // Footer pins (matches summary.rs unit test #5).
+    // Footer pins (matches summary.rs unit test #5). T0.2.5 shipped: this
+    // non-trivial run (the dedup collapses the near-identical pair) creates a
+    // real checkpoint, so the footer carries a real id — never the old
+    // "pending-T0.2.5" placeholder — plus the rollback command hint.
     assert!(
-        md.contains("**Checkpoint ID:** pending-T0.2.5"),
-        "Footer checkpoint-ID placeholder missing or malformed:\n{md}"
+        md.contains("**Checkpoint ID:** "),
+        "Footer checkpoint-ID line missing:\n{md}"
     );
     assert!(
-        md.contains("rollback ships at T0.2.5"),
-        "Footer T0.2.5 rollback literal phrase missing:\n{md}"
+        !md.contains("pending-T0.2.5"),
+        "Footer still shows the pre-T0.2.5 placeholder; real checkpoint id expected:\n{md}"
+    );
+    assert!(
+        md.contains("vault-cli checkpoint rollback"),
+        "Footer rollback command hint missing:\n{md}"
     );
 
     // Sanity: the run was non-trivial. Phase 1 clustered the near-identical
