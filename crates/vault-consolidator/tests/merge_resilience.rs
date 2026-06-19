@@ -117,7 +117,7 @@ async fn malformed_merge_response_does_not_abort_the_run() {
 
     // THE assertion: the run completes (Ok), it does NOT abort.
     let report = consolidator
-        .run_consolidation()
+        .run_consolidation(None)
         .await
         .expect("a malformed merge response MUST NOT abort the consolidation run");
 

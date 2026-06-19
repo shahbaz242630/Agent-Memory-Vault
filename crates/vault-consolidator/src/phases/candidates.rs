@@ -42,6 +42,9 @@
 
 use std::collections::BTreeSet;
 
+use vault_core::{Boundary, MemoryId, VaultResult};
+use vault_storage::StorageBackend;
+
 /// Per-fact neighbor count. Each fact contributes at most its top-K closest
 /// other facts as candidate contradiction partners. Small K keeps the judge's
 /// pair count bounded (≤ N·K/2 after the symmetric union) while still pairing a
@@ -131,6 +134,51 @@ pub fn nearest_neighbor_candidate_pairs(embeddings: &[Vec<f32>]) -> Vec<(usize, 
         }
     }
     pairs.into_iter().collect()
+}
+
+/// Incremental (ADR-082) contradiction-candidate neighbours for ONE seed:
+/// the seed's top-[`CONTRADICTION_NN_TOP_K`] LanceDB neighbours at/above
+/// [`CONTRADICTION_NN_SIMILARITY_FLOOR`], excluding the self-match, boundary-
+/// scoped.
+///
+/// This is the incremental analogue of [`nearest_neighbor_candidate_pairs`]: the
+/// full-sweep path embeds every active fact and computes all-pairs in memory,
+/// which costs O(N) embeddings; the incremental path instead seeds only on
+/// *changed* facts and asks LanceDB (which already holds every vector) for each
+/// seed's neighbours. The search hits the whole boundary corpus, so a NEW fact
+/// still surfaces an OLD same-subject neighbour (the cross-corpus invariant —
+/// ADR-082 §D4). The caller validates returned ids against the active set and
+/// pairs each `(seed, neighbour)` for the existing pairwise judge.
+///
+/// `LanceVectorStore::search` returns cosine *distance* (smaller = closer); for
+/// the L2-normalised embeddings the provider guarantees, the similarity floor
+/// `f` maps to `distance ≤ 1 - f` (mirrors `phases::cluster`).
+///
+/// # Errors
+///
+/// [`vault_core::VaultError`] propagated from the vector-store search.
+pub async fn contradiction_candidate_neighbours(
+    storage: &StorageBackend,
+    self_id: &MemoryId,
+    embedding: &[f32],
+    boundary: &Boundary,
+) -> VaultResult<Vec<MemoryId>> {
+    // Request one extra to absorb the self-match the store returns at distance 0.
+    let raw = storage
+        .vector_store()
+        .search(
+            embedding,
+            CONTRADICTION_NN_TOP_K + 1,
+            std::slice::from_ref(boundary),
+        )
+        .await?;
+    let max_distance = 1.0_f32 - CONTRADICTION_NN_SIMILARITY_FLOOR;
+    Ok(raw
+        .into_iter()
+        .filter(|(id, _)| id != self_id)
+        .filter(|(_, distance)| *distance <= max_distance)
+        .map(|(id, _)| id)
+        .collect())
 }
 
 #[cfg(test)]

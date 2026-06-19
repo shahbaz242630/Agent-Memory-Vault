@@ -50,7 +50,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, instrument, warn};
 
-use vault_core::{Boundary, MemoryId, VaultError, VaultResult};
+use vault_core::{Boundary, Memory, MemoryId, VaultError, VaultResult};
 use vault_embedding::EmbeddingProvider;
 use vault_storage::{MemoryFilter, StorageBackend};
 
@@ -106,13 +106,18 @@ impl Cluster {
 ///
 /// **Algorithm (BRD-locked):**
 ///
-/// 1. Enumerate memories in `boundary`, optionally filtered by
-///    `created_at >= since`. T0.2.2 always passes `since = None` (full-scan
-///    — incremental-scope is a T0.2.5 forward-compat parameter not yet wired
-///    by any caller).
-/// 2. For each memory, re-embed its content via `embeddings.embed(...)` and
+/// 1. Enumerate the **seeds** — memories in `boundary` filtered by
+///    `created_at >= since`. `since = None` (full sweep / cold start) seeds on
+///    the whole active boundary; `since = Some(watermark)` (ADR-082 incremental
+///    nightly / catch-up) seeds only on facts created since the last successful
+///    run. Separately resolve the **active-id set** — every active fact in the
+///    boundary regardless of age — so a seed can still pair with an OLD fact
+///    (the cross-corpus invariant; incremental scopes WHICH facts seed
+///    comparisons, not WHICH facts they may be compared against).
+/// 2. For each SEED, re-embed its content via `embeddings.embed(...)` and
 ///    query `TOP_K_NEIGHBORS + 1` nearest neighbours in the vector store,
-///    boundary-scoped.
+///    boundary-scoped. Neighbours are kept only if they are in the active-id
+///    set (old-but-active passes; retired lingering vectors are dropped).
 /// 3. Drop the self-match (`neighbour_id == memory.id`) and any neighbour
 ///    whose distance exceeds the threshold (cosine similarity below
 ///    `threshold`, equivalent to distance above `1.0 - threshold`).
@@ -136,8 +141,11 @@ impl Cluster {
 ///   boundary at a time per BRD §5.6 line 971 "one summary per boundary").
 /// - `threshold`: cosine similarity threshold ∈ [0.0, 1.0]. Recommended
 ///   default from `ConsolidatorConfig`: 0.92.
-/// - `since`: forward-compat checkpoint parameter for T0.2.5. Pass `None`
-///   at T0.2.2 — produces full-scan semantics matching BRD §5.6 line 936.
+/// - `since`: incremental watermark (ADR-082). `None` = full sweep over the
+///   whole active boundary (cold start / periodic deep-clean). `Some(ts)` =
+///   seed only on facts created at/after `ts` (the last successful run's start
+///   time), matching BRD §5.6 line 936 "memory added since last consolidation"
+///   — while still comparing each seed against the whole active corpus.
 ///
 /// **Returns:** `Vec<Cluster>` with deterministic ordering — clusters sorted
 /// by smallest-member ID ascending; cluster `id`s assigned 0..N in that
@@ -163,8 +171,15 @@ pub async fn find_candidate_clusters(
         )));
     }
 
-    // Step 1: enumerate memories in boundary.
-    let memories = storage
+    // Step 1a: enumerate the SEEDS — the facts to re-examine this run. With
+    // `since = Some(watermark)` (ADR-082 incremental nightly / catch-up) this is
+    // only facts created at/after the last successful run; with `since = None`
+    // (full sweep / cold start) it is every active fact in the boundary.
+    // `list_memories` with the default filter drops superseded rows but KEEPS
+    // `valid_until`-invalidated (retired) rows; a retired fact must never be
+    // re-seeded for clustering (it has been removed from the current truth).
+    // Mirror the Phase 2b / enrich active-set definition (Finding C).
+    let seeds: Vec<Memory> = storage
         .list_memories(
             MemoryFilter {
                 boundary: Some(boundary.clone()),
@@ -173,44 +188,92 @@ pub async fn find_candidate_clusters(
             },
             None,
         )
-        .await?;
+        .await?
+        .into_iter()
+        .filter(|m| m.valid_until.is_none())
+        .collect();
 
-    info!(memory_count = memories.len(), "starting Phase 1 clustering");
-
-    if memories.len() < 2 {
-        // No edges possible; short-circuit before any embedding work.
+    if seeds.is_empty() {
+        // Nothing new to examine this run (steady state of an idle vault).
         return Ok(Vec::new());
     }
 
-    // Step 2-3: re-embed + NN-search + edge collection, per memory.
+    // Step 1b: the VALID-NODE set — every active fact in the boundary, regardless
+    // of age. A seed's nearest neighbour may be an OLD fact created before the
+    // watermark; that new-vs-old pair MUST still cluster + merge (the cross-corpus
+    // invariant, ADR-082 §D4 — incremental scopes WHICH facts seed comparisons,
+    // not WHICH facts are eligible to be compared against). So edges are validated
+    // against the whole active set, not the seed set. When `since` is None the
+    // seeds already ARE the active set, so we reuse them rather than re-scan.
+    let active_ids: HashSet<MemoryId> = if since.is_some() {
+        storage
+            .list_memories(
+                MemoryFilter {
+                    boundary: Some(boundary.clone()),
+                    since: None,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await?
+            .into_iter()
+            // Exclude retired facts so a seed can never cluster/merge against an
+            // already-invalidated row (Finding C).
+            .filter(|m| m.valid_until.is_none())
+            .map(|m| m.id)
+            .collect()
+    } else {
+        // `since = None`: seeds already ARE the (now valid_until-filtered)
+        // active set, so reuse them.
+        seeds.iter().map(|m| m.id).collect()
+    };
+
+    info!(
+        seed_count = seeds.len(),
+        active_count = active_ids.len(),
+        incremental = since.is_some(),
+        "starting Phase 1 clustering"
+    );
+
+    if active_ids.len() < 2 {
+        // Fewer than two active facts in the boundary — no edge is possible.
+        return Ok(Vec::new());
+    }
+
+    // Step 2-3: re-embed each SEED + NN-search + edge collection.
     let mut edges: Vec<(MemoryId, MemoryId)> = Vec::new();
     let max_distance = 1.0_f32 - threshold;
 
-    // The set of valid graph nodes — only the active memories
-    // `list_memories` returned. The vector store can return neighbour ids
-    // that are NOT in this set: a superseded/invalidated memory's LanceDB
-    // vector lingers (supersede/invalidate update SQLite metadata only, not
-    // the vector), so an NN search may surface it even though `list_memories`
-    // (default filter) excludes it. Edges to such non-member ids must be
-    // dropped — otherwise `union_find_components` looks up an id that has no
-    // parent entry and panics. This SQLite/LanceDB divergence is an expected
-    // steady-state condition after any merge/supersede/invalidate, so the
-    // drop is normal hygiene, not an error.
-    let member_ids: HashSet<MemoryId> = memories.iter().map(|m| m.id).collect();
+    // Validating neighbour ids against `active_ids` (not the seed set) is what
+    // lets a seed pair with an OLD active fact while still excluding RETIRED
+    // lingering vectors: a superseded/invalidated/deleted memory's LanceDB
+    // vector lingers (those ops update SQLite metadata only — or tombstone the
+    // vector asynchronously), so an NN search can surface it even though it is
+    // not in the active set. Such edges are dropped — otherwise
+    // `union_find_components` would carry a retired fact into a live cluster.
+    // This SQLite/LanceDB divergence is an expected steady-state condition, so
+    // the drop is normal hygiene, not an error.
     let mut divergent_neighbours_dropped = 0usize;
 
-    for memory in &memories {
+    // Cluster-graph nodes: every seed (so a seed with a neighbour forms a
+    // >= 2 cluster), plus any active neighbour an edge actually reaches. Bounding
+    // the node set to seeds ∪ reached-neighbours keeps union-find O(seeds·K)
+    // rather than O(whole vault) in the incremental case.
+    let mut node_ids: HashSet<MemoryId> = seeds.iter().map(|m| m.id).collect();
+
+    for memory in &seeds {
         let embedding = embeddings.embed(&memory.content).await?;
         let neighbours =
             collect_edges_for_memory(storage, &memory.id, &embedding, boundary, max_distance)
                 .await?;
         for neighbour_id in neighbours {
-            // Drop edges to ids not among the active members (vector-store /
-            // metadata divergence — see the `member_ids` comment above).
-            if !member_ids.contains(&neighbour_id) {
+            // Drop edges to ids not in the ACTIVE set (retired lingering vectors
+            // — see the comment above). Old-but-active neighbours pass.
+            if !active_ids.contains(&neighbour_id) {
                 divergent_neighbours_dropped += 1;
                 continue;
             }
+            node_ids.insert(neighbour_id);
             // Canonicalise edge orientation (smaller-id, larger-id) so the
             // edge set deduplicates trivially across the symmetric pairs
             // produced by querying both endpoints.
@@ -226,15 +289,14 @@ pub async fn find_candidate_clusters(
     if divergent_neighbours_dropped > 0 {
         warn!(
             dropped = divergent_neighbours_dropped,
-            "dropped NN edges to non-member ids (vector-store/metadata divergence — \
-             superseded or invalidated vectors lingering in LanceDB)"
+            "dropped NN edges to non-active ids (vector-store/metadata divergence — \
+             superseded, invalidated, or deleted vectors lingering in LanceDB)"
         );
     }
     debug!(edge_count = edges.len(), "edges collected pre-dedup");
 
-    // Step 4: union-find transitive closure.
-    let clusters_map =
-        union_find_components(&memories.iter().map(|m| m.id).collect::<Vec<_>>(), &edges);
+    // Step 4: union-find transitive closure over seeds ∪ reached neighbours.
+    let clusters_map = union_find_components(&node_ids.into_iter().collect::<Vec<_>>(), &edges);
 
     // Step 5-6: filter singletons + assign deterministic Cluster ids.
     let mut clusters: Vec<Vec<MemoryId>> = clusters_map

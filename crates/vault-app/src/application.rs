@@ -91,6 +91,49 @@ where
     }
 }
 
+/// Environment variable that overrides the per-run consolidation hard timeout.
+pub(crate) const CONSOLIDATOR_TIMEOUT_ENV: &str = "VAULT_CONSOLIDATOR_TIMEOUT_SECS";
+
+/// Parse a [`CONSOLIDATOR_TIMEOUT_ENV`] override value into a [`Duration`].
+///
+/// Returns `None` (→ caller uses the default [`CONSOLIDATOR_HARD_TIMEOUT`]) for
+/// a missing, empty, or unparseable value. The sentinel `0` means **no limit**
+/// — a one-time full-sweep backfill on a large cold vault enriches every fact
+/// (O(facts)) and legitimately runs longer than the nightly default; this is
+/// how a scale-validation run is allowed to finish rather than being killed
+/// mid-job. Pure + side-effect-free so it is unit-testable without mutating
+/// process-global environment state.
+fn parse_timeout_override(raw: Option<&str>) -> Option<Duration> {
+    let secs = raw?.trim().parse::<u64>().ok()?;
+    // `0` is the "no limit" sentinel: an effectively-unbounded budget so a
+    // backfill run completes naturally. We map it to the max representable
+    // duration rather than skipping the timeout wrapper, keeping one code path.
+    if secs == 0 {
+        Some(Duration::MAX)
+    } else {
+        Some(Duration::from_secs(secs))
+    }
+}
+
+/// Resolve the per-run consolidation hard timeout: the [`CONSOLIDATOR_TIMEOUT_ENV`]
+/// override if present and valid, otherwise the [`CONSOLIDATOR_HARD_TIMEOUT`]
+/// default. Normal (nightly / unset) behaviour is unchanged.
+fn resolve_consolidator_timeout() -> Duration {
+    let raw = std::env::var(CONSOLIDATOR_TIMEOUT_ENV).ok();
+    match parse_timeout_override(raw.as_deref()) {
+        Some(dur) => {
+            tracing::info!(
+                target: "vault_app::consolidator",
+                timeout_secs = dur.as_secs(),
+                overridden = true,
+                "consolidation hard timeout overridden via {CONSOLIDATOR_TIMEOUT_ENV}"
+            );
+            dur
+        }
+        None => CONSOLIDATOR_HARD_TIMEOUT,
+    }
+}
+
 /// Composition root. Phase 1 wires the dep graph; Phase 1b adds the
 /// minimum lifecycle (retry-worker spawn) needed for write→search
 /// round-trips through the cascading orchestrator. Phase 2 adds full
@@ -733,22 +776,42 @@ async fn run_consolidation_under_safety(
     // unwind) which removes the lockfile.
     let _lock = ConsolidatorLock::try_acquire(vault_root)?;
 
+    // ADR-082: capture the run's START time and read the incremental watermark
+    // while holding the lock. The run seeds Phase 1 / Phase 2b on facts created
+    // since the watermark; it is advanced to `run_started_at` only after the
+    // FULL pipeline below succeeds. A watermark read failure fails open to a
+    // full sweep (a slow full run beats a missed merge/contradiction).
+    let run_started_at = chrono::Utc::now();
+    let since = match consolidator.consolidation_watermark().await {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!(
+                target: "vault_app::consolidator",
+                run_id = %run_id,
+                error = %e,
+                "could not read consolidation watermark; falling back to a full sweep"
+            );
+            None
+        }
+    };
+
     // Wrap the consolidator's run_consolidation + per-boundary REPORT
     // generation in one hard timeout — both phases call the LLM and
     // re-embed, so both belong under the same cancellation budget. We
     // .clone() the Arc<Consolidator> so the future is 'static-friendly
     // (no borrow on self threaded through tokio::timeout's internal
-    // future polling). enrich_facts + generate_reports run AFTER
-    // run_consolidation so they reflect the post-merge / post-invalidate
-    // active set (ADR-058 / ADR-074). All three call the LLM and/or
-    // re-embed, so all three belong under the same cancellation budget.
+    // future polling) AND so the original handle survives for the
+    // post-success watermark advance below. enrich_facts + generate_reports
+    // run AFTER run_consolidation so they reflect the post-merge /
+    // post-invalidate active set (ADR-058 / ADR-074).
+    let consolidator_run = consolidator.clone();
     let inner = async move {
-        let report = consolidator.run_consolidation().await?;
+        let report = consolidator_run.run_consolidation(since).await?;
         // ADR-074: document-side alias enrichment of the post-merge active
         // set (Gap-2 vocabulary-gap fix). Per-fact failures are counted
         // inside enrich_facts and never abort the run; only the initial
         // enumeration can error here.
-        let enrichment = consolidator.enrich_facts().await?;
+        let enrichment = consolidator_run.enrich_facts().await?;
         tracing::info!(
             target: "vault_app::consolidator",
             run_id = %run_id,
@@ -757,11 +820,11 @@ async fn run_consolidation_under_safety(
             failed = enrichment.facts_failed,
             "alias enrichment pass complete"
         );
-        let reports = consolidator.generate_reports(run_id).await?;
+        let reports = consolidator_run.generate_reports(run_id).await?;
         Ok::<_, VaultError>((report, reports))
     };
     let (report, reports) =
-        timeout_or_consolidator_timeout(CONSOLIDATOR_HARD_TIMEOUT, inner).await?;
+        timeout_or_consolidator_timeout(resolve_consolidator_timeout(), inner).await?;
 
     // Persist each per-boundary REPORT atomically to the vault root.
     // The filesystem write lives in this app layer (it owns
@@ -792,12 +855,31 @@ async fn run_consolidation_under_safety(
         }
     }
 
+    // ADR-082: the full pipeline succeeded and REPORTs are persisted — advance
+    // the incremental watermark to this run's START time. A run that timed out
+    // or errored above returned early via `?` and never reaches here, so its
+    // watermark stays put and the next run retries the same backlog. A failed
+    // advance is logged, not fatal (the run's work is already durable).
+    if let Err(e) = consolidator
+        .advance_consolidation_watermark(run_started_at)
+        .await
+    {
+        tracing::warn!(
+            target: "vault_app::consolidator",
+            run_id = %run_id,
+            error = %e,
+            "consolidation succeeded but advancing the watermark failed; \
+             the next run may re-process this window"
+        );
+    }
+
     tracing::info!(
         target: "vault_app::consolidator",
         run_id = %run_id,
         memories_processed = report.memories_processed,
         memories_merged = report.memories_merged,
         contradictions_resolved = report.contradictions_resolved,
+        contradictions_auto_resolved = report.contradictions_auto_resolved,
         reports_written = reports.len(),
         "consolidation run completed under safety wrapper"
     );
@@ -1156,6 +1238,47 @@ mod tests {
             ),
             other => panic!("expected VaultError::Storage, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_timeout_override_none_for_absent_value() {
+        assert_eq!(
+            parse_timeout_override(None),
+            None,
+            "an unset override MUST fall back to the default"
+        );
+    }
+
+    #[test]
+    fn parse_timeout_override_none_for_empty_or_garbage() {
+        assert_eq!(parse_timeout_override(Some("")), None);
+        assert_eq!(parse_timeout_override(Some("   ")), None);
+        assert_eq!(parse_timeout_override(Some("not-a-number")), None);
+        assert_eq!(parse_timeout_override(Some("-5")), None);
+        assert_eq!(parse_timeout_override(Some("3.5")), None);
+    }
+
+    #[test]
+    fn parse_timeout_override_parses_positive_seconds_and_trims() {
+        assert_eq!(
+            parse_timeout_override(Some("900")),
+            Some(Duration::from_secs(900))
+        );
+        assert_eq!(
+            parse_timeout_override(Some("  7200  ")),
+            Some(Duration::from_secs(7200)),
+            "surrounding whitespace MUST be tolerated"
+        );
+    }
+
+    #[test]
+    fn parse_timeout_override_zero_is_no_limit_sentinel() {
+        assert_eq!(
+            parse_timeout_override(Some("0")),
+            Some(Duration::MAX),
+            "the `0` sentinel MUST map to an effectively-unbounded budget so a \
+             one-time full-sweep backfill completes instead of being killed"
+        );
     }
 
     // =========================================================================

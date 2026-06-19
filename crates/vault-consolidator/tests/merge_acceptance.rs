@@ -168,7 +168,7 @@ async fn merge_acceptance_phase_1_to_3_end_to_end_against_100_fixture() {
 
     // ── Step 4: run the full consolidation pipeline ──────────────────────
     let report = consolidator
-        .run_consolidation()
+        .run_consolidation(None)
         .await
         .expect("run_consolidation must succeed");
 
@@ -398,7 +398,7 @@ async fn rollback_restores_pre_consolidation_state_exactly() {
         ConsolidatorConfig::default(),
     );
     let report = consolidator
-        .run_consolidation()
+        .run_consolidation(None)
         .await
         .expect("run_consolidation");
 
@@ -489,7 +489,7 @@ async fn rollback_reverts_combined_dedup_and_decay() {
     };
     let consolidator = Consolidator::new(storage.clone(), llm, embedder.clone(), config);
     let report = consolidator
-        .run_consolidation()
+        .run_consolidation(None)
         .await
         .expect("run_consolidation");
     let checkpoint_id = report
@@ -581,7 +581,7 @@ async fn summary_markdown_is_non_empty_and_contains_required_sections() {
     );
 
     let report = consolidator
-        .run_consolidation()
+        .run_consolidation(None)
         .await
         .expect("run_consolidation must succeed");
 

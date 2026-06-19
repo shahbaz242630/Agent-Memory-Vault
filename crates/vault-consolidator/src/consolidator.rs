@@ -29,7 +29,7 @@
 //! [`ConsolidationReport`] carries per-boundary sub-sections inside
 //! `summary_markdown`, not separate runs per boundary.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,7 +42,9 @@ use vault_embedding::EmbeddingProvider;
 use vault_llm::LlmProvider;
 use vault_storage::{CheckpointId, MemoryFilter, StorageBackend};
 
-use crate::phases::candidates::nearest_neighbor_candidate_pairs;
+use crate::phases::candidates::{
+    contradiction_candidate_neighbours, nearest_neighbor_candidate_pairs,
+};
 use crate::phases::cluster::{find_candidate_clusters, Cluster};
 use crate::phases::contradiction::judge_candidate_pairs;
 use crate::phases::decay::{self, plan_decay};
@@ -174,6 +176,27 @@ impl Consolidator {
         self.config.run_at
     }
 
+    /// Read the incremental-consolidation watermark (ADR-082) — the START time
+    /// of the last fully-successful run, or `None` (cold start → full sweep).
+    /// Thin delegate so the app-layer safety wrapper can scope a run without
+    /// reaching into the consolidator's private storage handle.
+    pub async fn consolidation_watermark(&self) -> VaultResult<Option<DateTime<Utc>>> {
+        self.storage.get_consolidation_watermark().await
+    }
+
+    /// Advance the incremental-consolidation watermark to `run_started_at`.
+    /// Called by the app-layer safety wrapper ONLY after the full pipeline
+    /// (run → enrich → REPORT persist) succeeds; a failed/timed-out run must
+    /// not advance it, so the next run retries the same backlog.
+    pub async fn advance_consolidation_watermark(
+        &self,
+        run_started_at: DateTime<Utc>,
+    ) -> VaultResult<()> {
+        self.storage
+            .set_consolidation_watermark(run_started_at)
+            .await
+    }
+
     /// Run a full consolidation cycle per BRD §5.6 lines 933-955.
     ///
     /// **Pipeline (T0.2.3 commit 2):**
@@ -204,8 +227,18 @@ impl Consolidator {
     /// creation + rollback ship at T0.2.5 per BRD §6.2. The
     /// `since: Option<DateTime<Utc>>` parameter on
     /// [`find_candidate_clusters`] is passed `None` (full-scan) at T0.2.3.
-    #[instrument(skip(self))]
-    pub async fn run_consolidation(&self) -> VaultResult<ConsolidationReport> {
+    /// `since` (ADR-082) scopes the run: `None` = full sweep over the whole
+    /// active vault (cold start / periodic deep-clean); `Some(watermark)` =
+    /// incremental — only facts created since the last successful run seed Phase
+    /// 1 clustering and Phase 2b contradiction detection, while each seed is
+    /// still compared against the whole active corpus (cross-corpus invariant).
+    /// The caller (app safety-wrapper / headless `schedule`) owns reading the
+    /// watermark and advancing it on full success.
+    #[instrument(skip(self), fields(incremental = since.is_some()))]
+    pub async fn run_consolidation(
+        &self,
+        since: Option<DateTime<Utc>>,
+    ) -> VaultResult<ConsolidationReport> {
         let started_at = Utc::now();
 
         // Step 1: snapshot the full memory set (incl. superseded) up-front —
@@ -263,7 +296,7 @@ impl Consolidator {
                 self.embeddings.as_ref(),
                 &boundary,
                 self.config.merge_similarity_threshold,
-                None, // T0.2.5 wires actual since-checkpoint values.
+                since, // ADR-082: None = full sweep; Some = incremental seeds.
             )
             .await?;
 
@@ -400,22 +433,28 @@ impl Consolidator {
                                     "Phi-4 surfaced contradiction with clear winner; \
                                      invalidating losers per ADR-051"
                                 );
+                                let mut invalidated = 0usize;
                                 for loser in losers {
                                     let invalidate_reason = format!(
                                         "auto-invalidated by consolidator (cluster {}): {reasoning}",
                                         cluster.id
                                     );
-                                    if let Err(e) =
-                                        self.storage.invalidate(loser, now, invalidate_reason).await
+                                    match self
+                                        .storage
+                                        .invalidate(loser, now, invalidate_reason)
+                                        .await
                                     {
-                                        tracing::warn!(
+                                        Ok(_) => invalidated += 1,
+                                        Err(e) => tracing::warn!(
                                             target: "vault_consolidator::contradiction",
                                             loser = %loser,
                                             error = %e,
                                             "invalidate failed; next consolidation cycle will retry"
-                                        );
+                                        ),
                                     }
                                 }
+                                // Surface the retirement count (Finding A).
+                                boundary_summary.contradictions_auto_resolved += invalidated;
                             }
                             None => {
                                 // Legacy path — queue ConflictReview for the
@@ -483,29 +522,92 @@ impl Consolidator {
                 continue;
             }
 
-            // Embed each active fact. Memory rows carry `embedding: None`
-            // (vectors live in LanceDB per ADR-045 §c); re-embed via the shared
-            // provider — embeds are deterministic, so the vectors match those
-            // Phase 1 clustering computed.
-            let mut embeddings = Vec::with_capacity(memories.len());
-            for m in memories {
-                embeddings.push(self.embeddings.embed(&m.content).await?);
-            }
+            // Build the candidate contradiction pairs. Two paths, by mode:
+            //
+            // - Full sweep (`since = None`): the proven A5 path — embed every
+            //   active fact and compute all-pairs nearest neighbours in memory
+            //   (`nearest_neighbor_candidate_pairs`). O(N) embeddings.
+            // - Incremental (`since = Some`, ADR-082): seed only on facts created
+            //   since the watermark and ask LanceDB for each seed's neighbours
+            //   (`contradiction_candidate_neighbours`), so a NEW fact still pairs
+            //   with an OLD same-subject neighbour (cross-corpus invariant) at
+            //   O(seeds) embeddings instead of O(N).
+            let pairs: Vec<(&Memory, &Memory)> = if let Some(ts) = since {
+                let active_ids: HashSet<MemoryId> = memories.iter().map(|m| m.id).collect();
+                let by_id: HashMap<MemoryId, &Memory> =
+                    memories.iter().map(|m| (m.id, m)).collect();
+                // Seeds: changed-since-watermark active facts in this boundary
+                // (re-query so the created_at filter runs in SQL, as in Phase 1).
+                let seeds: Vec<Memory> = self
+                    .storage
+                    .list_memories(
+                        MemoryFilter {
+                            boundary: Some(boundary.clone()),
+                            since: Some(ts),
+                            ..MemoryFilter::default()
+                        },
+                        None,
+                    )
+                    .await?
+                    .into_iter()
+                    .filter(|m| m.valid_until.is_none())
+                    .collect();
+                let mut pair_ids: BTreeSet<(MemoryId, MemoryId)> = BTreeSet::new();
+                for seed in &seeds {
+                    let embedding = self.embeddings.embed(&seed.content).await?;
+                    let neighbours = contradiction_candidate_neighbours(
+                        self.storage.as_ref(),
+                        &seed.id,
+                        &embedding,
+                        boundary,
+                    )
+                    .await?;
+                    for nid in neighbours {
+                        // Keep only active-set neighbours (drop retired lingering
+                        // vectors); canonicalise so seed↔neighbour dedups across
+                        // seeds.
+                        if !active_ids.contains(&nid) {
+                            continue;
+                        }
+                        let key = if seed.id <= nid {
+                            (seed.id, nid)
+                        } else {
+                            (nid, seed.id)
+                        };
+                        pair_ids.insert(key);
+                    }
+                }
+                pair_ids
+                    .into_iter()
+                    .filter_map(|(a, b)| match (by_id.get(&a), by_id.get(&b)) {
+                        (Some(x), Some(y)) => Some((*x, *y)),
+                        _ => None,
+                    })
+                    .collect()
+            } else {
+                // Embed each active fact. Memory rows carry `embedding: None`
+                // (vectors live in LanceDB per ADR-045 §c); re-embed via the
+                // shared provider — embeds are deterministic, so the vectors
+                // match those Phase 1 clustering computed.
+                let mut embeddings = Vec::with_capacity(memories.len());
+                for m in memories {
+                    embeddings.push(self.embeddings.embed(&m.content).await?);
+                }
+                nearest_neighbor_candidate_pairs(&embeddings)
+                    .iter()
+                    .map(|&(i, j)| (&memories[i], &memories[j]))
+                    .collect()
+            };
 
-            // Nearest-neighbor candidate pairs (index pairs into `memories`).
-            let pair_indices = nearest_neighbor_candidate_pairs(&embeddings);
-            if pair_indices.is_empty() {
+            if pairs.is_empty() {
                 continue;
             }
-            let pairs: Vec<(&Memory, &Memory)> = pair_indices
-                .iter()
-                .map(|&(i, j)| (&memories[i], &memories[j]))
-                .collect();
             tracing::info!(
                 target: "vault_consolidator::contradiction",
                 boundary = %boundary,
                 active = memories.len(),
                 candidate_pairs = pairs.len(),
+                incremental = since.is_some(),
                 "Phase 2b: judging nearest-neighbor contradiction candidates"
             );
 
@@ -553,19 +655,32 @@ impl Consolidator {
                 active = memories.len(),
                 "nearest-neighbor contradiction(s) detected; invalidating stale facts per ADR-051"
             );
+            let mut invalidated = 0usize;
             for stale_id in stale {
                 let reason = format!(
                     "auto-invalidated by consolidator (boundary '{boundary}'): {}",
                     verdict.reasoning
                 );
-                if let Err(e) = self.storage.invalidate(stale_id, now, reason).await {
-                    tracing::warn!(
+                match self.storage.invalidate(stale_id, now, reason).await {
+                    Ok(_) => invalidated += 1,
+                    Err(e) => tracing::warn!(
                         target: "vault_consolidator::contradiction",
                         stale = %stale_id,
                         error = %e,
                         "invalidate failed; next consolidation cycle will retry"
-                    );
+                    ),
                 }
+            }
+            // Surface the retirement count (Finding A). Phase 2b runs AFTER the
+            // per-boundary summaries were inserted by the merge phase, so update
+            // the existing entry (or create one for a boundary whose only change
+            // this run was a contradiction retirement).
+            if invalidated > 0 {
+                run_state
+                    .per_boundary
+                    .entry(boundary.clone())
+                    .or_default()
+                    .contradictions_auto_resolved += invalidated;
             }
         }
 
@@ -598,6 +713,13 @@ impl Consolidator {
             .per_boundary
             .values()
             .map(|b| b.contradictions.len())
+            .sum();
+        // Finding A: facts auto-retired by contradiction recency this run (both
+        // the merge-classifier and Phase 2b paths), summed across boundaries.
+        let contradictions_auto_resolved: usize = run_state
+            .per_boundary
+            .values()
+            .map(|b| b.contradictions_auto_resolved)
             .sum();
         let conflicts_for_user_review: Vec<ConflictReview> = run_state
             .per_boundary
@@ -647,6 +769,7 @@ impl Consolidator {
             memories_processed: run_state.memories_processed,
             memories_merged,
             contradictions_resolved,
+            contradictions_auto_resolved,
             memories_archived: 0, // Cold archive lands in a follow-up batch.
             memories_decayed: run_state.memories_decayed,
             clusters_deduped,
@@ -855,13 +978,20 @@ impl Consolidator {
     pub async fn generate_reports(&self, run_id: Uuid) -> VaultResult<Vec<Report>> {
         let generated_at = Utc::now();
 
-        // Re-enumerate active (non-superseded) memories and group by
-        // boundary — mirrors run_consolidation steps 1-2 so topic discovery
-        // sees exactly the set that survived the merge pipeline.
-        let all_memories = self
+        // Re-enumerate active memories and group by boundary — mirrors
+        // run_consolidation steps 1-2 so topic discovery sees exactly the set
+        // that survived the merge pipeline. The default filter drops superseded
+        // rows; the `valid_until` filter additionally drops retired
+        // (contradiction-invalidated / expired) rows so the REPORT reflects only
+        // the current truth — a retired fact must never appear in the knowledge
+        // state (Finding D). Mirrors the Phase 2b / enrich active-set definition.
+        let all_memories: Vec<Memory> = self
             .storage
             .list_memories(MemoryFilter::default(), None)
-            .await?;
+            .await?
+            .into_iter()
+            .filter(|m| m.valid_until.is_none())
+            .collect();
         let mut by_boundary: BTreeMap<Boundary, Vec<Memory>> = BTreeMap::new();
         for memory in all_memories {
             by_boundary
@@ -1041,13 +1171,45 @@ impl Consolidator {
             );
             tokio::time::sleep(wait).await;
 
-            match self.run_consolidation().await {
+            // Incremental scope (ADR-082): seed on facts created since the last
+            // successful run. Fail-open to a full sweep if the watermark read
+            // errors — a slow full run beats a missed merge/contradiction.
+            let run_started_at = chrono::Utc::now();
+            let since = match self.storage.get_consolidation_watermark().await {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "vault_consolidator::scheduler",
+                        error = %e,
+                        "could not read consolidation watermark; falling back to a full sweep"
+                    );
+                    None
+                }
+            };
+
+            match self.run_consolidation(since).await {
                 Ok(report) => {
                     if let Err(e) = self.enrich_facts().await {
                         tracing::warn!(
                             target: "vault_consolidator::scheduler",
                             error = %e,
                             "post-run enrichment failed; next cycle retries"
+                        );
+                    }
+                    // Advance the watermark ONLY on a successful cycle, to the
+                    // run's START time (so a fact created mid-run is picked up
+                    // next cycle, never skipped). A failed run leaves it
+                    // unchanged → the next cycle retries the same backlog.
+                    if let Err(e) = self
+                        .storage
+                        .set_consolidation_watermark(run_started_at)
+                        .await
+                    {
+                        tracing::warn!(
+                            target: "vault_consolidator::scheduler",
+                            error = %e,
+                            "consolidation succeeded but advancing the watermark failed; \
+                             next cycle may re-process this window"
                         );
                     }
                     tracing::info!(
@@ -1077,6 +1239,13 @@ pub struct ConsolidationReport {
     pub memories_processed: usize,
     pub memories_merged: usize,
     pub contradictions_resolved: usize,
+    /// Finding A: facts auto-retired by contradiction recency this run (a newer
+    /// fact won; the older same-attribute fact was invalidated). Counts both the
+    /// merge-classifier and Phase 2b paths. Distinct from `contradictions_resolved`
+    /// (the count of ambiguous conflicts queued for human review). `#[serde(default)]`
+    /// keeps pre-existing reports loadable.
+    #[serde(default)]
+    pub contradictions_auto_resolved: usize,
     pub memories_archived: usize,
     /// Phase 4 (T0.2.4): facts whose confidence was decayed this run. Additive
     /// to the BRD §5.6 baseline shape; `#[serde(default)]` keeps reports
@@ -1221,6 +1390,14 @@ pub(crate) struct BoundarySummary {
     /// (dedup error, or LLM merge decision / apply failure). Previously
     /// log-only — surfaced here so persistent skips are visible, not silent.
     pub skipped_clusters: usize,
+    /// Count of facts auto-retired by contradiction resolution this run — a
+    /// recency clear-winner invalidated the older fact(s). Counts BOTH the
+    /// Phase 2 merge-classifier `Contradiction { clear_winner }` path and the
+    /// Phase 2b nearest-neighbour path. Surfaced in the run summary so a
+    /// retirement is never silent — you cannot decide to roll back what the
+    /// summary hides (Finding A). Distinct from `contradictions` (the
+    /// review-queue for ambiguous conflicts that need a human).
+    pub contradictions_auto_resolved: usize,
 }
 
 /// An applied merge plus the inputs the summary markdown needs:

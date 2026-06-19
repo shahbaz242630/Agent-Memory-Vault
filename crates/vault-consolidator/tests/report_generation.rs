@@ -32,6 +32,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use chrono::Utc;
 use uuid::Uuid;
 use vault_consolidator::{write_report_atomic, Consolidator, ConsolidatorConfig, Report};
 use vault_core::Boundary;
@@ -136,6 +137,73 @@ async fn generate_reports_produces_topical_report_per_boundary() {
         unique_facts, expected,
         "the union of all topics' facts MUST equal the seeded set exactly \
          (no loss, no invention)"
+    );
+}
+
+/// Finding D — a retired (invalidated) fact must NOT appear in the generated
+/// REPORT. The REPORT is the "current truth, grouped by topic" view the read
+/// pipeline serves; a fact retired by contradiction/expiry has left the current
+/// truth, so surfacing it would present stale knowledge as live. Before the fix,
+/// `generate_reports` listed every non-superseded row (including `valid_until`-
+/// invalidated ones), so retired facts leaked into the REPORT.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn generate_reports_excludes_invalidated_facts() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+    let boundary = Boundary::new("personal").expect("valid boundary");
+    let embedder = open_bge_provider();
+    let (storage, _dir) = open_sealed_storage_for_test("report-excludes-invalidated").await;
+
+    let keep = "The user prefers the Rust programming language for backend work.";
+    let retire = "The user's flight to Berlin departs at 7am on the 14th.";
+
+    let keep_mem = make_memory_with_content(keep, &boundary);
+    let retire_mem = make_memory_with_content(retire, &boundary);
+    let retire_id = retire_mem.id;
+    let keep_emb = embedder.embed(keep).await.expect("embed keep");
+    let retire_emb = embedder.embed(retire).await.expect("embed retire");
+    insert_and_drain(
+        &storage,
+        vec![(keep_mem, keep_emb), (retire_mem, retire_emb)],
+    )
+    .await;
+
+    // Retire one fact via the bi-temporal invalidate API (ADR-051, metadata-only).
+    storage
+        .invalidate(retire_id, Utc::now(), "test: retired".to_string())
+        .await
+        .expect("invalidate must succeed");
+
+    let llm = Arc::new(MockLlmProvider::new(
+        "mock-topic-label",
+        "not-json".to_string(),
+    ));
+    let consolidator = Consolidator::new(
+        Arc::new(storage),
+        llm,
+        embedder,
+        ConsolidatorConfig::default(),
+    );
+
+    let reports = consolidator
+        .generate_reports(Uuid::new_v4())
+        .await
+        .expect("generate_reports must succeed");
+
+    let facts: Vec<&str> = reports
+        .iter()
+        .flat_map(|r| r.facts_by_topic.values())
+        .flat_map(|fs| fs.iter().map(|f| f.fact.as_str()))
+        .collect();
+
+    assert!(
+        facts.contains(&keep),
+        "the live fact must appear in the REPORT; got {facts:?}"
+    );
+    assert!(
+        !facts.contains(&retire),
+        "the RETIRED fact must NOT appear in the REPORT — a retired fact has left \
+         the current truth (Finding D); got {facts:?}"
     );
 }
 

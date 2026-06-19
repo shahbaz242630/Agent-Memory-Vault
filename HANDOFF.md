@@ -2,15 +2,179 @@
 
 **Current version:** V0.2 Closed Beta (BRD §6.2 — sleep consolidator, boundaries hardening, cross-device sync, 30 beta users)
 
-**Last updated:** 2026-06-16 — **A2 CHECKPOINT & ROLLBACK (T0.2.5) FULLY BUILT — all 5 DoD gates GREEN on a fresh `cargo clean` cold build (build 0-warn · clippy -D warnings · `vault-storage`+`vault-consolidator`+`vault-cli` tests all pass · fmt clean), UNCOMMITTED.** Every nightly run now records a rollback checkpoint; `vault-cli checkpoint list` / `checkpoint rollback <id>` undo a bad run. ADR-081 (capture-by-diff; enrichment excluded; top-level CLI). Next: confirm commit + push, CI-green-verify, then scale pressure-test + A1 cold-archive. Full detail in §1.
+**Last updated:** 2026-06-19 (session 7 close) — **incremental consolidation (Steps 1-3) + timeout knob + the 3 correctness-of-artifact fixes (Findings A/C/D) COMMITTED + PUSHED** after a full COLD-build DoD pass (`cargo test` 3 crates / `clippy --all-targets -D warnings` / `fmt --all --check` all GREEN) AND a LIVE A/C/D re-verify on a fresh 100-fact contradiction run. A/C/D verdict: retirements now VISIBLE in the run summary (`facts retired (contra): 3` + populated `## Contradictions`), clustering excludes already-retired facts (`active_count=78`), REPORT excludes retired facts (Italian/Porto absent). **NEXT SESSION FIRST: `gh run list --workflow=ci.yml -L 1` to CI-verify the push → then the 1k overnight backfill.** Two non-blocking follow-ups surfaced by the re-verify (career contradiction didn't resolve / REPORT topic-coverage 38-of-75 active) — tracked in §1. See §1.
 
 > **How to read this file:** §1 is the only thing you must act on. §2–§5 are current ground truth (incl. the post-scale roadmap in §5). §6 onward is reference you pull from when planning. Deep detail (full ADR text, session-by-session history, tuning evidence) lives in the three archives — cross-linked by ADR number. **Do not paraphrase archived ADRs — quote them.**
 
 ---
 
-## 1 · 🟢 ACTIVE TASK — A2 SHIPPED (T0.2.5); NEXT = scale pressure-test + A1 cold-archive
+## 1 · 🟢 NEXT SESSION OPENER — CI-VERIFY THE PUSH → then 1k overnight backfill
 
-> **🆕 2026-06-16 — A2 CHECKPOINT & ROLLBACK FULLY BUILT (UNCOMMITTED, all 5 DoD gates GREEN on a fresh `cargo clean` cold build).** The "undo a bad nightly run" safety net. Built in one batched pass (no per-step CI cycles — founder directive, the 3h cold build is paid once).
+> **🆕 2026-06-19 (session 7 CLOSE) — incremental consolidation (Steps 1-3) + timeout knob + A/C/D fixes COMMITTED + PUSHED. Full COLD-build DoD GREEN + LIVE A/C/D re-verify PASSED. ✅ COMMITTED.**
+> ### ✅ DONE this session
+> 1. **Full cold-build DoD pass GREEN** on the whole uncommitted set: `cargo test -p vault-consolidator -p vault-cli -p vault-app` (0 failed, incl. the 4 new A/C/D tests) · `cargo clippy --all-targets -- -D warnings` (20m28s, 0 warn) · `cargo fmt --all --check`.
+> 2. **LIVE A/C/D re-verify PASSED** on a fresh copy (`seeded-vault-100-reverify`): planted 3 fresh contradictions (Thai/Italian, Amsterdam/Berlin, data-scientist/structural-engineer) → incremental run with the fixed binary. **(A)** summary showed `facts retired (contra): 3` + `## Contradictions → Auto-resolved (newer fact won): 3`; **(C)** clustering ran on `active_count=78` (excludes the ~22 already-retired); **(D)** retired facts (Italian/Porto/Japanese) ABSENT from the REPORT, new winners present. Read path: all planted recalls survive, resolved contradictions show only the current value.
+> 3. **Committed + pushed** the whole set to `main` (founder-approved). CI-verify is the FIRST next-session action.
+>
+> ### ▶️ FIRST next session — CI-verify, then the 1k overnight backfill
+> 1. `gh run list --workflow=ci.yml -L 1` → confirm this push's CI = `success` (ignore any `schedule`-trigger `real-model-smoke` flake — tech-debt #6). If red, read the failing matrix job before new work.
+> 2. **1k overnight backfill** (founder plan: 100 ✅ → 1k overnight → 10k deferred to Pillar-2 Step 4). Copy `seeded-vault-1k`, run `consolidate run` with `VAULT_CONSOLIDATOR_TIMEOUT_SECS=0` overnight (enrich backfill ≈ 5.5 h), then an incremental run with a few new dup/contradiction facts → confirm fast + correct against the full 1k.
+>
+> ### 🟡 Tracked, NOT blocking (do not lose) — TWO NEW from the A/C/D re-verify
+> - **🆕 Finding E — a contradiction didn't resolve at 100 facts.** The career pair (`data scientist` new vs `structural engineer` old) stayed BOTH-active after the re-verify run; `stale_count=3` fired but only 2 of the 3 intended retirements (cuisine, location) showed in the read-path spot-check, so one retirement landed outside the checked set. Same family as Finding B (contradiction judge on repetitive data). Agent still safe (picks newer `as_of`, like the car). Needs a focused enumerate-the-retired-set look. NOT a regression from the A/C/D fix (the judge is untouched).
+> - **🆕 Finding F — REPORT topic-coverage is partial.** The post-fix REPORT surfaced **38 of 75 active facts** (30 topics). The A/C/D fix only removes *retired* facts (`valid_until` filter), so this ~half-coverage is pre-existing topic-discovery behavior, not introduced here. The READ PATH is complete (that's the product surface) — but the REPORT artifact under-covering is worth a look. Relates to Pillar-2 Step 4 (stored-vector REPORT reuse).
+> - **Finding B** — at 100 facts the contradiction judge retired 24 near-identical "office-noise" distractors; unconfirmed whether genuine dupes or over-aggressive on repetitive data. All planted answers survived. Needs a focused look (enumerate the retired set).
+> - **Read-precision (pre-existing 🟡 insurance, gap table):** `memory_read` did NOT abstain on "annual salary" (returned `$6,500 booking` noise) or "cat breed" (returned the golden retriever). Known money-noise + wrong-neighbour traps; agent-rescuable; not regressions.
+>
+> ### 🧹 Scratch (throwaway, not in repo) — safe to wipe when done
+> `C:\Projects\seeded-vault-100` + `seeded-vault-100-reverify` (consolidated test vaults) · `C:\Projects\mcp-probe\{incremental_write.py, read_check.py, reverify_write.py}` · logs in `C:\Users\shahb\{cold-test-run,cold-clippy,reverify-consolidate}.log`. Phi-4 GGUF: `…\com.shahbaz242630.memory-vault\models\Phi-4-mini-instruct-Q4_K_M.gguf`; BGE + reranker ONNX in `crates/vault-embedding/test-fixtures/`.
+
+> **🗄️ SUPERSEDED (session-7 mid) — the gate-then-commit plan below is DONE; kept for the bug detail. 🆕 2026-06-19 (session 7) — incremental consolidation test gate GREEN; feature validated LIVE at 100 facts; 3 correctness-of-artifact bugs FOUND + FIXED.**
+>
+> ### 📍 Where we are (read this first)
+> 1. **The incremental code (Steps 1-3) is test-GREEN.** Re-ran `cargo test -p vault-storage -p vault-consolidator -p vault-app` clean (vault-storage 277 · vault-consolidator 140 · vault-app 58, 0 failed; R1/R2 + properties green). The session-6 linker stall was an env issue; a keep-awake guard prevented a repeat. **The session-6 block below is SUPERSEDED on the test-gate point.**
+> 2. **Added a run-time consolidator-timeout knob** (`VAULT_CONSOLIDATOR_TIMEOUT_SECS` in `vault-app/src/application.rs`; `0` = no limit). Default stays 30 min. Needed so a one-time full-sweep backfill on a cold vault can FINISH (enrichment is ~20 s/fact → blows 30 min) instead of being killed mid-job. Not a latency change — just removes the kill-switch for backfill/validation.
+> 3. **Validated the feature LIVE at 100 facts** on a throwaway `C:\Projects\seeded-vault-100` (real BGE + Phi-4). The mechanism is PROVEN: full backfill ran to completion (40 min), then an incremental run seeded only the 3 NEW facts (`seed_count=3`, contradiction `candidate_pairs` 117→4, enrichment `enriched=3/skipped=72`), reconciled them against the whole corpus, and finished in **~3 min vs 40**. Read-path dogfood: all current values rank #1 (Italian over Japanese, Berlin over Porto, Rivian), all 8 answerable recalls rank #1, blood-type + OS correctly abstain. **The agent gets correct, current output.**
+>
+> ### 🐞 What the 100-fact validation EXPOSED (the issue) — 3 correctness-of-artifact bugs
+> All three are about the *consolidation artifacts*, not the read path (the read path stayed correct throughout). Likely pre-existing; surfaced by this validation.
+> - **Finding A — retirements were INVISIBLE in the run summary.** A run that retired 24 facts by contradiction printed `contradictions queued: 0` and an EMPTY "## Contradictions" section. The footer says "if this run looks wrong, roll it back" — but you can't roll back what the summary hides. Root: the only contradiction counter was the *review-queue* count (`b.contradictions.len()`); the auto-retired (recency clear-winner) facts were counted nowhere.
+> - **Finding C — Phase-1 clustering compared NEW facts against already-RETIRED ones.** `find_candidate_clusters` enumerated seeds + the active set with `list_memories(default)` which drops superseded rows but KEEPS `valid_until`-invalidated (retired) rows. A new fact could cluster/merge against a fact that's already out of the current truth.
+> - **Finding D — the REPORT included RETIRED facts.** `generate_reports` had the same bug: it listed every non-superseded row (incl. retired), so the on-disk REPORT showed ~100 facts when only ~75 were truly active. (Doesn't reach the user — the read path filters correctly — but the REPORT artifact was wrong.)
+>
+> ### 🔧 What was FIXED this session (in the working tree, UNCOMMITTED, NOT yet gated)
+> - **Finding C** — `vault-consolidator/src/phases/cluster.rs`: seeds + active-set now `.filter(|m| m.valid_until.is_none())` (+ `Memory` import). A retired fact can no longer be a clustering seed or node.
+> - **Finding D** — `vault-consolidator/src/consolidator.rs` `generate_reports`: same `valid_until` filter so the REPORT lists only live facts.
+> - **Finding A** — counted facts auto-retired by contradiction (BOTH the merge-classifier `clear_winner` path AND the Phase-2b NN path) into a new `BoundarySummary.contradictions_auto_resolved`, surfaced as a new `ConsolidationReport.contradictions_auto_resolved` field, and rendered it in: the CLI summary (`facts retired (contra): N`), the summary-markdown "## Contradictions" section (`**Auto-resolved (newer fact won):** N` + per-boundary detail), and the app completion log.
+> - **Tests added:** Finding C → `tests/incremental_consolidation.rs::invalidated_fact_is_excluded_from_clustering`; Finding D → `tests/report_generation.rs::generate_reports_excludes_invalidated_facts`; Finding A → `summary.rs::contradictions_section_surfaces_auto_resolved_retirements` + `_reports_zero_auto_resolved_for_empty_run`. `cargo fmt --all` already run (green).
+>
+> ### ⚠️ FIRST next session — COLD REBUILD + TEST (the fix is already clippy+fmt green), then re-verify, then commit
+> **Context:** this session `clippy --all-targets -D warnings` + `fmt --all --check` BOTH passed on the A/C/D fix (so the code compiles + is lint-clean). The ONLY unfinished gate is the `cargo test` RUN — and it failed PURELY on disk (link.exe exit 1318 while linking the huge `integration_smoke` test binary at ~3 GB free), NOT on code. We then did a **full `cargo clean` (removed 204 GB)** to reset a doubled-up `target/`, so disk is now ~196 GB free.
+> 1. **Cold rebuild + test** (this is now a COLD build, ~2.5-3h — **keep-awake guard ON first**, see prevention note below): `cargo test -p vault-consolidator -p vault-cli -p vault-app`. This rebuilds from scratch (the clean wiped everything) then runs the suite incl. the new A/C/D tests. After it's green, re-run `cargo clippy --all-targets -- -D warnings` + `cargo fmt --all --check` on the rebuilt tree to re-confirm full DoD before commit. **Run ONE thing at a time (no parallel cargo).** Disk is ample now, but a cold `target/` will grow back to ~60-80 GB — fine.
+> 2. **Re-verify A/C/D end-to-end** on a FRESH 100-fact vault (the existing `seeded-vault-100` is already consolidated, so re-seed a fresh copy OR add new contradicting facts + run again). Assert: (A) the run summary now shows `facts retired (contra): N` and a non-empty "## Contradictions" section; (D) the REPORT's active fact count == enrichment's `active=N` (no retired facts in the REPORT); (C) clustering log `active_count` excludes retired facts. The scripts are on disk: `C:\Projects\mcp-probe\incremental_write.py` (writes dup/contradiction facts via MCP) + `read_check.py` (read-path dogfood, uses field `fact`). Full-backfill CLI command + model paths are in the session-7 chat.
+> 3. **Then commit + push** (founder pre-approved commit+push) the WHOLE uncommitted set (Steps 1-3 + timeout knob + A/C/D fix) → `gh run list --workflow=ci.yml -L 1` to CI-verify. The session-6 "prepared commit message" below must be EXTENDED to cover the timeout knob + Findings A/C/D.
+> 4. **Then the 1k overnight backfill** (founder plan: 100 ✅ → 1k overnight → 10k deferred to Pillar-2 Step 4). Copy `seeded-vault-1k`, run `consolidate run` with `VAULT_CONSOLIDATOR_TIMEOUT_SECS=0` overnight (enrich backfill ≈ 5.5 h), then an incremental run with a few new dup/contradiction facts → confirm fast + correct against the full 1k.
+>
+> ### 🟡 Tracked, NOT blocking (do not lose)
+> - **Finding B** — at 100 facts the contradiction judge retired 24 near-identical "office-noise" distractors; unconfirmed whether genuine dupes or over-aggressive on repetitive data. All planted answers survived, so recall of real answers was intact. Needs a focused look (enumerate the retired set) — separate from the incremental feature.
+> - **Read-precision (pre-existing 🟡 insurance, gap table):** `memory_read` did NOT abstain on "annual salary" (returned `$6,500 booking` noise) or "cat breed" (returned the golden retriever). Known money-noise + wrong-neighbour traps; agent-rescuable; not regressions.
+>
+> ### 🛡️ Prevention — keep-awake guard before any long cargo run
+> This machine idle-sleeps + freezes long unattended builds (that caused the session-6 linker stall). Before any long `cargo` run, hold a background keep-awake task and stop it after: `Add-Type -Name Power -Namespace KeepAwake -MemberDefinition '[DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint e);'; [KeepAwake.Power]::SetThreadExecutionState(0x80000001); while($true){ Start-Sleep 60; [KeepAwake.Power]::SetThreadExecutionState(0x80000001) }` (run_in_background; ES_CONTINUOUS|ES_SYSTEM_REQUIRED; blocks idle-sleep only, not lid-close).
+>
+> ### 🧹 Scratch (throwaway, not in repo) — safe to wipe when done
+> `C:\Projects\seeded-vault-100` (consolidated 100-fact test vault) · `C:\Projects\mcp-probe\{incremental_write.py, read_check.py}` (this session's MCP write + read-dogfood scripts). Phi-4 GGUF: `…\com.shahbaz242630.memory-vault\models\Phi-4-mini-instruct-Q4_K_M.gguf`; BGE + reranker ONNX in `crates/vault-embedding/test-fixtures/`.
+
+> **🆕 2026-06-18 (session 6) — PILLAR 2 INCREMENTAL CONSOLIDATION Steps 1-3 BUILT — ⚠️ UNCOMMITTED (test gate interrupted, see "FIRST" below). ADR-082 (§8.14). fmt + clippy + build GREEN on a fresh cold build; `cargo test` blocked by a force-killed-linker leftover (env, not code). [SUPERSEDED 2026-06-19: test gate is now GREEN — see the session-7 block above. The "prepared commit message" below still applies but must be extended with the timeout knob + Findings A/C/D.]**
+>
+> **What shipped (incremental consolidation core — a nightly run is now O(facts changed), not O(vault)):**
+> - **vault-storage:** migration `0005` (`consolidation_state` single-row watermark) + `consolidation_state.rs` (`get/set_consolidation_watermark`) + 4 migration/round-trip tests.
+> - **vault-consolidator:** `run_consolidation(since: Option<DateTime<Utc>>)` — `cluster.rs` Phase 1 + `consolidator.rs` Phase 2b both incremental with the **cross-corpus fix** (seeds = `since`-filtered; edges/pairs validated against the WHOLE active set, so a NEW fact still merges / contradiction-checks against an OLD one — ADR-082 §D4). New `candidates::contradiction_candidate_neighbours` (per-seed LanceDB search). Headless `schedule()` made incremental. Full-sweep (`since=None`) path **unchanged**.
+> - **vault-app:** safety-wrapper reads the watermark, runs incremental, advances it to the run's START time **only on full pipeline success** (a timed-out/crashed run never advances → next run retries the same backlog; no lost work).
+> - **Tests (recall is sacrosanct):** **R1** (`tests/incremental_consolidation.rs`, fast keyed-embedder — a new fact clusters with an old one) + **R2** (`tests/contradiction_resolution.rs`, real BGE — an incremental run retires a stale OLD fact when only the NEW fact is a seed) + full-sweep + idle-vault regressions. All 13 existing `run_consolidation` callers updated to `(None)`.
+> - **DoD:** fmt ✅ · clippy `--all-targets -D warnings` ✅ (16m44s) · build `--all-targets` ✅ (145m, slow machine) · `cargo test` ⚠️ **NOT yet run-green** (linker leftover — see FIRST below).
+>
+> ### ⚠️ FIRST next session — FINISH THE TEST GATE, then COMMIT + PUSH (this is the top priority, before any 1k work)
+> The code is written + clippy/build GREEN; only the `cargo test` gate is unfinished. What happened: an overnight idle-sleep froze the test build on a hung `link.exe`; I force-killed it, and the next `cargo test` failed at **link** (`link.exe` exit 1201/1318) on `vault-storage`/`vault-app` test targets — a leftover from the kill, **NOT our code** (clippy + build `--all-targets` already linked those exact targets green). Recovery:
+> 1. `cargo test -p vault-storage -p vault-consolidator -p vault-app` — a clean re-run often clears killed-linker file locks (object files are intact; only the final link was interrupted).
+> 2. **If the linker errors persist:** surgical `cargo clean -p vault-storage -p vault-app` then re-test (per [[feedback_surgical_cargo_clean_first]] — NOT a full clean; that forces another ~145m cold build).
+> 3. Once tests are GREEN: final `cargo fmt --all --check` → `git status --short` → `git add -A` → **commit + push** (founder pre-approved "commit and push" on 2026-06-18) → then `gh run list --workflow=ci.yml -L 1` to CI-verify.
+>
+> **🛡️ Prevention (this machine idle-sleeps + freezes long unattended builds):** before kicking off any long `cargo` run, set a keep-awake guard, then clear it after — `Add-Type … SetThreadExecutionState(0x80000001)` (ES_CONTINUOUS|ES_SYSTEM_REQUIRED) held in a background task; stop the task when the gate finishes. (Blocks idle-sleep only; closing the lid still sleeps.) NOTE: fmt + clippy + build are already cached GREEN — do NOT `cargo clean` the whole workspace (that forces a fresh ~145m cold build); only the `cargo test` gate remains and it resumes from the warm cache.
+>
+> **Prepared commit message (to `main`; bare `Co-Authored-By: Claude` per repo convention):**
+> ```
+> Pillar 2 incremental consolidation Steps 1-3 (ADR-082): seed by watermark,
+> compare against the whole corpus
+>
+> A nightly consolidation run now processes only facts changed since the last
+> successful run (O(changes), not O(vault)) so it completes at scale, instead of
+> re-embedding/re-clustering/re-merging the whole vault every night. BRD §5.6
+> line 936 already specified this ("memory added since last consolidation"); the
+> shipped since=None full-scan was the deviation.
+>
+> - vault-storage: migration 0005 (single-row consolidation_state watermark) +
+>   get/set_consolidation_watermark + migration/round-trip tests.
+> - vault-consolidator: run_consolidation(since); Phase 1 (cluster.rs) and Phase
+>   2b (candidates.rs per-seed LanceDB search + consolidator.rs) made incremental
+>   and cross-corpus-safe — seeds are since-filtered but each is compared against
+>   the WHOLE active set, so a new fact still merges/contradiction-checks against
+>   an old one. Headless schedule() incremental. since=None full sweep unchanged.
+> - vault-app: safety-wrapper reads the watermark, runs incremental, advances it
+>   to the run's START time only on full-pipeline success.
+> - Tests (recall-safety): R1 (new clusters with old) + R2 (incremental retires a
+>   stale old fact when only the new one is a seed) + full-sweep/idle regressions.
+>
+> Deferred: Step 4 (stored-vector REPORT reuse), catch-up scheduling, full-sweep
+> CLI + configurable timeout, enrich-cap, dedup-gate.
+>
+> DoD green on a fresh cargo clean cold build.
+>
+> Co-Authored-By: Claude <noreply@anthropic.com>
+> ```
+> **Files in the working tree** (3 new + 10 modified): NEW `crates/vault-storage/src/consolidation_state.rs`, `.../migrations/0005_consolidation_watermark.sql`, `crates/vault-consolidator/tests/incremental_consolidation.rs`; MOD `vault-storage/{lib.rs, migrations/mod.rs}`, `vault-consolidator/src/{consolidator.rs, phases/candidates.rs, phases/cluster.rs}`, `vault-consolidator/tests/{contradiction_resolution, decay_integration, dedup_integration, merge_acceptance, merge_resilience, properties}.rs`, `vault-app/src/application.rs`, `HANDOFF.md`.
+>
+> ### ▶️ AFTER the commit lands + CI green — LIVE 1k confirmation (founder ask 2026-06-18)
+> **Founder reframe (act on this):** confirm the core feature WORKS + is fully wired at 1k FIRST; latency/timeout comes later.
+>
+> **STEP 0 — verify green.** `gh run list --workflow=ci.yml -L 1` → confirm this push's CI = `success` (ignore any `schedule`-trigger `real-model-smoke` flake — tech-debt #6). Then re-run `cargo test -p vault-storage -p vault-consolidator -p vault-app` locally (warm, fast) to re-confirm Steps 1-3 green before new work.
+>
+> **🔑 KEY INSIGHT — the 30-min timeout only bites a FULL SWEEP (the cold-start first run), NOT the incremental feature.** An incremental run touches only new facts → fast → never times out. BUT a cold 1k vault's FIRST run pays a one-time **enrichment backfill** (~20s/fact × 1k ≈ 5.5 h — `enrich_facts` is idempotent-by-fingerprint but is NOT `since`-gated, so it re-embeds every un-enriched fact once). That backfill is slow-but-correct, not broken. This is why the live test is two stages.
+>
+> **STEP 1 — make the consolidator timeout configurable** (small; needed anyway for the deferred full-sweep/backfill mode). `CONSOLIDATOR_HARD_TIMEOUT` in `vault-app/src/application.rs` → env-overridable (e.g. `VAULT_CONSOLIDATOR_TIMEOUT_SECS`, default 1800). One edit + warm rebuild + gate.
+>
+> **STEP 2 — the 1k live acceptance** (on a COPY of `seeded-vault-1k` — never the evidence vault):
+>   - **(a) one-time full backfill:** `consolidate run` with a large timeout → let it complete (hours, dominated by enrich) → confirms the pipeline COMPLETES + writes correct REPORTs/checkpoint at 1k AND sets the watermark. **Optionally do ~100 facts first (~40-min full backfill) for a fast green light before the 1k overnight.**
+>   - **(b) incremental run:** add a few NEW facts that DUPLICATE / CONTRADICT existing 1k facts (via MCP `memory_write`), then `consolidate run` again → now incremental (enrich skips the 1k; only new facts processed) → **fast** → confirm it correctly merges/retires the new facts against the full 1k corpus (verify via `checkpoint list`, `divergence-check`, REPORT). THIS proves the fix + full CLI/app wiring at scale.
+>
+> **STEP 3 — then the deferred Pillar 2 follow-ups** (full scope in session-6 chat + the scale scorecard below): **Step 4** stored-vector reuse for REPORT topic-discovery (removes the last embed-all → extends the win to 10k) · **catch-up scheduling** (run on startup if the watermark is stale — the "asleep at 3 AM" fix) · **full-sweep CLI command** · **enrich-cap** (chunk the first backfill across nights) · **loosen the dedup gate** (0/102 dense clusters caught).
+>
+> **🧹 Scratch:** wipe `C:\Projects\seeded-vault-1k-pressure` (old partial run). Copy `seeded-vault-1k` for the live test; don't mutate the evidence vault. Phi-4 GGUF: `…\com.shahbaz242630.memory-vault\models\Phi-4-mini-instruct-Q4_K_M.gguf`; BGE + reranker ONNX in `crates/vault-embedding/test-fixtures/`.
+>
+> ---
+>
+> **📊 Session-5 scale scorecard (the WHY for this work) — kept below as evidence:**
+
+> **🆕 2026-06-17 (session 5) — SCALE PRESSURE-TEST DONE (1k, real run). The "still-owed" scale validation is now closed with a definitive result. CI for A2 (`2bc5ba5`, run `27614962589`) = `success`.**
+>
+> ### 📊 Scale scorecard — 1k full `consolidate run`, 1800s hard budget (MEASURED, not projected)
+> Ran the real CLI pipeline against a throwaway copy of `seeded-vault-1k` (`C:\Projects\seeded-vault-1k-pressure`), real Phi-4 + BGE, full INFO logging. Terminal line: `error: consolidation run failed: consolidator timeout: hard budget exceeded after 1800s`.
+>
+> | Phase | Result at 1k |
+> |---|---|
+> | Phase 1 — re-embed 1000 facts + cluster | ✅ **~14 min** · found **102 clusters** (≥0.92) |
+> | Phase 2 — merge (LLM) | ⏳ **15 of 102 clusters** done (~52s each) then **TIMED OUT** |
+> | Deterministic dedup | **0 fired** — all 102 dense-template clusters went to the LLM merge path (the near-identical two-axis gate was too strict to catch them) |
+> | Phase 2b — contradiction | ❌ **never reached** (so `candidate_pairs` is unmeasurable at 1k — itself the finding) |
+> | Phase 4 — decay | ❌ never reached |
+> | Enrichment (ADR-074) | ❌ never reached |
+> | REPORT + checkpoint | ❌ never reached → **partial merged state, NOT rollback-able** (checkpoint is captured only at the END of `run_consolidation`) |
+>
+> **Per-fact embedding cost measured: ~0.8s/fact via BGE on Intel-UHD/Vulkan** → re-embedding 1k facts ≈ 14 min, 10k ≈ 2.3 h (would blow the budget before a single merge — so 10k was deliberately NOT run; it only confirms-worse at hours of machine load for zero new insight).
+>
+> ### 🔴 What this means for the product (the real takeaway)
+> The auto-scheduler we shipped (T0.2.6) fires THIS pipeline nightly at 03:00. On any real vault past ~100 facts it **times out every night**, never completing a cycle → **never regenerates the REPORT, never writes a checkpoint, never decays/enriches/de-dupes**. Reads still return facts (the REPORT_MISSING fallback is "degraded but harmless"), but the vault **never actually self-maintains at realistic scale**. The "self-maintaining vault" is real at toy scale only. This is the empirical confirmation of the handoff's long-standing Pillar-2 risk.
+>
+> ### 🧭 ROOT CAUSE = full-vault re-processing every run (architectural, fixable)
+> `find_candidate_clusters(..., since: None)` — the `since: Option<DateTime<Utc>>` incremental hook is passed `None`, so EVERY run re-embeds + re-clusters + re-merges + re-enriches the ENTIRE vault. Nightly cost is O(vault size), not O(nightly changes). That is the lever.
+>
+> ### ▶️ NEXT ARC — Pillar 2: "make the nightly run complete THEN it's already scheduled" (incremental consolidation)
+> Recommended order (each step is measurable on its own; write the incremental-semantics ADR before code):
+> 1. **Stop re-embedding facts that already have vectors.** Phase 1 (and Phase 2b, and dedup, and enrich) all re-embed via BGE even though the vectors already live in LanceDB. Pull the stored vector instead of recomputing. Phase 1 ~14 min → seconds. **Biggest, cheapest single win.** (Caveat: an ENRICHED fact's stored vector is `content + aliases` — that is the vector we want for clustering anyway, so this is consistent.)
+> 2. **Wire the `since` parameter → incremental consolidation.** A nightly run should process only facts written/changed since the last SUCCESSFUL run (the checkpoint table already records runs + timestamps — reuse it). **⚠️ Correctness subtlety to lock in the ADR:** "incremental" must mean *changed facts are the SEEDS, but their candidate partners (merge clusters, NN contradiction pairs) are drawn from the WHOLE active corpus* — otherwise a new fact that contradicts/duplicates an OLD untouched fact would be missed. So: changed-facts drive WHICH comparisons run, not WHICH facts are eligible to be compared against. Get this wrong and we silently lose merge/contradiction recall — gate it with a test that plants a new fact contradicting an old one and asserts detection.
+> 3. **Loosen the deterministic dedup gate** so obvious template-near-dups collapse without an LLM call (0/102 caught here is the signal it is mis-calibrated for real repetitive data).
+> 4. **Cosine-prune the contradiction candidate pairs** (already a documented fast-follow in `phases/contradiction.rs`).
+>
+> After 1+2 a 1k nightly run touches only the handful of new facts and finishes in seconds — which is how it must work for the auto-scheduler to be real. Latency budget stays IGNORED for the merge/enrich per-call cost (founder lock 2026-06-14) — the win is doing O(changes) work, not making each call faster.
+>
+> ### 🧹 Scratch (NOT in repo, throwaway)
+> - `C:\Projects\seeded-vault-1k-pressure` — partial-merged 1k copy from this run (15 merges, no checkpoint); safe to wipe.
+> - `C:\Projects\mcp-probe\pressure-logs\1k-run.{err,out}.log` — full run logs (the scorecard evidence). Phi-4 GGUF lives at `…\com.shahbaz242630.memory-vault\models\Phi-4-mini-instruct-Q4_K_M.gguf`.
+>
+> ### ⬇️ Still-open items carried forward (unchanged by this session)
+> A1 cold-archive (small UNBUILT code, write a policy ADR first) · C cross-device sync (`vault-sync`, biggest/most security-sensitive — re-read BRD §11 + ADR-SEC) · beta packaging · B5 auto date-extraction (LOW) · tech-debt §8. **A1 + scale are now decoupled: scale's answer is Pillar 2, above; A1 is independent.**
+
+> **🆕 2026-06-16 — A2 CHECKPOINT & ROLLBACK SHIPPED (`2bc5ba5`, pushed). All 5 DoD gates GREEN on a fresh `cargo clean` cold build).** The "undo a bad nightly run" safety net. Built in one batched pass (no per-step CI cycles — founder directive, the 3h cold build is paid once).
 >
 > **What shipped (the 5 build-plan steps, all done):**
 > 1. **vault-storage `checkpoint.rs`** — `create_checkpoint(entries) -> CheckpointId` (insert + prune to N=7), `rollback_checkpoint(id) -> RollbackReport` (restore 'modified' via existing `update_memory`; `delete_memory` for 'created'; mark `status='rolled_back'`; double-rollback + unknown-id guards), `list_checkpoints()`. Pre-image = versioned `{Memory, embedding}` blob (`CHECKPOINT_PAYLOAD_FORMAT_VERSION`). 8 unit tests. Migration v4 (`0004_…sql`) registered + table-existence test.
@@ -24,6 +188,31 @@
 > **▶️ NEXT — once committed + CI-green-verified:** the **scale pressure-test** (STILL OWED — consolidator proven correct at 6 facts only; seed 100 / 1k / 10k, re-run scheduler→pipeline→REPORT→checkpoint→shutdown at each, capture per-scale timing + correctness; KNOWN hardware wall ~90 facts on this machine) **+ A1 cold-archive** (the other half of Phase 4; `memories_archived` returns 0 today). Then beta-on-one-device → **C cross-device sync** (biggest/most security-sensitive; re-read BRD §11 + ADR-SEC first). **B5** (auto date-extraction) LOW-pri. **A3** (invalidate-on-contradiction) LARGELY DONE.
 >
 > **🧹 Scratch (NOT in repo, throwaway):** `C:\Projects\mcp-probe\scheduler_live_test.py` (scheduler E2E harness) + `client.py` (`fullcheck`/`isolation_test` modes added this session) · seeded throwaway vault `C:\Projects\seeded-vault-sched` (6 facts, consolidated). All safe to wipe.
+
+> ---
+>
+> ### ⚠️ FIRST next session — VERIFY CI
+> `gh run view 27614962589 --json status,conclusion` (the `2bc5ba5` push) should be `success`. It was QUEUED/running at session close (matrix build ~30-60 min). If red, read the failing matrix job log before new work. **Ignore the `schedule`-trigger `real-model-smoke` failures** — that's the known tech-debt #6 concurrent-download flake, NOT our code.
+>
+> ### 🗺️ Remaining V0.2 work — full map (recommended order)
+> The self-maintaining vault is **feature-complete on the core**: merge/dedup · contradiction · decay · REPORT · graph-fill · auto-scheduler (T0.2.6) · checkpoint+rollback (T0.2.5) — all shipped + dogfooded. What's left:
+>
+> **▶️ RECOMMENDED NEXT — A1 cold-archive + scale pressure-test together** (coupled — archive only matters at large N):
+> - **A1 cold-archive** (small UNBUILT code): the other half of Phase 4 — facts untouched for `archive_after_days` (default 365) move to an out-of-default-retrieval store. `memories_archived` returns 0 today (§6 "Not built"). First-class `Memory` state change (schema + retrieval-filter reach, larger than decay) → **write a policy ADR before the code**. See `phases/decay.rs` module doc for the scoping note.
+> - **Scale pressure-test (STILL OWED — validation, not new code):** consolidator proven *correct at 6 facts ONLY*. Seed 100 / 1k / 10k (reuse `C:\Projects\seeded-vault-1k` + `seeded-vault-10k`, still on disk; or `vault-app/tests/scale_eval.rs seed_live_vault`), re-run scheduler→pipeline→REPORT→checkpoint→shutdown at each scale; capture per-scale timing + correctness scorecard. Also test larger/longer content per memory. **KNOWN HARDWARE WALL:** full `consolidate run` does NOT finish in the 30-min budget past ~90 facts (Phi-4 contradiction ~20s/call) → likely needs latency/perf work first, or a documented partial result. (See the session-3 ⚠️ block below.)
+>
+> **THEN the locked fork (dogfood-first, founder 2026-06-12):** beta-on-one-device dogfood → **C cross-device sync** (`vault-sync`, Pillar 3 — the big UNBUILT feature: zero-knowledge multi-device, server cryptographically cannot read it. Largest + most security-sensitive surface — **RE-READ BRD §11 + ADR-SEC before ANY code**; sync ship-gate ADR-076 already landed).
+>
+> **Lower-priority / optional:**
+> - **Beta packaging + onboarding** (Pillar 4 — `vault-tauri` desktop polish + onboarding flow; V0.2 finish line, BRD §6.2 "30 beta users").
+> - **Read-precision hardening (🟡 INSURANCE, not must-fix):** confident-wrong-neighbour cases (salary-$ / wrong-subject) — agent rescues them today (§13.3); build ONLY if a correct fact gets truncated out of view at scale, or to harden Managed-mode. Relates tech-debt #1.
+> - **B5 auto date-extraction** (LOW — agent handles temporal today; settable `as_of` works).
+> - **Tech-debt cleanup** (§8, none blocking): graph relationship-rewrite-on-merge (#2 tail) · `graph.duckdb` encryption (#7, graph empty) · `VaultError::Storage` → structured variants (#3) · flaky weekly `real-model-smoke` cron (#6, CI-infra).
+>
+> **🚫 NOT V0.2 (V1.0+):** Gmail/Calendar connectors (`vault-connectors`), billing, Managed multi-tenancy, public launch.
+>
+> ### 💾 DISK (2026-06-16)
+> C: **~10 GB free (tight)**; `target/` = 147 GB (`deps` 105 + `build` 20 = compiled output, can't shrink without a full clean). Freed the 6.25 GB `incremental/` cache this session (SAFE — pure recompile accelerator; build artifacts intact, **no cold rebuild needed**). One-off experiment vaults wiped; `-1k`/`-10k`/`-tiny`/`-sched` kept as test assets. **Only big reclaim left = `cargo clean`** (frees ~147 GB but forces the ~2h cold rebuild) — founder's call if more headroom is needed.
 
 > **🗒️ Session-3 detail — what the feature TEST proved (2026-06-15):**
 >
@@ -250,8 +439,8 @@ Once the 1k/10k live test passes (§1), the retrieval **core** is proven correct
 **1. Read precision (Thread 2) — close the last known quality gap.** 🟢 *recommended first*
 The vault sometimes returns a confident wrong-neighbor instead of abstaining ("salary?" → catering $; "cat?" → the dog; "instrument?" → cello-correct + keyboards leaked). Fix = recall-safe `weak_match` hint on `memory_read` (let the agent judge, never drop a fact). Contained, high-value, squarely the "correctness IS the product" thesis. Full detail in §4 (Thread 2). Related: tech-debt #1 (carry-cosine-through-fusion + per-candidate filter) in §8.
 
-**2. Sleep consolidator — make it run on its own.** 🌙
-Today the nightly brain (merge duplicates, surface contradictions, build the REPORT) only runs when manually triggered. For real users it must run automatically + safely. Three pieces unbuilt (see §6 "Not built"): **Scheduling** (T0.2.6 — nightly cron), **Phase 4 decay + archive** (T0.2.4 — old memories fade gracefully), **Checkpoint + rollback** (T0.2.5 — undo a bad run). This turns a manually-poked library into a self-maintaining vault — the headline word in the V0.2 spec. Pair with sustained founder dogfood.
+**2. Sleep consolidator — make it COMPLETE on its own at scale.** 🌙 *(updated 2026-06-17 by the scale pressure-test)*
+The build-out is DONE: **Scheduling** (T0.2.6) ✅, **Phase 4 decay** (T0.2.4) ✅, **Checkpoint + rollback** (T0.2.5) ✅ — all shipped. The open Pillar-2 work is now **performance, specifically incremental consolidation**: the 1k pressure-test (§1) proved the full nightly run **times out at the 1800s budget on ≥~1k facts** because every run re-processes the WHOLE vault (re-embed all ~14 min/1k → re-cluster → re-merge all). So the auto-scheduler fires nightly but never completes → no REPORT/checkpoint/decay/enrich ever land at realistic scale. **Fix arc (full scope in §1):** (1) stop re-embedding facts that already have stored vectors; (2) wire the `since`-checkpoint param so a run touches only facts changed since the last successful run (changed facts as SEEDS, partners drawn from the whole corpus — ADR + recall test required); (3) loosen the dedup gate; (4) cosine-prune contradiction pairs. The remaining unbuilt piece is A1 **cold archive** (T0.2.4's other half — write a policy ADR first).
 
 **3. Cross-device sync (`vault-sync`) — the big multi-device feature.** 🔄
 The V0.2 promise: your memory on every device, readable by any agent, **without the server ever reading it** (zero-knowledge sync). Largest + most security-sensitive surface → re-read BRD §11 first, ADR-SEC entries required. **Ship gate:** tech-debt #4 (`pending_sync` sweep + migration 0003 payload, §8) MUST land before sync beta opens.
@@ -519,11 +708,35 @@ This is independent of DuckDB version — `1.4.4` AND `1.5.3` bundle the same an
 
 ---
 
+## 8.14 · 🆕 ADR-082 (IN FLIGHT) — incremental consolidation (Pillar 2 scale fix): seed by watermark, compare against the whole corpus
+
+**Context.** The session-5 1k pressure-test (§1 scorecard) proved a full nightly run cannot complete on this hardware — every run re-processes the WHOLE vault (re-embed all → re-cluster → re-merge → re-contradiction → re-enrich → rebuild REPORT). BRD §5.6 line 936 ALREADY specifies incremental ("for each memory **added since last consolidation**"); the shipped `since: None` full-scan was the deviation, not a new design.
+
+**Decision.** A run is scoped by a `since` watermark — `run_consolidation(since: Option<DateTime<Utc>>)`.
+- **D1** Watermark storage = a dedicated single-row `consolidation_state` table (migration `0005`), NOT the checkpoint table (which isn't written for a no-op run, so it can't reliably advance).
+- **D2** Watermark value = the run's **START** time (so a fact created mid-run is picked up next run, never skipped).
+- **D3** Advance the watermark **only on full-pipeline success** (`run_consolidation` → `enrich_facts` → `generate_reports` → REPORT persist). A timed-out / crashed / errored run leaves it untouched → the next run retries the same backlog. No lost work.
+- **D4 (the load-bearing invariant).** Changed facts are **seeds**; each seed is compared against the **whole active corpus**. Phase 1 enumerates seeds via `since` but validates neighbour edges against ALL active ids (not the seed set); Phase 2b searches LanceDB per seed (the whole boundary). So a new fact still merges / contradiction-checks against an OLD untouched fact. Getting this wrong silently loses merge/contradiction recall — the cardinal sin — so it is gated by **R1** (clustering, `tests/incremental_consolidation.rs`) and **R2** (contradiction, `tests/contradiction_resolution.rs`).
+- **D5** `since = None` stays the full-sweep path (cold start / periodic deep-clean), behaviourally unchanged (the proven A5 in-memory all-pairs path is preserved).
+- **D6** A watermark read failure **fails open to a full sweep** (a slow run beats a missed merge/contradiction).
+- **D7** Retired lingering vectors (superseded/invalidated/deleted, whose LanceDB vector lingers) are dropped by validating neighbours against the active-id set.
+
+**Scope SHIPPED (session 6, this commit) — Steps 1-3:** watermark (storage migration `0005` + `consolidation_state.rs`) + incremental Phase 1 (`cluster.rs`) + incremental Phase 2b (`candidates::contradiction_candidate_neighbours` + `consolidator.rs`) + app/headless watermark wiring + R1/R2 tests. This lets a 1k nightly run COMPLETE (merge/contradiction no longer fill the 30-min budget); the only O(N) cost left is REPORT topic-discovery's embed-all (~14 min, now fits) + the one-time enrich backfill.
+
+**Deferred (named follow-ups, NOT in this commit):**
+- **Step 4** — reuse stored vectors (new `vector_store` `get_by_id`) so REPORT topic-discovery stops re-embedding the corpus → extends the win to 10k.
+- **Catch-up scheduling** — on app start, if the watermark is stale (> ~24h), run once then resume nightly (the "laptop asleep at 3 AM" fix).
+- **Full-sweep CLI command** + a **configurable timeout** so the one-time cold-start backfill can complete (next session, STEP 1).
+- **Enrich-cap** — chunk the first-ever backfill across nights (enrich is idempotent → converges).
+- **Loosen the deterministic dedup gate** (0/102 dense-template clusters caught → all hit the LLM).
+
+**Consequences.** Nightly cost → O(facts changed), not O(vault). Trade-off: content-EDITED facts keep their `created_at`, so a `created_at`-based `since` re-enriches them (fingerprint) but does NOT re-merge / re-contradiction-check them nightly — the periodic full sweep covers that (documented V0.2 limitation).
+
 ## 9 · 📇 ADR index
 
 Full text of every ADR lives in an archive — cross-link by number, **quote don't paraphrase** ([[feedback_quote_locked_artefacts_dont_paraphrase]]).
 
-**In-flight (full text in HANDOFF, not yet archived):** **ADR-081** (Checkpoint & Rollback T0.2.5 — capture-by-diff, enrichment excluded from rollback, top-level `vault-cli checkpoint` command, §8.13) · **ADR-080** (consolidator scheduling T0.2.6 — production scheduler is app-layer; pure `scheduler.rs` timing + `Consolidator::schedule()` headless loop, §8.12) · **ADR-079** (Windows CI fix: VS2026 removed `stdext::checked_array_iterator` → `/FI` `_SECURE_SCL`-undef shim for bundled-DuckDB fmt, §8.11 — corrects the ADR-078/§1 "1.4.4 fixes CI" misdiagnosis; shim is a dead end, revert + toolset-pin pending) · **ADR-078** (graph-filling: entity + relationship extraction at consolidation, §8.10 — closes tech-debt #2; corrects ADR-077 to DuckDB 1.4.4 + defers encryption) · **ADR-077** (DuckDB dep upgrade — corrected to `=1.4.4` LTS, §8.9) · **ADR-076** (sync ship-gate `pending_sync` payload, §8.8) · **ADR-075** (Phase 4 confidence decay, §8.7) · **ADR-074** (document-side alias enrichment at consolidation, §8.6) · **ADR-073** (recall-safe `memory_read`, §8.5 — SHIPPED `a3e426b`).
+**In-flight (full text in HANDOFF, not yet archived):** **ADR-082** (incremental consolidation — Pillar 2 scale fix: seed by `since` watermark, compare against the whole corpus; cross-corpus invariant gated by R1/R2; §8.14) · **ADR-081** (Checkpoint & Rollback T0.2.5 — capture-by-diff, enrichment excluded from rollback, top-level `vault-cli checkpoint` command, §8.13) · **ADR-080** (consolidator scheduling T0.2.6 — production scheduler is app-layer; pure `scheduler.rs` timing + `Consolidator::schedule()` headless loop, §8.12) · **ADR-079** (Windows CI fix: VS2026 removed `stdext::checked_array_iterator` → `/FI` `_SECURE_SCL`-undef shim for bundled-DuckDB fmt, §8.11 — corrects the ADR-078/§1 "1.4.4 fixes CI" misdiagnosis; shim is a dead end, revert + toolset-pin pending) · **ADR-078** (graph-filling: entity + relationship extraction at consolidation, §8.10 — closes tech-debt #2; corrects ADR-077 to DuckDB 1.4.4 + defers encryption) · **ADR-077** (DuckDB dep upgrade — corrected to `=1.4.4` LTS, §8.9) · **ADR-076** (sync ship-gate `pending_sync` payload, §8.8) · **ADR-075** (Phase 4 confidence decay, §8.7) · **ADR-074** (document-side alias enrichment at consolidation, §8.6) · **ADR-073** (recall-safe `memory_read`, §8.5 — SHIPPED `a3e426b`).
 
 **Most relevant to current/next work (full text in `HANDOFF_V0.2_PART2_ARCHIVE.md`):**
 | ADR | Title | Status |

@@ -103,7 +103,7 @@ async fn consolidation_is_idempotent() {
 
     // Run 1: should apply the one merge cluster.
     let report1 = consolidator
-        .run_consolidation()
+        .run_consolidation(None)
         .await
         .expect("run 1 must succeed");
 
@@ -125,7 +125,7 @@ async fn consolidation_is_idempotent() {
     // merged-cluster originals are superseded (excluded by default filter)
     // and the new merged memory is alone in its semantic neighbourhood.
     let report2 = consolidator
-        .run_consolidation()
+        .run_consolidation(None)
         .await
         .expect("run 2 must succeed");
 
@@ -215,7 +215,7 @@ async fn no_memory_is_ever_lost() {
     );
 
     let report = consolidator
-        .run_consolidation()
+        .run_consolidation(None)
         .await
         .expect("run_consolidation must succeed");
 

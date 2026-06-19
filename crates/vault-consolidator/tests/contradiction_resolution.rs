@@ -135,7 +135,7 @@ async fn nearest_neighbor_contradiction_retires_stale_employment_fact() {
     );
 
     consolidator
-        .run_consolidation()
+        .run_consolidation(None)
         .await
         .expect("consolidation run must succeed");
 
@@ -168,6 +168,95 @@ async fn nearest_neighbor_contradiction_retires_stale_employment_fact() {
     assert!(
         atlas_row.valid_until.is_none(),
         "A5: the current Atlas fact MUST stay valid (valid_until None) — only the loser is retired"
+    );
+}
+
+/// R2 (ADR-082) — incremental cross-corpus contradiction. The NEW fact (Atlas,
+/// created after the watermark) is the ONLY seed; the OLD fact (Vega, created
+/// before it) is not. Incremental Phase 2b must still surface the pair (the
+/// seed's LanceDB neighbour search hits the whole corpus) and retire the stale
+/// Vega — proving a nightly run scoped to today's new facts does NOT miss a
+/// contradiction against yesterday's facts (the recall loss the cross-corpus
+/// invariant forbids).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn incremental_seed_retires_stale_old_fact() {
+    let (storage, _dir) = open_sealed_storage_for_test("a5-incremental-cross-corpus").await;
+    let storage = Arc::new(storage);
+    let embedder = open_bge_provider();
+    let boundary = Boundary::new("testeval").expect("valid boundary");
+
+    let jan = Utc.with_ymd_and_hms(2026, 1, 10, 0, 0, 0).unwrap();
+    let apr = Utc.with_ymd_and_hms(2026, 4, 1, 0, 0, 0).unwrap();
+
+    // OLD fact: written + drained first, so its created_at precedes the watermark.
+    let vega = fact(
+        "As of 2026-01-10 the user worked as a structural engineer at Vega Bridgeworks.",
+        &boundary,
+        jan,
+    );
+    let vega_id = vega.id;
+    let vega_emb = embedder.embed(&vega.content).await.expect("embed vega");
+    insert_and_drain(&storage, vec![(vega, vega_emb)]).await;
+
+    // Watermark AFTER the old fact: the incremental run seeds only on facts
+    // created from here on.
+    let watermark = Utc::now();
+
+    // NEW fact (the only seed): created after the watermark; contradicts the old.
+    let atlas = fact(
+        "As of 2026-04-01 the user works as a structural engineer at Atlas Structures, \
+         having left Vega Bridgeworks.",
+        &boundary,
+        apr,
+    );
+    let atlas_id = atlas.id;
+    let atlas_emb = embedder.embed(&atlas.content).await.expect("embed atlas");
+    insert_and_drain(&storage, vec![(atlas, atlas_emb)]).await;
+
+    let llm = Arc::new(MockLlmProvider::new(
+        "phi-4-mini-test",
+        r#"{"shared_attribute":"employer","contradiction":true,"stale":"a","reasoning":"Atlas explicitly supersedes Vega"}"#,
+    ));
+    let consolidator = Consolidator::new(
+        storage.clone(),
+        llm,
+        embedder.clone(),
+        ConsolidatorConfig::default(),
+    );
+
+    // Incremental run: seed = {atlas} only. The old Vega is reached via the
+    // seed's neighbour search, judged, and retired by recency.
+    consolidator
+        .run_consolidation(Some(watermark))
+        .await
+        .expect("incremental consolidation run must succeed");
+
+    let all = storage
+        .list_memories(
+            MemoryFilter {
+                include_superseded: true,
+                ..MemoryFilter::default()
+            },
+            None,
+        )
+        .await
+        .expect("list memories");
+    let vega_row = all
+        .iter()
+        .find(|m| m.id == vega_id)
+        .expect("vega row exists");
+    let atlas_row = all
+        .iter()
+        .find(|m| m.id == atlas_id)
+        .expect("atlas row exists");
+    assert!(
+        vega_row.valid_until.is_some(),
+        "R2: an incremental run seeded ONLY on the new Atlas fact must still retire the OLD Vega \
+         fact (cross-corpus invariant); valid_until None → the new-vs-old contradiction was missed"
+    );
+    assert!(
+        atlas_row.valid_until.is_none(),
+        "R2: the current Atlas fact must stay valid"
     );
 }
 
@@ -223,7 +312,7 @@ async fn co_topical_but_compatible_facts_are_not_falsely_invalidated() {
     );
 
     consolidator
-        .run_consolidation()
+        .run_consolidation(None)
         .await
         .expect("consolidation run must succeed");
 

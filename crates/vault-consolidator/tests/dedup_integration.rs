@@ -81,7 +81,7 @@ async fn near_identical_cluster_is_deduped_without_llm() {
     );
 
     let report = consolidator
-        .run_consolidation()
+        .run_consolidation(None)
         .await
         .expect("dedup run must complete");
 

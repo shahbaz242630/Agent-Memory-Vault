@@ -712,6 +712,10 @@ fn print_consolidation_report(r: &ConsolidationReport) {
     println!("  memories deduped     : {}", r.memories_deduped);
     println!("  clusters skipped     : {}", r.clusters_skipped);
     println!("  contradictions queued: {}", r.contradictions_resolved);
+    println!(
+        "  facts retired (contra): {}",
+        r.contradictions_auto_resolved
+    );
     println!("  memories archived    : {}", r.memories_archived);
     println!("  duration             : {:.2}s", r.duration.as_secs_f64());
     if r.clusters_skipped > 0 {

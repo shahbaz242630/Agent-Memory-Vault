@@ -61,7 +61,7 @@ async fn cold_fact_decays_through_consolidation_and_is_never_lost() {
 
     // ── First run: the cold fact decays ──────────────────────────────────
     let report = consolidator
-        .run_consolidation()
+        .run_consolidation(None)
         .await
         .expect("decay run must complete");
     assert_eq!(
@@ -91,7 +91,7 @@ async fn cold_fact_decays_through_consolidation_and_is_never_lost() {
 
     // ── Second run, immediately: idempotent, no re-decay ──────────────────
     let report2 = consolidator
-        .run_consolidation()
+        .run_consolidation(None)
         .await
         .expect("second run must complete");
     assert_eq!(

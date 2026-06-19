@@ -142,12 +142,35 @@ fn write_contradictions_section(
 ) {
     writeln!(out, "## Contradictions").expect("writing to String never fails");
     writeln!(out).expect("writing to String never fails");
+
+    // Aggregate auto-retirements (recency clear-winner) so a retirement is never
+    // silent — even when no ambiguous conflict was queued for human review. A
+    // retired fact you cannot see is one you cannot decide to roll back
+    // (Finding A).
+    let auto_resolved: usize = per_boundary
+        .values()
+        .map(|b| b.contradictions_auto_resolved)
+        .sum();
+    writeln!(out, "**Auto-resolved (newer fact won):** {auto_resolved}")
+        .expect("writing to String never fails");
+    writeln!(out).expect("writing to String never fails");
+
     for (boundary, summary) in per_boundary {
-        if summary.contradictions.is_empty() {
+        if summary.contradictions.is_empty() && summary.contradictions_auto_resolved == 0 {
             continue;
         }
         writeln!(out, "### {}", boundary.as_str()).expect("writing to String never fails");
         writeln!(out).expect("writing to String never fails");
+        if summary.contradictions_auto_resolved > 0 {
+            writeln!(
+                out,
+                "- Auto-resolved by recency: {} fact(s) retired \
+                 (older same-attribute fact superseded by a newer one).",
+                summary.contradictions_auto_resolved
+            )
+            .expect("writing to String never fails");
+            writeln!(out).expect("writing to String never fails");
+        }
         for conflict in &summary.contradictions {
             write_contradiction_entry(out, conflict);
         }
@@ -300,6 +323,28 @@ mod tests {
         }
     }
 
+    /// Fixture for Finding A: a boundary that auto-retired facts by recency
+    /// (clear-winner) with NO ambiguous conflict queued for review. Before the
+    /// fix this rendered an empty Contradictions section despite real
+    /// retirements.
+    fn run_state_with_auto_resolved_only() -> RunState {
+        let summary = BoundarySummary {
+            contradictions_auto_resolved: 3,
+            ..Default::default()
+        };
+
+        let mut per_boundary = BTreeMap::new();
+        per_boundary.insert(boundary("personal"), summary);
+
+        RunState {
+            started_at: fixed_started_at(),
+            duration: Duration::from_secs(20),
+            memories_processed: 5,
+            memories_decayed: 0,
+            per_boundary,
+        }
+    }
+
     /// Two-boundary fixture for the boundary-separation invariant test. Work
     /// boundary has one merge; personal boundary has one contradiction. Each
     /// boundary's strings carry a distinctive token (`WORK_*` / `PERSONAL_*`)
@@ -433,6 +478,38 @@ mod tests {
         assert!(
             md.contains("T0.2.15"),
             "review queue T0.2.15 placeholder missing — Tauri viewer is the downstream consumer"
+        );
+    }
+
+    /// Finding A: a run that auto-retired facts by recency with NOTHING queued
+    /// for review must STILL surface those retirements in the Contradictions
+    /// section (the aggregate line + the per-boundary count). A retired fact you
+    /// cannot see is one you cannot decide to roll back.
+    #[test]
+    fn contradictions_section_surfaces_auto_resolved_retirements() {
+        let state = run_state_with_auto_resolved_only();
+        let md = generate_summary_markdown(&state, "test-cp-finding-a");
+        assert!(
+            md.contains("**Auto-resolved (newer fact won):** 3"),
+            "aggregate auto-resolved count missing from Contradictions section:\n{md}"
+        );
+        assert!(
+            md.contains("### personal"),
+            "per-boundary sub-header missing despite a retirement (empty review queue must not hide it)"
+        );
+        assert!(
+            md.contains("3 fact(s) retired"),
+            "per-boundary retirement detail missing:\n{md}"
+        );
+    }
+
+    /// An empty run reports zero auto-resolved retirements (no false positives).
+    #[test]
+    fn contradictions_section_reports_zero_auto_resolved_for_empty_run() {
+        let md = generate_summary_markdown(&empty_run_state(), "test-cp-empty");
+        assert!(
+            md.contains("**Auto-resolved (newer fact won):** 0"),
+            "empty run must report 0 auto-resolved retirements:\n{md}"
         );
     }
 

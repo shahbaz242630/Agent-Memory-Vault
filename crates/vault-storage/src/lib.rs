@@ -16,6 +16,7 @@
 pub mod audit;
 pub mod cascading;
 pub mod checkpoint;
+pub mod consolidation_state;
 pub mod dead_letter;
 pub mod divergence;
 #[cfg(test)]

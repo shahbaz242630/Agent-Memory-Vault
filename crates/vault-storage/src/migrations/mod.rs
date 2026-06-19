@@ -46,6 +46,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "T0.2.5 checkpoint & rollback: consolidation_checkpoints + checkpoint_entries",
         up: include_str!("0004_consolidation_checkpoints.sql"),
     },
+    Migration {
+        version: 5,
+        description: "Pillar 2 incremental consolidation (ADR-082): consolidation_state watermark",
+        up: include_str!("0005_consolidation_watermark.sql"),
+    },
 ];
 
 /// Apply any pending migrations to the open connection. Uses the
@@ -306,6 +311,73 @@ mod tests {
                 .unwrap();
             assert_eq!(exists, 1, "expected index {index} to exist");
         }
+    }
+
+    #[test]
+    fn migration_0005_creates_consolidation_state_singleton() {
+        // Pillar 2 (ADR-082): the incremental-consolidation watermark lives in
+        // a single-row consolidation_state table. Verify the table exists, the
+        // seed row (id = 1) is present, and the CHECK(id = 1) constraint refuses
+        // a second row.
+        let mut conn = open_memory();
+        run(&mut conn).unwrap();
+
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='consolidation_state'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "expected consolidation_state table to exist");
+
+        // The seed row is present with a NULL watermark (no run yet).
+        let (id, watermark): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT id, last_run_started_at FROM consolidation_state",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(id, 1);
+        assert!(watermark.is_none(), "watermark starts NULL (full-scan)");
+
+        // CHECK(id = 1) forbids a second singleton row.
+        let err = conn.execute(
+            "INSERT INTO consolidation_state (id, last_run_started_at) VALUES (2, NULL)",
+            [],
+        );
+        assert!(err.is_err(), "CHECK(id = 1) must reject id != 1");
+    }
+
+    #[test]
+    fn migration_0005_is_idempotent_via_insert_or_ignore() {
+        // Running migrations twice must not duplicate or reset the seed row
+        // (INSERT OR IGNORE). Pin it by writing a watermark, re-running, and
+        // confirming the value survives.
+        let mut conn = open_memory();
+        run(&mut conn).unwrap();
+        conn.execute(
+            "UPDATE consolidation_state SET last_run_started_at = '2026-06-17T00:00:00+00:00' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+
+        // Re-run: 0005's INSERT OR IGNORE must not clobber the row.
+        run(&mut conn).unwrap();
+
+        let watermark: Option<String> = conn
+            .query_row(
+                "SELECT last_run_started_at FROM consolidation_state WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            watermark.as_deref(),
+            Some("2026-06-17T00:00:00+00:00"),
+            "re-running migrations must not reset an existing watermark"
+        );
     }
 
     #[test]
