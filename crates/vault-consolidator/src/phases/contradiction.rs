@@ -59,11 +59,16 @@
 //! ## Conservative by construction
 //!
 //! The judge flags a contradiction ONLY when two facts make incompatible
-//! claims about the *same attribute of the same subject* — co-topical-but-
-//! compatible facts ("works at Atlas" + "commutes by train") and near-
-//! duplicates of the same fact must NOT be flagged. The judge must first name
-//! the single `shared_attribute` both facts describe; a contradiction with no
-//! shared attribute is refused by the aggregator (ADR-062 iter 2). The `as_of`
+//! claims about the same *single-valued* attribute of the same subject — one
+//! the person holds only ONE current value of (employer, city, marital
+//! status). Co-topical-but-compatible facts ("works at Atlas" + "commutes by
+//! train"), near-duplicates of the same fact, and distinct *events* a person
+//! accumulates many of ("met Sarah Monday" + "met Sarah Thursday"; two office
+//! recaps on different days) must NOT be flagged — those are two true facts,
+//! not a superseded one, and retiring one would silently lose real data
+//! (ADR-083, the over-retention guard). The judge must first name the single
+//! `shared_attribute` both facts describe; a contradiction with no shared
+//! attribute is refused by the aggregator (ADR-062 iter 2). The `as_of`
 //! (fact-time) of each memory is supplied so the model can pick the current
 //! truth by recency or explicit supersession. If a pair conflicts but the
 //! current truth is genuinely undecidable, the pair judge returns
@@ -109,7 +114,7 @@ const CONTRADICTION_PAIR_SCHEMA: &str = r#"{
     "properties": {
         "shared_attribute": {
             "type": ["string", "null"],
-            "description": "The SINGLE attribute that BOTH memories describe about the same subject (e.g. 'employer', 'city of residence', 'favorite color'). null if the two memories describe DIFFERENT attributes (e.g. one a job, the other a hobby) or are unrelated."
+            "description": "The SINGLE-VALUED attribute that BOTH memories describe about the same subject — one the person holds only ONE current value of (e.g. 'employer', 'city of residence', 'favorite color'). null if the two memories describe DIFFERENT attributes (e.g. one a job, the other a hobby), are unrelated, OR describe distinct events/occurrences a person accumulates many of (e.g. separate meetings, trips, purchases, recaps) rather than one single-valued attribute."
         },
         "contradiction": {
             "type": "boolean",
@@ -140,6 +145,15 @@ const CONTRADICTION_PAIR_SYSTEM_PROMPT: &str =
      INCOMPATIBLE claims about that one shared attribute, such that they cannot both be currently \
      true. If shared_attribute is null, contradiction MUST be false. Near-duplicates of the same \
      fact are NOT contradictions. \
+     Only flag a contradiction when the shared attribute is SINGLE-VALUED — one a person can hold \
+     only ONE current value of at a time (employer, city of residence, marital status, favorite \
+     colour). Many facts instead describe distinct EVENTS or occurrences — meetings, trips, \
+     purchases, deliveries, tasks, messages, recaps, sign-ups, sessions — where a person \
+     legitimately accumulates MANY entries that differ in person, date, day, time, or place. Two \
+     such entries are BOTH true and are NOT a contradiction even when worded almost identically: \
+     set shared_attribute=null, contradiction=false, stale='neither'. A difference in date, day, \
+     time, location, or the people involved is the signature of two distinct events, not a \
+     superseded single-valued fact. \
      When contradiction=true, set stale to the memory that is NO LONGER TRUE — superseded by the \
      other (use the as_of dates, an explicit replacement such as 'having left X', or a more \
      specific statement): 'a' or 'b'. If they conflict on the shared attribute but you cannot \
@@ -160,6 +174,20 @@ const CONTRADICTION_PAIR_SYSTEM_PROMPT: &str =
      stale='neither'. \
      (6) a:'Lives in Berlin' b:'Lives in Lisbon' → shared_attribute='city of residence', \
      contradiction=true; if no date disambiguates, stale='neither'. \
+     (7) a:'Met Sarah for coffee on Monday' b:'Met Sarah for coffee on Thursday' → \
+     shared_attribute=null (two DISTINCT coffee meetings on different days — an event a person has \
+     many of, not one single-valued attribute), contradiction=false, stale='neither'. \
+     (8) a:'Recap of the cafeteria menu — Jenna shared the update yesterday' b:'Recap of the \
+     cafeteria menu — Kenji shared the update this morning' → shared_attribute=null (two distinct \
+     recap events, different people and times), contradiction=false, stale='neither'. \
+     (9) a:'Flew to Paris in March for a conference' b:'Flew to Paris in June for a conference' → \
+     shared_attribute=null (two SEPARATE trips to the same place on different dates — travel is an \
+     event a person repeats, not a single-valued attribute; the same place/activity recurring on a \
+     different date is a new occurrence, NOT a superseded fact), contradiction=false, \
+     stale='neither'. \
+     When in doubt about whether two facts describe ONE single-valued attribute or TWO distinct \
+     occurrences, prefer shared_attribute=null and contradiction=false — keeping both facts is \
+     safe; wrongly flagging two real events as a contradiction would discard a true memory. \
      Respond with strict JSON matching the schema.";
 
 /// Which member of a judged pair is no longer true. Serialises as the
@@ -1119,5 +1147,152 @@ mod tests {
         let llm = MockLlmProvider::new("phi-4-test", r#"{"reasoning":"no conflict"}"#);
         let verdict = detect_contradiction_nary(&group, &llm).await.unwrap();
         assert!(verdict.stale_memory_ids.is_empty());
+    }
+
+    // ─── REAL Phi-4 — the ADR-083 over-retention guard ──────────────────────
+    //
+    // The recall-safety acceptance for the single-valued-vs-event prompt fix.
+    // A prompt change only matters if the REAL model behaves differently, so a
+    // MockLlm test cannot prove it — this loads Phi-4 and asserts the agreed
+    // "keep when unsure" posture across three buckets:
+    //   - CLEAR distinct events (two coffee meetings, two office recaps, two
+    //     Paris trips) MUST keep BOTH facts — the over-retention guard, the one
+    //     unrescuable risk (a retired fact leaves default retrieval);
+    //   - CLEAR single-valued updates (Berlin→Lisbon, Vega→Atlas) MUST still
+    //     retire the older fact — the fix must not blunt real detection;
+    //   - GENUINELY AMBIGUOUS cases (Denver coordinator reassign-vs-two-sessions;
+    //     Tesla→Rivian, since one can own two cars) are INFORMATIONAL — printed,
+    //     not asserted, because neither outcome is wrong. Phi-4-mini's judgment
+    //     ceiling lives here; the safe-direction failure (keep) is covered by
+    //     decay + cold-archive (A1) + reversible checkpoints, not by forcing a
+    //     retire the model cannot reliably make.
+    //
+    // Ignored (needs the ~2.5 GB GGUF + minutes of CPU inference). Run:
+    //   $env:PHI4_MODEL_DIR='C:\Users\shahb\AppData\Roaming\com.shahbaz242630.memory-vault\models'
+    //   cargo test -p vault-consolidator --lib real_phi4_distinct_events_not_retired -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "loads the real Phi-4 GGUF; set PHI4_MODEL_DIR; run with --ignored --nocapture"]
+    async fn real_phi4_distinct_events_not_retired() {
+        use vault_llm::{Phi4MiniConfig, Phi4MiniProvider};
+
+        let model_dir = std::env::var("PHI4_MODEL_DIR").unwrap_or_else(|_| {
+            r"C:\Users\shahb\AppData\Roaming\com.shahbaz242630.memory-vault\models".to_string()
+        });
+        println!("\nloading Phi-4-mini from {model_dir}...");
+        let provider = Phi4MiniProvider::new(Phi4MiniConfig::v0_2_default(model_dir.into()))
+            .await
+            .expect("load real Phi-4-mini");
+
+        // Helper: judge one ordered pair (a = older) and return the retired ids.
+        async fn retired(a: &Memory, b: &Memory, llm: &dyn LlmProvider) -> Vec<MemoryId> {
+            judge_candidate_pairs(&[(a, b)], llm)
+                .await
+                .expect("judge pair")
+                .stale_memory_ids
+        }
+
+        // ── BUCKET 1: CLEAR distinct events — MUST keep both (retired empty). ──
+        // The over-retention guard: retiring either is unrescuable data loss.
+        let clear_events = [
+            (
+                mem_at("Met Sarah for coffee on Monday", day(3, 2)),
+                mem_at("Met Sarah for coffee on Thursday", day(3, 5)),
+            ),
+            (
+                mem_at(
+                    "Recap of the cafeteria menu — Jenna shared the update",
+                    day(4, 1),
+                ),
+                mem_at(
+                    "Recap of the cafeteria menu — Kenji shared the update",
+                    day(4, 8),
+                ),
+            ),
+            (
+                mem_at("Flew to Paris in March for a conference", day(3, 15)),
+                mem_at("Flew to Paris in June for a conference", day(6, 15)),
+            ),
+        ];
+        let mut event_failures = Vec::new();
+        for (a, b) in &clear_events {
+            let r = retired(a, b, &provider).await;
+            println!(
+                "EVENT  retired={r:?}\n   a: {}\n   b: {}",
+                a.content, b.content
+            );
+            if !r.is_empty() {
+                event_failures.push((a.content.clone(), b.content.clone()));
+            }
+        }
+
+        // ── BUCKET 2: CLEAR single-valued updates — MUST retire the older. ──
+        let clear_updates = [
+            (
+                mem_at("The user lives in Berlin", day(1, 10)),
+                mem_at("The user lives in Lisbon", day(5, 1)),
+            ),
+            (
+                mem_at("The user works at Vega Bridgeworks", day(1, 10)),
+                mem_at(
+                    "The user works at Atlas Structures, having left Vega",
+                    day(4, 1),
+                ),
+            ),
+        ];
+        let mut update_failures = Vec::new();
+        for (older, newer) in &clear_updates {
+            let r = retired(older, newer, &provider).await;
+            println!(
+                "UPDATE retired={r:?} (expect [{}])\n   older: {}\n   newer: {}",
+                older.id, older.content, newer.content
+            );
+            if r != vec![older.id] {
+                update_failures.push((older.content.clone(), newer.content.clone()));
+            }
+        }
+
+        // ── BUCKET 3: GENUINELY AMBIGUOUS — informational only, never asserted. ──
+        // Either outcome is defensible; we print to observe, not to gate.
+        let ambiguous = [
+            (
+                mem_at(
+                    "Supply closet inventory in Denver — Sam coordinating",
+                    day(2, 10),
+                ),
+                mem_at(
+                    "Supply closet inventory in Denver — Aisha coordinating",
+                    day(2, 17),
+                ),
+            ),
+            (
+                mem_at("The user drives a Tesla Model 3", day(1, 1)),
+                mem_at("The user drives a Rivian R1T", day(6, 1)),
+            ),
+        ];
+        for (a, b) in &ambiguous {
+            let r = retired(a, b, &provider).await;
+            println!(
+                "AMBIG  retired={r:?} (informational)\n   a: {}\n   b: {}",
+                a.content, b.content
+            );
+        }
+
+        println!("\n=== SUMMARY ===");
+        println!(
+            "clear-event pairs WRONGLY retired (must be 0): {}",
+            event_failures.len()
+        );
+        println!(
+            "clear-update pairs NOT resolved (must be 0): {}",
+            update_failures.len()
+        );
+        assert!(
+            event_failures.is_empty(),
+            "OVER-RETENTION GUARD FAILED — clear distinct events were retired (data loss): {event_failures:?}"
+        );
+        assert!(
+            update_failures.is_empty(),
+            "regression — clear single-valued updates were not resolved: {update_failures:?}"
+        );
     }
 }

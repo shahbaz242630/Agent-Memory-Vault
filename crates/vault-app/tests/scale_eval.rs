@@ -1853,3 +1853,259 @@ async fn probe_real_enrichment_1k() {
     }
     println!();
 }
+
+// ===========================================================================
+// CONTRADICTION-PAIR COSINE DISTRIBUTION PROBE (Finding G, 2026-06-19).
+//
+// MEASUREMENT ONLY — no LLM, no writes. Reproduces the FULL-SWEEP Phase-2b
+// candidate-pair generation on a real vault and prints the cosine distribution
+// of the resulting pairs, so we can decide — with data, not a guess — whether
+// raising the candidate floor can cut the pair count WITHOUT dropping a genuine
+// contradiction.
+//
+// WHY: the session-7 1k backfill logged `candidate_pairs=1730` and the handoff
+// called these "unpruned". That is FALSE — `nearest_neighbor_candidate_pairs`
+// already applies a 0.70 cosine floor + top-3 cap. So the 1730 are ALREADY
+// >=0.70. The known knowledge-update contradictions sit at cosine ~0.823
+// (Tesla/Rivian) and ~0.905 (Vega/Atlas) per `nn_contradiction_spike.rs`, so a
+// floor raised above ~0.82 would silently drop a real contradiction. This probe
+// measures where the 1730 actually live relative to that 0.82 line.
+//
+// This mirrors the consolidator full-sweep path EXACTLY: list active facts
+// (valid_until.is_none()), group by boundary, embed each fact's CONTENT via the
+// same BGE weights, and call the same `nearest_neighbor_candidate_pairs`.
+//
+// Read-only — safe to point at the pristine seed, but a copy is tidiest:
+//
+//   Copy-Item C:\Projects\seeded-vault-1k C:\Projects\seeded-vault-1k-cosine -Recurse -Force
+//   $env:PROBE_VAULT_DIR='C:\Projects\seeded-vault-1k-cosine'
+//   cargo test -p vault-app --test scale_eval probe_contradiction_pair_distribution -- --ignored --nocapture
+// ===========================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "contradiction-pair cosine distribution probe (measurement only, no LLM); run with --ignored --nocapture + PROBE_VAULT_DIR"]
+async fn probe_contradiction_pair_distribution() {
+    use vault_consolidator::phases::candidates::{
+        nearest_neighbor_candidate_pairs, CONTRADICTION_NN_SIMILARITY_FLOOR, CONTRADICTION_NN_TOP_K,
+    };
+    use vault_storage::{MemoryFilter, StorageBackend};
+
+    const DIM: usize = 384;
+    // The two measured genuine knowledge-update contradictions (nn_contradiction_spike.rs).
+    // Any floor that would exclude these loses real recall.
+    const KNOWN_CONTRADICTION_COSINES: &[(&str, f32)] =
+        &[("Tesla/Rivian", 0.823), ("Vega/Atlas", 0.905)];
+
+    let vault_dir = PathBuf::from(
+        std::env::var("PROBE_VAULT_DIR").expect("PROBE_VAULT_DIR (1k vault, read-only) required"),
+    );
+
+    let master_key = vault_app::keychain::read_or_init_master_key(
+        vault_app::keychain::PRODUCTION_NAMESPACE,
+        vault_app::keychain::VAULT_ID,
+    )
+    .expect("read master key (Windows keychain)");
+    let sql_key = vault_app::keychain::derive_sqlcipher_passphrase(&master_key);
+    let at_rest = vault_app::keychain::derive_at_rest_key(&master_key);
+
+    println!("\nloading BGE (real, same weights as prod)...");
+    let bge = BgeSmallProvider::open(
+        &fixture(BGE_FIXTURE_REL, "model.onnx"),
+        &fixture(BGE_FIXTURE_REL, "tokenizer.json"),
+        &ort_lib(),
+    )
+    .expect("open BGE");
+
+    let storage = StorageBackend::open_with_at_rest_key(
+        &vault_dir.join("vault.db"),
+        &vault_dir.join("lance"),
+        &vault_dir.join("graph.duckdb"),
+        sql_key,
+        DIM,
+        &at_rest,
+    )
+    .await
+    .expect("open vault");
+
+    // EXACTLY the full-sweep Phase-2b active set: non-superseded AND not retired.
+    let active: Vec<vault_core::Memory> = storage
+        .list_memories(MemoryFilter::default(), None)
+        .await
+        .expect("list_memories")
+        .into_iter()
+        .filter(|m| m.valid_until.is_none())
+        .collect();
+
+    let mut by_boundary: BTreeMap<Boundary, Vec<vault_core::Memory>> = BTreeMap::new();
+    for m in active {
+        by_boundary.entry(m.boundary.clone()).or_default().push(m);
+    }
+
+    // Word-token containment (|A∩B| / min(|A|,|B|)) — a LOCAL copy of the dedup
+    // gate's lexical axis (`phases::dedup::token_containment`, pub(crate) so not
+    // importable here). Same logic, so the numbers it prints match the gate.
+    fn containment(a: &str, b: &str) -> f32 {
+        let toks = |s: &str| -> std::collections::HashSet<String> {
+            s.split(|c: char| !c.is_alphanumeric())
+                .filter(|t| !t.is_empty())
+                .map(str::to_lowercase)
+                .collect()
+        };
+        let (ta, tb) = (toks(a), toks(b));
+        let min_len = ta.len().min(tb.len());
+        if min_len == 0 {
+            return 0.0;
+        }
+        ta.intersection(&tb).count() as f32 / min_len as f32
+    }
+    // The dedup gate's lexical floor (`phases::dedup::NEAR_IDENTICAL_LEX`).
+    const DEDUP_LEX_FLOOR: f32 = 0.80;
+    // The merge/dedup clustering gate (cluster.rs): only pairs >= this even
+    // reach merge/dedup; below it they are contradiction-only.
+    const MERGE_GATE_COS: f32 = 0.92;
+
+    // Collect every candidate pair across all boundaries with cosine +
+    // containment + both texts (the pair set is already 0.70-floored +
+    // top-K-capped by nearest_neighbor_candidate_pairs).
+    struct Pair {
+        cos: f32,
+        lex: f32,
+        a: String,
+        b: String,
+    }
+    let mut pairs_full: Vec<Pair> = Vec::new();
+    let mut total_active = 0usize;
+    for (boundary, memories) in &by_boundary {
+        total_active += memories.len();
+        if memories.len() < 2 {
+            continue;
+        }
+        println!("embedding {} active facts in {boundary}...", memories.len());
+        let mut embeddings = Vec::with_capacity(memories.len());
+        for m in memories {
+            embeddings.push(bge.embed(&m.content).await.expect("embed content"));
+        }
+        for (i, j) in nearest_neighbor_candidate_pairs(&embeddings) {
+            pairs_full.push(Pair {
+                cos: cosine(&embeddings[i], &embeddings[j]),
+                lex: containment(&memories[i].content, &memories[j].content),
+                a: memories[i].content.clone(),
+                b: memories[j].content.clone(),
+            });
+        }
+    }
+    pairs_full.sort_by(|x, y| y.cos.total_cmp(&x.cos)); // descending by cosine
+    let pair_cosines: Vec<f32> = pairs_full.iter().map(|p| p.cos).collect();
+
+    let total_pairs = pair_cosines.len();
+    println!("\n===== CONTRADICTION-PAIR COSINE DISTRIBUTION =====");
+    println!(
+        "active facts: {total_active} ; current floor={CONTRADICTION_NN_SIMILARITY_FLOOR} top-K={CONTRADICTION_NN_TOP_K}"
+    );
+    println!("candidate pairs (>= {CONTRADICTION_NN_SIMILARITY_FLOOR} floor): {total_pairs}");
+    if total_pairs == 0 {
+        println!("(no pairs — nothing to analyse)");
+        return;
+    }
+
+    // Histogram by 0.05 band from 0.70 up to 1.00.
+    println!("\n-- histogram (cosine band -> pair count) --");
+    let mut band = 0.70f32;
+    while band < 1.0 {
+        let hi = band + 0.05;
+        let n = pair_cosines
+            .iter()
+            .filter(|&&c| c >= band && c < hi)
+            .count();
+        let bar = "#".repeat((n as f32 / total_pairs as f32 * 60.0).round() as usize);
+        println!("  [{band:.2}, {hi:.2}) {n:>6}  {bar}");
+        band = hi;
+    }
+
+    // The decision table: if we RAISED the candidate floor to X, how many pairs
+    // survive (= LLM calls) — and is X safely below the known contradictions?
+    println!("\n-- if candidate floor raised to X: pairs surviving (LLM calls) & recall safety --");
+    println!(
+        "   (a real knowledge-update contradiction sits at ~0.82; a SAFE floor stays below it)"
+    );
+    for &x in &[0.70f32, 0.75, 0.78, 0.80, 0.82, 0.85, 0.88, 0.90, 0.92] {
+        let surviving = pair_cosines.iter().filter(|&&c| c >= x).count();
+        let pct = surviving as f32 / total_pairs as f32 * 100.0;
+        let loses = KNOWN_CONTRADICTION_COSINES
+            .iter()
+            .filter(|(_, c)| *c < x)
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>();
+        let verdict = if loses.is_empty() {
+            "recall-safe".to_string()
+        } else {
+            format!("DROPS {}", loses.join(", "))
+        };
+        println!("   floor {x:.2}: {surviving:>6} pairs ({pct:>5.1}%)   {verdict}");
+    }
+
+    // Near-dup tail: pairs >= the 0.92 merge gate that nonetheless reached
+    // Phase 2b — these signal merge/dedup under-collapsing (Finding B), the
+    // OTHER lever for shrinking the pair count.
+    let near_dups = pair_cosines
+        .iter()
+        .filter(|&&c| c >= MERGE_GATE_COS)
+        .count();
+    println!(
+        "\nnear-duplicate pairs (>= {MERGE_GATE_COS} merge gate, yet still contradiction-judged): {near_dups} ({:.1}%)",
+        near_dups as f32 / total_pairs as f32 * 100.0
+    );
+    println!("  ^ if dedup/merge collapsed these, they would never reach the slow judge.");
+
+    // ── WHY aren't the >= 0.92 pairs collapsing? Diagnose the dedup gate ──
+    // The dedup gate requires cosine >= 0.93 AND containment >= 0.80. For pairs
+    // already >= 0.92 cosine, the LEXICAL axis is the usual blocker. Split them.
+    let merge_eligible: Vec<&Pair> = pairs_full
+        .iter()
+        .filter(|p| p.cos >= MERGE_GATE_COS)
+        .collect();
+    let lex_pass = merge_eligible
+        .iter()
+        .filter(|p| p.lex >= DEDUP_LEX_FLOOR)
+        .count();
+    let lex_fail = merge_eligible.len() - lex_pass;
+    println!(
+        "\n-- of the {} pairs >= {MERGE_GATE_COS} cosine (merge-eligible) --",
+        merge_eligible.len()
+    );
+    println!(
+        "   containment >= {DEDUP_LEX_FLOOR} (dedup would fire): {lex_pass}\n   containment <  {DEDUP_LEX_FLOOR} (dedup BLOCKED by lexical axis): {lex_fail}"
+    );
+
+    // Eyeball sample: are these genuinely duplicates that SHOULD merge, or
+    // distinct facts? Print the lowest-containment merge-eligible pairs (the
+    // ones the lexical gate is rejecting) + a few high-cosine examples.
+    println!("\n-- sample merge-eligible pairs the LEXICAL gate rejects (cos>={MERGE_GATE_COS}, lex<{DEDUP_LEX_FLOOR}) --");
+    let mut lex_rejects: Vec<&&Pair> = merge_eligible
+        .iter()
+        .filter(|p| p.lex < DEDUP_LEX_FLOOR)
+        .collect();
+    lex_rejects.sort_by(|x, y| y.cos.total_cmp(&x.cos));
+    for p in lex_rejects.iter().take(12) {
+        println!(
+            "   cos={:.3} lex={:.2}\n      A: {}\n      B: {}",
+            p.cos, p.lex, p.a, p.b
+        );
+    }
+
+    // Also sample the 0.85–0.92 band (BELOW the merge gate but high) — if these
+    // are ALSO duplicates, the 0.92 clustering gate itself is too high.
+    println!("\n-- sample pairs in the 0.85-0.92 band (below merge gate; are these dups too?) --");
+    let mut mid: Vec<&Pair> = pairs_full
+        .iter()
+        .filter(|p| p.cos >= 0.85 && p.cos < MERGE_GATE_COS)
+        .collect();
+    mid.sort_by(|x, y| y.cos.total_cmp(&x.cos));
+    for p in mid.iter().take(12) {
+        println!(
+            "   cos={:.3} lex={:.2}\n      A: {}\n      B: {}",
+            p.cos, p.lex, p.a, p.b
+        );
+    }
+    println!("===================================================\n");
+}
