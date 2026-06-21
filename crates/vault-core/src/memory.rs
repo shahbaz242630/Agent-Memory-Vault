@@ -95,6 +95,17 @@ pub struct Memory {
     pub access_count: u32,
     pub last_accessed: DateTime<Utc>,
     pub superseded_by: Option<MemoryId>,
+    /// If `Some(t)`, this memory was moved to cold archive at time `t` —
+    /// untouched past `archive_after_days` (consolidator Phase 4, BRD §5.6
+    /// lines 995-996). Cold-archived facts are EXCLUDED from default retrieval
+    /// (like superseded/expired facts) and surfaced only via an explicit
+    /// "search archive" call (`RetrievalOptions::include_archived`). `None` =
+    /// active. The fact is never deleted — un-archiving is just clearing this
+    /// marker, so this is the demote-not-delete tool the "keep when unsure"
+    /// posture leans on (ADR-084). `#[serde(default)]` keeps pre-ADR-084
+    /// checkpoint pre-image blobs deserializable.
+    #[serde(default)]
+    pub archived_at: Option<DateTime<Utc>>,
     pub embedding: Option<Vec<f32>>,
     pub metadata: serde_json::Value,
 }
@@ -137,6 +148,7 @@ impl Memory {
             access_count: 0,
             last_accessed: now,
             superseded_by: None,
+            archived_at: None,
             embedding: None,
             metadata: args.metadata,
         };
@@ -156,8 +168,8 @@ impl Memory {
     /// `valid_from` / `valid_until` / `confidence` / etc. follow
     /// `try_new`'s defaults: `valid_from` defaults to `now` if
     /// omitted, system-managed fields (`created_at`, `last_accessed`,
-    /// `access_count`, `superseded_by`, `embedding`) get the same
-    /// defaults as `try_new`. Callers that need to preserve those
+    /// `access_count`, `superseded_by`, `archived_at`, `embedding`) get the
+    /// same defaults as `try_new`. Callers that need to preserve those
     /// (per ADR-028) read the existing memory first and then mutate
     /// the relevant fields on the returned struct.
     ///
@@ -237,6 +249,17 @@ impl Memory {
     #[must_use]
     pub fn is_expired_at(&self, at: DateTime<Utc>) -> bool {
         self.valid_until.is_some_and(|t| t <= at)
+    }
+
+    /// True if this memory has been moved to cold archive (consolidator
+    /// Phase 4, ADR-084). Retrieval skips these by default — they surface
+    /// only via an explicit "search archive" call
+    /// (`RetrievalOptions::include_archived = true`), mirroring how
+    /// [`Self::is_superseded`] / [`Self::is_expired_at`] gate the
+    /// non-default-retrieval bucket. Never deleted — archive is reversible.
+    #[must_use]
+    pub fn is_archived(&self) -> bool {
+        self.archived_at.is_some()
     }
 }
 

@@ -17,7 +17,7 @@
 //!         )
 //!         memories = metadata_store.get_memories_batch(&ids_in_hit_order)
 //!         scored = zip(memories, distances).map(|(m, dist)| (m, 1.0 - dist))   # Q7
-//!         scored.retain(|(m,_)| include_archived || !m.is_superseded())        # Q5b
+//!         scored.retain(|(m,_)| include_archived || (!m.is_superseded() && !m.is_expired_at(now) && !m.is_archived()))  # Q5b
 //!         scored.retain(|(_,s)| s >= threshold)                                # Q4
 //!         scored.sort_by(score DESC, then memory.created_at DESC)              # Q9
 //!         scored.truncate(max_results)
@@ -187,13 +187,15 @@ impl SemanticRetriever {
             .collect();
 
         // -- Q5b: include_archived filter ----------------------------------
-        // Default (include_archived=false): skip both superseded AND
-        // expired memories. Per ADR-051 (T0.2.7 Phase B), the single
-        // `include_archived` flag controls both behaviors; archival
-        // visibility means full historical state.
+        // Default (include_archived=false): skip the non-current bucket —
+        // superseded merge-losers, expired facts (ADR-051), AND cold-archived
+        // facts (ADR-084, untouched past archive_after_days). The single
+        // `include_archived` flag gates all three: archival visibility means
+        // full historical state, surfaced only by an explicit "search archive"
+        // call.
         if !query.options.include_archived {
             let now = Utc::now();
-            scored.retain(|(m, _)| !m.is_superseded() && !m.is_expired_at(now));
+            scored.retain(|(m, _)| !m.is_superseded() && !m.is_expired_at(now) && !m.is_archived());
         }
 
         // -- Q4: score_threshold filter ------------------------------------
@@ -711,6 +713,69 @@ mod tests {
         assert!(
             res.iter().any(|r| r.memory.id == expired.id),
             "expired memory must surface when include_archived=true per ADR-051"
+        );
+    }
+
+    // --- 8e. ADR-084: cold-archived memory is filtered by default ----------
+
+    #[tokio::test]
+    async fn archived_memory_is_filtered_by_default() {
+        let bundle = make_bundle().await;
+        let work = boundary("work");
+        let live = make_memory("still active", &work);
+        let archived = make_memory("cold for over a year", &work);
+        insert(&bundle, &live, 1).await;
+        insert(&bundle, &archived, 2).await;
+
+        // Move `archived` to cold archive (set archived_at).
+        let mut archived_mut = archived.clone();
+        archived_mut.archived_at = Some(chrono::Utc::now() - chrono::Duration::days(1));
+        bundle
+            .metadata
+            .update_memory(&archived_mut)
+            .await
+            .expect("update");
+
+        let res = bundle
+            .retriever
+            .retrieve(query("memory", vec![work], 10))
+            .await
+            .expect("retrieve");
+
+        assert!(
+            !res.iter().any(|r| r.memory.id == archived.id),
+            "cold-archived memory must be filtered out of default retrieval per ADR-084"
+        );
+        assert!(
+            res.iter().any(|r| r.memory.id == live.id),
+            "active memory must remain"
+        );
+    }
+
+    // --- 8f. ADR-084: cold-archived memory surfaces with include_archived=true
+
+    #[tokio::test]
+    async fn archived_memory_included_with_include_archived_true() {
+        let bundle = make_bundle().await;
+        let work = boundary("work");
+        let archived = make_memory("cold for over a year", &work);
+        insert(&bundle, &archived, 1).await;
+
+        let mut archived_mut = archived.clone();
+        archived_mut.archived_at = Some(chrono::Utc::now() - chrono::Duration::days(1));
+        bundle
+            .metadata
+            .update_memory(&archived_mut)
+            .await
+            .expect("update");
+
+        let mut q = query("memory", vec![work], 10);
+        q.options.include_archived = true;
+        let res = bundle.retriever.retrieve(q).await.expect("retrieve");
+
+        assert!(
+            res.iter().any(|r| r.memory.id == archived.id),
+            "cold-archived memory must surface when include_archived=true (search archive)"
         );
     }
 

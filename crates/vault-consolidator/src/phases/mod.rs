@@ -13,7 +13,8 @@
 //! | 3 — Apply merges | [`merge`] | T0.2.3 commit 2 |
 //! | 2b — Nearest-neighbor contradiction candidates | [`candidates`] | T0.3.x (ADR-065) |
 //! | 2b — Pairwise contradiction judging | [`contradiction`] | T0.3.x (A5 ship-gate) |
-//! | 4 — Confidence decay | [`decay`] | T0.2.4 (cold archive: follow-up batch) |
+//! | 4 — Confidence decay | [`decay`] | T0.2.4 |
+//! | 4 — Cold archive | [`archive`] | A1 (ADR-084) |
 //!
 //! File layout matches BRD §5.6 lines 987-989 verbatim (T0.2.3 commit 1
 //! refactor — T0.2.2 commit 1 shipped clustering as `src/clustering.rs`
@@ -24,6 +25,7 @@
 //! recency, so knowledge-update contradictions (which sit below the 0.92
 //! merge gate) get detected.
 
+pub mod archive;
 pub mod candidates;
 pub mod cluster;
 pub mod contradiction;

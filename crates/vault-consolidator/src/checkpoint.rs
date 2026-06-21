@@ -60,7 +60,10 @@ pub(crate) async fn diff_to_entries(
     // Modified: present in both, row changed. (Memory's PartialEq ignores the
     // always-None `embedding` field on both sides — vectors live in LanceDB —
     // so this compares content / confidence / valid_until / superseded_by /
-    // metadata, i.e. exactly the fields a run mutates.)
+    // archived_at / metadata, i.e. exactly the fields a run mutates. ADR-084:
+    // a fact this run cold-archives flips archived_at None → Some, so it is
+    // captured here as Modified with the pre-archive image — rollback restores
+    // archived_at = None, un-archiving it.)
     for (id, &before) in &pre_by_id {
         match post_by_id.get(id) {
             Some(&after) if after != before => {

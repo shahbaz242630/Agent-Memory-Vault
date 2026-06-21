@@ -51,6 +51,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "Pillar 2 incremental consolidation (ADR-082): consolidation_state watermark",
         up: include_str!("0005_consolidation_watermark.sql"),
     },
+    Migration {
+        version: 6,
+        description: "A1 cold archive (ADR-084): memories.archived_at marker + partial index",
+        up: include_str!("0006_memory_archived_at.sql"),
+    },
 ];
 
 /// Apply any pending migrations to the open connection. Uses the
@@ -348,6 +353,40 @@ mod tests {
             [],
         );
         assert!(err.is_err(), "CHECK(id = 1) must reject id != 1");
+    }
+
+    #[test]
+    fn migration_0006_adds_archived_at_column_and_index() {
+        // A1 cold archive (ADR-084): memories gain a nullable archived_at
+        // marker (NULL = active) + a partial index over the non-NULL rows so
+        // the active-only default-retrieval scan stays cheap. Verify the column
+        // and the index both exist after migrating.
+        let mut conn = open_memory();
+        run(&mut conn).unwrap();
+
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(memories)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            cols.iter().any(|c| c == "archived_at"),
+            "migration 0006 must add memories.archived_at; columns: {cols:?}"
+        );
+
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_memories_archived_at'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            exists, 1,
+            "expected idx_memories_archived_at index to exist"
+        );
     }
 
     #[test]

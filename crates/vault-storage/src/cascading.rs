@@ -844,6 +844,67 @@ impl StorageBackend {
         })
     }
 
+    /// Apply a cold-archive move: set the memory's `archived_at` marker so it
+    /// drops OUT of default retrieval (consolidator Phase 4, BRD §5.6 lines
+    /// 995-996; ADR-084).
+    ///
+    /// **Metadata-only** — the fact's CONTENT and stored vector are untouched,
+    /// so the (possibly ADR-074-enriched) embedding is preserved and there is
+    /// no LanceDB/DuckDB cascade and no re-embed. The fact is NOT deleted: the
+    /// archived row still lives in `memories`, retrievable via an explicit
+    /// archive search (`MemoryFilter::include_archived = true`). Archive is
+    /// reversible — checkpoint rollback restores `archived_at = None`. Mirrors
+    /// the `invalidate` / `apply_decay` metadata-only contract.
+    ///
+    /// Emits exactly one [`AuditEventType::MemoryArchived`] event with
+    /// `details_json` = `{"archived_at":"<rfc3339>"}`.
+    ///
+    /// **Boundary check is the caller's responsibility** — the consolidator
+    /// archives within the active set it enumerated, same convention as
+    /// `invalidate` / `apply_decay`.
+    ///
+    /// **Errors:**
+    /// - [`VaultError::NotFound`] if `memory_id` does not exist.
+    /// - [`VaultError::Storage`] on transaction-side failure.
+    #[instrument(skip(self), fields(memory = %memory_id))]
+    pub async fn apply_archive(
+        &self,
+        memory_id: MemoryId,
+        archived_at: DateTime<Utc>,
+    ) -> VaultResult<Ack> {
+        let store = self.metadata.clone();
+        let committed_at: DateTime<Utc> = store
+            .with_transaction(move |tx| {
+                let memory = tx_get_memory(tx, &memory_id)?.ok_or_else(|| {
+                    VaultError::NotFound(format!("memory {memory_id} does not exist"))
+                })?;
+
+                let boundary_for_audit = memory.boundary.clone();
+                let mut updated = memory;
+                updated.archived_at = Some(archived_at);
+                updated.validate()?;
+                tx_update_memory(tx, &updated)?;
+
+                let mut pending =
+                    PendingAuditEvent::success(AuditEventType::MemoryArchived, ActorKind::System)
+                        .with_resource("memory", memory_id.to_string())
+                        .with_boundary(boundary_for_audit);
+                pending.details_json = format!(
+                    r#"{{"archived_at":{}}}"#,
+                    json_string(&archived_at.to_rfc3339())
+                );
+                let event = tx_append_audit(tx, pending)?;
+
+                Ok::<_, VaultError>(event.timestamp)
+            })
+            .await?;
+
+        Ok(Ack {
+            memory_id,
+            sqlite_committed_at: committed_at,
+        })
+    }
+
     /// Drain `pending_sync` back into `retry_queue` (the cap-overflow recovery
     /// path; migration 0003 + T0.2.4 sync ship-gate). Oldest-first, atomically
     /// per entry: while `retry_queue` has capacity, re-enqueue the stored
@@ -2054,6 +2115,93 @@ mod tests {
         assert_eq!(
             back.confidence, m.confidence,
             "a rejected decay must not mutate confidence"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // apply_archive — Phase 4 cold archive (ADR-084)
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn apply_archive_sets_marker_metadata_only_and_excludes_from_default_list() {
+        let (_tmp, backend) = make_backend().await;
+        let m = sample_memory("personal", "a fact untouched for a year");
+        backend.write_memory(&m, &embedding(0.3)).await.unwrap();
+
+        let archived_at = Utc::now();
+        let ack = backend.apply_archive(m.id, archived_at).await.unwrap();
+        assert_eq!(ack.memory_id, m.id);
+
+        // The marker is persisted and the row is unchanged otherwise.
+        let back = backend.metadata.get_memory(&m.id).await.unwrap().unwrap();
+        assert!(back.is_archived(), "archived_at marker must be set");
+        assert_eq!(
+            back.archived_at.map(|d| d.to_rfc3339()),
+            Some(archived_at.to_rfc3339()),
+            "archived_at must round-trip"
+        );
+        assert_eq!(back.content, m.content, "archive must not change content");
+        assert_eq!(back.confidence, m.confidence, "archive must not decay");
+        assert_eq!(back.valid_until, None, "archive must not invalidate");
+        assert_eq!(back.superseded_by, None, "archive must not supersede");
+
+        // Default list excludes the archived fact; include_archived surfaces it.
+        let default_listed = backend
+            .list_memories(MemoryFilter::default(), None)
+            .await
+            .unwrap();
+        assert!(
+            !default_listed.iter().any(|x| x.id == m.id),
+            "archived fact must be excluded from default list (out of retrieval)"
+        );
+        let with_archived = backend
+            .list_memories(
+                MemoryFilter {
+                    include_archived: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            with_archived.iter().any(|x| x.id == m.id),
+            "archived fact must surface when include_archived = true"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_archive_returns_not_found_on_missing_memory() {
+        let (_tmp, backend) = make_backend().await;
+        let err = backend
+            .apply_archive(MemoryId::new(), Utc::now())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VaultError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn apply_archive_emits_memory_archived_audit_event() {
+        let (_tmp, backend) = make_backend().await;
+        let m = sample_memory("work", "archive me");
+        backend.write_memory(&m, &embedding(0.2)).await.unwrap();
+
+        let archived_at = Utc::now();
+        backend.apply_archive(m.id, archived_at).await.unwrap();
+
+        let events = backend.metadata.list_audit_events(1000).await.unwrap();
+        let archived = events
+            .iter()
+            .find(|e| e.event_type == AuditEventType::MemoryArchived)
+            .expect("a memory.archived audit event must be emitted");
+        assert_eq!(
+            archived.resource_id.as_deref(),
+            Some(m.id.to_string().as_str())
+        );
+        assert!(
+            archived.details_json.contains(&archived_at.to_rfc3339()),
+            "details_json must carry archived_at, got: {}",
+            archived.details_json
         );
     }
 

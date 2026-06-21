@@ -225,16 +225,19 @@ async fn no_memory_is_ever_lost() {
         "no-memory-lost property test consolidation complete"
     );
 
-    // Read post-state including superseded rows so we can audit each input
-    // ID's disposition.
+    // Read post-state including BOTH superseded AND archived rows so we can
+    // audit each input ID's disposition across all three end-states (BRD §5.6
+    // line 1023: active | superseded | archived). Omitting either filter would
+    // make a legitimately-retired fact look "lost".
     let all_filter = MemoryFilter {
         include_superseded: true,
+        include_archived: true,
         ..MemoryFilter::default()
     };
     let all_after = storage_arc
         .list_memories(all_filter, None)
         .await
-        .expect("list_memories with include_superseded");
+        .expect("list_memories with include_superseded + include_archived");
     let all_ids_after: HashSet<MemoryId> = all_after.iter().map(|m| m.id).collect();
 
     // Property assertion 1: every input ID is still in storage.
@@ -246,31 +249,35 @@ async fn no_memory_is_ever_lost() {
         );
     }
 
-    // Property assertion 2: partition every input ID into active (own row,
-    // superseded_by None) OR superseded (own row, superseded_by Some). At
-    // T0.2.3 there's no archive state yet (Phase 4 ships at T0.2.4); the
-    // binary partition exhausts the post-state outcomes per BRD §5.6
-    // line 982.
+    // Property assertion 2: partition every input ID into exactly one of the
+    // three end-states (BRD §5.6 line 1023): superseded (own row,
+    // superseded_by Some), archived (own row, archived_at Some), or active
+    // (own row, neither). The three-way partition exhausts the post-state
+    // outcomes — none is "lost".
     let by_id: std::collections::HashMap<MemoryId, &vault_core::Memory> =
         all_after.iter().map(|m| (m.id, m)).collect();
     let mut active_input_count = 0;
     let mut superseded_input_count = 0;
+    let mut archived_input_count = 0;
     for input_id in &input_ids {
         let memory = by_id
             .get(input_id)
             .expect("input ID present in post-state per assertion 1");
-        if memory.superseded_by.is_none() {
-            active_input_count += 1;
-        } else {
+        if memory.superseded_by.is_some() {
             superseded_input_count += 1;
+        } else if memory.is_archived() {
+            archived_input_count += 1;
+        } else {
+            active_input_count += 1;
         }
     }
     assert_eq!(
-        active_input_count + superseded_input_count,
+        active_input_count + superseded_input_count + archived_input_count,
         input_count,
-        "BRD §5.6 line 982 partition check: every input ID must be active \
-         or superseded; got active={active_input_count}, \
-         superseded={superseded_input_count}, input_count={input_count}"
+        "BRD §5.6 line 1023 partition check: every input ID must be active, \
+         superseded, or archived; got active={active_input_count}, \
+         superseded={superseded_input_count}, archived={archived_input_count}, \
+         input_count={input_count}"
     );
     assert!(
         superseded_input_count > 0,

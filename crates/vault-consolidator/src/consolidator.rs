@@ -42,6 +42,7 @@ use vault_embedding::EmbeddingProvider;
 use vault_llm::LlmProvider;
 use vault_storage::{CheckpointId, MemoryFilter, StorageBackend};
 
+use crate::phases::archive::plan_archive;
 use crate::phases::candidates::{
     contradiction_candidate_neighbours, nearest_neighbor_candidate_pairs,
 };
@@ -220,8 +221,9 @@ impl Consolidator {
     ///    `summary_markdown: String::new()` (commit 3 fills it via
     ///    `generate_summary_markdown(&run_state)`).
     ///
-    /// **Phase 4 (decay/archive) is NOT YET WIRED** — `memories_archived`
-    /// returns 0 at commit 2. Phase 4 ships at T0.2.4 per BRD §6.2.
+    /// **Phase 4 is WIRED**: confidence decay (T0.2.4) and cold archive
+    /// (A1, ADR-084) both run as the cycle's final pass — `memories_decayed`
+    /// and `memories_archived` carry the real per-run counts.
     ///
     /// **Checkpoints (BRD §5.6 line 957) are NOT YET WIRED** — checkpoint
     /// creation + rollback ship at T0.2.5 per BRD §6.2. The
@@ -241,30 +243,34 @@ impl Consolidator {
     ) -> VaultResult<ConsolidationReport> {
         let started_at = Utc::now();
 
-        // Step 1: snapshot the full memory set (incl. superseded) up-front —
-        // this is the pre-run baseline the T0.2.5 checkpoint diffs against at
-        // the end of the run (see `capture_checkpoint`). Including superseded
-        // rows means a row that was already superseded before this run is NOT
-        // mis-classified as "created" by the diff.
+        // Step 1: snapshot the full memory set (incl. superseded AND archived)
+        // up-front — this is the pre-run baseline the T0.2.5 checkpoint diffs
+        // against at the end of the run (see `capture_checkpoint`). Including
+        // superseded rows means a row already superseded before this run is NOT
+        // mis-classified as "created"; including archived rows (ADR-084) means
+        // a fact this run archives (archived_at None → Some) is seen by the
+        // diff as MODIFIED, not deleted — so it is captured for rollback (and
+        // a prior run's archived row isn't mis-classified as created either).
         let pre_snapshot = self
             .storage
             .list_memories(
                 MemoryFilter {
                     include_superseded: true,
+                    include_archived: true,
                     ..MemoryFilter::default()
                 },
                 None,
             )
             .await?;
 
-        // The run's own logic operates on the active (non-superseded) subset —
-        // identical to the previous `MemoryFilter::default()` enumeration, so
-        // Phase 1 clustering never sees superseded rows (ADR-046's
-        // single-supersession assumption). Derived in-process to avoid a second
-        // DB scan.
+        // The run's own logic operates on the active subset — non-superseded
+        // AND non-archived. Phase 1 clustering never sees superseded rows
+        // (ADR-046's single-supersession assumption) nor cold-archived rows
+        // (ADR-084 — out of default retrieval). Derived in-process to avoid a
+        // second DB scan.
         let all_memories: Vec<Memory> = pre_snapshot
             .iter()
-            .filter(|m| m.superseded_by.is_none())
+            .filter(|m| m.superseded_by.is_none() && !m.is_archived())
             .cloned()
             .collect();
 
@@ -285,7 +291,8 @@ impl Consolidator {
             started_at,
             duration: Duration::ZERO, // populated after the loop completes.
             memories_processed: 0,
-            memories_decayed: 0, // populated by Phase 4 below.
+            memories_decayed: 0,  // populated by Phase 4 below.
+            memories_archived: 0, // populated by Phase 4 below.
             per_boundary: BTreeMap::new(),
         };
         for (boundary, memories) in by_boundary {
@@ -691,9 +698,23 @@ impl Consolidator {
         // demoting stale knowledge without deleting it. Metadata-only (never
         // re-embeds — preserves the ADR-074 enriched vector) and idempotent (a
         // per-fact marker stops a second back-to-back run re-decaying, so the
-        // run converges per BRD §5.6 line 1022). Cold archive (BRD §5.6 lines
-        // 995-996) is the other half of Phase 4 and lands in a follow-up batch.
+        // run converges per BRD §5.6 line 1022).
         run_state.memories_decayed = self.decay_memories().await;
+
+        // ── Phase 4 (second half): cold archive (BRD §5.6 lines 995-996;
+        // ADR-084) ──
+        //
+        // A fact left untouched even longer than the decay threshold
+        // (`archive_after_days`, default 365) is moved OUT of default retrieval
+        // by setting its `archived_at` marker. Metadata-only (preserves the
+        // ADR-074 enriched vector), reversible (the checkpoint captures the
+        // pre-archive state), and idempotent (an already-archived fact is no
+        // longer in the active set and is guarded anyway). This is the
+        // demote-not-delete tool the "keep when unsure" posture leans on
+        // (ADR-083 founder posture): bloat is handled by decay + cold archive +
+        // the reranker, never by deletion. "No memory ever lost" (BRD §5.6 line
+        // 1023) holds with *archived* as the third end-state.
+        run_state.memories_archived = self.archive_memories().await;
 
         // Step 4: build the report. Populate RunState.duration first so
         // generate_summary_markdown can render the header from it.
@@ -770,7 +791,7 @@ impl Consolidator {
             memories_merged,
             contradictions_resolved,
             contradictions_auto_resolved,
-            memories_archived: 0, // Cold archive lands in a follow-up batch.
+            memories_archived: run_state.memories_archived,
             memories_decayed: run_state.memories_decayed,
             clusters_deduped,
             memories_deduped,
@@ -796,11 +817,16 @@ impl Consolidator {
         &self,
         pre_snapshot: &[Memory],
     ) -> VaultResult<Option<CheckpointId>> {
+        // Read the post-state with the SAME visibility as `pre_snapshot`
+        // (superseded + archived) so the diff is symmetric: a fact this run
+        // archived is seen as MODIFIED (archived_at None → Some), not as
+        // deleted, and is captured for rollback (ADR-084).
         let post_snapshot = self
             .storage
             .list_memories(
                 MemoryFilter {
                     include_superseded: true,
+                    include_archived: true,
                     ..MemoryFilter::default()
                 },
                 None,
@@ -894,6 +920,72 @@ impl Consolidator {
             "Phase 4 decay pass complete"
         );
         decayed
+    }
+
+    /// Phase 4 (A1, ADR-084): move cold facts to archive.
+    ///
+    /// Enumerates the active set, plans which facts are past the
+    /// `archive_after_days` idle threshold (see [`plan_archive`]), and applies
+    /// each via the metadata-only [`StorageBackend::apply_archive`] primitive
+    /// (sets `archived_at`, dropping the fact out of default retrieval). Returns
+    /// the number of facts archived.
+    ///
+    /// Runs AFTER decay in the same Phase 4: a fact that crossed both
+    /// thresholds is decayed this run and archived this run (archive is the
+    /// terminal cold state). The active-set enumeration uses
+    /// `MemoryFilter::default()` (already excludes superseded AND archived
+    /// facts), so a previously-archived fact is never re-examined —
+    /// idempotency for free, no metadata marker needed.
+    ///
+    /// Failure semantics (mirrors [`Self::decay_memories`]): a failed
+    /// enumeration returns 0 (the run's earlier work already committed
+    /// durably); a per-fact `apply_archive` failure is logged-and-counted and
+    /// the loop continues — one bad fact never aborts the pass, and it retries
+    /// next cycle (its marker was never written).
+    ///
+    /// [`StorageBackend::apply_archive`]: vault_storage::StorageBackend::apply_archive
+    async fn archive_memories(&self) -> usize {
+        let now = Utc::now();
+        let memories = match self
+            .storage
+            .list_memories(MemoryFilter::default(), None)
+            .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    target: "vault_consolidator::archive",
+                    error = %e,
+                    "Phase 4 archive: failed to enumerate active set; skipping (next cycle retries)"
+                );
+                return 0;
+            }
+        };
+        let plan = plan_archive(&memories, self.config.archive_after_days, now);
+        if plan.is_empty() {
+            return 0;
+        }
+        let mut archived = 0;
+        for pa in plan {
+            match self.storage.apply_archive(pa.id, now).await {
+                Ok(_) => archived += 1,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "vault_consolidator::archive",
+                        memory = %pa.id,
+                        error = %e,
+                        "Phase 4 archive: apply_archive failed for fact; skipping (next cycle retries)"
+                    );
+                }
+            }
+        }
+        tracing::info!(
+            target: "vault_consolidator::archive",
+            archived,
+            examined = memories.len(),
+            "Phase 4 cold-archive pass complete"
+        );
+        archived
     }
 
     /// Phase 2-pre (ADR-063): attempt deterministic dedup of one cluster.
@@ -1371,6 +1463,9 @@ pub(crate) struct RunState {
     /// Aggregate per BRD §5.6 line 968 ("no per-memory detail"); drives the
     /// summary's Decay section.
     pub memories_decayed: usize,
+    /// Phase 4 (A1, ADR-084): count of facts moved to cold archive this run.
+    /// Aggregate per BRD §5.6 line 968; drives the summary's Archive line.
+    pub memories_archived: usize,
     pub per_boundary: BTreeMap<Boundary, BoundarySummary>,
 }
 

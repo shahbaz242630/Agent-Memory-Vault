@@ -73,8 +73,11 @@ pub struct SearchToolParams {
     /// lets you judge). Use `memory_read` for a definitive abstain signal.
     #[serde(default)]
     pub score_threshold: Option<f32>,
-    /// Whether to include archived (superseded) memories. Defaults to
-    /// `false` (exclude archived).
+    /// Whether to include the non-current "archive" bucket — superseded
+    /// merge-losers, expired facts, AND cold-archived facts (untouched past
+    /// `archive_after_days`, ADR-084). Defaults to `false` (current facts
+    /// only); set `true` for an explicit "search archive" over historical
+    /// state.
     #[serde(default)]
     pub include_archived: Option<bool>,
 }

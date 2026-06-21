@@ -65,6 +65,12 @@ pub struct MemoryFilter {
     /// retrieval consumers pass `Some(Utc::now())` for "currently true"
     /// queries; admin/audit callers leave it `None`.
     pub valid_at: Option<DateTime<Utc>>,
+    /// If `false` (default), exclude cold-archived memories (`archived_at IS
+    /// NOT NULL`) — the consolidator Phase-4 archive state (ADR-084). Set to
+    /// `true` for the explicit "search archive" path or admin/audit tooling.
+    /// Mirrors `include_superseded`: default retrieval and consolidator passes
+    /// never want archived facts; only an explicit archive search does.
+    pub include_archived: bool,
 }
 
 /// Async, encrypted SQLite-backed metadata store. Cheap to clone (it holds
@@ -370,7 +376,7 @@ impl MetadataStore {
                 "SELECT id, content, memory_type, source_agent, boundary,
                         created_at, valid_from, valid_until,
                         confidence, access_count, last_accessed,
-                        superseded_by, metadata_json
+                        superseded_by, metadata_json, archived_at
                  FROM memories WHERE id IN ({})",
                 placeholders.join(", ")
             );
@@ -683,8 +689,8 @@ pub(crate) fn tx_insert_memory(tx: &Transaction<'_>, m: &Memory) -> VaultResult<
             id, content, memory_type, source_agent, boundary,
             created_at, valid_from, valid_until,
             confidence, access_count, last_accessed,
-            superseded_by, metadata_json
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            superseded_by, metadata_json, archived_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             m.id.to_string(),
             m.content,
@@ -699,6 +705,7 @@ pub(crate) fn tx_insert_memory(tx: &Transaction<'_>, m: &Memory) -> VaultResult<
             m.last_accessed.to_rfc3339(),
             m.superseded_by.map(|id| id.to_string()),
             m.metadata.to_string(),
+            m.archived_at.map(|d| d.to_rfc3339()),
         ],
     )
     .map(|_| ())
@@ -717,7 +724,7 @@ pub(crate) fn tx_update_memory(tx: &Transaction<'_>, m: &Memory) -> VaultResult<
             content = ?2, memory_type = ?3, source_agent = ?4, boundary = ?5,
             created_at = ?6, valid_from = ?7, valid_until = ?8,
             confidence = ?9, access_count = ?10, last_accessed = ?11,
-            superseded_by = ?12, metadata_json = ?13
+            superseded_by = ?12, metadata_json = ?13, archived_at = ?14
          WHERE id = ?1",
         params![
             m.id.to_string(),
@@ -733,6 +740,7 @@ pub(crate) fn tx_update_memory(tx: &Transaction<'_>, m: &Memory) -> VaultResult<
             m.last_accessed.to_rfc3339(),
             m.superseded_by.map(|id| id.to_string()),
             m.metadata.to_string(),
+            m.archived_at.map(|d| d.to_rfc3339()),
         ],
     )
     .map_err(|e| VaultError::Storage(format!("update memory {}: {e}", m.id)))
@@ -749,7 +757,7 @@ fn tx_list_memories(
         "SELECT id, content, memory_type, source_agent, boundary,
                 created_at, valid_from, valid_until,
                 confidence, access_count, last_accessed,
-                superseded_by, metadata_json
+                superseded_by, metadata_json, archived_at
          FROM memories WHERE 1 = 1",
     );
 
@@ -765,6 +773,13 @@ fn tx_list_memories(
     }
     if !filter.include_superseded {
         sql.push_str(" AND superseded_by IS NULL");
+    }
+    // ADR-084: cold-archived facts (archived_at IS NOT NULL) are out of default
+    // retrieval; the consolidator's active-set enumerations (cluster/decay/
+    // contradiction) and default reads exclude them. Only an explicit archive
+    // search sets include_archived = true.
+    if !filter.include_archived {
+        sql.push_str(" AND archived_at IS NULL");
     }
     // `created_at` is stored as RFC3339 with consistent UTC offset (see
     // `tx_create_memory`'s `m.created_at.to_rfc3339()` binding). RFC3339
@@ -891,7 +906,7 @@ pub(crate) fn tx_append_audit(
 const MEMORY_SELECT_SQL: &str = "SELECT id, content, memory_type, source_agent, boundary,
             created_at, valid_from, valid_until,
             confidence, access_count, last_accessed,
-            superseded_by, metadata_json
+            superseded_by, metadata_json, archived_at
          FROM memories WHERE id = ?1";
 
 const AUDIT_SELECT_SQL: &str = "SELECT seq, event_id, timestamp, user_id, device_id,
@@ -942,6 +957,9 @@ fn row_to_memory(row: &Row<'_>) -> rusqlite::Result<Memory> {
         access_count: access_count as u32,
         last_accessed: row.get(10)?,
         superseded_by,
+        // Column 13: archived_at (ADR-084). rusqlite's chrono FromSql parses
+        // the RFC3339 text; NULL maps to None (active).
+        archived_at: row.get(13)?,
         embedding: None, // lives in LanceDB, not SQLite
         metadata,
     })

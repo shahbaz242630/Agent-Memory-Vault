@@ -47,7 +47,7 @@ pub(crate) fn generate_summary_markdown(state: &RunState, checkpoint_id: &str) -
     write_header(&mut out, state);
     write_merges_section(&mut out, &state.per_boundary);
     write_contradictions_section(&mut out, &state.per_boundary);
-    write_decay_section(&mut out, state.memories_decayed);
+    write_decay_section(&mut out, state.memories_decayed, state.memories_archived);
     write_footer(&mut out, checkpoint_id);
     out
 }
@@ -196,16 +196,18 @@ fn write_contradiction_entry(out: &mut String, conflict: &ConflictReview) {
     writeln!(out).expect("writing to String never fails");
 }
 
-fn write_decay_section(out: &mut String, memories_decayed: usize) {
+fn write_decay_section(out: &mut String, memories_decayed: usize, memories_archived: usize) {
     writeln!(out, "## Decay").expect("writing to String never fails");
     writeln!(out).expect("writing to String never fails");
     writeln!(out, "**Decayed:** {memories_decayed}").expect("writing to String never fails");
-    writeln!(out, "**Archived:** 0").expect("writing to String never fails");
+    writeln!(out, "**Archived:** {memories_archived}").expect("writing to String never fails");
     writeln!(out).expect("writing to String never fails");
     writeln!(
         out,
-        "(Confidence decay is live as of T0.2.4. Cold archive — BRD §5.6 lines \
-         995-996 — lands in a follow-up batch; archived count stays 0 until then.)"
+        "(Confidence decay is live as of T0.2.4; cold archive — facts untouched \
+         past `archive_after_days`, moved out of default retrieval — is live as \
+         of ADR-084. Both demote stale knowledge; neither deletes. Browse \
+         decayed/archived facts via the audit viewer.)"
     )
     .expect("writing to String never fails");
     writeln!(out).expect("writing to String never fails");
@@ -249,6 +251,7 @@ mod tests {
             duration: Duration::from_secs(12),
             memories_processed: 0,
             memories_decayed: 0,
+            memories_archived: 0,
             per_boundary: BTreeMap::new(),
         }
     }
@@ -293,6 +296,7 @@ mod tests {
             duration: Duration::from_secs(45),
             memories_processed: 2,
             memories_decayed: 0,
+            memories_archived: 0,
             per_boundary,
         }
     }
@@ -319,6 +323,7 @@ mod tests {
             duration: Duration::from_secs(30),
             memories_processed: 2,
             memories_decayed: 0,
+            memories_archived: 0,
             per_boundary,
         }
     }
@@ -341,6 +346,7 @@ mod tests {
             duration: Duration::from_secs(20),
             memories_processed: 5,
             memories_decayed: 0,
+            memories_archived: 0,
             per_boundary,
         }
     }
@@ -400,6 +406,7 @@ mod tests {
             duration: Duration::from_secs(60),
             memories_processed: 4,
             memories_decayed: 0,
+            memories_archived: 0,
             per_boundary,
         }
     }
@@ -513,9 +520,9 @@ mod tests {
         );
     }
 
-    /// Test 4: Decay section renders the aggregate decayed count (BRD §5.6 line
-    /// 968 "no per-memory detail"). An empty run decays nothing → 0. Archive
-    /// stays 0 (cold archive is the deferred follow-up); the note names it.
+    /// Test 4: Decay section renders the aggregate decayed + archived counts
+    /// (BRD §5.6 line 968 "no per-memory detail"). An empty run decays and
+    /// archives nothing → both 0.
     #[test]
     fn decay_aggregate_section_renders_zero_for_empty_run() {
         let state = empty_run_state();
@@ -527,11 +534,25 @@ mod tests {
         );
         assert!(
             md.contains("**Archived:** 0"),
-            "archived count must be 0 — cold archive is a follow-up batch"
+            "an empty run archives nothing — count must be 0"
         );
         assert!(
-            md.contains("Cold archive"),
-            "the archive-deferral note must name cold archive as the follow-up"
+            md.contains("cold archive"),
+            "the Decay-section note must name cold archive (now live per ADR-084)"
+        );
+    }
+
+    /// Test 4c (ADR-084): a run that archived N facts renders `**Archived:** N`.
+    /// Pins the Phase-4 cold-archive count flow (RunState.memories_archived →
+    /// summary).
+    #[test]
+    fn archive_section_renders_nonzero_count() {
+        let mut state = empty_run_state();
+        state.memories_archived = 4;
+        let md = generate_summary_markdown(&state, "test-cp-004c");
+        assert!(
+            md.contains("**Archived:** 4"),
+            "archived count must flow through to the summary:\n{md}"
         );
     }
 

@@ -149,6 +149,22 @@ pub enum AuditEventType {
     ///
     /// [`StorageBackend::apply_decay`]: crate::cascading::StorageBackend::apply_decay
     MemoryDecayed,
+
+    /// Recorded when the sleep consolidator's Phase 4 moves a cold fact to
+    /// archive ([`StorageBackend::apply_archive`], BRD §5.6 lines 995-996;
+    /// ADR-084). A fact untouched past `archive_after_days` has its
+    /// `archived_at` marker set, dropping it OUT of default retrieval.
+    /// Distinct from [`Self::MemoryDecayed`] (confidence fade, still
+    /// retrievable) and [`Self::MemoryInvalidated`] (became false): an archive
+    /// is a system-driven, metadata-only state change — content and vector are
+    /// unchanged, and it is reversible (un-archiving clears the marker). The
+    /// audit viewer surfaces these in the run's Decay/Archive section.
+    ///
+    /// `details_json` shape: `{"archived_at":"<rfc3339>"}` — `resource_id`
+    /// carries the archived MemoryId.
+    ///
+    /// [`StorageBackend::apply_archive`]: crate::cascading::StorageBackend::apply_archive
+    MemoryArchived,
 }
 
 impl AuditEventType {
@@ -171,6 +187,7 @@ impl AuditEventType {
             Self::MemoryInvalidated => "memory.invalidated",
             Self::MemoryDeduped => "memory.deduped",
             Self::MemoryDecayed => "memory.decayed",
+            Self::MemoryArchived => "memory.archived",
         }
     }
 
@@ -198,6 +215,7 @@ impl AuditEventType {
             "memory.invalidated" => Some(Self::MemoryInvalidated),
             "memory.deduped" => Some(Self::MemoryDeduped),
             "memory.decayed" => Some(Self::MemoryDecayed),
+            "memory.archived" => Some(Self::MemoryArchived),
             _ => None,
         }
     }
@@ -559,6 +577,7 @@ mod tests {
             AuditEventType::MemoryInvalidated,
             AuditEventType::MemoryDeduped,
             AuditEventType::MemoryDecayed,
+            AuditEventType::MemoryArchived,
         ] {
             assert_eq!(AuditEventType::parse(et.as_str()), Some(et));
         }
@@ -583,6 +602,11 @@ mod tests {
         // for the audit-viewer Decay-section filter (distinguishes Phase-4
         // confidence decays from user-driven memory.update edits).
         assert_eq!(AuditEventType::MemoryDecayed.as_str(), "memory.decayed");
+        // Pin the memory.archived wire-format string per ADR-084 — load-bearing
+        // for the audit-viewer Archive-section filter (distinguishes Phase-4
+        // cold-archive moves from decays and from user-driven memory.update
+        // edits).
+        assert_eq!(AuditEventType::MemoryArchived.as_str(), "memory.archived");
         // Confirm the old v1.2 retrieval wire-format string no longer
         // round-trips — T0.1.9 §6.2 rule 1 specifies non-backward-compat.
         assert_eq!(AuditEventType::parse("retrieval.query"), None);
