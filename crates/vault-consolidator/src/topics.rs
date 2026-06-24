@@ -23,11 +23,25 @@
 //! facts share a topic only when they are actually close in embedding space.
 //! So we group by **connected components** over the cosine-similarity graph:
 //! for each fact take its top-[`TOPIC_NN_TOP_K`] neighbors at or above
-//! [`TOPIC_NN_SIMILARITY_FLOOR`], treat those as undirected edges, and run the
-//! union-find transitive closure ([`crate::phases::cluster::union_find_components`]).
-//! Genuinely-related facts cluster; unrelated facts stay as their own
-//! singleton topic with an honest per-fact label. A singleton with a correct
-//! label beats a forced group with a wrong one ([[correctness-is-the-product]]).
+//! [`TOPIC_NN_SIMILARITY_FLOOR`], keep an edge only where the two facts are
+//! **mutual** near-neighbours (each in the other's top-K — ADR-085), and run
+//! the union-find transitive closure
+//! ([`crate::phases::cluster::union_find_components`]). Genuinely-related facts
+//! cluster; unrelated facts stay as their own singleton topic with an honest
+//! per-fact label. A singleton with a correct label beats a forced group with a
+//! wrong one ([[correctness-is-the-product]]).
+//!
+//! ## Why edges must be *mutual* (ADR-085 — Finding F, 2026-06-24)
+//!
+//! Connected components take the *transitive closure* of the edge set, so a
+//! single one-way link (`j` was `i`'s 5th-nearest just above the floor, but `i`
+//! is nowhere near `j`'s top-K) silently welds two unrelated topics together.
+//! At 1k facts those weak bridge edges are everywhere: the 2026-06-21 scale run
+//! collapsed **629/651 facts (~97%) into one catch-all topic**. Requiring
+//! reciprocity (mutual k-NN) drops the bridges — a fact only joins a topic when
+//! its neighbours agree — fixing the giant-component collapse. Display-only:
+//! never affects which facts surface at read time
+//! ([[project_report_topics_shown_to_agent_but_dont_gate_recall]]).
 //!
 //! ## Threshold provenance (provisional — calibrate as the vault fills)
 //!
@@ -228,32 +242,64 @@ pub async fn discover_topics(
     })
 }
 
-/// Build the undirected topic-edge list (ADR-068). For each fact `i`, the
-/// [`TOPIC_NN_TOP_K`] most-similar *other* facts at or above
-/// [`TOPIC_NN_SIMILARITY_FLOOR`] become edges. `ids[i]` is the [`MemoryId`] for
+/// Build the undirected topic-edge list as a **reciprocal (mutual) k-NN
+/// graph** (ADR-068, mutualised at ADR-085). An edge `(i, j)` exists only when
+/// `j` is among `i`'s [`TOPIC_NN_TOP_K`] most-similar facts at/above
+/// [`TOPIC_NN_SIMILARITY_FLOOR`] **AND** `i` is among `j`'s — i.e. the two facts
+/// each consider the other a near neighbour. `ids[i]` is the [`MemoryId`] for
 /// `embeddings[i]` (both in the same sorted order). Edges are canonicalised
-/// `(min_id, max_id)` and deduplicated via a [`BTreeSet`] so the output is
-/// deterministic and a mutually-near pair appears once.
+/// `(min_id, max_id)` in a [`BTreeSet`] so the output is deterministic.
 ///
-/// Cost: O(N²) cosine evaluations (cheap, in-memory, offline at nightly
-/// consolidation). Mirrors
+/// ## Why mutual, not one-way (ADR-085 — Finding F fix, 2026-06-24)
+///
+/// The original ADR-068 graph added an edge whenever `j` was in `i`'s top-K
+/// (a *directed* top-K, symmetrised). At small N that is harmless, but the
+/// edges feed [`union_find_components`]'s **transitive closure**: one stray
+/// one-way link `i → j` (j was i's 5th-nearest at 0.71, but i is nowhere near
+/// j's top-K) welds two otherwise-separate topics together, and at 1k facts
+/// those weak bridge edges are everywhere. The 2026-06-21 scale run measured
+/// the result: **629 of 651 facts (~97%) collapsed into ONE catch-all topic**.
+/// Requiring the relationship to be *reciprocal* drops the bridge edges — a
+/// fact only joins a topic when its neighbours agree it belongs — so genuine
+/// clusters stay intact while unrelated facts stop chaining. This is the
+/// standard mutual-kNN fix for giant-component percolation in NN graphs. It is
+/// **display-only**: topic membership never gates read-time recall or rank
+/// ([[project_report_topics_shown_to_agent_but_dont_gate_recall]]).
+///
+/// Cost: O(N²) cosine evaluations + O(N·K) reciprocity checks (cheap,
+/// in-memory, offline at nightly consolidation). Mirrors
 /// [`crate::phases::candidates::nearest_neighbor_candidate_pairs`]; kept
 /// separate so topic grouping can carry its own (provisional) floor + K without
 /// coupling to the contradiction ship-gate path.
 fn topic_edges(embeddings: &[Vec<f32>], ids: &[MemoryId]) -> Vec<(MemoryId, MemoryId)> {
     let n = embeddings.len();
+
+    // Pass 1: each fact's directed top-K neighbour set (indices) at/above the
+    // floor. Descending similarity; ascending index breaks ties so the top-K
+    // selection is deterministic. `total_cmp` is NaN-safe (no `.unwrap()` on
+    // `partial_cmp` — hard rule).
+    let top_k: Vec<BTreeSet<usize>> = (0..n)
+        .map(|i| {
+            let mut sims: Vec<(usize, f32)> = (0..n)
+                .filter(|&j| j != i)
+                .map(|j| (j, cosine_similarity(&embeddings[i], &embeddings[j])))
+                .collect();
+            sims.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            sims.into_iter()
+                .take(TOPIC_NN_TOP_K)
+                .filter(|(_, sim)| *sim >= TOPIC_NN_SIMILARITY_FLOOR)
+                .map(|(j, _)| j)
+                .collect()
+        })
+        .collect();
+
+    // Pass 2: keep an edge only when membership is MUTUAL — `j ∈ top_k[i]`
+    // AND `i ∈ top_k[j]`. The reciprocity check is what removes the one-way
+    // bridge edges (ADR-085). Canonicalised + deduped via the BTreeSet.
     let mut edges: BTreeSet<(MemoryId, MemoryId)> = BTreeSet::new();
     for i in 0..n {
-        let mut sims: Vec<(usize, f32)> = (0..n)
-            .filter(|&j| j != i)
-            .map(|j| (j, cosine_similarity(&embeddings[i], &embeddings[j])))
-            .collect();
-        // Descending similarity; ascending index breaks ties so the top-K
-        // selection is deterministic. `total_cmp` is NaN-safe (no `.unwrap()`
-        // on `partial_cmp` — hard rule).
-        sims.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        for (j, sim) in sims.into_iter().take(TOPIC_NN_TOP_K) {
-            if sim >= TOPIC_NN_SIMILARITY_FLOOR {
+        for &j in &top_k[i] {
+            if top_k[j].contains(&i) {
                 let (a, b) = (ids[i].min(ids[j]), ids[i].max(ids[j]));
                 edges.insert((a, b));
             }
@@ -531,6 +577,57 @@ mod tests {
                 .iter()
                 .any(|t| t.member_ids.contains(&car_a) && t.member_ids.contains(&car_b)),
             "the two car facts MUST share a topic; got {:?}",
+            map.topics
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_topics_mutual_knn_drops_one_way_bridge_edges() {
+        // ADR-085 (Finding F fix): the reciprocal-kNN graph must NOT absorb a
+        // fact into a cluster via a one-way edge. Construction: 6 identical
+        // "hub" facts (all on the X axis, cosine 1.0 to each other) + one
+        // outsider C at cosine 0.80 to every hub fact (above the 0.70 floor).
+        //
+        // With TOP_K = 5 each hub fact's five nearest are the five OTHER hub
+        // facts (cosine 1.0), so C — at 0.80 — never makes any hub fact's
+        // top-K. C's own top-K, however, IS full of hub facts. Under the old
+        // one-way rule those C→hub edges would drag C into the hub blob (one
+        // topic of 7). Under mutual-kNN the edge is dropped (no hub fact
+        // reciprocates), so C stays its own topic.
+        //
+        // This is the exact mechanism behind the 1k collapse, in miniature:
+        // weak one-way links chaining unrelated facts into one giant topic.
+        let c_vec = vec![0.8f32, 0.6, 0.0, 0.0]; // unit; cosine to ex() == 0.8
+        let mems: Vec<Memory> = (1..=7)
+            .map(|n| memory_with_id(&format!("m{n}"), n as u128))
+            .collect();
+        let embedder = MockEmbedder::new(vec![
+            ("m1", ex()),
+            ("m2", ex()),
+            ("m3", ex()),
+            ("m4", ex()),
+            ("m5", ex()),
+            ("m6", ex()),
+            ("m7", c_vec),
+        ]);
+        let map = discover_topics(&boundary("personal"), &mems, &embedder, None)
+            .await
+            .unwrap();
+
+        let mut sizes: Vec<usize> = map.topics.iter().map(|t| t.member_ids.len()).collect();
+        sizes.sort_unstable();
+        assert_eq!(
+            sizes,
+            vec![1, 6],
+            "mutual-kNN MUST keep the 6 hub facts as one topic and leave the \
+             one-way-linked outsider C as its own singleton; got {sizes:?} \
+             (the old one-way rule would have produced a single topic of 7)"
+        );
+        // C (id 7) must be alone — proving the one-way bridge was dropped.
+        let c_id = MemoryId(Uuid::from_u128(7));
+        assert!(
+            map.topics.iter().any(|t| t.member_ids == vec![c_id]),
+            "outsider C MUST be its own singleton topic; got {:?}",
             map.topics
         );
     }
