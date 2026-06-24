@@ -26,8 +26,21 @@ vault-consolidator = { path = "../vault-consolidator" }
 # Workspace declaration carries `["derive"]`; this per-crate override
 # merges in `"env"` so vault-cli has both features available.
 clap = { workspace = true, features = ["env"] }
-tokio = { workspace = true }
+# `net` + `signal` added for the `daemon` subcommand: a loopback `TcpListener`
+# + graceful Ctrl-C shutdown (ADR-SEC-001). macros + rt-multi-thread back
+# `#[tokio::main]` as before.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "signal"] }
 anyhow = { workspace = true }
+
+# vault-mcp — the `daemon` subcommand mounts `vault_mcp::DaemonServer` (the
+# per-agent-auth HTTP handler, ADR-SEC-001) over the real `VaultAdapter`.
+vault-mcp = { path = "../vault-mcp" }
+# rmcp streamable-HTTP server transport — the multi-agent daemon serves
+# `DaemonServer` to many agents over localhost HTTP (vs `mcp serve`'s 1:1 stdio).
+rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
+# hyper-util — hosts the rmcp `StreamableHttpService` (a tower service) on the
+# loopback TCP listener. Exact-pinned to the in-tree version (no new crate).
+hyper-util = { version = "=0.1.20", features = ["server-auto", "service", "tokio"] }
 chrono = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }

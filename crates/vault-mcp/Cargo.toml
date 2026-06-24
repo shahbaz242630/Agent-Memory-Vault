@@ -82,6 +82,13 @@ serde_json = { workspace = true }
 # tree via vault-core, so this adds no new transitive deps.
 chrono = { workspace = true }
 
+# http — the daemon handler (`DaemonServer`, ADR-SEC-001) reads the inbound
+# request's `http::request::Parts` (the `Authorization: Bearer <token>` header)
+# out of rmcp's `RequestContext` extensions to authenticate each agent. Pinned
+# to the exact version already resolved in Cargo.lock (rmcp's http) — no new
+# crate enters the tree.
+http = "=1.4.0"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 tokio-test.workspace = true
@@ -95,4 +102,25 @@ tracing-test.workspace = true
 # `ServiceExt::serve` method for the client role is gated behind this feature).
 # Cargo unifies dev-dep features with the production `[dependencies]` entry at
 # test-build time only — production builds remain `client`-feature-free.
-rmcp = { workspace = true, features = ["client"] }
+#
+# **Multi-agent daemon SPIKE (next-arc, 2026-06-23) — DEV-ONLY transport features.**
+# `transport-streamable-http-server` + `transport-streamable-http-client-reqwest`
+# back `tests/streamable_http_spike.rs`, the compile-and-run proof that two rmcp
+# HTTP clients can talk to ONE localhost daemon concurrently. These are
+# test-build-only; the production stdio server is unchanged. If the daemon
+# graduates to production, the server feature moves to `[dependencies]` behind
+# the architecture + ADR-SEC decision (BRD §11 re-read).
+rmcp = { workspace = true, features = [
+    "client",
+    "transport-streamable-http-server",
+    "transport-streamable-http-client-reqwest",
+] }
+
+# hyper-util — hosts the rmcp `StreamableHttpService` (a `tower::Service`) on a
+# real loopback TCP port for the multi-agent daemon spike. Pinned to the exact
+# version ALREADY resolved transitively in Cargo.lock (no new crate enters the
+# tree, no lockfile churn) — chosen over axum so the spike adds zero new
+# supply-chain surface per ADR-026's minimize-deps posture. Features:
+# `server-auto` (HTTP/1+2 connection server), `service` (TowerToHyperService
+# tower→hyper adapter), `tokio` (TokioIo/TokioExecutor runtime glue). Dev-only.
+hyper-util = { version = "=0.1.20", features = ["server-auto", "service", "tokio"] }

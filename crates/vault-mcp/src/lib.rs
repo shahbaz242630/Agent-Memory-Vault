@@ -67,10 +67,12 @@
 
 mod adapter;
 mod audit;
+mod daemon;
 mod server;
 
 pub use adapter::Adapter;
 pub use audit::{ToolInvokeDetails, ToolInvokeError};
+pub use daemon::DaemonServer;
 pub use server::{
     DeleteToolParams, SearchToolParams, StdioServer, UpdateToolParams, WriteToolParams,
 };

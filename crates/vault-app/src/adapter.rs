@@ -286,6 +286,22 @@ impl Adapter for VaultAdapter {
         Ok(self.metadata.get_memory(&id).await?.map(|m| m.boundary))
     }
 
+    /// ADR-SEC-001 D3/D4: resolve a presented capability token's hash to the
+    /// connecting agent's authorized boundaries via the agent-token store
+    /// (migration 0007). `None` = no active agent for that token → the daemon
+    /// returns a generic 401 (SP-4 fail-secure). The daemon is the sole caller;
+    /// the stdio path uses the trusted construction-time slice instead.
+    async fn resolve_token_boundaries(
+        &self,
+        token_hash: &str,
+    ) -> VaultResult<Option<(String, Vec<Boundary>)>> {
+        Ok(self
+            .storage
+            .lookup_agent_by_token_hash(token_hash)
+            .await?
+            .map(|agent| (agent.agent_name, agent.boundaries)))
+    }
+
     async fn append_tool_invoke_audit(&self, details: ToolInvokeDetails) -> VaultResult<()> {
         self.append_audit_with_event_type(AuditEventType::McpToolInvoke, details, ActorKind::Agent)
             .await

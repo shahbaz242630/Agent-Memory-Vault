@@ -520,6 +520,10 @@ impl StdioServer {
                        phrase, not bare keywords, and search ONE topic per call — \
                        for a multi-part need make separate calls, since a mashed \
                        multi-topic query scores every result weak. \
+                       By default only CURRENT facts are searched; set \
+                       `include_archived: true` to also search the historical \
+                       archive — superseded, expired, and cold-archived facts — \
+                       for an explicit 'what did the vault used to hold' lookup. \
                        Authorization is mediated by the host application, not by \
                        this tool's parameters."
     )]
@@ -812,6 +816,14 @@ impl StdioServer {
                        6. Never first-person agent reference. NO 'I learned...', \
                        'I think...', 'I noticed...'. The memory is about the \
                        user, not about you. \
+                       \n\
+                       7. Decompose documents. If the user shares a long \
+                       document — a BRD, spec, long chat, or article — do NOT \
+                       store it as one memory. Extract the discrete facts and \
+                       save each as its own atomic memory. Only the first ~2000 \
+                       characters of any single memory feed the retrieval \
+                       embedding, so a whole dumped document is largely \
+                       invisible to search. \
                        \n\n\
                        The `boundary` field must name a boundary the host \
                        application has authorized for this MCP session. \
@@ -1107,7 +1119,7 @@ impl ServerHandler for StdioServer {
 /// `ModelIntegrityFailed`; the latter intentionally collapses to the
 /// same wire shape so an attacker can't fingerprint which model file
 /// failed integrity (ADR-024 reasoning §793).
-const ERROR_CODE_ACCESS_DENIED: ErrorCode = ErrorCode(-32001);
+pub(crate) const ERROR_CODE_ACCESS_DENIED: ErrorCode = ErrorCode(-32001);
 
 /// Map a `VaultError` into the JSON-RPC error shape ADR-024 specifies.
 ///
@@ -1136,7 +1148,7 @@ const ERROR_CODE_ACCESS_DENIED: ErrorCode = ErrorCode(-32001);
 /// reverted that drift in the same commit as the tool_write/update/
 /// delete wiring. Two-against-one to the locked artefacts (ADR-024 +
 /// JSON-RPC 2.0 spec) wins over one shipped test.
-fn vault_error_to_mcp(err: VaultError) -> McpError {
+pub(crate) fn vault_error_to_mcp(err: VaultError) -> McpError {
     match err {
         // ADR-024 line 765: -32602, "invalid params".
         VaultError::DimensionMismatch { .. } | VaultError::InvalidInput(_) => {

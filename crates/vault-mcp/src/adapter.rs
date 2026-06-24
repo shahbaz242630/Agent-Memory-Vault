@@ -100,6 +100,31 @@ pub trait Adapter: Send + Sync {
     /// `VaultError::NotFound`).
     async fn lookup_boundary(&self, id: MemoryId) -> VaultResult<Option<Boundary>>;
 
+    /// Resolve a presented capability token's BLAKE3 hash to the connecting
+    /// agent's authorized boundaries (ADR-SEC-001 D3/D4).
+    ///
+    /// Used ONLY by the HTTP daemon handler ([`crate::DaemonServer`]) to scope
+    /// each request to the connecting agent's boundaries. The stdio path never
+    /// calls this — it uses the trusted construction-time slice on
+    /// [`StdioServer`](crate::server::StdioServer) (OS-process trust, ADR-SEC-001 D8).
+    ///
+    /// Returns `Some((agent_name, boundaries))` for an active agent — the name
+    /// is used for per-agent audit/operational attribution (§11.9.2), the
+    /// boundaries scope the request. `None` when no active agent matches the
+    /// token (the daemon maps `None` to a generic 401 — SP-4 fail-secure, no
+    /// info leak).
+    ///
+    /// **Default impl returns `Ok(None)`** so stdio-only / test adapters — which
+    /// carry no token registry — never authorize a daemon connection. The
+    /// production `VaultAdapter` overrides this against the agent-token store
+    /// ([`vault_storage::StorageBackend::lookup_agent_by_token_hash`]).
+    async fn resolve_token_boundaries(
+        &self,
+        _token_hash: &str,
+    ) -> VaultResult<Option<(String, Vec<Boundary>)>> {
+        Ok(None)
+    }
+
     /// Append one `mcp.tool_invoke` audit event to the local audit
     /// chain. Called by the `tool_*` handlers in [`crate::server`] at
     /// invocation exit (success and error paths both append) per

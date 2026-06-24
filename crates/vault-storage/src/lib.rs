@@ -13,6 +13,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod agent_token_store;
 pub mod audit;
 pub mod cascading;
 pub mod checkpoint;
@@ -32,6 +33,7 @@ pub mod retry_worker;
 pub mod sealed_object_store;
 pub mod vector_store;
 
+pub use agent_token_store::{hash_capability_token, AgentToken};
 pub use audit::{
     seal, verify_chain, ActorKind, AuditEvent, AuditEventType, AuditResult, PendingAuditEvent,
     AUDIT_GENESIS_HASH,

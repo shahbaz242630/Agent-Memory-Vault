@@ -131,6 +131,22 @@ test-helpers = []
 tokio = { workspace = true, features = ["full", "test-util"] }
 tempfile.workspace = true
 serde_json = { workspace = true }
+
+# Multi-agent daemon SPIKE Stage B (next-arc, 2026-06-23) — DEV-ONLY.
+# `tests/concurrent_multiagent_stage_b.rs` proves the REAL three-store stack
+# (SQLCipher + LanceDB + DuckDB) survives two agents writing concurrently
+# THROUGH the localhost daemon (vs Stage A's mock-backed transport proof in
+# vault-mcp). Adds the rmcp client + streamable-HTTP transport features (the
+# production rmcp dep above stays server+stdio only) and hyper-util to host the
+# `StreamableHttpService` on a loopback port. Exact-pinned to the versions
+# already in Cargo.lock — no new crates enter the tree. If the daemon graduates
+# to production, these move to `[dependencies]` behind the ADR-SEC decision.
+rmcp = { workspace = true, features = [
+    "client",
+    "transport-streamable-http-server",
+    "transport-streamable-http-client-reqwest",
+] }
+hyper-util = { version = "=0.1.20", features = ["server-auto", "service", "tokio"] }
 # T0.2.0 ADR-041 (2026-05-11): bridge tests construct synthetic V0.1
 # SQLCipher fixtures via direct rusqlite usage (PRAGMA key + INSERT).
 # Production vault-app code stays rusqlite-free — the bridge composes

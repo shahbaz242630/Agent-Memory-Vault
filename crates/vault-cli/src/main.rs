@@ -39,10 +39,18 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
+use hyper_util::service::TowerToHyperService;
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
+use tokio::net::TcpListener;
 use uuid::Uuid;
+use vault_mcp::DaemonServer;
 
 use vault_app::keychain::{
     derive_at_rest_key, derive_sqlcipher_passphrase, read_or_init_master_key, PRODUCTION_NAMESPACE,
@@ -52,8 +60,8 @@ use vault_app::{AppConfig, Application};
 use vault_consolidator::ConsolidationReport;
 use vault_core::{Boundary, MemoryId};
 use vault_storage::{
-    CascadeOperation, CheckpointId, CheckpointStatus, DeadLetterEntry, DivergenceDetector,
-    DivergenceReport, Resolution, StorageBackend,
+    hash_capability_token, AgentToken, CascadeOperation, CheckpointId, CheckpointStatus,
+    DeadLetterEntry, DivergenceDetector, DivergenceReport, Resolution, StorageBackend,
 };
 
 #[derive(Parser, Debug)]
@@ -186,6 +194,50 @@ enum Command {
         #[command(subcommand)]
         action: McpAction,
     },
+    /// Manage per-agent capability tokens for the multi-agent daemon
+    /// (ADR-SEC-001). Storage-only — loads no models. Each agent connecting to
+    /// the daemon presents a bearer token that scopes it to a set of
+    /// boundaries; only the token's BLAKE3 hash is stored (the plaintext is
+    /// shown ONCE at `add` time). Agents authorized for the same boundary
+    /// SHARE its memories (D5 — boundaries are the walls, not agents).
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
+    },
+    /// Multi-agent vault daemon (ADR-SEC-001). Serves the vault to MULTIPLE
+    /// agents AT ONCE over rmcp streamable-HTTP on loopback — one process owns
+    /// the stores, so concurrent agents are safe (vs `mcp serve`'s 1:1 stdio).
+    /// Each agent authenticates with a capability token (`vault-cli agent add`)
+    /// that scopes it to its boundaries; agents sharing a boundary share its
+    /// memories. Blocks until Ctrl-C. Run nightly consolidation separately via
+    /// `vault-cli consolidate run`.
+    Daemon {
+        /// Path to the BGE-small-en-v1.5 ONNX model file.
+        #[arg(long, env = "VAULT_BGE_MODEL_PATH", value_name = "PATH")]
+        bge_model: PathBuf,
+        /// Path to the BGE-small-en-v1.5 tokenizer.json file.
+        #[arg(long, env = "VAULT_BGE_TOKENIZER_PATH", value_name = "PATH")]
+        bge_tokenizer: PathBuf,
+        /// Path to the ONNX Runtime dynamic library
+        /// (libonnxruntime.{dll,dylib,so}).
+        #[arg(long, env = "VAULT_ORT_LIB_PATH", value_name = "PATH")]
+        ort_lib: PathBuf,
+        /// Path to the Qwen3-Reranker-0.6B seq-cls ONNX model. When supplied
+        /// (with `--rerank-tokenizer`), the read pipeline uses the cross-encoder
+        /// reranker as its relevance gate; omit both to fall back to the cosine
+        /// relevance gate.
+        #[arg(long, env = "VAULT_RERANK_MODEL_PATH", value_name = "PATH")]
+        rerank_model: Option<PathBuf>,
+        /// Path to the Qwen3-Reranker tokenizer.json. Required iff
+        /// `--rerank-model` is supplied; reuses `--ort-lib` for the dylib.
+        #[arg(long, env = "VAULT_RERANK_TOKENIZER_PATH", value_name = "PATH")]
+        rerank_tokenizer: Option<PathBuf>,
+        /// Loopback TCP port to listen on. The daemon binds 127.0.0.1 only
+        /// (never a routable address); agents connect to
+        /// `http://127.0.0.1:<port>/mcp`.
+        #[arg(long, default_value_t = 8765)]
+        port: u16,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -220,6 +272,38 @@ enum McpAction {
     /// second SIGINT the process exits with code 130 per the locked
     /// `handle_signals` semantics in `vault-app`.
     Serve,
+}
+
+#[derive(Subcommand, Debug)]
+enum AgentAction {
+    /// Register a new agent and mint its capability token. Prints the token
+    /// ONCE — copy it into that agent's MCP config; only its hash is stored,
+    /// so it cannot be recovered afterwards.
+    Add {
+        /// Stable agent identity (lowercase kebab-case, e.g. `claude`,
+        /// `work-coder`).
+        name: String,
+        /// A boundary this agent may reach. Repeatable; at least one required.
+        /// Agents authorized for the same boundary share its memories (D5).
+        #[arg(long, value_name = "NAME", required = true)]
+        boundary: Vec<String>,
+    },
+    /// List every registered agent (active + revoked), name-ordered.
+    List,
+    /// Re-scope an active agent's authorized boundaries (replaces the old set;
+    /// effective on the agent's next request — no restart, ADR-SEC-001 D4).
+    SetBoundaries {
+        /// Agent name to re-scope.
+        name: String,
+        /// The new full boundary set. Repeatable; at least one required.
+        #[arg(long, value_name = "NAME", required = true)]
+        boundary: Vec<String>,
+    },
+    /// Revoke an agent's token — its next request is rejected (401).
+    Revoke {
+        /// Agent name to revoke.
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -372,6 +456,33 @@ async fn real_main() -> Result<()> {
             )
             .await
         }
+        Command::Agent { action } => {
+            let backend = open_and_warn(&vault_db, &vector_dir, &graph_db, dimension).await?;
+            dispatch_agent(&backend, action).await
+        }
+        Command::Daemon {
+            bge_model,
+            bge_tokenizer,
+            ort_lib,
+            rerank_model,
+            rerank_tokenizer,
+            port,
+        } => {
+            // `Application::new` owns the embedding dimension (same as mcp/consolidate).
+            let _ = dimension;
+            dispatch_daemon(
+                &vault_db,
+                &vector_dir,
+                &graph_db,
+                bge_model,
+                bge_tokenizer,
+                ort_lib,
+                rerank_model,
+                rerank_tokenizer,
+                port,
+            )
+            .await
+        }
     }
 }
 
@@ -486,6 +597,124 @@ async fn rollback_checkpoint(backend: &StorageBackend, id: &str) -> Result<()> {
         "Rolled back checkpoint {}: restored {} memory(ies), deleted {} created memory(ies).",
         report.checkpoint_id, report.restored, report.deleted,
     );
+    Ok(())
+}
+
+// =====================================================================
+// `agent` subcommand (ADR-SEC-001) — per-agent capability tokens for the
+// multi-agent daemon. Storage-only: operates on the open StorageBackend,
+// loads no models.
+// =====================================================================
+
+/// Dispatch the `agent` subcommand to its action handler.
+async fn dispatch_agent(backend: &StorageBackend, action: AgentAction) -> Result<()> {
+    match action {
+        AgentAction::Add { name, boundary } => agent_add(backend, &name, boundary).await,
+        AgentAction::List => agent_list(backend).await,
+        AgentAction::SetBoundaries { name, boundary } => {
+            agent_set_boundaries(backend, &name, boundary).await
+        }
+        AgentAction::Revoke { name } => agent_revoke(backend, &name).await,
+    }
+}
+
+/// Parse the repeatable `--boundary` flags into validated [`Boundary`] values.
+fn parse_agent_boundaries(raw: Vec<String>) -> Result<Vec<Boundary>> {
+    raw.iter()
+        .map(|b| Boundary::new(b).map_err(|e| anyhow!("invalid boundary {b:?}: {e}")))
+        .collect()
+}
+
+/// Mint a fresh capability token. Two v4 UUIDs (uuid draws from a CSPRNG via
+/// getrandom) concatenated as 64 lowercase-hex chars ≈ 244 bits of entropy —
+/// ample for a local bearer token, and adds no new dependency.
+fn mint_capability_token() -> String {
+    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+
+/// Render an agent's boundary set as a comma-separated display string.
+fn boundary_display(boundaries: &[Boundary]) -> String {
+    boundaries
+        .iter()
+        .map(Boundary::as_str)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Register a new agent and print its freshly-minted token ONCE.
+async fn agent_add(backend: &StorageBackend, name: &str, boundary: Vec<String>) -> Result<()> {
+    let boundaries = parse_agent_boundaries(boundary)?;
+    let token = mint_capability_token();
+    let token_hash = hash_capability_token(&token);
+    backend
+        .register_agent_token(name, &token_hash, &boundaries)
+        .await
+        .with_context(|| format!("register agent {name:?} (does it already exist?)"))?;
+
+    println!(
+        "Registered agent {name:?} with boundaries: {}",
+        boundary_display(&boundaries)
+    );
+    println!();
+    println!("Capability token — shown ONCE, copy it into {name}'s MCP config now");
+    println!("(only its hash is stored; it cannot be recovered later):");
+    println!();
+    println!("    {token}");
+    println!();
+    println!("The agent presents it to the vault daemon as an HTTP header:");
+    println!("    Authorization: Bearer {token}");
+    Ok(())
+}
+
+/// List every registered agent (active + revoked).
+async fn agent_list(backend: &StorageBackend) -> Result<()> {
+    let agents: Vec<AgentToken> = backend.list_agent_tokens().await?;
+    if agents.is_empty() {
+        println!("No agents registered. Add one with:");
+        println!("    vault-cli agent add <name> --boundary <boundary>");
+        return Ok(());
+    }
+    println!("{} agent(s):", agents.len());
+    for a in &agents {
+        let status = match a.revoked_at {
+            None => "active".to_string(),
+            Some(ts) => format!("revoked {}", ts.to_rfc3339()),
+        };
+        println!(
+            "  {}  [{status}]  boundaries: {}",
+            a.agent_name,
+            boundary_display(&a.boundaries)
+        );
+    }
+    Ok(())
+}
+
+/// Re-scope an active agent's authorized boundaries (live — effective on the
+/// agent's next request per ADR-SEC-001 D4).
+async fn agent_set_boundaries(
+    backend: &StorageBackend,
+    name: &str,
+    boundary: Vec<String>,
+) -> Result<()> {
+    let boundaries = parse_agent_boundaries(boundary)?;
+    let found = backend.set_agent_boundaries(name, &boundaries).await?;
+    if !found {
+        anyhow::bail!("no active agent named {name:?} (list via `vault-cli agent list`)");
+    }
+    println!(
+        "Re-scoped agent {name:?} to boundaries: {} (effective on its next request).",
+        boundary_display(&boundaries)
+    );
+    Ok(())
+}
+
+/// Revoke an active agent's token.
+async fn agent_revoke(backend: &StorageBackend, name: &str) -> Result<()> {
+    let found = backend.revoke_agent_token(name).await?;
+    if !found {
+        anyhow::bail!("no active agent named {name:?} to revoke");
+    }
+    println!("Revoked agent {name:?}. Its capability token is now rejected.");
     Ok(())
 }
 
@@ -619,6 +848,97 @@ async fn run_mcp_serve(
         .await
         .context("MCP serve task exited with an error")?;
     eprintln!("vault-cli mcp serve: clean shutdown");
+    Ok(())
+}
+
+/// Dispatch the `daemon` subcommand (ADR-SEC-001). Builds the real
+/// [`Application`], wraps its adapter in the per-agent-auth [`DaemonServer`],
+/// and serves it to MULTIPLE agents over rmcp streamable-HTTP on loopback until
+/// Ctrl-C. The single-instance guard is structural: opening the vault takes the
+/// DuckDB exclusive lock AND the port bind is exclusive, so a second daemon
+/// fails to start (no separate lockfile needed).
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_daemon(
+    vault_db: &Path,
+    vector_dir: &Path,
+    graph_db: &Path,
+    bge_model: PathBuf,
+    bge_tokenizer: PathBuf,
+    ort_lib: PathBuf,
+    rerank_model: Option<PathBuf>,
+    rerank_tokenizer: Option<PathBuf>,
+    port: u16,
+) -> Result<()> {
+    // No Phi-4: the daemon serves reads/writes; nightly consolidation runs
+    // out-of-band via `vault-cli consolidate run` (an in-daemon scheduler that
+    // mirrors `start_with_mcp` is a follow-up — see ADR-SEC-001).
+    let app = build_application(
+        vault_db,
+        vector_dir,
+        graph_db,
+        bge_model,
+        bge_tokenizer,
+        ort_lib,
+        None,
+        rerank_model,
+        rerank_tokenizer,
+    )
+    .await?;
+
+    // Start the cascading retry worker (drains SQLite → vector store). The
+    // returned sender is held for the daemon's lifetime; dropping it on
+    // shutdown asks the worker to exit.
+    let _worker_shutdown = app.start();
+
+    // Wrap the REAL adapter in the auth-gating multi-agent handler.
+    let adapter: Arc<dyn vault_mcp::Adapter> = app.adapter().clone();
+    let daemon = DaemonServer::new(adapter);
+
+    // rmcp streamable-HTTP service over the daemon handler. The per-session
+    // factory hands each connection a clone (all share the one inner adapter →
+    // every agent funnels through the single storage gate). The default config
+    // restricts `allowed_hosts` to loopback (DNS-rebinding guard).
+    let service = StreamableHttpService::new(
+        move || Ok::<_, std::io::Error>(daemon.clone()),
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default(),
+    );
+
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let listener = TcpListener::bind(addr).await.with_context(|| {
+        format!("bind {addr} failed (is another vault daemon already running on this port?)")
+    })?;
+    eprintln!(
+        "vault-cli daemon: listening on http://{addr}/mcp — connect agents with their \
+         capability tokens (Authorization: Bearer <token>). Ctrl-C to stop."
+    );
+
+    // Accept loop with graceful Ctrl-C shutdown.
+    let shutdown = tokio::signal::ctrl_c();
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _peer) = accepted.context("accept connection failed")?;
+                let io = TokioIo::new(stream);
+                let hyper_service = TowerToHyperService::new(service.clone());
+                tokio::spawn(async move {
+                    // A per-connection error (an agent dropping mid-stream) is
+                    // normal teardown, not a daemon fault.
+                    let _ = auto::Builder::new(TokioExecutor::new())
+                        .serve_connection(io, hyper_service)
+                        .await;
+                });
+            }
+            _ = &mut shutdown => {
+                eprintln!("vault-cli daemon: shutdown signal received — stopping.");
+                break;
+            }
+        }
+    }
+
+    // `_worker_shutdown` drops here → the cascading worker exits cleanly.
+    eprintln!("vault-cli daemon: clean shutdown.");
     Ok(())
 }
 

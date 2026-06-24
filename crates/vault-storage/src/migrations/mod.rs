@@ -56,6 +56,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "A1 cold archive (ADR-084): memories.archived_at marker + partial index",
         up: include_str!("0006_memory_archived_at.sql"),
     },
+    Migration {
+        version: 7,
+        description: "ADR-SEC-001 multi-agent daemon: agent_tokens (per-agent capability tokens)",
+        up: include_str!("0007_agent_tokens.sql"),
+    },
 ];
 
 /// Apply any pending migrations to the open connection. Uses the
@@ -386,6 +391,36 @@ mod tests {
         assert_eq!(
             exists, 1,
             "expected idx_memories_archived_at index to exist"
+        );
+    }
+
+    #[test]
+    fn migration_0007_creates_agent_tokens_table_and_hash_index() {
+        // ADR-SEC-001: per-agent capability tokens live in agent_tokens, with a
+        // UNIQUE index on token_hash (the auth-lookup hot path). Verify both
+        // exist after migrating.
+        let mut conn = open_memory();
+        run(&mut conn).unwrap();
+
+        let table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='agent_tokens'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table, 1, "expected agent_tokens table to exist");
+
+        let index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_agent_tokens_hash'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            index, 1,
+            "expected idx_agent_tokens_hash unique index to exist"
         );
     }
 

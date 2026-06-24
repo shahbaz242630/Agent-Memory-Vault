@@ -301,6 +301,10 @@ async fn memory_write_description_contains_canonical_save_contract() {
         ("Strip conversation framing", "canonical rule 4"),
         ("Absolute dates", "canonical rule 5"),
         ("Never first-person agent reference", "canonical rule 6"),
+        (
+            "Decompose documents",
+            "canonical rule 7 (big-document case)",
+        ),
         ("ANY AI agent", "cross-platform thesis"),
         ("WHEN TO CALL", "when-to-call section header"),
         ("WHEN NOT TO CALL", "when-not-to-call section header"),
