@@ -8,7 +8,12 @@
 
 ---
 
-## 1 · 🟢 NEXT SESSION OPENER — MULTI-AGENT DAEMON SHIPPED (DoD green, committed this commit); NEXT = verify CI, then LIVE TWO-AGENT DOGFOOD
+## 1 · 🟢 NEXT SESSION OPENER — daemon CI was RED (disk, not code); fix pushed — verify green, then LIVE TWO-AGENT DOGFOOD
+
+> ### 🆕 2026-06-24 (session 12) — CI RED on `4174c4c` was DISK EXHAUSTION on the ubuntu build leg, NOT a code bug. Fix committed (ci.yml only).
+> **Finding.** `gh run list` showed the daemon commit `4174c4c` CI = **failure** (run `28095804243`). Only `cargo build + test (ubuntu-latest)` failed; clippy-ubuntu + Windows + macOS all PASSED — so the code compiles + tests fine on Linux. The run-level annotation was unambiguous: **`System.IO.IOException: No space left on device`** — the ubuntu runner's disk filled during `cargo build --workspace --all-targets` (step killed mid-build ~13.5 min in, no compile error ever flushed). **Root cause:** the daemon arc added rmcp streamable-http + hyper-util deps AND two heavy new integration-test binaries (`streamable_http_spike`, `concurrent_multiagent_stage_b`), each linking the full vault stack; under `--all-targets` with full debug-info that pushed `target/` past the Linux free space. The ubuntu leg had only the apt cleanup — no extra disk headroom + no debug-info shrink (Windows already has both).
+> **Fix (ci.yml only — no Rust code changed; build/test/clippy/fmt unaffected).** On the ubuntu build-and-test leg: (1) `tool-cache: true` on the existing `jlumbroso/free-disk-space` step → frees ~8 GB of unused `/opt/hostedtoolcache`; (2) a Linux `RUSTFLAGS=-D warnings -C debuginfo=line-tables-only` step before rust-cache → the identical proven debug-info shrink the Windows leg already uses (cuts artifact volume ~10×, keeps file:line backtraces, no test-semantics change). YAML validated (`yaml.safe_load` OK).
+> **▶️ NEXT:** verify the new run on this commit is `success` across `[ubuntu, windows, macos]`; if green, the daemon is fully shipped → go to the LIVE TWO-AGENT DOGFOOD (§ below). If still red, read the failing ubuntu job's disk/annotation first.
 
 > ### 🆕 2026-06-24 (session 11) — MULTI-AGENT DAEMON ARC BUILT + FULL DoD GREEN (fresh cold build) + COMMITTED (this commit)
 > **The locked concurrent-multi-agent arc (ADR-SEC-001) is DONE and shipped in this commit.** All 6 build-plan steps landed; a `cargo clean` → fresh cold DoD pass is green end-to-end.

@@ -325,11 +325,23 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       # Linux-only — see clippy job above for rationale.
+      # tool-cache:true added 2026-06-24 (multi-agent daemon arc): the daemon
+      # added rmcp streamable-http + hyper-util deps AND two heavy new
+      # integration-test binaries (streamable_http_spike,
+      # concurrent_multiagent_stage_b), each linking the full vault stack.
+      # Under `cargo build --all-targets` that tipped the ubuntu runner over
+      # `No space left on device` (run 28095804243 — runner process killed
+      # mid-build at ~13 min, System.IO.IOException, no compile error: the
+      # code compiles fine, clippy-ubuntu passed). tool-cache:true frees the
+      # ~8 GB /opt/hostedtoolcache we don't use (our Rust toolchain, protoc,
+      # libclang are all installed fresh in later steps). Pairs with the
+      # Linux debuginfo=line-tables-only shrink below.
       - if: runner.os == 'Linux'
         uses: jlumbroso/free-disk-space@main
         with:
           large-packages: true
           docker-images: true
+          tool-cache: true
       # Windows-only: T0.2.3 close commit 15 fix-forward (2026-05-25). The
       # windows-2025 runner hits "LLVM ERROR: IO failure on output stream:
       # no space on device" during lld-link of large workspace test binaries
@@ -536,6 +548,19 @@ jobs:
             "https://packages.lunarg.com/vulkan/lunarg-vulkan-${UBUNTU_CODENAME}.list"
           sudo apt-get update
           sudo apt-get install -y vulkan-sdk
+      # Linux-only: shrink target/ debug-info to keep `cargo build
+      # --all-targets` under the runner disk ceiling. Added 2026-06-24 with
+      # the multi-agent daemon arc (see the tool-cache:true note above for the
+      # `No space left on device` root cause). `-C debuginfo=line-tables-only`
+      # cuts per-artifact debug-info volume ~10× while keeping panic
+      # backtraces with file:line — the identical proven flag the Windows leg
+      # already uses (T0.2.3 commit 13). Does NOT change test semantics. Set
+      # before rust-cache so the cache key reflects the flag (mirrors the
+      # Windows RUSTFLAGS override placement). macOS unaffected (more disk).
+      - if: runner.os == 'Linux'
+        name: Reduce debuginfo on Linux (disk-ceiling fix)
+        shell: bash
+        run: echo "RUSTFLAGS=-D warnings -C debuginfo=line-tables-only" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Cache vault-embedding test fixtures (~165 MB total: model.onnx ~133 MB
