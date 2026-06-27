@@ -42,20 +42,22 @@
 //! DuckDB before V0.2 ships (tracked in HANDOFF.md In Progress).
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use duckdb::{params, Connection, OptionalExt};
-use tracing::{instrument, warn};
+use tracing::{info, instrument};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use vault_core::{
     Boundary, Entity, EntityId, EntityType, Relationship, RelationshipId, VaultError, VaultResult,
 };
 
 use crate::migrations_graph;
+use crate::sealed_object_store::{seal_file_bytes, unseal_file_bytes};
 use crate::vector_store::{build_boundary_filter, quote_sql_string};
 
 /// Relation types whose endpoints may legally span boundaries (ADR-015).
@@ -103,6 +105,14 @@ pub trait GraphStore: Send + Sync {
     ///
     /// Validates `entity` at the API boundary (BRD §11.7.1).
     async fn create_entity(&self, entity: &Entity) -> VaultResult<()>;
+
+    /// Persist the graph at rest (ADR-SEC-002). Default is a no-op for stores
+    /// that don't seal (mocks, ephemeral in-memory). The sealed DuckDB store
+    /// overrides this to write its encrypted snapshot blob. Callers invoke at
+    /// consolidation boundaries (see `Consolidator::enrich_facts`).
+    async fn flush(&self) -> VaultResult<()> {
+        Ok(())
+    }
 
     /// Look up an entity by its unique `(name, entity_type, boundary)` key.
     /// Returns `Ok(None)` when no such entity exists.
@@ -182,9 +192,22 @@ pub trait GraphStore: Send + Sync {
 ///
 /// Cheap to clone (it holds an `Arc` internally); share freely across tasks.
 ///
+/// ## At-rest encryption (ADR-SEC-002)
+///
+/// The graph runs in an **in-memory** DuckDB and persists as a single sealed
+/// snapshot blob (`<graph_path>.sealed`) via the same XChaCha20-Poly1305
+/// envelope that seals the vector store ([`crate::sealed_object_store`]). An
+/// in-memory engine means the graph is never written to disk in plaintext (BRD
+/// §11.5.1 / §11.12 vault-storage: "no plaintext data on disk, ever").
+/// Durability comes from [`DuckDbGraphStore::flush`], which callers invoke at
+/// consolidation boundaries + graceful shutdown. The graph is *derived* data
+/// (re-extractable from memories), so a crash between flushes costs at most the
+/// deltas since the last flush — never a stored memory ("no memory ever lost"
+/// holds; memories live durably in SQLite + LanceDB).
+///
 /// Intentionally does **not** implement `Debug`: same posture as
-/// [`crate::MetadataStore`] (ADR-007) — types holding live DB connections
-/// don't get a stub `Debug` impl.
+/// [`crate::MetadataStore`] (ADR-007) — types holding live DB connections (and
+/// here a key) don't get a stub `Debug` impl.
 #[derive(Clone)]
 pub struct DuckDbGraphStore {
     inner: Arc<Inner>,
@@ -192,6 +215,20 @@ pub struct DuckDbGraphStore {
 
 struct Inner {
     conn: Mutex<Connection>,
+    /// `Some` for the production sealed-at-rest path; `None` for an ephemeral
+    /// in-memory graph (tests / throwaway). [`DuckDbGraphStore::flush`] is a
+    /// no-op when `None`.
+    seal: Option<GraphSeal>,
+}
+
+/// Where + how the in-memory graph persists at rest (ADR-SEC-002).
+struct GraphSeal {
+    /// Path of the sealed snapshot blob on disk (`<graph_path>.sealed`).
+    blob_path: PathBuf,
+    /// K3-derived at-rest key (NOT the master key — see
+    /// [`crate::sealed_object_store`] module docs). Zeroized on drop; the
+    /// enclosing type has no `Debug`, so the key never reaches a log.
+    key: Zeroizing<[u8; 32]>,
 }
 
 impl Inner {
@@ -202,43 +239,227 @@ impl Inner {
     }
 }
 
+/// AAD for the single graph snapshot blob. Domain-separated from the LanceDB
+/// per-file AAD (`"vault-at-rest-v1"`) to prevent cross-context envelope reuse.
+fn graph_snapshot_aad() -> [u8; 32] {
+    *blake3::hash(b"vault-graph-snapshot-v1").as_bytes()
+}
+
+/// Sealed-blob path for a historical `graph.duckdb` path: sibling `graph.sealed`.
+fn sealed_blob_path(graph_path: &Path) -> PathBuf {
+    graph_path.with_extension("sealed")
+}
+
+// Snapshot shape — RAW column values, round-tripped verbatim. No semantic
+// re-interpretation (no EntityType parse, no UUID decode), so the bi-temporal
+// + blob-id columns round-trip with exact fidelity.
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct EntitySnap {
+    id: Vec<u8>,
+    name: String,
+    entity_type: String,
+    boundary: String,
+    created_at: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RelSnap {
+    id: Vec<u8>,
+    from_entity_id: Vec<u8>,
+    to_entity_id: Vec<u8>,
+    relation_type: String,
+    boundary: String,
+    valid_from: String,
+    valid_until: Option<String>,
+    confidence: f64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct GraphSnapshot {
+    entities: Vec<EntitySnap>,
+    relationships: Vec<RelSnap>,
+}
+
+/// Read every row out of the graph into a serializable snapshot.
+fn dump_snapshot(conn: &Connection) -> VaultResult<GraphSnapshot> {
+    let entities = conn
+        .prepare("SELECT id, name, entity_type, boundary, created_at FROM entities ORDER BY id")
+        .map_err(|e| VaultError::Storage(format!("graph snapshot prepare entities: {e}")))?
+        .query_map([], |row| {
+            Ok(EntitySnap {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                entity_type: row.get(2)?,
+                boundary: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })
+        .map_err(|e| VaultError::Storage(format!("graph snapshot query entities: {e}")))?
+        .collect::<duckdb::Result<Vec<_>>>()
+        .map_err(|e| VaultError::Storage(format!("graph snapshot collect entities: {e}")))?;
+
+    let relationships = conn
+        .prepare(
+            "SELECT id, from_entity_id, to_entity_id, relation_type, boundary, \
+             valid_from, valid_until, confidence FROM relationships ORDER BY id",
+        )
+        .map_err(|e| VaultError::Storage(format!("graph snapshot prepare rels: {e}")))?
+        .query_map([], |row| {
+            Ok(RelSnap {
+                id: row.get(0)?,
+                from_entity_id: row.get(1)?,
+                to_entity_id: row.get(2)?,
+                relation_type: row.get(3)?,
+                boundary: row.get(4)?,
+                valid_from: row.get(5)?,
+                valid_until: row.get(6)?,
+                confidence: row.get(7)?,
+            })
+        })
+        .map_err(|e| VaultError::Storage(format!("graph snapshot query rels: {e}")))?
+        .collect::<duckdb::Result<Vec<_>>>()
+        .map_err(|e| VaultError::Storage(format!("graph snapshot collect rels: {e}")))?;
+
+    Ok(GraphSnapshot {
+        entities,
+        relationships,
+    })
+}
+
+/// Restore a snapshot into a freshly-migrated (empty) connection.
+fn load_snapshot(conn: &Connection, snap: &GraphSnapshot) -> VaultResult<()> {
+    for e in &snap.entities {
+        conn.execute(
+            "INSERT INTO entities (id, name, entity_type, boundary, created_at) \
+             VALUES (?, ?, ?, ?, ?)",
+            params![e.id, e.name, e.entity_type, e.boundary, e.created_at],
+        )
+        .map_err(|err| VaultError::Storage(format!("graph restore entity: {err}")))?;
+    }
+    for r in &snap.relationships {
+        conn.execute(
+            "INSERT INTO relationships (id, from_entity_id, to_entity_id, relation_type, \
+             boundary, valid_from, valid_until, confidence) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                r.id,
+                r.from_entity_id,
+                r.to_entity_id,
+                r.relation_type,
+                r.boundary,
+                r.valid_from,
+                r.valid_until,
+                r.confidence
+            ],
+        )
+        .map_err(|err| VaultError::Storage(format!("graph restore relationship: {err}")))?;
+    }
+    Ok(())
+}
+
+/// Write `bytes` to `path` atomically: write a sibling temp file then rename
+/// over the target (rename is atomic on the same filesystem on all supported
+/// OSes — no half-written snapshot is ever observable).
+fn atomic_write(path: &Path, bytes: &[u8]) -> VaultResult<()> {
+    let tmp = path.with_extension("sealed.tmp");
+    std::fs::write(&tmp, bytes)
+        .map_err(|e| VaultError::Storage(format!("write graph snapshot tmp: {e}")))?;
+    std::fs::rename(&tmp, path)
+        .map_err(|e| VaultError::Storage(format!("rename graph snapshot into place: {e}")))?;
+    Ok(())
+}
+
 impl DuckDbGraphStore {
-    /// Open or create a DuckDB graph database at `path`.
-    ///
-    /// On first open, schema migrations are applied automatically
-    /// (idempotent — safe to call repeatedly). The startup WARN log fires
-    /// unconditionally per the ADR-010 plaintext-on-disk compensating
-    /// control extended to DuckDB.
+    /// Open the production graph: an **in-memory** DuckDB sealed at rest to
+    /// `<graph_path>.sealed` with `at_rest_key` (ADR-SEC-002). On open: run
+    /// migrations, one-time-migrate any legacy plaintext `graph_path`, then
+    /// load the existing sealed snapshot if present.
     ///
     /// # Errors
     ///
-    /// - [`VaultError::Storage`] if the path is unreachable or migrations fail.
-    pub async fn open(path: impl AsRef<Path>) -> VaultResult<Self> {
-        let path = path.as_ref().to_path_buf();
-        tokio::task::spawn_blocking(move || Self::open_blocking(&path))
+    /// [`VaultError::Storage`] on migration failure, a corrupt / inauthentic
+    /// sealed blob (wrong key or tampering → fail closed, SP-4), or I/O error.
+    pub async fn open_with_at_rest_key(
+        graph_path: impl AsRef<Path>,
+        at_rest_key: &[u8; 32],
+    ) -> VaultResult<Self> {
+        let graph_path = graph_path.as_ref().to_path_buf();
+        let key = Zeroizing::new(*at_rest_key);
+        tokio::task::spawn_blocking(move || Self::open_sealed_blocking(graph_path, key))
             .await
             .map_err(|e| VaultError::Storage(format!("spawn_blocking join: {e}")))?
     }
 
-    fn open_blocking(path: &Path) -> VaultResult<Self> {
-        let mut conn = Connection::open(path)
-            .map_err(|e| VaultError::Storage(format!("open duckdb {}: {e}", path.display())))?;
+    /// Open an ephemeral in-memory graph with **no** at-rest persistence
+    /// ([`flush`](Self::flush) is a no-op). Tests + throwaway use only.
+    pub async fn open_ephemeral() -> VaultResult<Self> {
+        tokio::task::spawn_blocking(|| {
+            let mut conn = Connection::open_in_memory()
+                .map_err(|e| VaultError::Storage(format!("open in-memory duckdb: {e}")))?;
+            migrations_graph::run(&mut conn)?;
+            Ok(Self {
+                inner: Arc::new(Inner {
+                    conn: Mutex::new(conn),
+                    seal: None,
+                }),
+            })
+        })
+        .await
+        .map_err(|e| VaultError::Storage(format!("spawn_blocking join: {e}")))?
+    }
 
+    fn open_sealed_blocking(graph_path: PathBuf, key: Zeroizing<[u8; 32]>) -> VaultResult<Self> {
+        let mut conn = Connection::open_in_memory()
+            .map_err(|e| VaultError::Storage(format!("open in-memory duckdb: {e}")))?;
         migrations_graph::run(&mut conn)?;
 
-        // ADR-010 (extended to DuckDB per HANDOFF.md In Progress): unconditional
-        // startup WARN that the graph data dir is plaintext until T0.2.0 ships.
-        warn!(
-            data_dir = %path.display(),
-            "DuckDB graph store data is PLAINTEXT on disk (V0.1 alpha — see ADR-010). \
-             Encryption layer ships in T0.2.0."
-        );
+        // One-time migration of a legacy plaintext graph.duckdb (pre-ADR-SEC-002).
+        Self::migrate_legacy_plaintext(&conn, &graph_path)?;
+
+        // Load the existing sealed snapshot, if any. A wrong key or a tampered
+        // blob fails closed here (AEAD authentication) — SP-4.
+        let sealed_path = sealed_blob_path(&graph_path);
+        if sealed_path.exists() {
+            let sealed = std::fs::read(&sealed_path)
+                .map_err(|e| VaultError::Storage(format!("read graph snapshot: {e}")))?;
+            let plain = unseal_file_bytes(&sealed, &key, &graph_snapshot_aad())
+                .map_err(|e| VaultError::Storage(format!("unseal graph snapshot: {e}")))?;
+            let snap: GraphSnapshot = serde_json::from_slice(&plain)
+                .map_err(|e| VaultError::Storage(format!("decode graph snapshot: {e}")))?;
+            load_snapshot(&conn, &snap)?;
+        }
 
         Ok(Self {
             inner: Arc::new(Inner {
                 conn: Mutex::new(conn),
+                seal: Some(GraphSeal {
+                    blob_path: sealed_path,
+                    key,
+                }),
             }),
         })
+    }
+
+    /// One-time upgrade: if a legacy plaintext `graph.duckdb` exists
+    /// (pre-ADR-SEC-002), import its rows into the in-memory graph then delete
+    /// the plaintext file. Idempotent — absent file is a no-op.
+    fn migrate_legacy_plaintext(conn: &Connection, graph_path: &Path) -> VaultResult<()> {
+        if !graph_path.exists() {
+            return Ok(());
+        }
+        info!(
+            path = %graph_path.display(),
+            "migrating legacy plaintext graph into the sealed at-rest store (ADR-SEC-002)"
+        );
+        let legacy = Connection::open(graph_path).map_err(|e| {
+            VaultError::Storage(format!("open legacy graph {}: {e}", graph_path.display()))
+        })?;
+        let snap = dump_snapshot(&legacy)?;
+        drop(legacy);
+        load_snapshot(conn, &snap)?;
+        std::fs::remove_file(graph_path)
+            .map_err(|e| VaultError::Storage(format!("remove legacy plaintext graph: {e}")))?;
+        Ok(())
     }
 }
 
@@ -356,6 +577,26 @@ fn is_duplicate_key_error(e: &duckdb::Error) -> bool {
 
 #[async_trait]
 impl GraphStore for DuckDbGraphStore {
+    /// Persist the in-memory graph as a sealed snapshot blob (atomic write).
+    /// No-op for an ephemeral store. Callers invoke at consolidation boundaries
+    /// (ADR-SEC-002).
+    async fn flush(&self) -> VaultResult<()> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let Some(seal) = inner.seal.as_ref() else {
+                return Ok(());
+            };
+            let conn = inner.lock()?;
+            let snap = dump_snapshot(&conn)?;
+            let plain = serde_json::to_vec(&snap)
+                .map_err(|e| VaultError::Storage(format!("encode graph snapshot: {e}")))?;
+            let sealed = seal_file_bytes(&plain, &seal.key, &graph_snapshot_aad());
+            atomic_write(&seal.blob_path, &sealed)
+        })
+        .await
+        .map_err(|e| VaultError::Storage(format!("spawn_blocking join: {e}")))?
+    }
+
     #[instrument(
         skip(self, entity),
         fields(entity_id = %entity.id, boundary = entity.boundary.as_str()),
@@ -969,9 +1210,10 @@ mod tests {
     }
 
     async fn open_tmp() -> (TempDir, DuckDbGraphStore) {
+        // Operation tests use an ephemeral in-memory graph (ADR-SEC-002);
+        // persistence + sealing are covered by the dedicated at-rest tests.
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("graph.duckdb");
-        let store = DuckDbGraphStore::open(&path).await.unwrap();
+        let store = DuckDbGraphStore::open_ephemeral().await.unwrap();
         (dir, store)
     }
 
@@ -1005,52 +1247,154 @@ mod tests {
 
     #[tokio::test]
     async fn open_is_idempotent() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("graph.duckdb");
-        // First close before reopening — duckdb file lock.
-        {
-            let _store = DuckDbGraphStore::open(&path).await.unwrap();
-        }
-        let _store2 = DuckDbGraphStore::open(&path).await.unwrap();
+        // Ephemeral in-memory graphs open repeatedly without file contention.
+        let _store = DuckDbGraphStore::open_ephemeral().await.unwrap();
+        let _store2 = DuckDbGraphStore::open_ephemeral().await.unwrap();
     }
 
-    /// **T0.1.10 Phase 3b — ADR-010 (extended via ADR-014 / module
-    /// docstring at line 211-212) compensating-control #3 pin for
-    /// DuckDB.**
-    ///
-    /// Sibling pin to `vector_store.rs::open_emits_adr_010_plaintext_warn_log`.
-    /// The WARN itself has been live in `DuckDbGraphStore::open_blocking`
-    /// since T0.1.5 (`graph_store.rs:213-217`); this test pins it
-    /// against regression. Same regression vectors as the LanceDB
-    /// counterpart: a future change that drops the WARN, demotes its
-    /// level, or removes the ADR-010 / T0.2.0 references trips CI
-    /// immediately.
-    ///
-    /// Asserts the same three properties as the LanceDB counterpart:
-    /// (1) WARN fires on every `DuckDbGraphStore::open`, (2) message
-    /// contains "ADR-010", (3) message contains "T0.2.0".
+    // -------- ADR-SEC-002: at-rest sealing --------
+
+    const TEST_AT_REST_KEY: [u8; 32] = [0x5a; 32];
+
+    /// A sealed graph round-trips across flush + reopen: entities and
+    /// relationships survive, and traversal still works on the restored graph.
     #[tokio::test]
-    #[tracing_test::traced_test]
-    async fn open_emits_adr_010_plaintext_warn_log() {
-        let _ = open_tmp().await;
+    async fn sealed_graph_roundtrips_across_flush_and_reopen() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.duckdb");
+
+        let alice = ent("Alice", EntityType::Person, "work");
+        let bob = ent("Bob", EntityType::Person, "work");
+        {
+            let store = DuckDbGraphStore::open_with_at_rest_key(&path, &TEST_AT_REST_KEY)
+                .await
+                .unwrap();
+            store.create_entity(&alice).await.unwrap();
+            store.create_entity(&bob).await.unwrap();
+            store
+                .create_relationship(&rel(alice.id, bob.id, "knows", 0.9))
+                .await
+                .unwrap();
+            store.flush().await.unwrap();
+        }
+
+        // Reopen from the sealed blob with the same key.
+        let reopened = DuckDbGraphStore::open_with_at_rest_key(&path, &TEST_AT_REST_KEY)
+            .await
+            .unwrap();
+        let hops = reopened
+            .traverse(&alice.id, &[b("work")], opts(1))
+            .await
+            .unwrap();
+        let names: StdHashSet<String> = hops.iter().map(|(e, _)| e.name.clone()).collect();
+        assert!(
+            names.contains("Bob"),
+            "relationship Alice->Bob must survive seal + reopen; got {names:?}"
+        );
+    }
+
+    /// The sealed blob on disk contains NO plaintext entity names, and no
+    /// plaintext `graph.duckdb` file is left behind (BRD §11.12).
+    #[tokio::test]
+    async fn sealed_blob_has_no_plaintext_and_no_plaintext_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.duckdb");
+        let store = DuckDbGraphStore::open_with_at_rest_key(&path, &TEST_AT_REST_KEY)
+            .await
+            .unwrap();
+        store
+            .create_entity(&ent(
+                "Zylophone Industries",
+                EntityType::Organization,
+                "work",
+            ))
+            .await
+            .unwrap();
+        store.flush().await.unwrap();
+
+        let sealed_path = path.with_extension("sealed");
+        assert!(sealed_path.exists(), "sealed blob must be written on flush");
+        assert!(
+            !path.exists(),
+            "no plaintext graph.duckdb may exist alongside the sealed blob"
+        );
+        let on_disk = std::fs::read(&sealed_path).unwrap();
+        let needle = b"Zylophone Industries";
+        assert!(
+            !on_disk.windows(needle.len()).any(|w| w == needle),
+            "sealed graph blob leaked a plaintext entity name (BRD §11.12: no plaintext on disk)"
+        );
+    }
+
+    /// Reopening a sealed graph with the WRONG key fails closed (SP-4).
+    #[tokio::test]
+    async fn wrong_key_fails_closed_on_reopen() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.duckdb");
+        {
+            let store = DuckDbGraphStore::open_with_at_rest_key(&path, &TEST_AT_REST_KEY)
+                .await
+                .unwrap();
+            store
+                .create_entity(&ent("Alice", EntityType::Person, "work"))
+                .await
+                .unwrap();
+            store.flush().await.unwrap();
+        }
+        let wrong_key = [0x11u8; 32];
+        let result = DuckDbGraphStore::open_with_at_rest_key(&path, &wrong_key).await;
+        assert!(
+            result.is_err(),
+            "SP-4: reopening a sealed graph with the wrong key MUST fail closed"
+        );
+    }
+
+    /// A legacy plaintext `graph.duckdb` is migrated into the sealed store on
+    /// first open: rows preserved, plaintext file deleted, sealed blob created.
+    #[tokio::test]
+    async fn legacy_plaintext_graph_is_migrated_and_deleted() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.duckdb");
+
+        // Build a legacy plaintext graph with one entity, the old way.
+        let legacy_entity = ent("LegacyCorp", EntityType::Organization, "work");
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            migrations_graph::run(&mut conn).unwrap();
+            conn.execute(
+                "INSERT INTO entities (id, name, entity_type, boundary, created_at) \
+                 VALUES (?, ?, ?, ?, ?)",
+                params![
+                    legacy_entity.id.0.as_bytes().to_vec(),
+                    legacy_entity.name,
+                    entity_type_to_text(&legacy_entity.entity_type).unwrap(),
+                    legacy_entity.boundary.as_str(),
+                    legacy_entity.created_at.to_rfc3339(),
+                ],
+            )
+            .unwrap();
+        }
+        assert!(path.exists(), "precondition: legacy plaintext file exists");
+
+        // Opening with the sealed constructor migrates it.
+        let store = DuckDbGraphStore::open_with_at_rest_key(&path, &TEST_AT_REST_KEY)
+            .await
+            .unwrap();
+        store.flush().await.unwrap();
 
         assert!(
-            tracing_test::internal::logs_with_scope_contain(
-                "vault_storage",
-                "DuckDB graph store data is PLAINTEXT",
-            ),
-            "ADR-010 (extended to DuckDB) compensating-control #3 WARN log MUST fire on \
-             every DuckDbGraphStore::open. If this fails, the WARN at graph_store.rs:213-217 \
-             has been removed, demoted, or its scope altered."
+            !path.exists(),
+            "legacy plaintext file must be deleted after migration"
         );
         assert!(
-            tracing_test::internal::logs_with_scope_contain("vault_storage", "ADR-010",),
-            "ADR-010 reference MUST appear in the DuckDB WARN message"
+            path.with_extension("sealed").exists(),
+            "sealed blob must exist after migration + flush"
         );
-        assert!(
-            tracing_test::internal::logs_with_scope_contain("vault_storage", "T0.2.0",),
-            "T0.2.0 reference MUST appear in the DuckDB WARN message"
-        );
+        let found = store
+            .get_entity("LegacyCorp", &EntityType::Organization, &b("work"))
+            .await
+            .unwrap();
+        assert!(found.is_some(), "migrated entity must be retrievable");
     }
 
     // -------- create_entity --------

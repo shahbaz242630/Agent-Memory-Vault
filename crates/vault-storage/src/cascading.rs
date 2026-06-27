@@ -215,8 +215,17 @@ impl StorageBackend {
         let vector =
             LanceVectorStore::open_with_at_rest_key(vector_data_dir, dimension, at_rest_key)
                 .await?;
-        let graph = DuckDbGraphStore::open(graph_path).await?;
+        // ADR-SEC-002: the graph runs in-memory + sealed at rest with the same
+        // at_rest_key as the vector store (no plaintext DuckDB file).
+        let graph = DuckDbGraphStore::open_with_at_rest_key(graph_path, at_rest_key).await?;
         Self::assemble(metadata, vector, graph).await
+    }
+
+    /// Persist the graph store to its sealed at-rest snapshot (ADR-SEC-002).
+    /// No-op for graph backends that don't seal. Invoked by the consolidator
+    /// after each enrichment pass (the graph's only writer).
+    pub async fn flush_graph(&self) -> VaultResult<()> {
+        self.graph_store().flush().await
     }
 
     /// Shared assembly path used by [`Self::open_with_at_rest_key`].

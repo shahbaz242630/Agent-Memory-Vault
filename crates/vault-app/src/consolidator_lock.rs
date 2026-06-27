@@ -47,6 +47,13 @@ use vault_core::{VaultError, VaultResult};
 /// the consolidator's run, the previous run crashed.
 pub(crate) const LOCKFILE_NAME: &str = ".consolidator.lock";
 
+/// Filename of the vault-owner lock (ADR-SEC-002). At most one live
+/// `vault-cli daemon` owns a vault at a time — this replaces the implicit
+/// single-writer guard the DuckDB exclusive file lock provided before the graph
+/// moved in-memory (ADR-SEC-002). Distinct from [`LOCKFILE_NAME`], which
+/// serializes consolidation runs.
+pub const VAULT_LOCKFILE_NAME: &str = ".vault.lock";
+
 /// RAII guard for the consolidator's cross-process lockfile.
 ///
 /// Acquired by [`Self::try_acquire`]; released on drop by removing the
@@ -80,7 +87,19 @@ impl ConsolidatorLock {
     /// - [`VaultError::Io`] — non-`AlreadyExists` I/O failure (permissions,
     ///   disk full, parent directory missing, etc.).
     pub fn try_acquire(vault_root: &Path) -> VaultResult<Self> {
-        let path = vault_root.join(LOCKFILE_NAME);
+        Self::try_acquire_named(vault_root, LOCKFILE_NAME)
+    }
+
+    /// Like [`Self::try_acquire`] but with a caller-chosen lockfile name. Used
+    /// for the vault-owner lock ([`VAULT_LOCKFILE_NAME`], ADR-SEC-002) — at most
+    /// one live daemon per vault — distinct from the consolidator run lock.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::try_acquire`]: [`VaultError::ConsolidatorBusy`] when the
+    /// lockfile already exists, [`VaultError::Io`] otherwise.
+    pub fn try_acquire_named(vault_root: &Path, lockfile_name: &str) -> VaultResult<Self> {
+        let path = vault_root.join(lockfile_name);
         match OpenOptions::new().create_new(true).write(true).open(&path) {
             Ok(mut file) => {
                 // Forensic payload — PID + ISO-8601 timestamp. Best-effort;

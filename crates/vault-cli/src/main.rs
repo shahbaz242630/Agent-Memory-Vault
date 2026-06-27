@@ -56,7 +56,7 @@ use vault_app::keychain::{
     derive_at_rest_key, derive_sqlcipher_passphrase, read_or_init_master_key, PRODUCTION_NAMESPACE,
     VAULT_ID,
 };
-use vault_app::{AppConfig, Application};
+use vault_app::{AppConfig, Application, ConsolidatorLock, VAULT_LOCKFILE_NAME};
 use vault_consolidator::ConsolidationReport;
 use vault_core::{Boundary, MemoryId};
 use vault_storage::{
@@ -738,6 +738,17 @@ async fn dispatch_consolidate(
     phi4_model: PathBuf,
     action: ConsolidateAction,
 ) -> Result<()> {
+    // ADR-SEC-002: hold the vault-owner lock for the command's lifetime so a
+    // manual consolidation can't race a running daemon (or another writer) —
+    // restores the single-owner guard the in-memory graph removed.
+    let _vault_lock = ConsolidatorLock::try_acquire_named(
+        vault_db
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new(".")),
+        VAULT_LOCKFILE_NAME,
+    )
+    .context("vault is already in use by another vault-cli process (daemon/serve/consolidate)")?;
+
     let app = build_application(
         vault_db,
         vector_dir,
@@ -807,6 +818,17 @@ async fn dispatch_mcp(
         })
         .transpose()?;
 
+    // ADR-SEC-002: hold the vault-owner lock for the serve session's lifetime
+    // so a stdio MCP server can't race a running daemon (or another writer) —
+    // restores the single-owner guard the in-memory graph removed.
+    let _vault_lock = ConsolidatorLock::try_acquire_named(
+        vault_db
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new(".")),
+        VAULT_LOCKFILE_NAME,
+    )
+    .context("vault is already in use by another vault-cli process (daemon/serve/consolidate)")?;
+
     let app = build_application(
         vault_db,
         vector_dir,
@@ -854,9 +876,11 @@ async fn run_mcp_serve(
 /// Dispatch the `daemon` subcommand (ADR-SEC-001). Builds the real
 /// [`Application`], wraps its adapter in the per-agent-auth [`DaemonServer`],
 /// and serves it to MULTIPLE agents over rmcp streamable-HTTP on loopback until
-/// Ctrl-C. The single-instance guard is structural: opening the vault takes the
-/// DuckDB exclusive lock AND the port bind is exclusive, so a second daemon
-/// fails to start (no separate lockfile needed).
+/// Ctrl-C. The single-instance guard is the explicit `.vault.lock` acquired at
+/// the top of this function (ADR-SEC-002): the graph now runs in-memory + sealed
+/// so the DuckDB exclusive file lock no longer guards the vault, and the port
+/// bind only guards a single port — the lockfile makes a second daemon on ANY
+/// port fail to start.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_daemon(
     vault_db: &Path,
@@ -869,6 +893,18 @@ async fn dispatch_daemon(
     rerank_tokenizer: Option<PathBuf>,
     port: u16,
 ) -> Result<()> {
+    // ADR-SEC-002: acquire the vault-owner lock BEFORE opening the vault. The
+    // graph now runs in-memory + sealed (no plaintext DuckDB file), so the
+    // DuckDB exclusive file lock that used to make a second daemon fail to open
+    // is gone — this explicit `.vault.lock` restores that single-owner guard.
+    // The guard is held for the daemon's whole lifetime (RAII) and released on
+    // shutdown. A second daemon on ANY port now fails here with a clear error.
+    let vault_root = vault_db
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let _vault_lock = ConsolidatorLock::try_acquire_named(vault_root, VAULT_LOCKFILE_NAME)
+        .context("vault is already in use by another vault-cli process (daemon/serve)")?;
+
     // No Phi-4: the daemon serves reads/writes; nightly consolidation runs
     // out-of-band via `vault-cli consolidate run` (an in-daemon scheduler that
     // mirrors `start_with_mcp` is a follow-up — see ADR-SEC-001).

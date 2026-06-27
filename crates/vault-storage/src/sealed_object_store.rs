@@ -158,7 +158,7 @@ fn compute_aad(relative_path: &str) -> [u8; 32] {
 ///
 /// dryoc's `push_to_vec` requires `&Vec<u8>` (not `&[u8]`) for both
 /// plaintext and AAD — sized-input quirk per ADR-008 archive line 684.
-fn seal_file_bytes(plaintext: &[u8], key: &[u8; 32], aad: &[u8; 32]) -> Vec<u8> {
+pub(crate) fn seal_file_bytes(plaintext: &[u8], key: &[u8; 32], aad: &[u8; 32]) -> Vec<u8> {
     let dryoc_key: Key = (*key).into();
     let (mut push, header): (DryocStream<Push>, Header) = DryocStream::init_push(&dryoc_key);
 
@@ -179,7 +179,11 @@ fn seal_file_bytes(plaintext: &[u8], key: &[u8; 32], aad: &[u8; 32]) -> Vec<u8> 
 /// Unseal envelope. Returns Err on framing mismatch, AEAD authenticity
 /// failure (wrong key, tampered ciphertext, wrong AAD), or malformed
 /// framing. Error string is bounded; not for end-user display.
-fn unseal_file_bytes(sealed: &[u8], key: &[u8; 32], aad: &[u8; 32]) -> Result<Vec<u8>, String> {
+pub(crate) fn unseal_file_bytes(
+    sealed: &[u8],
+    key: &[u8; 32],
+    aad: &[u8; 32],
+) -> Result<Vec<u8>, String> {
     if sealed.len() < TOTAL_FRAMING_LEN {
         return Err(format!(
             "sealed envelope too short ({} bytes < {} framing)",

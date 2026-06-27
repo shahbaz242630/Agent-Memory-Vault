@@ -1228,6 +1228,22 @@ impl Consolidator {
             failed = report.facts_failed,
             "alias enrichment pass complete"
         );
+
+        // ADR-SEC-002: persist the graph entities/relationships written above to
+        // the sealed at-rest snapshot. Best-effort — a flush failure is logged,
+        // not fatal: the graph is derived data, so the next successful run
+        // re-extracts and re-flushes. Covers every consolidation path (CLI
+        // `consolidate run`, the app scheduler, and the headless `schedule`),
+        // all of which funnel through `enrich_facts`.
+        if let Err(e) = self.storage.flush_graph().await {
+            tracing::warn!(
+                target: "vault_consolidator::enrich",
+                error = %e,
+                "graph snapshot flush failed after enrichment (ADR-SEC-002); \
+                 graph deltas will persist on the next successful flush"
+            );
+        }
+
         Ok(report)
     }
 
