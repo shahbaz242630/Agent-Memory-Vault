@@ -133,6 +133,31 @@ pub trait GraphStore: Send + Sync {
         boundary: &Boundary,
     ) -> VaultResult<Option<Entity>>;
 
+    /// Enumerate every entity whose `boundary` is in `authorized_boundaries`.
+    ///
+    /// Empty `authorized_boundaries` returns an empty list (mirrors
+    /// [`traverse`](GraphStore::traverse)'s compile-time-impossible-to-forget
+    /// access control — never a leak across boundaries). Used by the read-path
+    /// `GraphRetriever` to match query terms against the names of known
+    /// entities before traversing from them.
+    async fn list_entities(&self, authorized_boundaries: &[Boundary]) -> VaultResult<Vec<Entity>>;
+
+    /// Return every still-live relationship that **touches** `entity` — i.e.
+    /// where `entity` is either endpoint (`from` OR `to`) — within
+    /// `authorized_boundaries`. Retired edges (`valid_until` set) are excluded.
+    ///
+    /// Bidirectional on purpose: most facts are `the user --rel--> <thing>`, so
+    /// a query naming `<thing>` must find the INCOMING edge. The returned
+    /// relationships carry `source_memory_id`, which the read-path
+    /// `GraphRetriever` follows to the memories that mention this entity.
+    ///
+    /// Empty `authorized_boundaries` returns an empty list (access control).
+    async fn relationships_for_entity(
+        &self,
+        entity: &EntityId,
+        authorized_boundaries: &[Boundary],
+    ) -> VaultResult<Vec<Relationship>>;
+
     /// Insert a relationship.
     ///
     /// Returns [`VaultError::AccessDenied`] (with a CRR-violation message)
@@ -736,6 +761,90 @@ impl GraphStore for DuckDbGraphStore {
                 .optional()
                 .map_err(|e| VaultError::Storage(format!("get_entity: {e}")))?;
             raw.map(RawEntity::try_into_entity).transpose()
+        })
+        .await
+        .map_err(|e| VaultError::Storage(format!("spawn_blocking join: {e}")))?
+    }
+
+    #[instrument(skip(self, authorized_boundaries))]
+    async fn list_entities(&self, authorized_boundaries: &[Boundary]) -> VaultResult<Vec<Entity>> {
+        // Compile-time-impossible-to-forget access control: empty list short-circuits.
+        if authorized_boundaries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let auth = authorized_boundaries.to_vec();
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = inner.lock()?;
+            // build_boundary_filter quotes each boundary as a SQL literal; the
+            // `Boundary` newtype already bars quote chars (defense in depth).
+            let sql = format!(
+                "SELECT id, name, entity_type, boundary, created_at FROM entities \
+                 WHERE {} ORDER BY id",
+                build_boundary_filter(&auth)
+            );
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| VaultError::Storage(format!("list_entities prepare: {e}")))?;
+            let raws = stmt
+                .query_map([], |row| {
+                    Ok(RawEntity {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        entity_type: row.get(2)?,
+                        boundary: row.get(3)?,
+                        created_at: row.get(4)?,
+                    })
+                })
+                .map_err(|e| VaultError::Storage(format!("list_entities query: {e}")))?
+                .collect::<duckdb::Result<Vec<_>>>()
+                .map_err(|e| VaultError::Storage(format!("list_entities collect: {e}")))?;
+            raws.into_iter()
+                .map(RawEntity::try_into_entity)
+                .collect::<VaultResult<Vec<_>>>()
+        })
+        .await
+        .map_err(|e| VaultError::Storage(format!("spawn_blocking join: {e}")))?
+    }
+
+    #[instrument(skip(self, authorized_boundaries), fields(entity = %entity))]
+    async fn relationships_for_entity(
+        &self,
+        entity: &EntityId,
+        authorized_boundaries: &[Boundary],
+    ) -> VaultResult<Vec<Relationship>> {
+        if authorized_boundaries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let entity_blob = entity.0.as_bytes().to_vec();
+        let auth = authorized_boundaries.to_vec();
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = inner.lock()?;
+            // Same canonical column order row_to_relationship decodes. The two `?`
+            // params are the entity blob (from-side then to-side); the boundary
+            // IN clause is built from quoted literals (no injection surface).
+            let sql = format!(
+                "SELECT id, from_entity_id, to_entity_id, relation_type, \
+                        valid_from, valid_until, confidence, source_memory_id \
+                 FROM relationships \
+                 WHERE (from_entity_id = ? OR to_entity_id = ?) \
+                   AND valid_until IS NULL AND {}",
+                build_boundary_filter(&auth)
+            );
+            let mut stmt = conn.prepare(&sql).map_err(|e| {
+                VaultError::Storage(format!("relationships_for_entity prepare: {e}"))
+            })?;
+            let raws = stmt
+                .query_map(params![entity_blob, entity_blob], row_to_relationship)
+                .map_err(|e| VaultError::Storage(format!("relationships_for_entity query: {e}")))?
+                .collect::<duckdb::Result<Vec<_>>>()
+                .map_err(|e| {
+                    VaultError::Storage(format!("relationships_for_entity collect: {e}"))
+                })?;
+            raws.into_iter()
+                .map(RawRelationship::try_into_relationship)
+                .collect::<VaultResult<Vec<_>>>()
         })
         .await
         .map_err(|e| VaultError::Storage(format!("spawn_blocking join: {e}")))?
@@ -1984,6 +2093,91 @@ mod tests {
             "alias destination outside authorized boundaries leaked: {} hits",
             result.len()
         );
+    }
+
+    // -------- list_entities (read-path GraphRetriever support) --------
+
+    #[tokio::test]
+    async fn list_entities_returns_only_authorized_boundaries() {
+        let (_dir, store) = open_tmp().await;
+        let work_a = ent("Acme", EntityType::Organization, "work");
+        let work_b = ent("Maria", EntityType::Person, "work");
+        let personal = ent("Rex", EntityType::Concept, "personal");
+        store.create_entity(&work_a).await.unwrap();
+        store.create_entity(&work_b).await.unwrap();
+        store.create_entity(&personal).await.unwrap();
+
+        // Only the work boundary is authorized → personal entity never appears.
+        let got = store.list_entities(&[b("work")]).await.unwrap();
+        let names: StdHashSet<String> = got.iter().map(|e| e.name.clone()).collect();
+        assert_eq!(names, StdHashSet::from(["Acme".into(), "Maria".into()]));
+        assert!(
+            !names.contains("Rex"),
+            "an unauthorized boundary's entity must never be listed"
+        );
+
+        // Empty authorization → empty (compile-time-safe access control).
+        assert!(store.list_entities(&[]).await.unwrap().is_empty());
+
+        // Multi-boundary authorization unions both.
+        let both = store
+            .list_entities(&[b("work"), b("personal")])
+            .await
+            .unwrap();
+        assert_eq!(both.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn relationships_for_entity_is_bidirectional_and_excludes_retired() {
+        let (_dir, store) = open_tmp().await;
+        let user = ent("the user", EntityType::Person, "work");
+        let acme = ent("Acme", EntityType::Organization, "work");
+        let maria = ent("Maria", EntityType::Person, "work");
+        store.create_entity(&user).await.unwrap();
+        store.create_entity(&acme).await.unwrap();
+        store.create_entity(&maria).await.unwrap();
+
+        let m1 = MemoryId::new(); // the user --works_at--> Acme (Acme is the TO side)
+        let m2 = MemoryId::new(); // the user --sibling_of--> Maria
+        store
+            .create_relationship(&rel_src(user.id, acme.id, "works_at", m1))
+            .await
+            .unwrap();
+        store
+            .create_relationship(&rel_src(user.id, maria.id, "sibling_of", m2))
+            .await
+            .unwrap();
+
+        // Acme is only ever a TO endpoint, yet the incoming edge is found
+        // (bidirectional) — this is the case outgoing-only traverse would miss.
+        let acme_edges = store
+            .relationships_for_entity(&acme.id, &[b("work")])
+            .await
+            .unwrap();
+        assert_eq!(acme_edges.len(), 1);
+        assert_eq!(acme_edges[0].source_memory_id, Some(m1));
+
+        // The user touches both edges.
+        let user_edges = store
+            .relationships_for_entity(&user.id, &[b("work")])
+            .await
+            .unwrap();
+        assert_eq!(user_edges.len(), 2);
+
+        // Retiring the works_at fact drops its edge from the live result.
+        store.retire_relationships_for_memory(m1).await.unwrap();
+        assert!(store
+            .relationships_for_entity(&acme.id, &[b("work")])
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Empty authorization → empty (access control).
+        assert!(store
+            .relationships_for_entity(&user.id, &[])
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     // -------- provenance + retire_relationships_for_memory (ADR-SEC-002 Part 2) --------

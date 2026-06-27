@@ -43,8 +43,8 @@ pub use retriever::{
 };
 pub use search_hint::{search_hint, SearchHint, SEPARATION_RATIO, STRONG_RELEVANCE};
 pub use strategies::{
-    AbstainConfig, AbstainingRetriever, HybridConfig, HybridRetriever, KeywordIndex,
-    KeywordRetriever, SemanticRetriever,
+    AbstainConfig, AbstainingRetriever, GraphRetriever, HybridConfig, HybridRetriever,
+    KeywordIndex, KeywordRetriever, SemanticRetriever,
 };
 pub use structured_read_pipeline::{
     HealthInfo, HealthStatus, HealthWarning, ReadQuery, RelevantFact, StructuredReadPipeline,

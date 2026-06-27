@@ -110,6 +110,11 @@ pub struct RerankedRetriever {
     /// Optional pure-semantic channel for the ADR-069 recall-union. `None`
     /// disables the union (the base pool is reranked as-is).
     semantic: Option<Arc<dyn Retriever>>,
+    /// Optional knowledge-graph channel (ADR-SEC-002 Part 2). When `Some`, its
+    /// hits for relational queries are unioned into the rerank pool exactly like
+    /// `semantic` — additive recall, reorder-only, can never lower precision.
+    /// `None` = today's exact behavior (safe default + instant rollback).
+    graph: Option<Arc<dyn Retriever>>,
     /// The relevance authority. Shares the same warm `Arc` the read pipeline
     /// holds, so no second model load.
     reranker: Arc<dyn RerankProvider>,
@@ -130,8 +135,20 @@ impl RerankedRetriever {
         Self {
             base,
             semantic,
+            graph: None,
             reranker,
         }
+    }
+
+    /// Attach an optional knowledge-graph recall channel (ADR-SEC-002 Part 2).
+    /// `Some` unions the graph retriever's hits into the rerank pool for
+    /// relational queries; `None` (the default from [`new`](Self::new)) leaves
+    /// behavior unchanged. Builder form so existing 3-arg call sites are
+    /// untouched.
+    #[must_use]
+    pub fn with_graph(mut self, graph: Option<Arc<dyn Retriever>>) -> Self {
+        self.graph = graph;
+        self
     }
 
     /// Union the semantic channel's top-[`SEARCH_CANDIDATE_FANOUT`] onto `hits`,
@@ -159,6 +176,39 @@ impl RerankedRetriever {
         let present: std::collections::HashSet<vault_core::MemoryId> =
             hits.iter().map(|h| h.memory.id).collect();
         for h in sem_hits {
+            if !present.contains(&h.memory.id) {
+                hits.push(h);
+            }
+        }
+        Ok(hits)
+    }
+
+    /// Union the knowledge-graph channel's hits onto `hits`, deduped by id
+    /// (ADR-SEC-002 Part 2). Same recall-safe contract as
+    /// [`union_semantic_recall`](Self::union_semantic_recall): the reranker
+    /// re-sorts the whole pool and the structured-read `abstain` owns honesty,
+    /// so unioning graph candidates only widens recall for relational queries —
+    /// it can never lower precision. No-op when no graph channel is wired.
+    async fn union_graph_recall(
+        &self,
+        mut hits: Vec<RetrievedMemory>,
+        query_text: &str,
+        boundaries: &[vault_core::Boundary],
+    ) -> VaultResult<Vec<RetrievedMemory>> {
+        let Some(graph) = &self.graph else {
+            return Ok(hits);
+        };
+        let graph_hits = graph
+            .retrieve(RetrievalQuery {
+                query_text: query_text.to_string(),
+                authorized_boundaries: boundaries.to_vec(),
+                max_results: SEARCH_CANDIDATE_FANOUT,
+                options: RetrievalOptions::default(),
+            })
+            .await?;
+        let present: std::collections::HashSet<vault_core::MemoryId> =
+            hits.iter().map(|h| h.memory.id).collect();
+        for h in graph_hits {
             if !present.contains(&h.memory.id) {
                 hits.push(h);
             }
@@ -326,9 +376,14 @@ impl RerankedRetriever {
             })
             .await?;
 
-        // 2. Recall-union (ADR-069): rescue strong semantic matches RRF starves.
+        // 2. Recall-union (ADR-069): rescue strong semantic matches RRF starves,
+        //    then (ADR-SEC-002 Part 2) graph-connected memories for relational
+        //    queries. Both are reorder-only widens — the reranker judges them.
         let pool = self
             .union_semantic_recall(hits, &query_text, &boundaries)
+            .await?;
+        let pool = self
+            .union_graph_recall(pool, &query_text, &boundaries)
             .await?;
 
         // 3. Rerank + re-sort by relevance. REORDER-ONLY — nothing is dropped, so
@@ -698,5 +753,58 @@ mod tests {
 
         assert_eq!(out.len(), 1, "only the above-threshold result survives");
         assert_eq!(out[0].memory.content, "strong match");
+    }
+
+    /// ADR-SEC-002 Part 2: the graph channel's hits are unioned into the rerank
+    /// pool, deduped by id, and reranked alongside the base pool. A graph-only
+    /// answer the base never returned can be promoted to the top.
+    #[tokio::test]
+    async fn graph_channel_hits_are_unioned_deduped_and_reranked() {
+        // Base returns mem 1. Graph returns mem 2 (NEW, the relational answer)
+        // plus mem 1 again (a duplicate that must be deduped).
+        let base = MockRetriever::new(vec![retrieved(
+            fake_memory(1, "base fact", "personal"),
+            0.1,
+        )]);
+        let graph = MockRetriever::new(vec![
+            retrieved(fake_memory(2, "graph fact", "personal"), 0.5),
+            retrieved(fake_memory(1, "base fact", "personal"), 0.5),
+        ]);
+        // The reranker scores the graph fact highest.
+        let reranker = MockReranker::new(vec![("graph fact", 3.0), ("base fact", 0.0)], 0.0, -10.0);
+        let retriever = RerankedRetriever::new(base, None, reranker).with_graph(Some(graph));
+
+        let out = retriever
+            .retrieve(query("where does maria work", 10))
+            .await
+            .unwrap();
+
+        assert_eq!(out.len(), 2, "base ∪ graph, the duplicate id appears once");
+        assert_eq!(
+            out[0].memory.id,
+            MemoryId(uuid::Uuid::from_u128(2)),
+            "the graph-only answer is reranked to the top"
+        );
+        assert!(
+            out.iter()
+                .any(|h| h.memory.id == MemoryId(uuid::Uuid::from_u128(1))),
+            "the base fact is still present"
+        );
+    }
+
+    /// With no graph channel wired (the default), behavior is unchanged — the
+    /// safe-default / instant-rollback guarantee.
+    #[tokio::test]
+    async fn no_graph_channel_leaves_pool_unchanged() {
+        let base = MockRetriever::new(vec![retrieved(
+            fake_memory(1, "base fact", "personal"),
+            0.1,
+        )]);
+        let reranker = MockReranker::new(vec![("base fact", 1.0)], 0.0, -10.0);
+        let retriever = RerankedRetriever::new(base, None, reranker); // no .with_graph
+
+        let out = retriever.retrieve(query("q", 10)).await.unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].memory.id, MemoryId(uuid::Uuid::from_u128(1)));
     }
 }

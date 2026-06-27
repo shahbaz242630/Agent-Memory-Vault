@@ -93,17 +93,24 @@ fn enrichment_prompt(content: &str) -> String {
          common generic words — e.g. for a job: work, career, employer, occupation; for a \
          pet: animal, pet, companion. Prefer generic single words over repeating specific \
          names already in the text. Lowercase.\n\
-         2. \"entities\": the distinct people, organizations, places, projects, or concepts \
-         named. Each has a \"name\" and a \"type\". Types: person; organization (a company \
-         or institution like a hospital or employer); location (a place); project; concept \
-         (anything else — a product, vehicle, instrument, skill, subject, or medical \
-         condition). A car, a cello, or a school subject is a concept, NOT an organization. \
-         ALWAYS include \"the user\" as a person. List every name you use in a relationship.\n\
+         2. \"entities\": the distinct NAMED people, organizations, places, projects, or \
+         concepts. Each has a \"name\" and a \"type\". Types: person; organization (a \
+         company, startup, university, school, hospital, or other institution); location \
+         (a geographic place — a city, country, or address); project (something the user \
+         is building or working on); concept (any other thing — a product, vehicle, \
+         instrument, skill, language, subject, event, or medical condition). A car, a \
+         cello, a school subject, or a named event like a marathon is a concept. A \
+         university or company is an organization, NOT a location or a project. Do NOT \
+         extract job titles, roles, or professions (\"senior engineer\", \"VP of \
+         Engineering\", \"teacher\") as entities — they describe a person, not a separate \
+         thing. ALWAYS include \"the user\" as a person. List every name you use in a \
+         relationship.\n\
          3. \"relationships\": how the entities connect. Each is {{\"from\":..., \
          \"relation\":..., \"to\":...}} where BOTH \"from\" and \"to\" are names from your \
          entities list, and \"relation\" is a short snake_case verb (works_at, lives_in, \
          sibling_of, owns, drives, learning, allergic_to). Capture the user's most \
-         important link (e.g. the user to their employer).\n\n\
+         important link (e.g. the user to their employer); ALWAYS capture the user's \
+         relationship to any family member named (parent_of, sibling_of, married_to).\n\n\
          Memory: {content}"
     )
 }
@@ -315,6 +322,7 @@ pub async fn enrich_one(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use vault_core::{Boundary, MemoryType, NewMemory};
@@ -733,5 +741,434 @@ mod tests {
             }
         }
         println!("\n========================================================\n");
+    }
+
+    // ─── SCORED extraction-quality measurement (ADR-SEC-002 Part 2 gate) ──────
+    //
+    // The print-only probe above is for eyeballing; THIS measures
+    // entity/relationship precision + recall against a hand-labelled corpus, so
+    // the "is the graph good enough to wire into the read path?" gate is a
+    // number, not a vibe. Reuses the production `generate_enrichment` path
+    // (real combined schema + prompt + parse/cleanup), so it scores exactly what
+    // ships.
+    //
+    // Relationships are scored two ways: STRICT (exact relation label) and
+    // ENDPOINT (the from->to connection, any label). Endpoint is the decision
+    // metric — a wrong *connection* corrupts answers; a label variant
+    // (employed_at vs works_at) does not. The bar (founder-set 2026-06-27):
+    // endpoint-precision >= 0.85, entity-precision >= 0.90, endpoint-recall >= 0.60.
+
+    /// One hand-labelled fact: content + the entities `(name, type)` and
+    /// relationships `(from, relation, to)` a correct extraction should produce.
+    /// `the user` (person) is implied present in every fact.
+    struct Labeled {
+        fact: &'static str,
+        entities: &'static [(&'static str, &'static str)],
+        rels: &'static [(&'static str, &'static str, &'static str)],
+    }
+
+    /// The labelled corpus — representative user memories spanning all five
+    /// entity types and the common relations. Ground truth is intentionally
+    /// conservative (only links a careful human would call unambiguous).
+    const LABELLED_CORPUS: &[Labeled] = &[
+        Labeled {
+            fact: "The user works at Acme Corp as a senior engineer.",
+            entities: &[("the user", "person"), ("Acme Corp", "organization")],
+            rels: &[("the user", "works_at", "Acme Corp")],
+        },
+        Labeled {
+            fact: "The user's sister Maria lives in Lisbon and works for a hospital.",
+            entities: &[
+                ("the user", "person"),
+                ("Maria", "person"),
+                ("Lisbon", "location"),
+                ("hospital", "organization"),
+            ],
+            rels: &[
+                ("the user", "sibling_of", "Maria"),
+                ("Maria", "lives_in", "Lisbon"),
+                ("Maria", "works_at", "hospital"),
+            ],
+        },
+        Labeled {
+            fact: "The user settled in Porto after years of moving around.",
+            entities: &[("the user", "person"), ("Porto", "location")],
+            rels: &[("the user", "lives_in", "Porto")],
+        },
+        Labeled {
+            fact: "The user drives a Tesla Model 3 and is learning to play the cello.",
+            entities: &[
+                ("the user", "person"),
+                ("Tesla Model 3", "concept"),
+                ("cello", "concept"),
+            ],
+            rels: &[
+                ("the user", "drives", "Tesla Model 3"),
+                ("the user", "learning", "cello"),
+            ],
+        },
+        Labeled {
+            fact: "The user comes out in hives whenever they eat shellfish.",
+            entities: &[("the user", "person"), ("shellfish", "concept")],
+            rels: &[("the user", "allergic_to", "shellfish")],
+        },
+        Labeled {
+            fact: "The user married Elena last spring.",
+            entities: &[("the user", "person"), ("Elena", "person")],
+            rels: &[("the user", "married_to", "Elena")],
+        },
+        Labeled {
+            fact: "The user is building a side project called Habitly, a habit tracker.",
+            entities: &[("the user", "person"), ("Habitly", "project")],
+            rels: &[("the user", "works_on", "Habitly")],
+        },
+        Labeled {
+            fact: "The user studied computer science at Stanford.",
+            entities: &[
+                ("the user", "person"),
+                ("Stanford", "organization"),
+                ("computer science", "concept"),
+            ],
+            rels: &[("the user", "studied_at", "Stanford")],
+        },
+        Labeled {
+            fact: "The user reports to Sarah, the VP of Engineering.",
+            entities: &[("the user", "person"), ("Sarah", "person")],
+            rels: &[("the user", "reports_to", "Sarah")],
+        },
+        Labeled {
+            fact: "The user lived in Berlin before relocating to Lisbon.",
+            entities: &[
+                ("the user", "person"),
+                ("Berlin", "location"),
+                ("Lisbon", "location"),
+            ],
+            rels: &[
+                ("the user", "lived_in", "Berlin"),
+                ("the user", "lives_in", "Lisbon"),
+            ],
+        },
+        Labeled {
+            fact: "The user is allergic to penicillin.",
+            entities: &[("the user", "person"), ("penicillin", "concept")],
+            rels: &[("the user", "allergic_to", "penicillin")],
+        },
+        Labeled {
+            fact: "The user co-founded a startup named Nimbus with their friend David.",
+            entities: &[
+                ("the user", "person"),
+                ("Nimbus", "organization"),
+                ("David", "person"),
+            ],
+            rels: &[
+                ("the user", "founded", "Nimbus"),
+                ("the user", "knows", "David"),
+            ],
+        },
+        Labeled {
+            fact: "The user owns a small apartment in Madrid.",
+            entities: &[
+                ("the user", "person"),
+                ("apartment", "concept"),
+                ("Madrid", "location"),
+            ],
+            rels: &[("the user", "owns", "apartment")],
+        },
+        Labeled {
+            fact: "The user speaks fluent Japanese.",
+            entities: &[("the user", "person"), ("Japanese", "concept")],
+            rels: &[("the user", "speaks", "Japanese")],
+        },
+        Labeled {
+            fact: "The user volunteers at the Red Cross on weekends.",
+            entities: &[("the user", "person"), ("Red Cross", "organization")],
+            rels: &[("the user", "volunteers_at", "Red Cross")],
+        },
+        Labeled {
+            fact: "The user is training for the Boston Marathon.",
+            entities: &[("the user", "person"), ("Boston Marathon", "concept")],
+            rels: &[("the user", "training_for", "Boston Marathon")],
+        },
+        Labeled {
+            fact: "The user manages a team of five at Globex.",
+            entities: &[("the user", "person"), ("Globex", "organization")],
+            rels: &[("the user", "works_at", "Globex")],
+        },
+        Labeled {
+            fact: "The user grew up in Dublin.",
+            entities: &[("the user", "person"), ("Dublin", "location")],
+            rels: &[("the user", "grew_up_in", "Dublin")],
+        },
+        Labeled {
+            fact: "The user's father Tom is a retired teacher.",
+            entities: &[("the user", "person"), ("Tom", "person")],
+            rels: &[("the user", "parent_of", "Tom")],
+        },
+        Labeled {
+            fact: "The user uses Notion to organise their research.",
+            entities: &[("the user", "person"), ("Notion", "concept")],
+            rels: &[("the user", "uses", "Notion")],
+        },
+    ];
+
+    /// Map an [`EntityType`] to the lowercase label the corpus uses.
+    fn et_label(et: &vault_core::EntityType) -> String {
+        use vault_core::EntityType as T;
+        match et {
+            T::Person => "person".into(),
+            T::Organization => "organization".into(),
+            T::Project => "project".into(),
+            T::Location => "location".into(),
+            T::Concept => "concept".into(),
+            T::Custom(s) => s.to_lowercase(),
+        }
+    }
+
+    /// Micro-averaged precision/recall accumulator over set-membership keys.
+    #[derive(Default)]
+    struct PrAccum {
+        tp: usize,
+        predicted: usize,
+        truth: usize,
+    }
+
+    impl PrAccum {
+        fn add(&mut self, predicted: &HashSet<String>, truth: &HashSet<String>) {
+            self.tp += predicted.intersection(truth).count();
+            self.predicted += predicted.len();
+            self.truth += truth.len();
+        }
+        fn precision(&self) -> f64 {
+            if self.predicted == 0 {
+                0.0
+            } else {
+                self.tp as f64 / self.predicted as f64
+            }
+        }
+        fn recall(&self) -> f64 {
+            if self.truth == 0 {
+                0.0
+            } else {
+                self.tp as f64 / self.truth as f64
+            }
+        }
+    }
+
+    fn nk(s: &str) -> String {
+        s.trim().to_lowercase()
+    }
+
+    /// Build the (entity, strict-rel, endpoint-rel) key sets for a predicted or
+    /// ground-truth graph. Pure — unit-tested below without the LLM.
+    fn entity_keys(g: &ExtractedGraph) -> HashSet<String> {
+        g.entities
+            .iter()
+            .map(|e| format!("{}|{}", nk(&e.name), et_label(&e.entity_type)))
+            .collect()
+    }
+    fn strict_rel_keys(g: &ExtractedGraph) -> HashSet<String> {
+        g.relationships
+            .iter()
+            .map(|r| format!("{}|{}|{}", nk(&r.from), nk(&r.relation), nk(&r.to)))
+            .collect()
+    }
+    fn endpoint_rel_keys(g: &ExtractedGraph) -> HashSet<String> {
+        g.relationships
+            .iter()
+            .map(|r| format!("{}|{}", nk(&r.from), nk(&r.to)))
+            .collect()
+    }
+
+    fn labeled_to_graph(l: &Labeled) -> ExtractedGraph {
+        ExtractedGraph {
+            entities: l
+                .entities
+                .iter()
+                .map(|(n, t)| super::extract::ExtractedEntity {
+                    name: (*n).to_string(),
+                    entity_type: match *t {
+                        "person" => vault_core::EntityType::Person,
+                        "organization" => vault_core::EntityType::Organization,
+                        "project" => vault_core::EntityType::Project,
+                        "location" => vault_core::EntityType::Location,
+                        _ => vault_core::EntityType::Concept,
+                    },
+                })
+                .collect(),
+            relationships: l
+                .rels
+                .iter()
+                .map(|(f, rel, t)| super::extract::ExtractedRelationship {
+                    from: (*f).to_string(),
+                    relation: (*rel).to_string(),
+                    to: (*t).to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Unit test the scorer math with NO LLM — a known predicted graph vs a
+    /// known truth graph, asserting the P/R it produces.
+    #[test]
+    fn extraction_scorer_computes_precision_recall() {
+        // Truth: 2 entities, 1 relationship (user works_at Acme).
+        let truth = ExtractedGraph {
+            entities: vec![
+                super::extract::ExtractedEntity {
+                    name: "the user".into(),
+                    entity_type: vault_core::EntityType::Person,
+                },
+                super::extract::ExtractedEntity {
+                    name: "Acme Corp".into(),
+                    entity_type: vault_core::EntityType::Organization,
+                },
+            ],
+            relationships: vec![super::extract::ExtractedRelationship {
+                from: "the user".into(),
+                relation: "works_at".into(),
+                to: "Acme Corp".into(),
+            }],
+        };
+        // Prediction: right entities, but the relation LABEL differs
+        // (employed_at) and it adds one spurious entity.
+        let pred = ExtractedGraph {
+            entities: vec![
+                super::extract::ExtractedEntity {
+                    name: "The User".into(), // case-insensitive match
+                    entity_type: vault_core::EntityType::Person,
+                },
+                super::extract::ExtractedEntity {
+                    name: "Acme Corp".into(),
+                    entity_type: vault_core::EntityType::Organization,
+                },
+                super::extract::ExtractedEntity {
+                    name: "spurious".into(),
+                    entity_type: vault_core::EntityType::Concept,
+                },
+            ],
+            relationships: vec![super::extract::ExtractedRelationship {
+                from: "the user".into(),
+                relation: "employed_at".into(),
+                to: "Acme Corp".into(),
+            }],
+        };
+
+        let mut ent = PrAccum::default();
+        ent.add(&entity_keys(&pred), &entity_keys(&truth));
+        // 2 of 3 predicted entities correct → P = 2/3; both truth found → R = 1.
+        assert!((ent.precision() - 2.0 / 3.0).abs() < 1e-9);
+        assert!((ent.recall() - 1.0).abs() < 1e-9);
+
+        let mut strict = PrAccum::default();
+        strict.add(&strict_rel_keys(&pred), &strict_rel_keys(&truth));
+        // Label differs → strict miss: P = 0, R = 0.
+        assert_eq!(strict.tp, 0);
+
+        let mut endpoint = PrAccum::default();
+        endpoint.add(&endpoint_rel_keys(&pred), &endpoint_rel_keys(&truth));
+        // Endpoint (user→Acme) matches regardless of label → P = 1, R = 1.
+        assert!((endpoint.precision() - 1.0).abs() < 1e-9);
+        assert!((endpoint.recall() - 1.0).abs() < 1e-9);
+    }
+
+    // Run:
+    //   $env:PHI4_MODEL_DIR='C:\Users\shahb\AppData\Roaming\com.shahbaz242630.memory-vault\models'
+    //   cargo test -p vault-consolidator --lib real_phi4_extraction_scored -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "loads the real Phi-4 GGUF; set PHI4_MODEL_DIR; run with --ignored --nocapture"]
+    async fn real_phi4_extraction_scored() {
+        use vault_llm::{Phi4MiniConfig, Phi4MiniProvider};
+
+        let model_dir = std::env::var("PHI4_MODEL_DIR").unwrap_or_else(|_| {
+            r"C:\Users\shahb\AppData\Roaming\com.shahbaz242630.memory-vault\models".to_string()
+        });
+        println!("\nloading Phi-4-mini from {model_dir}...");
+        let provider = Phi4MiniProvider::new(Phi4MiniConfig::v0_2_default(model_dir.into()))
+            .await
+            .expect("load real Phi-4-mini");
+
+        let (mut ent, mut strict, mut endpoint) =
+            (PrAccum::default(), PrAccum::default(), PrAccum::default());
+
+        println!(
+            "\n================ SCORED EXTRACTION ({} facts) ================",
+            LABELLED_CORPUS.len()
+        );
+        for l in LABELLED_CORPUS {
+            let truth = labeled_to_graph(l);
+            let predicted = match generate_enrichment(l.fact, &provider).await {
+                Ok(enr) => enr.graph,
+                Err(e) => {
+                    println!("\n  FACT: {}\n    -> ERROR: {e}", l.fact);
+                    ExtractedGraph::default()
+                }
+            };
+
+            let (pe, te) = (entity_keys(&predicted), entity_keys(&truth));
+            let (pp, tp_) = (endpoint_rel_keys(&predicted), endpoint_rel_keys(&truth));
+            ent.add(&pe, &te);
+            strict.add(&strict_rel_keys(&predicted), &strict_rel_keys(&truth));
+            endpoint.add(&pp, &tp_);
+
+            println!("\n  FACT: {}", l.fact);
+            println!("    entities  pred {:?}", pe);
+            println!("              want {:?}", te);
+            println!("    miss-ent  {:?}", te.difference(&pe).collect::<Vec<_>>());
+            println!("    extra-ent {:?}", pe.difference(&te).collect::<Vec<_>>());
+            println!("    rel endpoints pred {:?}", pp);
+            println!("                  want {:?}", tp_);
+            println!(
+                "    miss-rel  {:?}",
+                tp_.difference(&pp).collect::<Vec<_>>()
+            );
+            println!(
+                "    extra-rel {:?}",
+                pp.difference(&tp_).collect::<Vec<_>>()
+            );
+        }
+
+        println!("\n================ SCORECARD ================");
+        println!(
+            "  entities     P={:.3}  R={:.3}   (tp {}/{} pred, {} truth)",
+            ent.precision(),
+            ent.recall(),
+            ent.tp,
+            ent.predicted,
+            ent.truth
+        );
+        println!(
+            "  rel strict   P={:.3}  R={:.3}",
+            strict.precision(),
+            strict.recall()
+        );
+        println!(
+            "  rel endpoint P={:.3}  R={:.3}   (tp {}/{} pred, {} truth)",
+            endpoint.precision(),
+            endpoint.recall(),
+            endpoint.tp,
+            endpoint.predicted,
+            endpoint.truth
+        );
+        println!("\n  BAR (wiring gate): entity-P>=0.90  endpoint-P>=0.85  endpoint-R>=0.60");
+        let pass =
+            ent.precision() >= 0.90 && endpoint.precision() >= 0.85 && endpoint.recall() >= 0.60;
+        println!(
+            "  RESULT: {}",
+            if pass {
+                "CLEARS the bar"
+            } else {
+                "BELOW the bar"
+            }
+        );
+        println!("===========================================\n");
+
+        // Conservative sanity floor — a catastrophic extraction (endpoint
+        // precision below half) fails loudly even in a manual run. The wiring
+        // decision itself is made by reading the scorecard above, jointly.
+        assert!(
+            endpoint.precision() >= 0.5,
+            "endpoint precision {:.3} is catastrophically low — extraction is broken, not just imperfect",
+            endpoint.precision()
+        );
     }
 }

@@ -53,8 +53,8 @@ use vault_embedding::{
 use vault_llm::{LlmProvider, Phi4MiniConfig, Phi4MiniProvider};
 use vault_mcp::{Adapter, StdioServer};
 use vault_retrieval::{
-    FilesystemReportLoader, HybridRetriever, KeywordIndex, KeywordRetriever, RerankedRetriever,
-    Retriever, SemanticRetriever, StructuredReadPipeline,
+    FilesystemReportLoader, GraphRetriever, HybridRetriever, KeywordIndex, KeywordRetriever,
+    RerankedRetriever, Retriever, SemanticRetriever, StructuredReadPipeline,
 };
 use vault_storage::{MemoryFilter, MetadataStore, RetryWorker, StorageBackend};
 
@@ -303,7 +303,9 @@ impl Application {
             .await?;
         keyword_index.bulk_insert(&all_memories).await?;
         drop(all_memories);
-        let keyword = KeywordRetriever::new(keyword_index.clone(), retriever_metadata);
+        // Clone (not move): the graph retrieval channel below also needs this
+        // metadata-store handle to hydrate connected memories (ADR-SEC-002 Part 2).
+        let keyword = KeywordRetriever::new(keyword_index.clone(), retriever_metadata.clone());
         let keyword: Arc<dyn Retriever> = Arc::new(keyword);
 
         // 7. HybridRetriever — fuses semantic + keyword via Reciprocal
@@ -371,13 +373,23 @@ impl Application {
             Some(reranker) => {
                 tracing::info!(
                     target: "vault_app::startup",
-                    "memory_search: reranked retriever (hybrid ∪ semantic → rerank → floor, ADR-071)"
+                    "memory_search: reranked retriever (hybrid ∪ semantic ∪ graph → rerank → floor, ADR-071 + ADR-SEC-002 Part 2)"
                 );
-                Arc::new(RerankedRetriever::new(
-                    hybrid.clone(),
-                    Some(semantic.clone()),
-                    reranker.clone(),
-                ))
+                // ADR-SEC-002 Part 2: knowledge-graph recall channel. Resolves
+                // query-named entities → traverses → surfaces the connected
+                // memories, unioned into the rerank pool (additive, reorder-only).
+                let graph_channel: Arc<dyn Retriever> = Arc::new(GraphRetriever::new(
+                    storage.graph_store().clone(),
+                    retriever_metadata.clone(),
+                ));
+                Arc::new(
+                    RerankedRetriever::new(
+                        hybrid.clone(),
+                        Some(semantic.clone()),
+                        reranker.clone(),
+                    )
+                    .with_graph(Some(graph_channel)),
+                )
             }
             None => {
                 tracing::info!(
