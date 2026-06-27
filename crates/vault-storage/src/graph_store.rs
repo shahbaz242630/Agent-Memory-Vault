@@ -53,7 +53,8 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use vault_core::{
-    Boundary, Entity, EntityId, EntityType, Relationship, RelationshipId, VaultError, VaultResult,
+    Boundary, Entity, EntityId, EntityType, MemoryId, Relationship, RelationshipId, VaultError,
+    VaultResult,
 };
 
 use crate::migrations_graph;
@@ -170,6 +171,23 @@ pub trait GraphStore: Send + Sync {
         new_rel: &Relationship,
     ) -> VaultResult<()>;
 
+    /// Retire every still-live edge that was extracted from `memory_id`
+    /// (ADR-SEC-002 Part 2). Sets `valid_until = now` on each relationship whose
+    /// `source_memory_id` matches and is not already retired; returns the number
+    /// of rows retired.
+    ///
+    /// This is the stale-links fix: when a fact stops being the current truth —
+    /// its content changed (about to be re-extracted), it was merged away, or it
+    /// was retired by a contradiction — its edges must stop being live so the
+    /// graph reflects only current facts. History is preserved (the rows stay,
+    /// `valid_until` set), matching the bi-temporal `supersede_relationship`
+    /// posture.
+    ///
+    /// Idempotent: a second call for the same memory retires nothing (its edges
+    /// are already retired) and returns 0. A memory with no edges returns 0.
+    /// Legacy edges with a `NULL` `source_memory_id` are never matched.
+    async fn retire_relationships_for_memory(&self, memory_id: MemoryId) -> VaultResult<usize>;
+
     /// Eager validation that the store is readable end-to-end (not merely
     /// open-able). Used by `StorageBackend::open` (T0.1.6 Phase C, ADR-018)
     /// to surface hard fragment corruption immediately.
@@ -273,6 +291,11 @@ struct RelSnap {
     valid_from: String,
     valid_until: Option<String>,
     confidence: f64,
+    /// ADR-SEC-002 Part 2 provenance. `#[serde(default)]` so a snapshot written
+    /// by Part 1 (before this column existed) deserialises with `None` instead
+    /// of failing — old sealed blobs round-trip forward without a re-flush.
+    #[serde(default)]
+    source_memory_id: Option<Vec<u8>>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -302,7 +325,8 @@ fn dump_snapshot(conn: &Connection) -> VaultResult<GraphSnapshot> {
     let relationships = conn
         .prepare(
             "SELECT id, from_entity_id, to_entity_id, relation_type, boundary, \
-             valid_from, valid_until, confidence FROM relationships ORDER BY id",
+             valid_from, valid_until, confidence, source_memory_id \
+             FROM relationships ORDER BY id",
         )
         .map_err(|e| VaultError::Storage(format!("graph snapshot prepare rels: {e}")))?
         .query_map([], |row| {
@@ -315,6 +339,7 @@ fn dump_snapshot(conn: &Connection) -> VaultResult<GraphSnapshot> {
                 valid_from: row.get(5)?,
                 valid_until: row.get(6)?,
                 confidence: row.get(7)?,
+                source_memory_id: row.get(8)?,
             })
         })
         .map_err(|e| VaultError::Storage(format!("graph snapshot query rels: {e}")))?
@@ -340,7 +365,8 @@ fn load_snapshot(conn: &Connection, snap: &GraphSnapshot) -> VaultResult<()> {
     for r in &snap.relationships {
         conn.execute(
             "INSERT INTO relationships (id, from_entity_id, to_entity_id, relation_type, \
-             boundary, valid_from, valid_until, confidence) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+             boundary, valid_from, valid_until, confidence, source_memory_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 r.id,
                 r.from_entity_id,
@@ -349,7 +375,8 @@ fn load_snapshot(conn: &Connection, snap: &GraphSnapshot) -> VaultResult<()> {
                 r.boundary,
                 r.valid_from,
                 r.valid_until,
-                r.confidence
+                r.confidence,
+                r.source_memory_id,
             ],
         )
         .map_err(|err| VaultError::Storage(format!("graph restore relationship: {err}")))?;
@@ -451,9 +478,14 @@ impl DuckDbGraphStore {
             path = %graph_path.display(),
             "migrating legacy plaintext graph into the sealed at-rest store (ADR-SEC-002)"
         );
-        let legacy = Connection::open(graph_path).map_err(|e| {
+        let mut legacy = Connection::open(graph_path).map_err(|e| {
             VaultError::Storage(format!("open legacy graph {}: {e}", graph_path.display()))
         })?;
+        // Bring the legacy file up to the current schema before dumping so
+        // `dump_snapshot` can read every current column (e.g. the 0002
+        // `source_memory_id` it predates — added here as all-NULL). Idempotent;
+        // the file is deleted immediately after, so this mutation is throwaway.
+        migrations_graph::run(&mut legacy)?;
         let snap = dump_snapshot(&legacy)?;
         drop(legacy);
         load_snapshot(conn, &snap)?;
@@ -519,7 +551,8 @@ impl RawEntity {
 }
 
 /// Reconstruct a [`Relationship`] from the canonical column order:
-/// `(id, from_entity_id, to_entity_id, relation_type, valid_from, valid_until, confidence)`.
+/// `(id, from_entity_id, to_entity_id, relation_type, valid_from, valid_until,
+/// confidence, source_memory_id)`.
 /// Note: the `boundary` column is NOT part of the [`Relationship`] domain
 /// type (it's a denormalised storage detail — see migrations_graph/0001).
 fn row_to_relationship(row: &duckdb::Row<'_>) -> duckdb::Result<RawRelationship> {
@@ -531,6 +564,7 @@ fn row_to_relationship(row: &duckdb::Row<'_>) -> duckdb::Result<RawRelationship>
         valid_from: row.get(4)?,
         valid_until: row.get(5)?,
         confidence: row.get(6)?,
+        source_memory_id: row.get(7)?,
     })
 }
 
@@ -542,6 +576,7 @@ struct RawRelationship {
     valid_from: String,
     valid_until: Option<String>,
     confidence: f64,
+    source_memory_id: Option<Vec<u8>>,
 }
 
 impl RawRelationship {
@@ -557,6 +592,10 @@ impl RawRelationship {
                 .map(|s| datetime_from_text(&s))
                 .transpose()?,
             confidence: self.confidence as f32,
+            source_memory_id: self
+                .source_memory_id
+                .map(|b| uuid_from_blob(&b).map(MemoryId))
+                .transpose()?,
         })
     }
 }
@@ -739,8 +778,8 @@ impl GraphStore for DuckDbGraphStore {
             tx.execute(
                 "INSERT INTO relationships \
                  (id, from_entity_id, to_entity_id, relation_type, boundary, \
-                  valid_from, valid_until, confidence) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                  valid_from, valid_until, confidence, source_memory_id) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     rel.id.0.as_bytes().to_vec(),
                     rel.from_entity.0.as_bytes().to_vec(),
@@ -750,6 +789,7 @@ impl GraphStore for DuckDbGraphStore {
                     rel.valid_from.to_rfc3339(),
                     rel.valid_until.map(|d| d.to_rfc3339()),
                     rel.confidence as f64,
+                    rel.source_memory_id.map(|m| m.0.as_bytes().to_vec()),
                 ],
             )
             .map_err(|e| VaultError::Storage(format!("create_relationship insert: {e}")))?;
@@ -885,8 +925,8 @@ impl GraphStore for DuckDbGraphStore {
             tx.execute(
                 "INSERT INTO relationships \
                  (id, from_entity_id, to_entity_id, relation_type, boundary, \
-                  valid_from, valid_until, confidence) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                  valid_from, valid_until, confidence, source_memory_id) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     new_rel.id.0.as_bytes().to_vec(),
                     new_rel.from_entity.0.as_bytes().to_vec(),
@@ -896,12 +936,38 @@ impl GraphStore for DuckDbGraphStore {
                     new_rel.valid_from.to_rfc3339(),
                     new_rel.valid_until.map(|d| d.to_rfc3339()),
                     new_rel.confidence as f64,
+                    new_rel.source_memory_id.map(|m| m.0.as_bytes().to_vec()),
                 ],
             )
             .map_err(|e| VaultError::Storage(format!("supersede insert new: {e}")))?;
 
             tx.commit()
                 .map_err(|e| VaultError::Storage(format!("commit: {e}")))
+        })
+        .await
+        .map_err(|e| VaultError::Storage(format!("spawn_blocking join: {e}")))?
+    }
+
+    #[instrument(skip(self), fields(memory_id = %memory_id))]
+    async fn retire_relationships_for_memory(&self, memory_id: MemoryId) -> VaultResult<usize> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = inner.lock()?;
+            // Set valid_until = now on every still-live edge sourced from this
+            // memory. `valid_until IS NULL` makes it idempotent (already-retired
+            // rows are skipped) and `source_memory_id = ?` never matches a legacy
+            // NULL row. duckdb's `execute` returns the affected-row count.
+            let now = Utc::now().to_rfc3339();
+            let retired = conn
+                .execute(
+                    "UPDATE relationships SET valid_until = ? \
+                     WHERE source_memory_id = ? AND valid_until IS NULL",
+                    params![now, memory_id.0.as_bytes().to_vec()],
+                )
+                .map_err(|e| {
+                    VaultError::Storage(format!("retire_relationships_for_memory: {e}"))
+                })?;
+            Ok(retired)
         })
         .await
         .map_err(|e| VaultError::Storage(format!("spawn_blocking join: {e}")))?
@@ -1128,7 +1194,7 @@ fn traverse_blocking(
         .join(", ");
     let rel_sql = format!(
         "SELECT id, from_entity_id, to_entity_id, relation_type, \
-                valid_from, valid_until, confidence \
+                valid_from, valid_until, confidence, source_memory_id \
          FROM relationships WHERE id IN ({placeholders})"
     );
     let mut rel_stmt = conn
@@ -1206,7 +1272,12 @@ mod tests {
     }
 
     fn rel(from: EntityId, to: EntityId, rt: &str, conf: f32) -> Relationship {
-        Relationship::try_new(from, to, rt, conf).expect("valid relationship in test fixture")
+        Relationship::try_new(from, to, rt, conf, None).expect("valid relationship in test fixture")
+    }
+
+    fn rel_src(from: EntityId, to: EntityId, rt: &str, src: MemoryId) -> Relationship {
+        Relationship::try_new(from, to, rt, 0.9, Some(src))
+            .expect("valid relationship in test fixture")
     }
 
     async fn open_tmp() -> (TempDir, DuckDbGraphStore) {
@@ -1265,6 +1336,7 @@ mod tests {
 
         let alice = ent("Alice", EntityType::Person, "work");
         let bob = ent("Bob", EntityType::Person, "work");
+        let src = MemoryId::new();
         {
             let store = DuckDbGraphStore::open_with_at_rest_key(&path, &TEST_AT_REST_KEY)
                 .await
@@ -1272,7 +1344,7 @@ mod tests {
             store.create_entity(&alice).await.unwrap();
             store.create_entity(&bob).await.unwrap();
             store
-                .create_relationship(&rel(alice.id, bob.id, "knows", 0.9))
+                .create_relationship(&rel_src(alice.id, bob.id, "knows", src))
                 .await
                 .unwrap();
             store.flush().await.unwrap();
@@ -1290,6 +1362,17 @@ mod tests {
         assert!(
             names.contains("Bob"),
             "relationship Alice->Bob must survive seal + reopen; got {names:?}"
+        );
+        // Provenance survives the snapshot seal → unseal → restore cycle.
+        let edge = hops
+            .iter()
+            .flat_map(|(_, rels)| rels)
+            .find(|r| r.relation_type == "knows")
+            .expect("knows edge present after reopen");
+        assert_eq!(
+            edge.source_memory_id,
+            Some(src),
+            "source_memory_id must survive seal + reopen"
         );
     }
 
@@ -1901,6 +1984,123 @@ mod tests {
             "alias destination outside authorized boundaries leaked: {} hits",
             result.len()
         );
+    }
+
+    // -------- provenance + retire_relationships_for_memory (ADR-SEC-002 Part 2) --------
+
+    #[tokio::test]
+    async fn source_memory_provenance_round_trips_through_create_and_traverse() {
+        let (_dir, store) = open_tmp().await;
+        let a = ent("the user", EntityType::Person, "work");
+        let acme = ent("Acme", EntityType::Organization, "work");
+        store.create_entity(&a).await.unwrap();
+        store.create_entity(&acme).await.unwrap();
+        let src = MemoryId::new();
+        store
+            .create_relationship(&rel_src(a.id, acme.id, "works_at", src))
+            .await
+            .unwrap();
+
+        let reached = store.traverse(&a.id, &[b("work")], opts(1)).await.unwrap();
+        let edge = reached
+            .iter()
+            .flat_map(|(_, rels)| rels)
+            .find(|r| r.relation_type == "works_at")
+            .expect("works_at edge reachable");
+        assert_eq!(
+            edge.source_memory_id,
+            Some(src),
+            "provenance survives create → DuckDB → traverse decode"
+        );
+    }
+
+    #[tokio::test]
+    async fn retire_relationships_for_memory_retires_only_that_memorys_live_edges() {
+        let (_dir, store) = open_tmp().await;
+        let user = ent("the user", EntityType::Person, "work");
+        let acme = ent("Acme", EntityType::Organization, "work");
+        let globex = ent("Globex", EntityType::Organization, "work");
+        store.create_entity(&user).await.unwrap();
+        store.create_entity(&acme).await.unwrap();
+        store.create_entity(&globex).await.unwrap();
+
+        // Two facts: an obsolete one (→ Acme) and a current one (→ Globex), plus
+        // a legacy edge with no provenance that must be left untouched.
+        let stale_fact = MemoryId::new();
+        let current_fact = MemoryId::new();
+        store
+            .create_relationship(&rel_src(user.id, acme.id, "works_at", stale_fact))
+            .await
+            .unwrap();
+        store
+            .create_relationship(&rel_src(user.id, globex.id, "works_at", current_fact))
+            .await
+            .unwrap();
+        store
+            .create_relationship(&rel(user.id, acme.id, "knows_of", 0.5)) // legacy, NULL source
+            .await
+            .unwrap();
+
+        // Retire the obsolete fact's edges.
+        let retired = store
+            .retire_relationships_for_memory(stale_fact)
+            .await
+            .unwrap();
+        assert_eq!(retired, 1, "exactly the one stale edge is retired");
+
+        // Idempotent: a second call retires nothing.
+        let again = store
+            .retire_relationships_for_memory(stale_fact)
+            .await
+            .unwrap();
+        assert_eq!(again, 0, "already-retired edges are not re-retired");
+
+        // A memory with no edges retires nothing.
+        let none = store
+            .retire_relationships_for_memory(MemoryId::new())
+            .await
+            .unwrap();
+        assert_eq!(none, 0);
+
+        // Raw-row inspection: only the stale fact's edge has valid_until set;
+        // the current fact's edge and the legacy NULL-provenance edge stay live.
+        let inner = store.inner.clone();
+        let (stale_blob, current_blob) = (
+            stale_fact.0.as_bytes().to_vec(),
+            current_fact.0.as_bytes().to_vec(),
+        );
+        tokio::task::spawn_blocking(move || {
+            let conn = inner.lock().unwrap();
+            let live_for = |src: Option<&Vec<u8>>| -> i64 {
+                match src {
+                    Some(s) => conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM relationships \
+                             WHERE source_memory_id = ? AND valid_until IS NULL",
+                            params![s],
+                            |r| r.get(0),
+                        )
+                        .unwrap(),
+                    None => conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM relationships \
+                             WHERE source_memory_id IS NULL AND valid_until IS NULL",
+                            [],
+                            |r| r.get(0),
+                        )
+                        .unwrap(),
+                }
+            };
+            assert_eq!(live_for(Some(&stale_blob)), 0, "stale fact edge retired");
+            assert_eq!(
+                live_for(Some(&current_blob)),
+                1,
+                "current fact edge stays live"
+            );
+            assert_eq!(live_for(None), 1, "legacy NULL-provenance edge stays live");
+        })
+        .await
+        .unwrap();
     }
 
     // -------- supersede + bi-temporal --------

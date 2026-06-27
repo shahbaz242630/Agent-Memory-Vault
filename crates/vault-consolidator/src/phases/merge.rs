@@ -269,15 +269,17 @@ pub struct AppliedMerge {
 /// 2. Mark original memories as `superseded_by` the new one (do not delete
 ///    — preserve provenance).
 /// 3. Re-embed the merged content, update vector store.
-/// 4. Update graph: relationships pointing to old memories now point to new
-///    merged memory.
+/// 4. Update graph: the superseded originals' relationships are retired and the
+///    merged memory's are re-extracted fresh.
 ///
-/// **Step 4 is a no-op + WARN at T0.2.3** per the HANDOFF tech-debt entry
-/// "T0.2.x — entity-extraction-at-consolidation + GraphStore
-/// relationship-rewrite primitive on merge." Entity extraction at write
-/// time does not exist in V0.2, so there are no graph relationships to
-/// rewrite. The no-op is honest about scope; the WARN fires every merge so
-/// the gap is visible in production logs.
+/// **Step 4 is handled downstream, not here (ADR-SEC-002 Part 2).** `apply_merge`
+/// marks the originals superseded; the graph rewrite happens in
+/// [`crate::Consolidator::enrich_facts`], whose reconciliation pass retires every
+/// live edge whose source fact left the active set (these superseded originals),
+/// and whose enrichment pass writes the merged memory's fresh edges tagged with
+/// its own `source_memory_id`. Keeping all graph mutation in the enrichment pass
+/// is deliberate — it is the graph's sole writer (so the sealed-snapshot flush
+/// stays co-located, ADR-SEC-002).
 ///
 /// **Inputs:**
 /// - `cluster`: from Phase 1's [`find_candidate_clusters`].
@@ -390,18 +392,12 @@ pub async fn apply_merge(
         superseded_memory_ids.push(member.id);
     }
 
-    // 7. Graph update deferred to T0.2.x — see HANDOFF tech-debt entry
-    //    "T0.2.x — entity-extraction-at-consolidation + GraphStore
-    //    relationship-rewrite primitive on merge." V0.2 cascade never
-    //    extracted entities at write time, so there are no graph
-    //    relationships to rewrite at merge time. The WARN keeps the
-    //    deferred surface visible in production logs.
-    warn!(
-        new_memory_id = %new_memory_id,
-        cluster_size = hydrated.len(),
-        "graph update deferred to T0.2.x — see HANDOFF tech-debt entry: \
-         entity-extraction-at-consolidation"
-    );
+    // 7. Graph update is NOT done here (ADR-SEC-002 Part 2). The superseded
+    //    originals' edges are retired by `Consolidator::enrich_facts`'s
+    //    reconciliation pass (every live edge whose source fact left the active
+    //    set), and the merged memory's fresh edges are written by the same
+    //    enrichment pass — keeping the enrichment pass the graph's sole writer
+    //    (so the sealed-snapshot flush stays co-located).
 
     Ok(AppliedMerge {
         new_memory_id,
@@ -886,11 +882,17 @@ mod tests {
         assert_eq!(embedder.last().await, Some(merged_text.to_string()));
     }
 
-    // ─── floor 5: emits_warn_for_graph_update_deferral ────────────────
+    // ─── floor 5: no longer defers the graph update (ADR-SEC-002 Part 2) ──
 
+    /// The graph rewrite is no longer deferred at merge time — it moved to
+    /// `Consolidator::enrich_facts` (retire the superseded originals' edges +
+    /// re-extract the merged memory's). `apply_merge` must therefore NOT emit
+    /// the old "graph update deferred to T0.2.x" WARN. (The positive
+    /// retirement behaviour is tested in
+    /// `consolidator::enrich_facts_reconciliation_retires_edges_of_superseded_fact`.)
     #[tokio::test]
     #[tracing_test::traced_test]
-    async fn apply_merge_emits_warn_for_graph_update_deferral() {
+    async fn apply_merge_no_longer_emits_graph_deferral_warn() {
         let (storage, _dir) = open_test_storage().await;
         let boundary = Boundary::new("test").unwrap();
         let id1 = insert_with_overrides(&storage, &boundary, "a", 0.5, 0).await;
@@ -902,12 +904,10 @@ mod tests {
             .await
             .unwrap();
 
-        // Pin the WARN-log substring per ADR-046 + the T0.2.x tech-debt
-        // entry. If the no-op disposition is ever replaced with real
-        // graph-rewrite code, this test must be updated alongside.
         assert!(
-            logs_contain("graph update deferred to T0.2.x"),
-            "apply_merge must emit a WARN log for the graph-update deferral"
+            !logs_contain("graph update deferred"),
+            "apply_merge must NOT emit the obsolete graph-deferral WARN; \
+             the rewrite now happens in enrich_facts (ADR-SEC-002 Part 2)"
         );
     }
 }

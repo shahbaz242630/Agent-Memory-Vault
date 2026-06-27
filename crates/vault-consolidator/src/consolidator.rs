@@ -1168,6 +1168,30 @@ impl Consolidator {
                 })) => match self.storage.update_memory(&enriched, &embedding).await {
                     Ok(_) => {
                         report.facts_enriched += 1;
+                        // Stale-links fix (ADR-SEC-002 Part 2): this fact is
+                        // being (re-)enriched, so its content is fresh or
+                        // changed. Retire any edges from its PRIOR content before
+                        // writing the new extraction, so the graph replaces
+                        // rather than accumulates. First-ever enrichment retires
+                        // 0 (no prior edges); a content change retires the stale
+                        // ones. Runs even when the new extraction is empty (a
+                        // fact that lost all its entities must still shed its old
+                        // edges). Best-effort: a retire failure is logged, the
+                        // enrichment still counts.
+                        match self
+                            .storage
+                            .graph_store()
+                            .retire_relationships_for_memory(enriched.id)
+                            .await
+                        {
+                            Ok(n) => report.relationships_retired += n,
+                            Err(e) => tracing::warn!(
+                                target: "vault_consolidator::enrich",
+                                memory_id = %enriched.id,
+                                error = %e,
+                                "retiring prior edges failed; fresh edges still written"
+                            ),
+                        }
                         // Graph-fill AFTER the vector is persisted: the
                         // content_fp is now written, so a transient graph
                         // failure is never re-extracted into duplicate edges on
@@ -1178,6 +1202,7 @@ impl Consolidator {
                                 &enriched.boundary,
                                 &graph,
                                 enriched.confidence,
+                                enriched.id,
                             )
                             .await
                             {
@@ -1228,6 +1253,53 @@ impl Consolidator {
             failed = report.facts_failed,
             "alias enrichment pass complete"
         );
+
+        // Stale-links reconciliation (ADR-SEC-002 Part 2). The per-fact retire
+        // above only covers facts that were (re-)enriched this pass — it cannot
+        // see a fact that LEFT the active set (merged away → superseded, or
+        // contradiction-retired): those are never enriched again, so their edges
+        // would stay live forever. Here we retire every live edge whose source
+        // fact is no longer in the current active set. Idempotent: a fact
+        // retired in a prior run retires 0 now, so steady-state runs do near-zero
+        // work. Best-effort, per fact — one failure never aborts the pass.
+        let active_ids: HashSet<MemoryId> = active.iter().map(|m| m.id).collect();
+        match self
+            .storage
+            .list_memories(
+                MemoryFilter {
+                    include_superseded: true,
+                    include_archived: true,
+                    ..MemoryFilter::default()
+                },
+                None,
+            )
+            .await
+        {
+            Ok(full) => {
+                for m in full.iter().filter(|m| !active_ids.contains(&m.id)) {
+                    match self
+                        .storage
+                        .graph_store()
+                        .retire_relationships_for_memory(m.id)
+                        .await
+                    {
+                        Ok(n) => report.relationships_retired += n,
+                        Err(e) => tracing::warn!(
+                            target: "vault_consolidator::enrich",
+                            memory_id = %m.id,
+                            error = %e,
+                            "reconciliation: retiring edges of a non-active fact failed"
+                        ),
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(
+                target: "vault_consolidator::enrich",
+                error = %e,
+                "reconciliation: could not enumerate full memory set; \
+                 non-active edges not retired this pass"
+            ),
+        }
 
         // ADR-SEC-002: persist the graph entities/relationships written above to
         // the sealed at-rest snapshot. Best-effort — a flush failure is logged,
@@ -1422,6 +1494,11 @@ pub struct EnrichmentReport {
     /// aliases were still enriched.
     #[serde(default)]
     pub graph_write_failures: usize,
+    /// Graph edges retired this pass because their source fact stopped being
+    /// current — content changed (re-extracted), merged away, or contradiction-
+    /// retired (ADR-SEC-002 Part 2 stale-links fix).
+    #[serde(default)]
+    pub relationships_retired: usize,
 }
 
 /// One contradiction flagged by Phase 2 for user review per BRD §5.6
@@ -1835,6 +1912,93 @@ mod tests {
         assert_eq!(
             r2.relationships_created, 0,
             "no duplicate relationships on re-run"
+        );
+        assert_eq!(
+            r2.relationships_retired, 0,
+            "an unchanged, still-active fact retires nothing"
+        );
+    }
+
+    // ─── stale-links retirement (ADR-SEC-002 Part 2) ─────────────────────────
+
+    #[tokio::test]
+    async fn enrich_facts_retires_prior_edges_when_fact_content_changes() {
+        let (storage, _dir) = open_test_storage().await;
+        let id = write_fact(&storage, "The user works at Acme Corp.").await;
+
+        let combined = r#"{"aliases":["work","career","job"],"entities":[{"name":"the user","type":"person"},{"name":"Acme Corp","type":"organization"}],"relationships":[{"from":"the user","relation":"works_at","to":"Acme Corp"}]}"#;
+        let consolidator = consolidator_with(storage.clone(), combined);
+
+        // First pass: 1 edge written, nothing to retire (first-ever enrichment).
+        let r1 = consolidator.enrich_facts().await.expect("enrich pass 1");
+        assert_eq!(r1.relationships_created, 1);
+        assert_eq!(
+            r1.relationships_retired, 0,
+            "first enrichment has no prior edges to retire"
+        );
+
+        // The fact's content changes (as a merge / update would mint). Stale
+        // fingerprint → next pass re-enriches it.
+        let mut changed = storage
+            .list_memories(MemoryFilter::default(), None)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.id == id)
+            .expect("fact present");
+        changed.content = "The user now works at Globex Inc.".into();
+        let embedding = vec![1.0_f32 / (EMBEDDING_DIM as f32).sqrt(); EMBEDDING_DIM];
+        storage
+            .update_memory(&changed, &embedding)
+            .await
+            .expect("content update");
+
+        // Second pass: the fact re-enriches → its PRIOR edge is retired before
+        // the fresh one is written (the stale-links fix). No accumulation.
+        let r2 = consolidator.enrich_facts().await.expect("enrich pass 2");
+        assert_eq!(r2.facts_enriched, 1, "changed fact re-enriched");
+        assert_eq!(
+            r2.relationships_retired, 1,
+            "the prior content's edge is retired on re-enrichment"
+        );
+        assert_eq!(
+            r2.relationships_created, 1,
+            "the fresh extraction writes a new edge"
+        );
+    }
+
+    #[tokio::test]
+    async fn enrich_facts_reconciliation_retires_edges_of_superseded_fact() {
+        let (storage, _dir) = open_test_storage().await;
+        let id = write_fact(&storage, "The user works at Acme Corp.").await;
+
+        let combined = r#"{"aliases":["work","career","job"],"entities":[{"name":"the user","type":"person"},{"name":"Acme Corp","type":"organization"}],"relationships":[{"from":"the user","relation":"works_at","to":"Acme Corp"}]}"#;
+        let consolidator = consolidator_with(storage.clone(), combined);
+
+        // First pass fills the graph for the (active) fact.
+        let r1 = consolidator.enrich_facts().await.expect("enrich pass 1");
+        assert_eq!(r1.relationships_created, 1);
+        assert_eq!(r1.relationships_retired, 0);
+
+        // The fact is merged away / superseded (as Phase 3 apply_merge does).
+        storage
+            .mark_superseded(id, MemoryId::new())
+            .await
+            .expect("mark superseded");
+
+        // Next pass: the fact is no longer active and is never re-enriched, so
+        // the reconciliation pass retires its now-orphaned edge.
+        let r2 = consolidator.enrich_facts().await.expect("enrich pass 2");
+        assert_eq!(
+            r2.relationships_retired, 1,
+            "reconciliation retires the superseded fact's orphaned edge"
+        );
+
+        // Idempotent: a later pass retires nothing (already retired).
+        let r3 = consolidator.enrich_facts().await.expect("enrich pass 3");
+        assert_eq!(
+            r3.relationships_retired, 0,
+            "already-retired edges are not retired again"
         );
     }
 }

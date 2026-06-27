@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 use crate::boundary::Boundary;
 use crate::error::{VaultError, VaultResult};
+use crate::memory::MemoryId;
 
 /// Maximum length of an entity name in bytes (BRD §11.7.1).
 pub const MAX_ENTITY_NAME_BYTES: usize = 256;
@@ -193,6 +194,18 @@ impl Entity {
 /// - `relation_type` is non-empty and ≤ 64 bytes
 /// - `confidence` is finite and in `[0.0, 1.0]`
 /// - `valid_until`, if present, is ≥ `valid_from`
+///
+/// ## Provenance (`source_memory_id`, ADR-SEC-002 Part 2)
+///
+/// The memory this edge was extracted from. `Some` for every edge the
+/// consolidator's enrichment pass writes; `None` only for edges that predate
+/// provenance (legacy rows migrated from the pre-provenance schema). Provenance
+/// is what lets the consolidator **retire an edge when its source fact stops
+/// being the current truth** — a fact whose content changed (re-extracted), was
+/// merged away, or was retired by a contradiction. Without it, an edge from an
+/// obsolete fact (e.g. `user —works_at→ Acme` after the fact changed to Globex)
+/// would live forever and pollute the graph. See
+/// `vault_consolidator::phases::extract` and `Consolidator::enrich_facts`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Relationship {
     pub id: RelationshipId,
@@ -202,6 +215,9 @@ pub struct Relationship {
     pub valid_from: DateTime<Utc>,
     pub valid_until: Option<DateTime<Utc>>,
     pub confidence: f32,
+    /// The memory this edge was extracted from (ADR-SEC-002 Part 2). `None`
+    /// only for legacy rows that predate provenance.
+    pub source_memory_id: Option<MemoryId>,
 }
 
 /// Maximum length of a relation-type label in bytes.
@@ -209,6 +225,11 @@ pub const MAX_RELATION_TYPE_BYTES: usize = 64;
 
 impl Relationship {
     /// Create a new validated relationship with a fresh ID and `valid_from = now`.
+    ///
+    /// `source_memory_id` is the memory this edge was extracted from (the
+    /// consolidator always supplies it; only legacy/migrated edges carry
+    /// `None`). It drives edge retirement when the source fact changes — see
+    /// [`Relationship`] docs.
     ///
     /// # Errors
     ///
@@ -218,6 +239,7 @@ impl Relationship {
         to_entity: EntityId,
         relation_type: impl Into<String>,
         confidence: f32,
+        source_memory_id: Option<MemoryId>,
     ) -> VaultResult<Self> {
         let rel = Self {
             id: RelationshipId::new(),
@@ -227,6 +249,7 @@ impl Relationship {
             valid_from: Utc::now(),
             valid_until: None,
             confidence,
+            source_memory_id,
         };
         rel.validate()?;
         Ok(rel)
@@ -360,9 +383,10 @@ mod tests {
     fn relationship_try_new_produces_valid_edge() {
         let a = EntityId::new();
         let b = EntityId::new();
-        let r = Relationship::try_new(a, b, "works_with", 0.8).unwrap();
+        let r = Relationship::try_new(a, b, "works_with", 0.8, None).unwrap();
         r.validate().unwrap();
         assert!(!r.is_retired_at(Utc::now()));
+        assert!(r.source_memory_id.is_none());
     }
 
     #[test]
@@ -370,11 +394,11 @@ mod tests {
         let a = EntityId::new();
         let b = EntityId::new();
         assert!(matches!(
-            Relationship::try_new(a, b, "rel", 2.0),
+            Relationship::try_new(a, b, "rel", 2.0, None),
             Err(VaultError::InvalidInput(_))
         ));
         assert!(matches!(
-            Relationship::try_new(a, b, "rel", f32::NAN),
+            Relationship::try_new(a, b, "rel", f32::NAN, None),
             Err(VaultError::InvalidInput(_))
         ));
     }
@@ -385,7 +409,7 @@ mod tests {
         let b = EntityId::new();
         let too_long = "x".repeat(MAX_RELATION_TYPE_BYTES + 1);
         assert!(matches!(
-            Relationship::try_new(a, b, too_long, 0.5),
+            Relationship::try_new(a, b, too_long, 0.5, None),
             Err(VaultError::InvalidInput(_))
         ));
     }
@@ -394,7 +418,7 @@ mod tests {
     fn relationship_retired_at_after_valid_until() {
         let a = EntityId::new();
         let b = EntityId::new();
-        let mut r = Relationship::try_new(a, b, "rel", 0.5).unwrap();
+        let mut r = Relationship::try_new(a, b, "rel", 0.5, None).unwrap();
         let cutoff = r.valid_from + chrono::Duration::seconds(10);
         r.valid_until = Some(cutoff);
         r.validate().unwrap();
@@ -433,11 +457,28 @@ mod tests {
     fn relationship_serde_roundtrip() {
         let a = EntityId::new();
         let b = EntityId::new();
-        let r = Relationship::try_new(a, b, "owns", 0.95).unwrap();
+        let r = Relationship::try_new(a, b, "owns", 0.95, None).unwrap();
         let json = serde_json::to_string(&r).unwrap();
         let back: Relationship = serde_json::from_str(&json).unwrap();
         assert_eq!(r, back);
         back.validate().unwrap();
+    }
+
+    #[test]
+    fn relationship_carries_source_memory_provenance_and_round_trips() {
+        let a = EntityId::new();
+        let b = EntityId::new();
+        let src = MemoryId::new();
+        let r = Relationship::try_new(a, b, "works_at", 0.9, Some(src)).unwrap();
+        assert_eq!(
+            r.source_memory_id,
+            Some(src),
+            "provenance is carried onto the edge"
+        );
+        // Survives a serde round-trip (snapshot/restore relies on this).
+        let back: Relationship = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(r, back);
+        assert_eq!(back.source_memory_id, Some(src));
     }
 
     proptest! {

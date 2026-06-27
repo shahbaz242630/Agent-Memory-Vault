@@ -25,11 +25,18 @@ struct Migration {
 }
 
 /// All graph-store migrations, in order. Append new ones — never edit existing ones.
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    description: "Initial schema: entities, relationships",
-    up: include_str!("0001_initial.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        description: "Initial schema: entities, relationships",
+        up: include_str!("0001_initial.sql"),
+    },
+    Migration {
+        version: 2,
+        description: "Relationship provenance: source_memory_id (ADR-SEC-002 Part 2)",
+        up: include_str!("0002_relationship_provenance.sql"),
+    },
+];
 
 /// Apply any pending migrations to the open connection. Uses the
 /// hard-coded production [`MIGRATIONS`] slice.

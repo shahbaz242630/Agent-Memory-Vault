@@ -31,19 +31,28 @@
 //! Extraction rides inside [`super::enrich::enrich_one`], which is skipped for
 //! a fact already enriched for its current content (the `content_fp`
 //! fingerprint). So a steady-state nightly run never re-extracts an unchanged
-//! fact → no duplicate entities or relationships. (A fact whose *content*
-//! changed re-extracts and may leave the prior content's relationships behind;
-//! retiring those is the relationship-rewrite-on-merge follow-up still tracked
-//! under tech-debt #2 — out of scope for the first graph-filling milestone,
-//! and harmless while the graph is dogfood-only.)
+//! fact → no duplicate entities or relationships.
+//!
+//! ## Stale-link retirement (ADR-SEC-002 Part 2)
+//!
+//! A fact whose *content* changed re-extracts. Its prior content's edges are
+//! retired by [`super::enrich`]'s orchestrator
+//! ([`crate::Consolidator::enrich_facts`]), which calls
+//! [`vault_storage::GraphStore::retire_relationships_for_memory`] for the fact
+//! BEFORE writing the fresh extraction — and reconciles merged-away /
+//! contradiction-retired facts (no longer active) the same way. Every edge this
+//! module writes is therefore tagged with its `source_memory_id` (the
+//! `source_memory_id` argument to [`write_extracted_to_graph`]) so that
+//! retirement can find it. Without provenance, an obsolete fact's edges (e.g.
+//! `user —works_at→ Acme` after the fact became Globex) would live forever.
 
 use std::collections::HashMap;
 
 use serde_json::Value;
 use tracing::warn;
 use vault_core::{
-    Boundary, Entity, EntityType, NewEntity, Relationship, VaultResult, MAX_ENTITY_NAME_BYTES,
-    MAX_RELATION_TYPE_BYTES,
+    Boundary, Entity, EntityType, MemoryId, NewEntity, Relationship, VaultResult,
+    MAX_ENTITY_NAME_BYTES, MAX_RELATION_TYPE_BYTES,
 };
 use vault_storage::GraphStore;
 
@@ -245,6 +254,12 @@ fn parse_relationships(value: &Value, entities: &[ExtractedEntity]) -> Vec<Extra
 /// `confidence` is the source memory's confidence — carried onto each edge so
 /// retrieval can weight graph facts the same way it weights memories.
 ///
+/// `source_memory_id` is the memory these entities/relationships were extracted
+/// from; it is tagged onto every edge as provenance so the consolidator can
+/// retire the edge when the fact stops being current (ADR-SEC-002 Part 2). The
+/// caller ([`crate::Consolidator::enrich_facts`]) retires this memory's prior
+/// edges BEFORE calling this, so the write replaces rather than accumulates.
+///
 /// # Errors
 ///
 /// Returns the underlying [`VaultError`] only on a genuine storage failure
@@ -257,6 +272,7 @@ pub async fn write_extracted_to_graph(
     boundary: &Boundary,
     extracted: &ExtractedGraph,
     confidence: f32,
+    source_memory_id: MemoryId,
 ) -> VaultResult<ExtractionWriteStats> {
     let mut stats = ExtractionWriteStats::default();
     let mut name_to_id = HashMap::new();
@@ -295,7 +311,13 @@ pub async fn write_extracted_to_graph(
             stats.relationships_failed += 1;
             continue;
         };
-        match Relationship::try_new(from_id, to_id, r.relation.clone(), confidence) {
+        match Relationship::try_new(
+            from_id,
+            to_id,
+            r.relation.clone(),
+            confidence,
+            Some(source_memory_id),
+        ) {
             Ok(rel) => match graph.create_relationship(&rel).await {
                 Ok(()) => stats.relationships_created += 1,
                 Err(e) => {
