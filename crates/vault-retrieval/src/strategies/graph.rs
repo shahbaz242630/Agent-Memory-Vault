@@ -13,10 +13,21 @@
 //! The read path holds no LLM. Query → entity resolution is pure string
 //! matching: tokenise the query, and match those tokens against the *names* of
 //! entities already in the graph (within the authorized boundaries). For each
-//! matched entity we pull the live relationships touching it
-//! ([`GraphStore::relationships_for_entity`]), follow each edge's
-//! `source_memory_id` to the memory that produced it, and return those
-//! memories. No model, no network, fully reproducible.
+//! matched entity we collect the live edges (1) directly touching it
+//! (bidirectional, [`GraphStore::relationships_for_entity`]) and (2) along
+//! outgoing paths up to [`MAX_HOPS`] away ([`GraphStore::traverse`]), follow
+//! each edge's `source_memory_id` to the memory that produced it, and return
+//! those memories. No model, no network, fully reproducible.
+//!
+//! ## Why two hops (ADR-SEC-002 Part 2 Amendment 1, 2026-06-28)
+//!
+//! A single hop only ever surfaces the source fact of an edge *directly*
+//! touching the named entity — and that fact contains the entity's name by
+//! construction, so lexical/semantic search already ranks it #1 (the 2026-06-28
+//! dogfood measured 1-hop as redundant: graph-ON == graph-OFF, byte-identical).
+//! The *second* hop reaches the answer fact two relationships away that never
+//! names the query entity (e.g. "what is Maria's hospital known for?" → Maria →
+//! St. Mary's → its specialty fact) — exactly what dense + lexical search miss.
 //!
 //! ## Additive + recall-safe
 //!
@@ -44,7 +55,7 @@ use async_trait::async_trait;
 use tracing::info;
 
 use vault_core::{EntityId, Memory, MemoryId, VaultResult};
-use vault_storage::{GraphStore, MetadataStore};
+use vault_storage::{GraphStore, MetadataStore, TraversalOptions};
 
 use crate::retriever::{RetrievalQuery, RetrievedMemory, Retriever};
 
@@ -54,6 +65,18 @@ const HUB_ENTITY_NAMES: &[&str] = &["the user", "user"];
 /// Cap on how many query-matched entities we traverse from, bounding work on a
 /// pathological query that names many entities.
 const MAX_MATCHED_ENTITIES: usize = 8;
+
+/// How many outgoing hops to walk from each matched entity. `2` is the value the
+/// graph read-path dogfood (2026-06-28) showed is the real unlock: 1-hop only
+/// ever surfaces the source fact of an edge directly touching the named entity —
+/// which, by construction, contains that entity's name, so lexical/semantic
+/// search already ranks it #1 (the channel was redundant). A *second* hop reaches
+/// the answer fact that is two relationships away and never names the query
+/// entity (e.g. "what is Maria's hospital known for?" → Maria → St. Mary's → its
+/// specialty fact), which dense + lexical search genuinely miss. Spec-supported
+/// (BRD §6 V0.1: 1–3 hops). Kept at 2 — 3+ adds noise the reranker must filter
+/// for little marginal reach (ADR-SEC-002 Part 2 Amendment 1).
+const MAX_HOPS: usize = 2;
 
 /// Cap on graph-surfaced candidate memories handed upward, mirroring the
 /// semantic union fan-out — the reranker is the relevance authority and dedups.
@@ -155,16 +178,40 @@ impl Retriever for GraphRetriever {
             .take(MAX_MATCHED_ENTITIES)
             .collect();
 
-        // 2) For each matched entity, collect the source memories of the edges
-        //    touching it (bidirectional). Track which entity connected each
-        //    memory for the explanation string.
+        // 2) For each matched entity, collect the source memories of:
+        //    (a) the edges DIRECTLY touching it — bidirectional 1-hop
+        //        ([`GraphStore::relationships_for_entity`]); this catches the
+        //        incoming `the user --rel--> <entity>` edge a query naming
+        //        `<entity>` must still see; and
+        //    (b) the edges along OUTGOING paths up to [`MAX_HOPS`] away
+        //        ([`GraphStore::traverse`]) — the multi-hop reach that lets the
+        //        graph answer questions whose answer fact is two relationships
+        //        away and never names the query entity. Outgoing-only traversal
+        //        from a *specific* named entity walks AWAY from the "the user"
+        //        hub, so it does not re-introduce the hub explosion the design
+        //        avoids (D4). The union dedups by source memory id, so the hop-1
+        //        overlap between (a) and (b) is harmless.
+        //    Track which entity connected each memory for the explanation string.
         let mut connectors: HashMap<MemoryId, HashSet<String>> = HashMap::new();
-        for (entity_id, entity_name) in &matched {
-            let rels = self
+        'outer: for (entity_id, entity_name) in &matched {
+            let direct = self
                 .graph
                 .relationships_for_entity(entity_id, boundaries)
                 .await?;
-            for r in rels {
+            let paths = self
+                .graph
+                .traverse(
+                    entity_id,
+                    boundaries,
+                    TraversalOptions {
+                        max_hops: MAX_HOPS,
+                        relation_filter: None,
+                        follow_aliases: false,
+                    },
+                )
+                .await?;
+            let path_rels = paths.into_iter().flat_map(|(_entity, rels)| rels);
+            for r in direct.into_iter().chain(path_rels) {
                 if let Some(src) = r.source_memory_id {
                     connectors
                         .entry(src)
@@ -172,11 +219,8 @@ impl Retriever for GraphRetriever {
                         .insert(entity_name.clone());
                 }
                 if connectors.len() >= MAX_CANDIDATE_MEMORIES {
-                    break;
+                    break 'outer;
                 }
-            }
-            if connectors.len() >= MAX_CANDIDATE_MEMORIES {
-                break;
             }
         }
 
@@ -345,6 +389,19 @@ mod tests {
         link_via(&graph, &maria, &hospital, "works_at", mem_c).await;
         link_via(&graph, &user_p, &rex, "owns", mem_d).await;
 
+        // A 2-hop chain off Maria: General Hospital --specializes_in--> pediatric
+        // cardiology (mem E). The answer fact never names Maria, so it is reachable
+        // ONLY by walking Maria → Hospital → specialty (the multi-hop case).
+        let mem_e = make_memory(
+            &meta,
+            "The General Hospital specializes in pediatric cardiology.",
+            "work",
+        )
+        .await;
+        let pediatrics =
+            make_entity_via(&graph, "pediatric cardiology", EntityType::Concept, "work").await;
+        link_via(&graph, &hospital, &pediatrics, "specializes_in", mem_e).await;
+
         let retriever = GraphRetriever::new(graph, meta);
         (
             Fixture {
@@ -413,6 +470,99 @@ mod tests {
         assert!(
             !ids.contains(&mem_a),
             "an unrelated entity's memory is not surfaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn surfaces_two_hop_connected_memory() {
+        let (fx, _a, _b, _c, _d) = fixture().await;
+        // "Maria" is named; the answer fact ("...specializes in pediatric
+        // cardiology") is TWO hops away (Maria → General Hospital → specialty) and
+        // never mentions Maria — the case 1-hop + lexical search both miss.
+        let hits = fx
+            .retriever
+            .retrieve(query("what is Maria's hospital known for", &["work"]))
+            .await
+            .unwrap();
+        assert!(
+            hits.iter()
+                .any(|h| h.memory.content.contains("pediatric cardiology")),
+            "the 2-hop answer fact must surface via Maria → Hospital → specialty"
+        );
+    }
+
+    #[tokio::test]
+    async fn dogfood_exact_two_hop_maria_delgado_st_marys() {
+        // DIAGNOSTIC (2026-06-29): mirrors the graph_readpath_dogfood corpus
+        // EXACTLY — entity names "Maria Delgado" / "St. Mary's Hospital" and the
+        // possessive query "What is Maria Delgado's hospital known for?" — to
+        // localize why the hard dogfood saw graph-ON == graph-OFF (the specialty
+        // fact never surfaced). PASS here ⇒ the GraphRetriever injects correctly
+        // and the loss is DOWNSTREAM (rerank-pool truncation / burial). FAIL ⇒
+        // entity resolution misses this exact phrasing.
+        let dir = tempdir().unwrap();
+        let key = SqlCipherKey::new("graph-dogfood-mirror");
+        let meta = Arc::new(
+            MetadataStore::open(dir.path().join("m.db"), key)
+                .await
+                .unwrap(),
+        );
+        let graph: Arc<dyn GraphStore> =
+            Arc::new(DuckDbGraphStore::open_ephemeral().await.unwrap());
+
+        let m_sib = make_memory(
+            &meta,
+            "The user's sister is named Maria Delgado.",
+            "personal",
+        )
+        .await;
+        let m_works = make_memory(
+            &meta,
+            "Maria Delgado works as a cardiac nurse at St. Mary's Hospital.",
+            "personal",
+        )
+        .await;
+        let m_spec = make_memory(
+            &meta,
+            "St. Mary's Hospital specializes in pediatric cardiology and neonatal care.",
+            "personal",
+        )
+        .await;
+
+        let user = make_entity_via(&graph, "the user", EntityType::Person, "personal").await;
+        let maria = make_entity_via(&graph, "Maria Delgado", EntityType::Person, "personal").await;
+        let hospital = make_entity_via(
+            &graph,
+            "St. Mary's Hospital",
+            EntityType::Organization,
+            "personal",
+        )
+        .await;
+        let pediatrics = make_entity_via(
+            &graph,
+            "pediatric cardiology",
+            EntityType::Concept,
+            "personal",
+        )
+        .await;
+
+        link_via(&graph, &user, &maria, "sibling_of", m_sib).await;
+        link_via(&graph, &maria, &hospital, "works_at", m_works).await;
+        link_via(&graph, &hospital, &pediatrics, "specializes_in", m_spec).await;
+
+        let retriever = GraphRetriever::new(graph, meta);
+        let hits = retriever
+            .retrieve(query(
+                "What is Maria Delgado's hospital known for?",
+                &["personal"],
+            ))
+            .await
+            .unwrap();
+        assert!(
+            hits.iter()
+                .any(|h| h.memory.content.contains("pediatric cardiology")),
+            "the 2-hop specialty fact must surface from the EXACT dogfood corpus; got: {:?}",
+            hits.iter().map(|h| &h.memory.content).collect::<Vec<_>>()
         );
     }
 

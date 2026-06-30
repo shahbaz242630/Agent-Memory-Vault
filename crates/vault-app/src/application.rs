@@ -371,24 +371,44 @@ impl Application {
         //    hybrid (recall-first, ADR-067) — mirrors the read cosine fallback.
         let retriever: Arc<dyn Retriever> = match &reranker_opt {
             Some(reranker) => {
-                tracing::info!(
-                    target: "vault_app::startup",
-                    "memory_search: reranked retriever (hybrid ∪ semantic ∪ graph → rerank → floor, ADR-071 + ADR-SEC-002 Part 2)"
-                );
-                // ADR-SEC-002 Part 2: knowledge-graph recall channel. Resolves
-                // query-named entities → traverses → surfaces the connected
-                // memories, unioned into the rerank pool (additive, reorder-only).
-                let graph_channel: Arc<dyn Retriever> = Arc::new(GraphRetriever::new(
-                    storage.graph_store().clone(),
-                    retriever_metadata.clone(),
-                ));
+                // ADR-SEC-002 Part 2 Amendment 1 — the knowledge-graph recall
+                // channel is PARKED as tech-debt #9 (2026-06-29): the hard
+                // 40-distractor dogfood showed no win (graph-ON == graph-OFF,
+                // byte-identical), so it ships OFF by default. The tested mechanism
+                // (recall-channels-first pool assembly + the 2-hop traverse) is
+                // preserved behind an opt-in switch: `VAULT_ENABLE_GRAPH_CHANNEL=1`
+                // (or `true`) wires it ON at runtime with NO recompile — the lever
+                // the graph read-path dogfood A/B uses to isolate the channel's
+                // contribution when we revisit it on real beta/agent demand.
+                let graph_enabled = std::env::var("VAULT_ENABLE_GRAPH_CHANNEL")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+                let graph_channel: Option<Arc<dyn Retriever>> = if graph_enabled {
+                    tracing::info!(
+                        target: "vault_app::startup",
+                        "memory_search: reranked retriever (hybrid ∪ semantic ∪ graph → rerank → floor, ADR-071 + ADR-SEC-002 Part 2) — graph channel ENABLED via VAULT_ENABLE_GRAPH_CHANNEL"
+                    );
+                    // ADR-SEC-002 Part 2: knowledge-graph recall channel. Resolves
+                    // query-named entities → traverses → surfaces the connected
+                    // memories, unioned into the rerank pool (additive, reorder-only).
+                    Some(Arc::new(GraphRetriever::new(
+                        storage.graph_store().clone(),
+                        retriever_metadata.clone(),
+                    )) as Arc<dyn Retriever>)
+                } else {
+                    tracing::info!(
+                        target: "vault_app::startup",
+                        "memory_search: reranked retriever (hybrid ∪ semantic → rerank → floor, ADR-071) — graph channel PARKED OFF (tech-debt #9; set VAULT_ENABLE_GRAPH_CHANNEL=1 to revisit)"
+                    );
+                    None
+                };
                 Arc::new(
                     RerankedRetriever::new(
                         hybrid.clone(),
                         Some(semantic.clone()),
                         reranker.clone(),
                     )
-                    .with_graph(Some(graph_channel)),
+                    .with_graph(graph_channel),
                 )
             }
             None => {

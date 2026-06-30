@@ -30,8 +30,13 @@
 //!    [`SEARCH_CANDIDATE_FANOUT`], NOT the agent's small final `max_results`, so
 //!    the reranker can rescue a deep-but-correct answer the agent would never see
 //!    otherwise.
-//! 2. Unions in the semantic channel's top-N (ADR-069 recall-union) so a strong
-//!    pure-semantic match the hybrid's RRF starves is still scored.
+//! 2. Unions in the recall channels — the knowledge graph (ADR-SEC-002 Part 2,
+//!    relational hits) and the semantic top-N (ADR-069) — **assembled
+//!    recall-channels-first** so that when the pool exceeds
+//!    [`RERANK_CANDIDATE_CAP`] the cap trims the base hybrid's weak lexical tail,
+//!    never the recall hits it exists to protect. (Assembly order only governs
+//!    truncation survival; the reranker re-sorts the whole pool next, so it never
+//!    affects the final ranking.)
 //! 3. Reranks the pool and re-sorts by relevance DESC. **Reorder-only — nothing
 //!    is dropped.** The reranker only pulls the right answer up; the result is
 //!    empty ONLY when the base pool was genuinely empty.
@@ -95,10 +100,13 @@ pub const SEARCH_CANDIDATE_FANOUT: usize = 20;
 
 /// Hard cap on the number of candidates handed to the reranker. Sized to the
 /// hybrid([`SEARCH_CANDIDATE_FANOUT`]) ∪ semantic([`SEARCH_CANDIDATE_FANOUT`])
-/// union (`2 ×`) so a unioned-in semantic match is never truncated before the
-/// reranker scores it. Also bounds reranker cost (~0.39 s/candidate CPU →
-/// ≤ ~16 s worst case at 40; correctness-before-latency, GPU/int8 is the
-/// latency fast-follow). Mirrors the read pipeline's `RERANK_CANDIDATE_CAP`.
+/// union (`2 ×`). The pool is assembled recall-channels-first (graph + semantic
+/// lead, base hybrid last — see [`RerankedRetriever::retrieve_inner`]), so when
+/// graph hits push the pool past this cap the truncation trims the base hybrid's
+/// weak lexical tail rather than the bounded recall hits the cap protects. Also
+/// bounds reranker cost (~0.39 s/candidate CPU → ≤ ~16 s worst case at 40;
+/// correctness-before-latency, GPU/int8 is the latency fast-follow). Mirrors the
+/// read pipeline's `RERANK_CANDIDATE_CAP`.
 pub const RERANK_CANDIDATE_CAP: usize = 2 * SEARCH_CANDIDATE_FANOUT;
 
 /// A [`Retriever`] decorator: base retrieval → recall-union → cross-encoder
@@ -151,69 +159,53 @@ impl RerankedRetriever {
         self
     }
 
-    /// Union the semantic channel's top-[`SEARCH_CANDIDATE_FANOUT`] onto `hits`,
-    /// deduped by id. The reranker re-sorts the whole pool and drops below-floor
-    /// junk, so unioning extra candidates only widens recall — it cannot lower
-    /// precision. No-op when no semantic channel is wired. Mirrors
-    /// `StructuredReadPipeline::union_semantic_recall` (ADR-069).
-    async fn union_semantic_recall(
+    /// Fetch the semantic channel's top-[`SEARCH_CANDIDATE_FANOUT`] hits — the
+    /// ADR-069 recall-union source that rescues a strong pure-semantic match the
+    /// hybrid's RRF starves. Empty when no semantic channel is wired. The caller
+    /// ([`retrieve_inner`](Self::retrieve_inner)) deduplicates these against the
+    /// other channels when it assembles the rerank pool.
+    async fn semantic_recall_hits(
         &self,
-        mut hits: Vec<RetrievedMemory>,
         query_text: &str,
         boundaries: &[vault_core::Boundary],
     ) -> VaultResult<Vec<RetrievedMemory>> {
         let Some(semantic) = &self.semantic else {
-            return Ok(hits);
+            return Ok(Vec::new());
         };
-        let sem_hits = semantic
+        semantic
             .retrieve(RetrievalQuery {
                 query_text: query_text.to_string(),
                 authorized_boundaries: boundaries.to_vec(),
                 max_results: SEARCH_CANDIDATE_FANOUT,
                 options: RetrievalOptions::default(),
             })
-            .await?;
-        let present: std::collections::HashSet<vault_core::MemoryId> =
-            hits.iter().map(|h| h.memory.id).collect();
-        for h in sem_hits {
-            if !present.contains(&h.memory.id) {
-                hits.push(h);
-            }
-        }
-        Ok(hits)
+            .await
     }
 
-    /// Union the knowledge-graph channel's hits onto `hits`, deduped by id
-    /// (ADR-SEC-002 Part 2). Same recall-safe contract as
-    /// [`union_semantic_recall`](Self::union_semantic_recall): the reranker
-    /// re-sorts the whole pool and the structured-read `abstain` owns honesty,
-    /// so unioning graph candidates only widens recall for relational queries —
-    /// it can never lower precision. No-op when no graph channel is wired.
-    async fn union_graph_recall(
+    /// Fetch the knowledge-graph channel's hits for a relational query
+    /// (ADR-SEC-002 Part 2). Empty when no graph channel is wired. Same
+    /// recall-safe contract as the semantic channel: the reranker re-scores the
+    /// whole pool and the structured-read `abstain` owns honesty, so these
+    /// candidates can only widen recall — never lower precision. Graph hits are
+    /// few (bounded by the graph retriever's own candidate cap), which is why
+    /// they can lead the pool without crowding it (see the assembly note in
+    /// [`retrieve_inner`](Self::retrieve_inner)).
+    async fn graph_recall_hits(
         &self,
-        mut hits: Vec<RetrievedMemory>,
         query_text: &str,
         boundaries: &[vault_core::Boundary],
     ) -> VaultResult<Vec<RetrievedMemory>> {
         let Some(graph) = &self.graph else {
-            return Ok(hits);
+            return Ok(Vec::new());
         };
-        let graph_hits = graph
+        graph
             .retrieve(RetrievalQuery {
                 query_text: query_text.to_string(),
                 authorized_boundaries: boundaries.to_vec(),
                 max_results: SEARCH_CANDIDATE_FANOUT,
                 options: RetrievalOptions::default(),
             })
-            .await?;
-        let present: std::collections::HashSet<vault_core::MemoryId> =
-            hits.iter().map(|h| h.memory.id).collect();
-        for h in graph_hits {
-            if !present.contains(&h.memory.id) {
-                hits.push(h);
-            }
-        }
-        Ok(hits)
+            .await
     }
 
     /// Rerank the pool and re-sort by relevance DESC. **Reorder-only** — every
@@ -363,7 +355,7 @@ impl RerankedRetriever {
         //    small final top-K. `score_threshold` is dropped (see above);
         //    `include_archived` is preserved. Query-text validation propagates
         //    from the base.
-        let hits = self
+        let base_hits = self
             .base
             .retrieve(RetrievalQuery {
                 query_text: query_text.clone(),
@@ -376,15 +368,30 @@ impl RerankedRetriever {
             })
             .await?;
 
-        // 2. Recall-union (ADR-069): rescue strong semantic matches RRF starves,
-        //    then (ADR-SEC-002 Part 2) graph-connected memories for relational
-        //    queries. Both are reorder-only widens — the reranker judges them.
-        let pool = self
-            .union_semantic_recall(hits, &query_text, &boundaries)
-            .await?;
-        let pool = self
-            .union_graph_recall(pool, &query_text, &boundaries)
-            .await?;
+        // 2. Recall-union, assembled RECALL-CHANNELS-FIRST. The graph
+        //    (ADR-SEC-002 Part 2) and semantic (ADR-069) channels lead the pool;
+        //    the base hybrid is appended last. This ordering matters because
+        //    `rerank_pool` caps the pool at `RERANK_CANDIDATE_CAP` by trimming
+        //    its TAIL: a full pool must shed the base hybrid's weakest lexical
+        //    results, NOT the recall hits the cap exists to protect. (The bug
+        //    this fixes: the graph hit was unioned LAST, so `truncate` dropped
+        //    it before the reranker ever scored it — defeating the graph channel
+        //    in exactly the crowded vault its recall-insurance exists for.)
+        //    The reranker re-sorts the WHOLE pool by relevance next, so this
+        //    assembly order changes only which candidates survive truncation,
+        //    never the final ranking. Graph hits are few, so leading with them
+        //    costs the base hybrid only its weak tail.
+        let graph_hits = self.graph_recall_hits(&query_text, &boundaries).await?;
+        let semantic_hits = self.semantic_recall_hits(&query_text, &boundaries).await?;
+        let mut pool: Vec<RetrievedMemory> =
+            Vec::with_capacity(graph_hits.len() + semantic_hits.len() + base_hits.len());
+        let mut seen: std::collections::HashSet<vault_core::MemoryId> =
+            std::collections::HashSet::new();
+        for h in graph_hits.into_iter().chain(semantic_hits).chain(base_hits) {
+            if seen.insert(h.memory.id) {
+                pool.push(h);
+            }
+        }
 
         // 3. Rerank + re-sort by relevance. REORDER-ONLY — nothing is dropped, so
         //    the result is empty ONLY when the base pool was empty (genuinely no
@@ -520,6 +527,58 @@ mod tests {
     // ---------------------------------------------------------------------
     // Tests
     // ---------------------------------------------------------------------
+
+    /// REGRESSION GUARD (2026-06-29) — the graph hit must reach the reranker even
+    /// when `base ∪ semantic` already fill [`RERANK_CANDIDATE_CAP`]. This was RED
+    /// by design before the pool-assembly fix: the graph channel was unioned LAST
+    /// (pushed onto the tail), then `rerank_pool` does
+    /// `truncate(RERANK_CANDIDATE_CAP)`, so in a crowded relational query the
+    /// graph's connected fact was dropped BEFORE the reranker ever scored it —
+    /// reproducing the hard graph dogfood's graph-ON == graph-OFF (the 2-hop
+    /// St. Mary's specialty fact never surfaced under 40 hospital distractors).
+    /// The fix assembles the pool RECALL-CHANNELS-FIRST (graph + semantic lead,
+    /// base hybrid last), so a full pool now trims the base hybrid's weak tail
+    /// instead of the graph hit. If this fails again, that protection has
+    /// regressed and the graph channel is once more structurally defeated exactly
+    /// when it is needed most (a full pool = the scale it insures against).
+    #[tokio::test]
+    async fn graph_hit_survives_a_full_candidate_pool() {
+        let target = fake_memory(99, "the 2-hop graph answer fact", "personal");
+        // base: SEARCH_CANDIDATE_FANOUT distinct distractors (ids 1..=20).
+        let base_hits: Vec<RetrievedMemory> = (1..=SEARCH_CANDIDATE_FANOUT as u128)
+            .map(|n| retrieved(fake_memory(n, &format!("distractor {n}"), "personal"), 0.5))
+            .collect();
+        // semantic: SEARCH_CANDIDATE_FANOUT MORE distinct distractors (ids 21..=40)
+        // → base ∪ semantic = 2 * FANOUT = RERANK_CANDIDATE_CAP, a full pool.
+        let sem_hits: Vec<RetrievedMemory> = (SEARCH_CANDIDATE_FANOUT as u128 + 1
+            ..=2 * SEARCH_CANDIDATE_FANOUT as u128)
+            .map(|n| retrieved(fake_memory(n, &format!("distractor {n}"), "personal"), 0.5))
+            .collect();
+        assert_eq!(base_hits.len() + sem_hits.len(), RERANK_CANDIDATE_CAP);
+
+        let base = MockRetriever::new(base_hits);
+        let semantic = MockRetriever::new(sem_hits);
+        let graph = MockRetriever::new(vec![retrieved(target, 0.5)]);
+        // The reranker rates the graph's fact the single best answer; every
+        // distractor scores far below floor. So IF the graph hit reaches the
+        // reranker it must come back rank 1.
+        let reranker = MockReranker::new(vec![("the 2-hop graph answer fact", 9.0)], -10.0, -2.5);
+        let retriever =
+            RerankedRetriever::new(base, Some(semantic), reranker).with_graph(Some(graph));
+
+        let out = retriever
+            .retrieve(query("relational query naming an entity", 10))
+            .await
+            .expect("retrieve ok");
+
+        assert!(
+            out.iter()
+                .any(|h| h.memory.content == "the 2-hop graph answer fact"),
+            "graph hit must reach the reranker even when base ∪ semantic fill the cap; \
+             if this fails, truncate(RERANK_CANDIDATE_CAP) is dropping graph hits that \
+             are unioned last — the graph channel is nullified in a full pool"
+        );
+    }
 
     /// The core promise: the reranker re-orders a deep-but-correct answer to
     /// the top. Base ranks the right fact LAST; the reranker scores it highest;
