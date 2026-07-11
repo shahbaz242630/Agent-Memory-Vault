@@ -4,289 +4,142 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Memory Vault</title>
-    <style>
-      * { box-sizing: border-box; }
-      body {
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-        background: #1a1a1a;
-        color: #e0e0e0;
-        margin: 0;
-        padding: 0;
-        font-size: 14px;
-      }
-
-      /* Tab navigation */
-      .tabs {
-        display: flex;
-        background: #222;
-        border-bottom: 1px solid #333;
-      }
-      .tab {
-        padding: 0.75rem 1.5rem;
-        cursor: pointer;
-        color: #999;
-        border-bottom: 2px solid transparent;
-      }
-      .tab:hover { color: #e0e0e0; background: #2a2a2a; }
-      .tab.active {
-        color: #ff9800;
-        border-bottom-color: #ff9800;
-        background: #1a1a1a;
-      }
-
-      /* View containers */
-      .view { display: none; padding: 1.5rem; }
-      .view.active { display: block; }
-
-      /* Form controls */
-      label { display: block; margin: 1rem 0 0.25rem; font-weight: 600; color: #ccc; }
-      input[type="text"], textarea, select {
-        width: 100%;
-        background: #2a2a2a;
-        color: #e0e0e0;
-        border: 1px solid #444;
-        padding: 0.5rem;
-        border-radius: 4px;
-        font-family: inherit;
-        font-size: inherit;
-      }
-      textarea { min-height: 100px; resize: vertical; }
-      input[type="text"]:focus, textarea:focus, select:focus {
-        outline: none;
-        border-color: #ff9800;
-      }
-      .button {
-        background: #ff9800;
-        color: #000;
-        border: none;
-        padding: 0.5rem 1.25rem;
-        font-weight: 600;
-        cursor: pointer;
-        border-radius: 4px;
-        margin-top: 1rem;
-      }
-      .button:hover { background: #ffa726; }
-      .button:disabled { background: #555; color: #888; cursor: not-allowed; }
-
-      /* Output area */
-      .output {
-        margin-top: 1rem;
-        padding: 0.75rem;
-        background: #2a2a2a;
-        border: 1px solid #333;
-        border-radius: 4px;
-        font-family: ui-monospace, "Cascadia Mono", "Consolas", monospace;
-        font-size: 12px;
-        white-space: pre-wrap;
-        max-height: 400px;
-        overflow-y: auto;
-      }
-      .output.success { border-color: #4caf50; }
-      .output.error { border-color: #f44336; }
-
-      /* Search results */
-      .search-result {
-        background: #222;
-        border: 1px solid #333;
-        border-radius: 4px;
-        padding: 0.75rem;
-        margin-bottom: 0.75rem;
-      }
-      .search-result-meta {
-        font-size: 11px;
-        color: #999;
-        margin-bottom: 0.25rem;
-      }
-      .search-result-content {
-        color: #e0e0e0;
-        line-height: 1.4;
-      }
-      .search-result-actions {
-        margin-top: 0.5rem;
-        display: flex;
-        gap: 0.5rem;
-      }
-      .button-small {
-        padding: 0.25rem 0.75rem;
-        font-size: 12px;
-        background: #444;
-        color: #e0e0e0;
-      }
-      .button-small.danger { background: #b71c1c; }
-      .button-small:hover { background: #555; }
-      .button-small.danger:hover { background: #c62828; }
-
-      /* Settings view */
-      .settings-row {
-        padding: 0.75rem 0;
-        border-bottom: 1px solid #333;
-      }
-      .settings-label { font-weight: 600; color: #ccc; margin-bottom: 0.25rem; }
-      .settings-value { color: #999; font-family: ui-monospace, "Cascadia Mono", monospace; font-size: 12px; }
-      .settings-value.set { color: #4caf50; }
-
-      h1 { margin-top: 0; color: #ff9800; }
-    </style>
+    <link rel="stylesheet" href="styles.css" />
+    <script src="app.js" defer></script>
   </head>
   <body>
-    <div class="tabs">
-      <div class="tab active" data-view="add">Add Memory</div>
-      <div class="tab" data-view="search">Search</div>
-      <div class="tab" data-view="settings">Settings</div>
-    </div>
+    <div class="app">
 
-    <!-- Add view -->
-    <div id="add-view" class="view active">
-      <h1>Add Memory</h1>
-      <label for="add-content">Content</label>
-      <textarea id="add-content" placeholder="What do you want to remember?"></textarea>
-
-      <label for="add-memory-type">Memory Type</label>
-      <select id="add-memory-type">
-        <option value="semantic">Semantic (facts, knowledge)</option>
-        <option value="episodic">Episodic (events, experiences)</option>
-        <option value="procedural">Procedural (how-to, processes)</option>
-      </select>
-
-      <label for="add-boundary">Boundary</label>
-      <input type="text" id="add-boundary" value="default" />
-
-      <button class="button" id="add-submit">Add Memory</button>
-      <div id="add-output" class="output" style="display:none"></div>
-    </div>
-
-    <!-- Search view -->
-    <div id="search-view" class="view">
-      <h1>Search Memories</h1>
-      <label for="search-query">Query</label>
-      <input type="text" id="search-query" placeholder="What are you looking for?" />
-
-      <label for="search-limit">Max Results</label>
-      <!-- Phase 5e fix-forward (T0.1.12 dogfood Finding #1): default lowered from 10 to 3
-           to reduce visible-noise UX issue in V0.1. Underlying score_threshold filter is
-           None per commands.rs::search_memories_inner; lowering max_results caps the
-           visible result-card noise without picking an arbitrary score threshold without
-           empirical bge-small distribution data. V0.2 alpha-distribution adds proper
-           score_threshold UI input + result-card score color-coding + match-snippet rendering. -->
-      <input type="text" id="search-limit" value="3" />
-
-      <button class="button" id="search-submit">Search</button>
-      <div id="search-results" class="output" style="display:none"></div>
-    </div>
-
-    <!-- Settings view -->
-    <div id="settings-view" class="view">
-      <h1>Settings</h1>
-      <div class="settings-row">
-        <div class="settings-label">Master Key Provenance</div>
-        <div class="settings-value set">Windows Credential Manager (com.memoryvault.v0.2)</div>
+      <!-- ================= WELCOME ================= -->
+      <div id="screen-welcome" class="screen welcome hidden">
+        <div class="wordmark kicker">M E M O R Y&nbsp;&nbsp;V A U L T</div>
+        <div class="orb"><div class="orb-core"></div></div>
+        <h1>A quiet place for<br />everything they learn.</h1>
+        <p class="sub">Memory Vault keeps what your AI agents know about you — on your computer, encrypted, and entirely under your control.</p>
+        <div id="checks" class="checks"></div>
+        <button id="begin-btn" class="btn-pill">Begin set up</button>
+        <div id="begin-hint" class="begin-hint"></div>
       </div>
-      <div class="settings-row">
-        <div class="settings-label">Memory Vault Version</div>
-        <div class="settings-value">vault-tauri 0.1.0 (V0.2)</div>
+
+      <!-- ================= CONNECT AGENT ================= -->
+      <div id="screen-connect" class="screen onboard hidden">
+        <div class="kicker">STEP 2 OF 3</div>
+        <h1>Introduce your first agent.</h1>
+        <p class="sub">Any MCP-compatible agent can read and write your vault. Choose one to see how.</p>
+        <div id="agent-grid" class="agent-grid"></div>
+        <div id="snippet-wrap" class="snippet-wrap hidden">
+          <div class="snippet-head">
+            <span id="snippet-hint" class="snippet-hint"></span>
+            <button id="copy-snippet" class="copy-chip">copy</button>
+          </div>
+          <div id="snippet-code" class="snippet-code"></div>
+        </div>
+        <div class="onboard-foot">
+          <button id="connect-cta" class="btn-pill">Continue</button>
+          <button id="connect-skip" class="link-quiet">I'll connect an agent later</button>
+        </div>
       </div>
-      <div class="settings-row">
-        <div class="settings-label">Boundary Management</div>
-        <div class="settings-value">V0.1 hardcoded "default"; multi-boundary UI deferred to V0.2 alpha-distribution</div>
+
+      <!-- ================= FIRST MEMORY ================= -->
+      <div id="screen-memory" class="screen onboard memory-screen hidden">
+        <div class="kicker">STEP 3 OF 3</div>
+        <h1>What should they remember first?</h1>
+        <p class="sub">Something true about you. Your agents will recall it whenever it helps.</p>
+        <textarea id="mem-text" class="mv-input" placeholder="e.g. I run a small design studio in London. I prefer short, direct answers."></textarea>
+        <div id="mem-err" class="err-note" style="margin-top:16px"></div>
+        <div class="onboard-foot">
+          <button id="mem-save" class="btn-pill disabled">Keep this memory</button>
+          <button id="mem-skip" class="link-quiet">skip for now</button>
+        </div>
       </div>
-    </div>
 
-    <script type="module">
-      const { invoke } = window.__TAURI__.core;
+      <!-- onboarding progress dots -->
+      <div id="progress-dots" class="progress-dots hidden">
+        <span></span><span></span><span></span>
+      </div>
 
-      // Tab switching
-      document.querySelectorAll(".tab").forEach((tab) => {
-        tab.addEventListener("click", () => {
-          const view = tab.dataset.view;
-          document.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
-          document.querySelectorAll(".view").forEach((v) => v.classList.remove("active"));
-          tab.classList.add("active");
-          document.getElementById(`${view}-view`).classList.add("active");
-        });
-      });
+      <!-- ================= HOME ================= -->
+      <div id="screen-home" class="screen home hidden">
+        <div class="topbar">
+          <div class="brand">
+            <div class="dot"></div>
+            <span class="nm">Memory Vault</span>
+          </div>
+          <div id="nav" class="nav"></div>
+        </div>
 
-      // Add memory
-      document.getElementById("add-submit").addEventListener("click", async () => {
-        const btn = document.getElementById("add-submit");
-        const out = document.getElementById("add-output");
-        btn.disabled = true;
-        out.style.display = "block";
-        out.classList.remove("success", "error");
-        out.textContent = "Adding memory...";
-        try {
-          const id = await invoke("add_memory", {
-            content: document.getElementById("add-content").value,
-            memoryType: document.getElementById("add-memory-type").value,
-            boundary: document.getElementById("add-boundary").value,
-          });
-          out.classList.add("success");
-          out.textContent = `Added memory: ${id}`;
-          document.getElementById("add-content").value = "";
-        } catch (err) {
-          out.classList.add("error");
-          out.textContent = `Error: ${err}`;
-        } finally {
-          btn.disabled = false;
-        }
-      });
+        <div id="toast-wrap" class="toast-wrap hidden">
+          <div class="toast">Your vault is ready. First memory kept. ✓</div>
+        </div>
 
-      // Search memories
-      document.getElementById("search-submit").addEventListener("click", async () => {
-        const btn = document.getElementById("search-submit");
-        const out = document.getElementById("search-results");
-        btn.disabled = true;
-        out.style.display = "block";
-        out.classList.remove("success", "error");
-        out.textContent = "Searching...";
-        try {
-          const limit = parseInt(document.getElementById("search-limit").value, 10) || 10;
-          const results = await invoke("search_memories", {
-            query: document.getElementById("search-query").value,
-            limit,
-          });
-          out.classList.add("success");
-          if (results.length === 0) {
-            out.textContent = "No matching memories found.";
-          } else {
-            out.innerHTML = results
-              .map(
-                (r) => `
-              <div class="search-result">
-                <div class="search-result-meta">id: ${escapeHtml(r.id)} · score: ${r.score.toFixed(3)} · boundary: ${escapeHtml(r.boundary)} · type: ${escapeHtml(r.memory_type)} · ${escapeHtml(r.created_at)}</div>
-                <div class="search-result-content">${escapeHtml(r.content)}</div>
-                <div class="search-result-actions">
-                  <button class="button-small danger" data-id="${escapeHtml(r.id)}" data-action="delete">Delete</button>
-                </div>
+        <!-- memories tab -->
+        <div id="tab-memories" class="tab-pane home" style="overflow:hidden">
+          <div class="recall-hero">
+            <div class="headline">What would you like to recall?</div>
+            <input id="search-input" class="mv-input" placeholder="⌕  Search your memories…" />
+            <div class="kbd-hint">or press <span class="kbd">Ctrl K</span> anywhere</div>
+          </div>
+          <div class="mem-list-wrap">
+            <div class="mem-list-head">
+              <span id="mem-list-title" class="mem-list-title">Recently remembered</span>
+              <button id="add-toggle" class="link-quiet">+ Add a memory</button>
+            </div>
+            <div id="inline-add" class="inline-add hidden">
+              <textarea id="add-text" class="mv-input" placeholder="Something worth remembering…"></textarea>
+              <div class="chip-row">
+                <span class="chip-lbl">This is:</span>
+                <span id="add-chips" class="chip-row" style="margin:0"></span>
               </div>
-            `
-              )
-              .join("");
-            // Wire delete buttons
-            out.querySelectorAll('[data-action="delete"]').forEach((btn) => {
-              btn.addEventListener("click", async () => {
-                if (!confirm(`Delete memory ${btn.dataset.id}? This cannot be undone.`)) return;
-                try {
-                  await invoke("delete_memory", { id: btn.dataset.id });
-                  btn.closest(".search-result").remove();
-                } catch (err) {
-                  alert(`Delete failed: ${err}`);
-                }
-              });
-            });
-          }
-        } catch (err) {
-          out.classList.add("error");
-          out.textContent = `Error: ${err}`;
-        } finally {
-          btn.disabled = false;
-        }
-      });
+              <div class="actions">
+                <button id="add-save" class="btn-pill">Keep this memory</button>
+                <button id="add-cancel" class="link-quiet">cancel</button>
+                <span id="add-err" class="err-note"></span>
+              </div>
+            </div>
+            <div id="mem-rows"></div>
+          </div>
+        </div>
 
-      function escapeHtml(s) {
-        return String(s).replace(/[&<>"']/g, (c) => ({
-          "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
-        }[c]));
-      }
-    </script>
+        <!-- boundaries tab -->
+        <div id="tab-boundaries" class="tab-pane tab-body hidden">
+          <div class="headline">Who can see what.</div>
+          <p class="sub">Boundaries keep memories separated. An agent only reads the boundaries you grant it.</p>
+          <div id="boundary-rows" class="tab-rows"></div>
+          <p class="boundary-note">Everything currently lives in <b>default</b>. Creating more boundaries — like <i>personal</i>, <i>work</i>, or <i>health</i> — and granting agents per-boundary access arrives in the next update.</p>
+        </div>
+
+        <!-- agents tab -->
+        <div id="tab-agents" class="tab-pane tab-body hidden">
+          <div class="headline">Your agents.</div>
+          <p class="sub">Agents you've set up on this device. Everything they read or write is recorded in the audit log.</p>
+          <div id="agent-rows" class="tab-rows"></div>
+          <div id="no-agents" class="empty-note hidden">No agents connected yet.</div>
+          <div class="center-link">
+            <button id="connect-panel-label" class="link-underline">+ Connect an agent</button>
+          </div>
+          <div id="agents-panel" class="agents-panel hidden">
+            <div class="snippet-head">
+              <span class="snippet-hint">Add this to your agent's MCP config:</span>
+              <button id="copy-agents-snippet" class="copy-chip">copy</button>
+            </div>
+            <div id="agents-snippet" class="snippet-code"></div>
+          </div>
+        </div>
+
+        <!-- settings tab -->
+        <div id="tab-settings" class="tab-pane tab-body settings-body hidden">
+          <div class="headline">Settings.</div>
+          <div id="settings-rows" class="tab-rows"></div>
+          <div class="settings-actions">
+            <button id="replay-welcome" class="link-underline">Replay welcome</button>
+          </div>
+        </div>
+
+        <div class="statusbar">
+          <span class="st"></span><span id="footer-status"></span>
+        </div>
+      </div>
+
+    </div>
   </body>
 </html>

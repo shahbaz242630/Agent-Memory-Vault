@@ -10,9 +10,11 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "Memory Vault — Alpha",
+        "title": "Memory Vault",
         "width": 900,
         "height": 700,
+        "minWidth": 900,
+        "minHeight": 700,
         "resizable": true
       }
     ],
