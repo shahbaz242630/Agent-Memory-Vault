@@ -15,6 +15,7 @@
     "allow-create-boundary",
     "allow-list-agents",
     "allow-revoke-agent",
-    "allow-get-settings-info"
+    "allow-get-settings-info",
+    "allow-ensure-recall-engine"
   ]
 }

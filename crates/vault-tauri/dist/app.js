@@ -9,6 +9,12 @@ const invoke = window.__TAURI__ && window.__TAURI__.core
   ? window.__TAURI__.core.invoke
   : async () => { throw new Error("vault engine not connected (running outside Tauri)"); };
 
+// Same guard for the event bridge. Used only for first-run acquisition
+// progress; outside Tauri this is a no-op so the UI still renders.
+const listenEvent = window.__TAURI__ && window.__TAURI__.event
+  ? window.__TAURI__.event.listen
+  : async () => () => {};
+
 // ---------------------------------------------------------------- utilities
 
 function esc(s) {
@@ -140,6 +146,52 @@ const CHECK_DEFS = [
 ];
 const SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const CHECK_MS = 2800; // per-check animation duration — one line completes fully before the next appears
+
+// ------------------------------------------------- first-run acquisition
+//
+// On a fresh install the recall engine's files are not on disk yet. They are
+// fetched in the background while the user works through onboarding (founder
+// decision 2026-07-20: the download OVERLAPS setup rather than blocking it),
+// and onboarding completion GATES on the fetch so nobody reaches search
+// before the engine is fully prepared.
+//
+// Until it completes, search still works — it just ranks less sharply
+// (ADR-089). Nothing here is load-bearing for correctness; it is about not
+// handing someone a half-prepared engine as their first impression.
+//
+// White-label (ADR-086): "recall engine", never a model or runtime name.
+const engineFetch = {
+  percent: 0,
+  active: false,   // a transfer has actually reported bytes
+  done: false,
+  failed: false,
+  waiting: false,  // onboarding is currently blocked on the fetch
+  tick: 0,
+  promise: null,
+};
+
+// Kick off (or join) acquisition. Idempotent on both sides: the Rust command
+// shares one transfer between concurrent callers, and `promise` keeps the JS
+// side from stacking invocations. On failure `promise` is cleared so a retry
+// genuinely re-attempts instead of re-awaiting the settled rejection.
+function startEngineFetch() {
+  if (engineFetch.done) return Promise.resolve();
+  if (engineFetch.promise) return engineFetch.promise;
+  engineFetch.failed = false;
+  engineFetch.promise = invoke("ensure_recall_engine")
+    .then(() => {
+      engineFetch.done = true;
+      engineFetch.percent = 100;
+      renderEngineRow();
+    })
+    .catch((err) => {
+      engineFetch.failed = true;
+      engineFetch.promise = null;
+      renderEngineRow();
+      throw err;
+    });
+  return engineFetch.promise;
+}
 
 // MCP connection snippets use the REAL entry point: `vault-cli mcp serve`
 // (stdio, 1:1) — cross-agent proven (Claude / Cursor / Codex).
@@ -279,6 +331,45 @@ function runChecks() {
   }
 }
 
+// A fourth boot-check row, rendered ONLY while a transfer is genuinely in
+// flight. Honest UI (ADR-086): when the files are already present nothing
+// appears at all — the app never claims work it did not do. That is also why
+// this row is created on the first progress event rather than up front.
+function renderEngineRow() {
+  const host = $("checks");
+  if (!host) return;
+  let row = $("check-engine");
+
+  if (engineFetch.done || (!engineFetch.active && !engineFetch.failed)) {
+    if (row) row.remove();
+    return;
+  }
+
+  if (!row) {
+    row = document.createElement("div");
+    row.id = "check-engine";
+    row.className = "check-item active";
+    const ico = document.createElement("span");
+    ico.className = "ico";
+    const lbl = document.createElement("span");
+    lbl.className = "lbl";
+    row.append(ico, lbl);
+    host.appendChild(row);
+  }
+
+  const ico = row.querySelector(".ico");
+  const lbl = row.querySelector(".lbl");
+  if (engineFetch.failed) {
+    row.className = "check-item done";
+    ico.textContent = "[!]";
+    lbl.textContent = "couldn't finish preparing the recall engine — you can retry in a moment";
+    return;
+  }
+  row.className = "check-item active";
+  ico.textContent = SPIN[engineFetch.tick % SPIN.length];
+  lbl.textContent = `preparing recall engine — ${engineFetch.percent}%`;
+}
+
 function renderBeginState() {
   const ready = state.checksDone >= CHECK_DEFS.length;
   // The Begin button stays invisible (space reserved) until every check
@@ -363,7 +454,58 @@ async function saveFirstMemory() {
   }
 }
 
-function finishOnboarding(withToast) {
+// Reflect "still preparing" on the last onboarding screen. The two buttons
+// that leave onboarding are disabled while we wait, so the gate cannot be
+// clicked past, and the message carries the live percentage so the wait never
+// looks like a hang.
+function renderFinishWait() {
+  const waiting = engineFetch.waiting;
+  const save = $("mem-save");
+  const skip = $("mem-skip");
+  if (save) save.classList.toggle("disabled", waiting);
+  if (skip) skip.classList.toggle("disabled", waiting);
+  if (!waiting) return;
+  const err = $("mem-err");
+  if (err) {
+    err.textContent = engineFetch.failed
+      ? "Couldn't finish preparing the recall engine. Check your connection — retrying."
+      : `Finishing setup — preparing your recall engine (${engineFetch.percent}%)…`;
+  }
+}
+
+// Onboarding completion GATES on acquisition (founder decision 2026-07-20).
+// The download has been running underneath the previous screens; by the time
+// most people reach here it is already done and this returns immediately.
+// When it is not, we wait rather than dropping the user into a vault whose
+// engine is still half-prepared.
+//
+// Note this is the ONLY gate: a returning user (`mv_onboarded` already true)
+// goes straight to the home screen without passing through here. That is
+// exactly why an unprepared engine has to DEGRADE rather than error
+// (ADR-089) — the gate cannot cover them, so the engine must cope without it.
+async function finishOnboarding(withToast) {
+  // Re-entrancy guard: `.disabled` is a visual class, so a second click can
+  // still reach here while the first is awaiting.
+  if (engineFetch.waiting) return;
+  if (!engineFetch.done) {
+    engineFetch.waiting = true;
+    renderFinishWait();
+    try {
+      await startEngineFetch();
+    } catch {
+      // Do not strand the user mid-onboarding. Surface the failure, let them
+      // through, and leave search on the degraded path until a later attempt
+      // succeeds — a vault they can use beats a modal they cannot dismiss.
+      engineFetch.waiting = false;
+      renderFinishWait();
+      const err = $("mem-err");
+      if (err) {
+        err.textContent = "Couldn't finish preparing the recall engine — continuing anyway. Recall will sharpen once it completes.";
+      }
+    }
+    engineFetch.waiting = false;
+    renderFinishWait();
+  }
   store.set("mv_onboarded", true);
   showScreen("home");
   if (withToast) {
@@ -786,6 +928,28 @@ function init() {
 
   // home — settings
   $("replay-welcome").addEventListener("click", replayWelcome);
+
+  // First-run acquisition. Started for EVERY launch, not just onboarding
+  // ones: a returning user whose files were never fetched (or were removed)
+  // has no onboarding gate to pass through, so this is their only route to a
+  // fully prepared engine. It short-circuits once the files are present and
+  // verified, and runs entirely in the background — nothing here blocks the
+  // window from appearing.
+  listenEvent("recall-engine://progress", (event) => {
+    const p = event && event.payload;
+    if (!p) return;
+    engineFetch.percent = typeof p.percent === "number" ? p.percent : 0;
+    engineFetch.active = true;
+    engineFetch.tick += 1;
+    renderEngineRow();
+    renderFinishWait();
+  }).catch(() => { /* no event bridge outside Tauri — progress just stays hidden */ });
+
+  startEngineFetch().catch(() => {
+    // Swallowed here on purpose: a background failure must not throw during
+    // init. It is surfaced where it matters — the onboarding gate retries and
+    // reports, and search degrades gracefully meanwhile (ADR-089).
+  });
 
   showScreen(state.screen);
 }

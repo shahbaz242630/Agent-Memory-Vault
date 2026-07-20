@@ -282,6 +282,21 @@ impl ToolInvokeError {
                 category: "ConsolidatorTimeout".to_string(),
                 message: format!("hard budget exceeded after {elapsed_secs}s"),
             },
+            // ADR-089 (2026-07-20): an optional model component is absent —
+            // the ordinary state of an install whose first-run download has
+            // not landed. Should NEVER reach the audit path: both rerank
+            // consumers catch this variant and degrade (see
+            // `RerankedRetriever::rerank_pool` /
+            // `StructuredReadPipeline::apply_reranker`), so a tool call never
+            // fails with it. Recorded defensively with its own category so
+            // that if one ever DOES surface here, the audit log names it
+            // rather than burying it — an unexpected `ModelUnavailable` in
+            // the chain means a degrade path was missed, which is exactly the
+            // kind of regression worth being able to grep for.
+            VaultError::ModelUnavailable { component } => Self::Internal {
+                category: "ModelUnavailable".to_string(),
+                message: component.clone(),
+            },
         }
     }
 }

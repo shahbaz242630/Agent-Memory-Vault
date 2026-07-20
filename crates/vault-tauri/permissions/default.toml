@@ -18,6 +18,7 @@ permissions = [
   "allow-list-agents",
   "allow-revoke-agent",
   "allow-get-settings-info",
+  "allow-ensure-recall-engine",
 ]
 
 [[permission]]
@@ -72,3 +73,10 @@ commands.allow = ["revoke_agent"]
 identifier = "allow-get-settings-info"
 description = "Allow invoking the get_settings_info command (vault path, version, counts, audit-chain verification result)."
 commands.allow = ["get_settings_info"]
+
+# First-run acquisition (ADR-089).
+
+[[permission]]
+identifier = "allow-ensure-recall-engine"
+description = "Allow invoking the ensure_recall_engine command (fetch and integrity-verify the recall engine's files on first run). Takes no parameters — the destination, source and expected hashes are all fixed at build time."
+commands.allow = ["ensure_recall_engine"]

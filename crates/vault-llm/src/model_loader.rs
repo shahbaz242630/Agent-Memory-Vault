@@ -98,6 +98,31 @@ fn compute_sha256_of_file_blocking(path: &Path) -> VaultLlmResult<[u8; 32]> {
     Ok(hasher.finalize().into())
 }
 
+/// Bytes transferred so far for one file, reported to a progress callback.
+///
+/// `total_bytes` is the caller's EXPECTED size (the pinned constant), not the
+/// server's `Content-Length`. The two are cross-checked by the
+/// streaming-abort heuristic before any progress is reported, and using the
+/// pinned value keeps the denominator stable even if a server omits the
+/// header — a progress bar that can jump to a different total mid-download is
+/// worse than no progress bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DownloadProgress {
+    /// Bytes written to the in-flight `.partial` file so far.
+    pub downloaded_bytes: u64,
+    /// Expected total size of this file, in bytes.
+    pub total_bytes: u64,
+}
+
+/// Emit a progress callback at most once per this many bytes.
+///
+/// Byte-quantised rather than time-quantised on purpose: it keeps the callback
+/// cadence deterministic (so a test can assert exactly how many times it
+/// fires) and avoids a clock read per chunk. At 8 MB this is ~143 callbacks
+/// across the 1.15 GB reranker — smooth enough for a progress bar, far too
+/// coarse to flood the Tauri event channel.
+const PROGRESS_EMIT_INTERVAL_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Ensure the model file is available at `path` with verified SHA-256.
 ///
 /// Three operational paths converge here per ADR-043:
@@ -106,12 +131,38 @@ fn compute_sha256_of_file_blocking(path: &Path) -> VaultLlmResult<[u8; 32]> {
 ///    from this function's POV (no distinction in the runtime behavior).
 /// 3. **Fresh download**: file absent OR hash mismatch → stream from `url`,
 ///    hash on the fly, atomic rename to final path on hash pass.
+///
+/// Reports no progress. Use [`ensure_model_at_path_with_progress`] when a UI
+/// has to show the transfer.
 pub async fn ensure_model_at_path(
     path: &Path,
     url: &str,
     expected_sha256_hex: &str,
     expected_bytes: u64,
 ) -> VaultLlmResult<()> {
+    ensure_model_at_path_with_progress(path, url, expected_sha256_hex, expected_bytes, |_| {}).await
+}
+
+/// As [`ensure_model_at_path`], but invokes `on_progress` as bytes arrive.
+///
+/// The callback fires roughly every [`PROGRESS_EMIT_INTERVAL_BYTES`], plus
+/// once at completion so a UI always lands on 100% rather than stalling at the
+/// last partial interval. It does NOT fire on the cache-hit path — a cached
+/// file transfers nothing, and reporting fake progress for it would make the
+/// first-run UI claim work it never did.
+///
+/// The callback runs inline on the download task, so it must be cheap and must
+/// not block; anything expensive belongs behind a channel.
+pub async fn ensure_model_at_path_with_progress<F>(
+    path: &Path,
+    url: &str,
+    expected_sha256_hex: &str,
+    expected_bytes: u64,
+    on_progress: F,
+) -> VaultLlmResult<()>
+where
+    F: FnMut(DownloadProgress),
+{
     let file_label = display_label(path);
 
     if path.exists() {
@@ -132,15 +183,19 @@ pub async fn ensure_model_at_path(
         std::fs::remove_file(path)?;
     }
 
-    download_with_verify(path, url, expected_sha256_hex, expected_bytes).await
+    download_with_verify(path, url, expected_sha256_hex, expected_bytes, on_progress).await
 }
 
-async fn download_with_verify(
+async fn download_with_verify<F>(
     path: &Path,
     url: &str,
     expected_sha256_hex: &str,
     expected_bytes: u64,
-) -> VaultLlmResult<()> {
+    mut on_progress: F,
+) -> VaultLlmResult<()>
+where
+    F: FnMut(DownloadProgress),
+{
     let file_label = display_label(path);
     tracing::info!(
         file = %file_label,
@@ -176,14 +231,36 @@ async fn download_with_verify(
     let mut hasher = Sha256::new();
     let mut stream = resp.bytes_stream();
 
+    let mut downloaded: u64 = 0;
+    let mut last_reported: u64 = 0;
+
     while let Some(chunk_result) = stream.next().await {
         let chunk = chunk_result
             .map_err(|e| VaultLlmError::DownloadFailed(format!("stream chunk: {e}")))?;
         hasher.update(&chunk);
         file.write_all(&chunk).await?;
+
+        downloaded = downloaded.saturating_add(chunk.len() as u64);
+        if downloaded - last_reported >= PROGRESS_EMIT_INTERVAL_BYTES {
+            last_reported = downloaded;
+            on_progress(DownloadProgress {
+                downloaded_bytes: downloaded,
+                total_bytes: expected_bytes,
+            });
+        }
     }
     file.flush().await?;
     drop(file);
+
+    // Always land on a final report. Without this the last partial interval
+    // would leave a progress bar short of 100% while the (potentially long)
+    // hash verification runs, which reads as a stall.
+    if downloaded != last_reported {
+        on_progress(DownloadProgress {
+            downloaded_bytes: downloaded,
+            total_bytes: expected_bytes,
+        });
+    }
 
     let actual = hex::encode(hasher.finalize());
     if actual != expected_sha256_hex {

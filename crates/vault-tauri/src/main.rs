@@ -118,6 +118,7 @@ fn main() {
             vault_tauri::commands::agent::list_agents,
             vault_tauri::commands::agent::revoke_agent,
             vault_tauri::commands::settings::get_settings_info,
+            vault_tauri::commands::engine::ensure_recall_engine,
         ])
         .setup(|app| {
             // 1. Resolve libonnxruntime dylib path per ADR-019.
@@ -269,10 +270,24 @@ fn main() {
             // in-process scheduling that may re-evaluate this default.
             // ADR-087: resolve the reranker before building AppConfig. Never
             // fatal — absent files degrade ranking, they do not block startup.
-            let reranker_paths = resolve_reranker_paths(&data_dir);
-            if reranker_paths.is_some() {
-                tracing::info!("reranker files resolved — read relevance gate active");
-            }
+            //
+            // ADR-089: these are passed unconditionally, EVEN IF THE FILES ARE
+            // NOT THERE YET, and that is deliberate. `LazyQwen3Reranker` binds
+            // paths at construction but opens the model on first use, so a
+            // download that lands after startup is picked up by the next query
+            // with no relaunch and no re-init of `Application`. Gating on
+            // `exists()` here would have frozen the decision at startup and
+            // made a first-run download take effect only on the SECOND launch.
+            //
+            // This is only safe because an absent model now degrades instead
+            // of failing (ADR-089): until the bytes arrive, search and read
+            // return the retriever's own order rather than erroring.
+            let (rerank_model, rerank_tokenizer) = resolve_reranker_paths(&data_dir);
+            tracing::info!(
+                model = %rerank_model.display(),
+                present = rerank_model.exists() && rerank_tokenizer.exists(),
+                "reranker paths bound (loaded lazily on first query)"
+            );
 
             let config = AppConfig {
                 metadata_path,
@@ -285,12 +300,11 @@ fn main() {
                 at_rest_key,
                 qwen_model_path: None,
                 phi4_model_path: None,
-                // ADR-087: the reranker IS wired now. The previous
-                // unconditional `None` predated UI slice 1 and left the
-                // desktop app ranking on the cosine gate. `None` here now
-                // means "files genuinely absent", not "not supported".
-                rerank_model_path: reranker_paths.as_ref().map(|(m, _)| m.clone()),
-                rerank_tokenizer_path: reranker_paths.as_ref().map(|(_, t)| t.clone()),
+                // ADR-087 wired the reranker; ADR-089 makes the binding
+                // unconditional so a first-run download takes effect in the
+                // session that fetched it. Absent files degrade at query time.
+                rerank_model_path: Some(rerank_model),
+                rerank_tokenizer_path: Some(rerank_tokenizer),
             };
 
             // 6. Construct Application and spawn the cascading retry
@@ -335,6 +349,15 @@ fn main() {
             //    deliberate lifecycle).
             app.manage(application);
             app.manage(_shutdown_sender);
+
+            // 8. First-run acquisition state (ADR-089). Bound to the same
+            //    models directory `resolve_reranker_paths` resolves against,
+            //    so what the download writes is exactly what the reranker
+            //    later opens. Managed rather than created per-call so
+            //    concurrent callers share one transfer.
+            app.manage(vault_tauri::commands::engine::RecallEngineFetch::new(
+                data_dir.join("models"),
+            ));
 
             Ok(())
         });
@@ -411,7 +434,7 @@ fn resolve_model_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 /// transport that flow will call. Until then this resolves what is already
 /// present — which covers dev fixtures via the env overrides, and any install
 /// where the files have been fetched or placed by hand.
-fn resolve_reranker_paths(data_dir: &std::path::Path) -> Option<(PathBuf, PathBuf)> {
+fn resolve_reranker_paths(data_dir: &std::path::Path) -> (PathBuf, PathBuf) {
     // Dev override: both must be set together. A half-configured pair is
     // treated as unset rather than silently pairing an override with a
     // default — mismatched model/tokenizer is the insidious failure class
@@ -420,19 +443,11 @@ fn resolve_reranker_paths(data_dir: &std::path::Path) -> Option<(PathBuf, PathBu
         env_override_for("VAULT_RERANK_MODEL_PATH"),
         env_override_for("VAULT_RERANK_TOKENIZER_PATH"),
     ) {
-        return Some((model, tokenizer));
+        return (model, tokenizer);
     }
 
     let paths = model_fetch::reranker_paths_in(&data_dir.join("models"));
-    if paths.model.exists() && paths.tokenizer.exists() {
-        Some((paths.model, paths.tokenizer))
-    } else {
-        tracing::info!(
-            "reranker model files not present — search runs on the cosine gate \
-             until first-run download completes (ADR-087)"
-        );
-        None
-    }
+    (paths.model, paths.tokenizer)
 }
 
 /// Resolve bundled tokenizer.json path. Dev-mode override via

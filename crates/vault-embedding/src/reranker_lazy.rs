@@ -87,6 +87,35 @@ impl LazyQwen3Reranker {
     async fn provider(&self) -> VaultResult<Arc<Qwen3RerankerProvider>> {
         self.inner
             .get_or_try_init(|| async {
+                // ADR-089: an ABSENT file is the ordinary state of an install
+                // whose first-run download has not landed yet — not a fault.
+                // Classify it before attempting the load, so the caller can
+                // degrade to the un-reranked path instead of failing the
+                // whole query. A file that IS present but hashes wrong still
+                // falls through to `open` and fails fatally there: absent and
+                // tampered are deliberately different outcomes.
+                //
+                // Only the two DOWNLOADED files are treated this way. The ORT
+                // dylib is installer-bundled, so its absence is a corrupt
+                // install rather than a pending download, and it is left to
+                // fail loudly through `open`.
+                for (component, path) in [
+                    ("reranker-model", &self.model_path),
+                    ("reranker-tokenizer", &self.tokenizer_path),
+                ] {
+                    if !path.exists() {
+                        tracing::debug!(
+                            target: "vault_embedding::reranker",
+                            component,
+                            "reranker component not present — reporting unavailable so the \
+                             caller can degrade (ADR-089)"
+                        );
+                        return Err(VaultError::ModelUnavailable {
+                            component: component.to_string(),
+                        });
+                    }
+                }
+
                 let model = self.model_path.clone();
                 let tokenizer = self.tokenizer_path.clone();
                 let ort_lib = self.ort_lib_path.clone();
@@ -206,17 +235,90 @@ mod tests {
             .await
             .expect_err("bogus model path must fail the deferred load");
         assert!(
-            matches!(
-                err,
-                VaultError::Embedding(_)
-                    | VaultError::ModelIntegrityFailed { .. }
-                    | VaultError::Io(_)
-            ),
-            "expected a load failure, got {err:?}"
+            matches!(err, VaultError::ModelUnavailable { .. }),
+            "absent files must report unavailable so the caller can degrade, got {err:?}"
         );
         assert!(
             !lazy.is_loaded(),
             "a failed load must leave the cell cold for retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_files_report_unavailable_and_name_the_missing_component() {
+        // ADR-089: the pre-download state. This is what lets the read/search
+        // paths degrade instead of erroring while the first-run fetch is
+        // still in flight.
+        let lazy = bogus();
+        let err = lazy
+            .rerank("q", &["a candidate".to_string()])
+            .await
+            .expect_err("absent files must not load");
+        match err {
+            VaultError::ModelUnavailable { component } => {
+                assert_eq!(
+                    component, "reranker-model",
+                    "the model is checked first, so it is the component named"
+                );
+            }
+            other => panic!("expected ModelUnavailable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tokenizer_that_is_absent_alone_is_still_reported_unavailable() {
+        // Only one of the two files present — still the pre-download state.
+        // Guards against a check that only looks at the model path.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let model = dir.path().join("model.onnx");
+        std::fs::write(&model, b"not the real model").expect("write model");
+        let tokenizer = dir.path().join("tokenizer.json");
+
+        let lazy = LazyQwen3Reranker::new(&model, &tokenizer, Path::new("/nonexistent/ort"));
+        let err = lazy
+            .rerank("q", &["a candidate".to_string()])
+            .await
+            .expect_err("absent tokenizer must not load");
+        match err {
+            VaultError::ModelUnavailable { component } => {
+                assert_eq!(component, "reranker-tokenizer");
+            }
+            other => panic!("expected ModelUnavailable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn present_but_corrupt_files_fail_integrity_not_unavailable() {
+        // THE security-critical half of ADR-089, and the reason absent and
+        // tampered are separate variants. Both files exist here, so the
+        // pre-download check passes and the load proceeds to SHA-256
+        // verification — which rejects them. If this ever returned
+        // `ModelUnavailable`, a tampered model file would silently take the
+        // degrade path and the vault would quietly stop verifying what it
+        // loads (BRD §11.12 vault-embedding: "Model files signed and verified
+        // before loading").
+        //
+        // Note this needs no 1.15 GB fixture: integrity is checked before the
+        // ORT session is ever built, so junk bytes fail at the hash gate.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let model = dir.path().join("model.onnx");
+        let tokenizer = dir.path().join("tokenizer.json");
+        std::fs::write(&model, b"tampered model bytes").expect("write model");
+        std::fs::write(&tokenizer, b"tampered tokenizer bytes").expect("write tokenizer");
+
+        let lazy = LazyQwen3Reranker::new(&model, &tokenizer, Path::new("/nonexistent/ort"));
+        let err = lazy
+            .rerank("q", &["a candidate".to_string()])
+            .await
+            .expect_err("corrupt files must fail the load");
+        assert!(
+            !matches!(err, VaultError::ModelUnavailable { .. }),
+            "a present-but-wrong file must NEVER classify as merely unavailable — \
+             that would let a tampered model through the degrade path; got {err:?}"
+        );
+        assert!(
+            matches!(err, VaultError::ModelIntegrityFailed { .. }),
+            "expected an integrity failure, got {err:?}"
         );
     }
 

@@ -38,6 +38,7 @@ const COMMAND_SOURCES: &[(&str, &str)] = &[
     ("boundary.rs", include_str!("../src/commands/boundary.rs")),
     ("agent.rs", include_str!("../src/commands/agent.rs")),
     ("settings.rs", include_str!("../src/commands/settings.rs")),
+    ("engine.rs", include_str!("../src/commands/engine.rs")),
 ];
 
 const MAIN_RS: &str = include_str!("../src/main.rs");
@@ -305,6 +306,52 @@ fn extractors_find_the_expected_command_surface() {
         registered, permitted,
         "registered and permitted command sets must match exactly"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Guard 3 — the progress event name must agree across the language boundary
+// ---------------------------------------------------------------------------
+
+/// The event channel is a bare string declared independently in Rust
+/// (`engine.rs::PROGRESS_EVENT`) and in JS (`app.js`'s listener). Nothing at
+/// compile time connects them: rename one and the download still runs, the
+/// UI still loads, and the progress bar simply never moves — a silent
+/// failure of exactly the kind the command-wiring guard exists to prevent.
+#[test]
+fn progress_event_name_matches_between_rust_and_the_frontend() {
+    const ENGINE_RS: &str = include_str!("../src/commands/engine.rs");
+
+    let declared = collect_between(ENGINE_RS, "pub const PROGRESS_EVENT: &str = \"", "\"")
+        .into_iter()
+        .next()
+        .expect("engine.rs must declare PROGRESS_EVENT as a string literal");
+
+    assert!(
+        APP_JS.contains(&format!("listenEvent(\"{declared}\"")),
+        "dist/app.js must listen on the event name Rust emits.\n\
+         Rust declares PROGRESS_EVENT = \"{declared}\", but app.js does not \
+         listen for it. First-run progress would silently never appear."
+    );
+}
+
+/// ADR-086 white-label: the event name crosses into frontend source, so it is
+/// one rename away from putting a model name in the UI layer.
+#[test]
+fn progress_event_name_does_not_leak_the_stack() {
+    const ENGINE_RS: &str = include_str!("../src/commands/engine.rs");
+    let declared = collect_between(ENGINE_RS, "pub const PROGRESS_EVENT: &str = \"", "\"")
+        .into_iter()
+        .next()
+        .expect("engine.rs must declare PROGRESS_EVENT");
+    let lowered = declared.to_lowercase();
+
+    for banned in ["qwen", "onnx", "bge", "phi", "gguf", "llama", "rerank"] {
+        assert!(
+            !lowered.contains(banned),
+            "ADR-086: the progress event name must not name the stack \
+             ('{banned}'); got \"{declared}\""
+        );
+    }
 }
 
 #[test]

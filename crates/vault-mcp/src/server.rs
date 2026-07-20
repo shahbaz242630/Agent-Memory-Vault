@@ -1215,7 +1215,16 @@ pub(crate) fn vault_error_to_mcp(err: VaultError) -> McpError {
         // "internal error" privacy posture if they ever do leak to the MCP
         // wire (which would itself be a regression worth investigating).
         | VaultError::ConsolidatorBusy(_)
-        | VaultError::ConsolidatorTimeout(_) => McpError::internal_error("internal error", None),
+        | VaultError::ConsolidatorTimeout(_)
+        // ADR-089 (2026-07-20): an optional model component is absent. Both
+        // rerank consumers catch this and degrade, so it should never reach
+        // the MCP wire. Mapped to the generic internal error deliberately:
+        // telling a client WHICH component is missing would hand an
+        // attacker a free fingerprint of the local install's state, and
+        // §11.4.4 requires a generic error to the client regardless of
+        // cause. The audit row keeps the detail (see
+        // `ToolInvokeError::from_vault_error`).
+        | VaultError::ModelUnavailable { .. } => McpError::internal_error("internal error", None),
     }
 }
 

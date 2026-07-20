@@ -773,13 +773,38 @@ impl StructuredReadPipeline {
         if candidates.is_empty() {
             return Ok(candidates);
         }
-        candidates.truncate(RERANK_CANDIDATE_CAP);
+        // Split rather than truncate — see the matching note in
+        // `RerankedRetriever::rerank_pool`. On the ADR-089 degrade path the
+        // whole pool is returned in retriever order; on success the tail is
+        // dropped exactly as `truncate` did.
+        let tail = candidates.split_off(RERANK_CANDIDATE_CAP.min(candidates.len()));
 
         let docs: Vec<String> = candidates
             .iter()
             .map(|c| c.memory.content.clone())
             .collect();
-        let scores = reranker.rerank(query, &docs).await?;
+        let scores = match reranker.rerank(query, &docs).await {
+            Ok(scores) => scores,
+            // ADR-089: ranking model not downloaded yet — degrade to the
+            // retriever's own order, which is precisely what this function
+            // already returns when `self.reranker` is `None` (see the early
+            // return above). The downstream abstain HINT is unaffected: it is
+            // computed in `read`, and already has to cope with the no-reranker
+            // case. Failing the read instead would hide memories the vault
+            // holds — the cardinal sin (ADR-073).
+            Err(VaultError::ModelUnavailable { component }) => {
+                tracing::warn!(
+                    target: "vault_retrieval::reranker",
+                    component = %component,
+                    candidates = candidates.len() + tail.len(),
+                    "ranking model unavailable — read falls back to retriever order \
+                     (degraded, not failed; ADR-089)"
+                );
+                candidates.extend(tail);
+                return Ok(candidates);
+            }
+            Err(e) => return Err(e),
+        };
         if scores.len() != candidates.len() {
             return Err(VaultError::Embedding(format!(
                 "reranker returned {} scores for {} candidates",
@@ -1572,6 +1597,110 @@ mod tests {
         fn relevance_floor(&self) -> f32 {
             self.floor
         }
+    }
+
+    /// Mock reranker reporting the model as absent — the ADR-089 pre-download
+    /// state of a fresh install.
+    struct UnavailableReranker;
+
+    #[async_trait]
+    impl RerankProvider for UnavailableReranker {
+        async fn rerank(&self, _query: &str, _docs: &[String]) -> VaultResult<Vec<f32>> {
+            Err(VaultError::ModelUnavailable {
+                component: "reranker-model".to_string(),
+            })
+        }
+        fn relevance_floor(&self) -> f32 {
+            0.0
+        }
+    }
+
+    /// Mock reranker failing for a reason that is NOT "not downloaded yet".
+    struct TamperedReranker;
+
+    #[async_trait]
+    impl RerankProvider for TamperedReranker {
+        async fn rerank(&self, _query: &str, _docs: &[String]) -> VaultResult<Vec<f32>> {
+            Err(VaultError::ModelIntegrityFailed {
+                file: "reranker-model".to_string(),
+                expected: "aa".to_string(),
+                actual: "bb".to_string(),
+            })
+        }
+        fn relevance_floor(&self) -> f32 {
+            0.0
+        }
+    }
+
+    /// ADR-089 — `memory_read` degrades rather than failing when the ranking
+    /// model has not been downloaded yet.
+    ///
+    /// Failing here would be worse than on the search path: the read is the
+    /// primary answer path, so an error means the vault refuses to answer
+    /// about memories it actually holds — the cardinal sin ADR-073 was written
+    /// to prevent, arrived at from a different direction.
+    #[tokio::test]
+    async fn read_degrades_to_retriever_order_when_the_model_is_not_downloaded_yet() {
+        let now = read_clock_now();
+        let first = fake_memory(1, "the user plays the cello", "personal", now, 0.9, None);
+        let second = fake_memory(
+            2,
+            "the user likes strong coffee",
+            "personal",
+            now,
+            0.9,
+            None,
+        );
+        let pipeline = StructuredReadPipeline::new(
+            MockRetriever::new(vec![retrieved(first, 0.9), retrieved(second, 0.4)]),
+            MockReportLoader::empty(),
+        )
+        .with_clock(FixedClock::arc(now))
+        .with_reranker(Arc::new(UnavailableReranker));
+
+        let resp = pipeline
+            .read(ReadQuery {
+                query_text: "what instrument does the user play?".into(),
+                authorized_boundaries: vec![boundary("personal")],
+            })
+            .await
+            .expect("an absent ranking model must NOT fail the read");
+
+        assert_eq!(
+            resp.relevant_facts.len(),
+            2,
+            "the degrade path must keep every candidate the retriever found"
+        );
+        assert_eq!(
+            resp.relevant_facts[0].fact, "the user plays the cello",
+            "degrade preserves the retriever's own order"
+        );
+    }
+
+    /// The other half of ADR-089 on the read path: a tampered model file must
+    /// still fail loudly, never quietly fall back to un-reranked results.
+    #[tokio::test]
+    async fn read_with_a_tampered_model_fails_and_does_not_degrade() {
+        let now = read_clock_now();
+        let m = fake_memory(1, "a fact", "personal", now, 0.9, None);
+        let pipeline = StructuredReadPipeline::new(
+            MockRetriever::new(vec![retrieved(m, 0.9)]),
+            MockReportLoader::empty(),
+        )
+        .with_clock(FixedClock::arc(now))
+        .with_reranker(Arc::new(TamperedReranker));
+
+        let err = pipeline
+            .read(ReadQuery {
+                query_text: "anything".into(),
+                authorized_boundaries: vec![boundary("personal")],
+            })
+            .await
+            .expect_err("an integrity failure must propagate, never degrade");
+        assert!(
+            matches!(err, VaultError::ModelIntegrityFailed { .. }),
+            "expected the integrity failure to reach the caller, got {err:?}"
+        );
     }
 
     #[tokio::test]

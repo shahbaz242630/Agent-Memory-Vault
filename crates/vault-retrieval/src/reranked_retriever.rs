@@ -231,13 +231,40 @@ impl RerankedRetriever {
         if candidates.is_empty() {
             return Ok(candidates);
         }
-        candidates.truncate(RERANK_CANDIDATE_CAP);
+        // Split rather than truncate. On the ADR-089 degrade path below the
+        // pool is returned WHOLE in base order — exactly what a vault with no
+        // reranker configured would have returned — instead of being silently
+        // capped at the reranker's batch size. On the success path the tail is
+        // dropped exactly as the previous `truncate` did.
+        let tail = candidates.split_off(RERANK_CANDIDATE_CAP.min(candidates.len()));
 
         let docs: Vec<String> = candidates
             .iter()
             .map(|c| c.memory.content.clone())
             .collect();
-        let scores = self.reranker.rerank(query_text, &docs).await?;
+        let scores = match self.reranker.rerank(query_text, &docs).await {
+            Ok(scores) => scores,
+            // ADR-089: the ranking model has not been downloaded yet (or was
+            // removed). Degrade to the base hybrid order rather than failing
+            // the query. This is the SAME result a vault with no reranker
+            // configured returns, so it is a known-good path, not a new one.
+            // Recall is sacrosanct: a missing optional quality component must
+            // never take search down.
+            //
+            // Every other error — integrity failure above all — propagates.
+            Err(VaultError::ModelUnavailable { component }) => {
+                tracing::warn!(
+                    target: "vault_retrieval::reranker",
+                    component = %component,
+                    candidates = candidates.len() + tail.len(),
+                    "ranking model unavailable — returning base retriever order \
+                     (search degraded, not failed; ADR-089)"
+                );
+                candidates.extend(tail);
+                return Ok(candidates);
+            }
+            Err(e) => return Err(e),
+        };
         if scores.len() != candidates.len() {
             return Err(VaultError::Embedding(format!(
                 "reranker returned {} scores for {} candidates",
@@ -515,6 +542,39 @@ mod tests {
         }
     }
 
+    /// Mock reranker that always reports the model as absent — the ADR-089
+    /// pre-download state of a fresh install.
+    struct UnavailableReranker;
+
+    #[async_trait]
+    impl RerankProvider for UnavailableReranker {
+        async fn rerank(&self, _query: &str, _docs: &[String]) -> VaultResult<Vec<f32>> {
+            Err(VaultError::ModelUnavailable {
+                component: "reranker-model".to_string(),
+            })
+        }
+        fn relevance_floor(&self) -> f32 {
+            0.0
+        }
+    }
+
+    /// Mock reranker that fails for a reason that is NOT "not downloaded yet".
+    struct TamperedReranker;
+
+    #[async_trait]
+    impl RerankProvider for TamperedReranker {
+        async fn rerank(&self, _query: &str, _docs: &[String]) -> VaultResult<Vec<f32>> {
+            Err(VaultError::ModelIntegrityFailed {
+                file: "reranker-model".to_string(),
+                expected: "aa".to_string(),
+                actual: "bb".to_string(),
+            })
+        }
+        fn relevance_floor(&self) -> f32 {
+            0.0
+        }
+    }
+
     fn query(text: &str, max_results: usize) -> RetrievalQuery {
         RetrievalQuery {
             query_text: text.to_string(),
@@ -527,6 +587,81 @@ mod tests {
     // ---------------------------------------------------------------------
     // Tests
     // ---------------------------------------------------------------------
+
+    /// ADR-089 — search DEGRADES when the ranking model has not been
+    /// downloaded yet; it must not fail.
+    ///
+    /// This is the state of every fresh install until the first-run fetch
+    /// lands, and of any install whose models were removed. Before ADR-089
+    /// the rerank error propagated with `?` and the whole query returned an
+    /// error — so a user whose download had not finished (or who had already
+    /// onboarded and so never passed a download gate at all) would see search
+    /// break outright rather than rank slightly less sharply.
+    #[tokio::test]
+    async fn search_degrades_to_base_order_when_the_model_is_not_downloaded_yet() {
+        let base = MockRetriever::new(vec![
+            retrieved(fake_memory(1, "first by base score", "personal"), 0.9),
+            retrieved(fake_memory(2, "second by base score", "personal"), 0.5),
+        ]);
+        let retriever = RerankedRetriever::new(base, None, Arc::new(UnavailableReranker));
+
+        let out = retriever
+            .retrieve(query("anything", 10))
+            .await
+            .expect("an absent ranking model must NOT fail the query");
+
+        assert_eq!(out.len(), 2, "no candidate may be lost on the degrade path");
+        assert_eq!(
+            out[0].memory.content, "first by base score",
+            "degrade must preserve the base retriever's order"
+        );
+    }
+
+    /// The other half of ADR-089: only "not downloaded yet" degrades.
+    /// A tampered model file must still fail the query loudly — silently
+    /// ranking on cosine because someone swapped the model file would turn a
+    /// tamper signal into a quality regression nobody notices.
+    #[tokio::test]
+    async fn a_tampered_model_still_fails_the_query_and_does_not_degrade() {
+        let base = MockRetriever::new(vec![retrieved(fake_memory(1, "a fact", "personal"), 0.9)]);
+        let retriever = RerankedRetriever::new(base, None, Arc::new(TamperedReranker));
+
+        let err = retriever
+            .retrieve(query("anything", 10))
+            .await
+            .expect_err("an integrity failure must propagate, never degrade");
+        assert!(
+            matches!(err, VaultError::ModelIntegrityFailed { .. }),
+            "expected the integrity failure to reach the caller, got {err:?}"
+        );
+    }
+
+    /// The degrade path must not silently cap recall at the reranker's batch
+    /// size. `rerank_pool` splits the pool for the reranker; on degrade the
+    /// tail has to come back, otherwise a degraded search would quietly
+    /// return fewer memories than a vault with no reranker configured.
+    #[tokio::test]
+    async fn degrade_returns_the_whole_pool_not_just_the_reranker_batch() {
+        let over_cap = RERANK_CANDIDATE_CAP + 5;
+        let base_hits: Vec<RetrievedMemory> = (1..=over_cap as u128)
+            .map(|n| retrieved(fake_memory(n, &format!("fact {n}"), "personal"), 0.5))
+            .collect();
+        let base = MockRetriever::new(base_hits);
+        let retriever = RerankedRetriever::new(base, None, Arc::new(UnavailableReranker));
+
+        let out = retriever
+            .retrieve(query("anything", over_cap))
+            .await
+            .expect("degrade ok");
+
+        assert_eq!(
+            out.len(),
+            over_cap,
+            "the degrade path must return the whole pool, not the truncated \
+             reranker batch — otherwise recall silently shrinks when the model \
+             is missing"
+        );
+    }
 
     /// REGRESSION GUARD (2026-06-29) — the graph hit must reach the reranker even
     /// when `base ∪ semantic` already fill [`RERANK_CANDIDATE_CAP`]. This was RED

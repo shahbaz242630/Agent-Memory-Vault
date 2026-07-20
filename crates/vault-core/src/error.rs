@@ -99,6 +99,30 @@ pub enum VaultError {
         actual: String,
     },
 
+    /// An OPTIONAL model component is not present on disk, so the provider
+    /// that needs it could not be constructed. The caller MAY degrade to a
+    /// path that does not need it.
+    ///
+    /// **Deliberately distinct from [`Self::ModelIntegrityFailed`], and the
+    /// distinction is the whole point (ADR-089).** Absent means "the bytes
+    /// have not arrived yet" — the ordinary state of a first-run install
+    /// before [`vault_tauri::model_fetch`] has fetched them, and of any
+    /// install whose optional models were never downloaded. Integrity-failed
+    /// means "the bytes are here and they are WRONG", which is a tamper
+    /// signal and stays fatal. Collapsing the two would mean either erroring
+    /// on an ordinary pre-download state (taking recall down for a missing
+    /// nice-to-have) or silently degrading past a tampered model file. Both
+    /// are unacceptable, so the two states carry different variants.
+    ///
+    /// Verify-before-use (BRD §11.12 vault-embedding: *"Model files signed and
+    /// verified before loading"*) is untouched: a component that is absent is
+    /// never loaded, so there is nothing unverified to use.
+    #[error("model component unavailable: {component}")]
+    ModelUnavailable {
+        /// Logical name of the absent component (e.g. "reranker-model").
+        component: String,
+    },
+
     /// The requested resource (memory, entity, boundary) does not exist.
     #[error("not found: {0}")]
     NotFound(String),
@@ -290,5 +314,41 @@ mod tests {
         assert!(s.contains("def456"), "display should mention actual: {s}");
         let matched = matches!(err, VaultError::ModelIntegrityFailed { .. });
         assert!(matched);
+    }
+
+    #[test]
+    fn model_unavailable_is_structured_and_names_the_component() {
+        let err = VaultError::ModelUnavailable {
+            component: "reranker-model".into(),
+        };
+        let s = err.to_string();
+        assert!(
+            s.contains("reranker-model"),
+            "display should name the absent component: {s}"
+        );
+        let matched = matches!(err, VaultError::ModelUnavailable { .. });
+        assert!(matched);
+    }
+
+    #[test]
+    fn absent_and_tampered_models_are_different_variants_per_adr_089() {
+        // THE property the degrade path depends on. `ModelUnavailable` means
+        // "not downloaded yet" and callers may degrade past it;
+        // `ModelIntegrityFailed` means "present and WRONG" and must stay
+        // fatal. If these ever collapse into one variant, a tampered model
+        // file would silently take the degrade path.
+        let absent = VaultError::ModelUnavailable {
+            component: "reranker-model".into(),
+        };
+        let tampered = VaultError::ModelIntegrityFailed {
+            file: "reranker-model".into(),
+            expected: "aa".into(),
+            actual: "bb".into(),
+        };
+        assert!(matches!(absent, VaultError::ModelUnavailable { .. }));
+        assert!(
+            !matches!(tampered, VaultError::ModelUnavailable { .. }),
+            "an integrity failure must NEVER classify as merely unavailable"
+        );
     }
 }

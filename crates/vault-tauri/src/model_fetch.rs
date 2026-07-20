@@ -23,17 +23,18 @@
 //!   an installer concern, not an inference concern. `vault-embedding` stays a
 //!   pure inference crate that is handed paths.
 //!
-//! ## What is deliberately NOT here
+//! ## Progress
 //!
-//! No progress reporting. A 1.15 GB silent download would make first launch
-//! look frozen — the exact failure this product cannot afford — so progress UI
-//! is its own piece of work against the "Quiet" design, not a side effect of
-//! the plumbing. This module is the transport; the UI wraps it.
+//! [`ensure_reranker_with_progress`] reports aggregate progress across both
+//! files so first launch never looks frozen behind a silent 1.15 GB transfer.
+//! The plain [`ensure_reranker`] keeps the silent form for callers with no UI
+//! (tests, scripts). This module remains the transport — the presentation of
+//! that progress belongs to the Tauri command layer and the frontend.
 
 use std::path::{Path, PathBuf};
 
 use vault_embedding::integrity::{QWEN3_RERANKER_MODEL_SHA256, QWEN3_RERANKER_TOKENIZER_SHA256};
-use vault_llm::model_loader::ensure_model_at_path;
+use vault_llm::model_loader::ensure_model_at_path_with_progress;
 use vault_llm::VaultLlmResult;
 
 /// Directory name the reranker files live under, inside the app's models dir.
@@ -147,6 +148,49 @@ pub fn reranker_paths_in(models_dir: &Path) -> RerankerPaths {
 /// or unverified file is never left at the final path for the reranker to load.
 #[tracing::instrument(skip(models_dir), fields(dir = %models_dir.display()))]
 pub async fn ensure_reranker(models_dir: &Path) -> VaultLlmResult<RerankerPaths> {
+    ensure_reranker_with_progress(models_dir, |_| {}).await
+}
+
+/// Total bytes the reranker acquisition transfers on a cold first run.
+///
+/// The denominator for overall progress. A cache hit on either file still
+/// counts toward this total (see [`ensure_reranker_with_progress`]), so a
+/// partially-cached run still finishes at 100% rather than at some fraction.
+pub const RERANKER_TOTAL_BYTES: u64 = RERANKER_MODEL_BYTES + RERANKER_TOKENIZER_BYTES;
+
+/// Overall progress across every file the reranker needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RerankerFetchProgress {
+    /// Bytes accounted for so far, across all files.
+    pub downloaded_bytes: u64,
+    /// [`RERANKER_TOTAL_BYTES`], carried so a UI never has to know the
+    /// constants.
+    pub total_bytes: u64,
+}
+
+/// As [`ensure_reranker`], but reports aggregate progress across both files.
+///
+/// Progress is reported against the COMBINED expected size, so the fraction a
+/// UI shows moves monotonically from 0 to 1 across the whole acquisition
+/// rather than resetting between files.
+///
+/// **A cached file jumps the counter forward rather than reporting a
+/// transfer.** `ensure_model_at_path_with_progress` stays silent on a cache
+/// hit (it moved no bytes), so this function credits that file's full size the
+/// moment it completes. That keeps a warm run honest — it shows completion,
+/// not a fabricated download.
+///
+/// # Errors
+///
+/// As [`ensure_reranker`].
+#[tracing::instrument(skip(models_dir, on_progress), fields(dir = %models_dir.display()))]
+pub async fn ensure_reranker_with_progress<F>(
+    models_dir: &Path,
+    mut on_progress: F,
+) -> VaultLlmResult<RerankerPaths>
+where
+    F: FnMut(RerankerFetchProgress),
+{
     let paths = reranker_paths_in(models_dir);
 
     // Create the subdirectory before either download — `File::create` on the
@@ -159,21 +203,41 @@ pub async fn ensure_reranker(models_dir: &Path) -> VaultLlmResult<RerankerPaths>
     // Tokenizer first: it is ~100x smaller, so a broken URL, a captive-portal
     // redirect or a dead network surfaces in seconds rather than after a
     // long partial transfer of the big file.
-    ensure_model_at_path(
+    ensure_model_at_path_with_progress(
         &paths.tokenizer,
         RERANKER_TOKENIZER_URL,
         QWEN3_RERANKER_TOKENIZER_SHA256,
         RERANKER_TOKENIZER_BYTES,
+        |p| {
+            on_progress(RerankerFetchProgress {
+                downloaded_bytes: p.downloaded_bytes,
+                total_bytes: RERANKER_TOTAL_BYTES,
+            })
+        },
     )
     .await?;
+    on_progress(RerankerFetchProgress {
+        downloaded_bytes: RERANKER_TOKENIZER_BYTES,
+        total_bytes: RERANKER_TOTAL_BYTES,
+    });
 
-    ensure_model_at_path(
+    ensure_model_at_path_with_progress(
         &paths.model,
         RERANKER_MODEL_URL,
         QWEN3_RERANKER_MODEL_SHA256,
         RERANKER_MODEL_BYTES,
+        |p| {
+            on_progress(RerankerFetchProgress {
+                downloaded_bytes: RERANKER_TOKENIZER_BYTES.saturating_add(p.downloaded_bytes),
+                total_bytes: RERANKER_TOTAL_BYTES,
+            })
+        },
     )
     .await?;
+    on_progress(RerankerFetchProgress {
+        downloaded_bytes: RERANKER_TOTAL_BYTES,
+        total_bytes: RERANKER_TOTAL_BYTES,
+    });
 
     tracing::info!("reranker model files present + integrity verified");
     Ok(paths)
