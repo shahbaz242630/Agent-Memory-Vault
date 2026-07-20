@@ -85,7 +85,7 @@ use vault_app::keychain::{
 use vault_app::{AppConfig, Application};
 use vault_tauri::{
     dylib_filename_for_os, env_override_for, format_keychain_error_dialog,
-    format_startup_failure_dialog,
+    format_startup_failure_dialog, model_fetch,
 };
 
 /// Exit code for keychain provenance failures (ADR-040 + ADR-040 amendment;
@@ -267,6 +267,13 @@ fn main() {
             // The vault-cli `consolidate run` subcommand is the V0.2
             // entry point for nightly merge work; T0.2.6 will land
             // in-process scheduling that may re-evaluate this default.
+            // ADR-087: resolve the reranker before building AppConfig. Never
+            // fatal — absent files degrade ranking, they do not block startup.
+            let reranker_paths = resolve_reranker_paths(&data_dir);
+            if reranker_paths.is_some() {
+                tracing::info!("reranker files resolved — read relevance gate active");
+            }
+
             let config = AppConfig {
                 metadata_path,
                 vector_dir,
@@ -278,10 +285,12 @@ fn main() {
                 at_rest_key,
                 qwen_model_path: None,
                 phi4_model_path: None,
-                // V0.1 Tauri shell is UI-only (ADR-034, no MCP server bound):
-                // no read pipeline, so no reranker. Both None.
-                rerank_model_path: None,
-                rerank_tokenizer_path: None,
+                // ADR-087: the reranker IS wired now. The previous
+                // unconditional `None` predated UI slice 1 and left the
+                // desktop app ranking on the cosine gate. `None` here now
+                // means "files genuinely absent", not "not supported".
+                rerank_model_path: reranker_paths.as_ref().map(|(m, _)| m.clone()),
+                rerank_tokenizer_path: reranker_paths.as_ref().map(|(_, t)| t.clone()),
             };
 
             // 6. Construct Application and spawn the cascading retry
@@ -376,6 +385,54 @@ fn resolve_model_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     app.path()
         .resolve("models/model.onnx", tauri::path::BaseDirectory::Resource)
         .map_err(|e| format!("resolve model.onnx: {e}"))
+}
+
+/// Resolve the Qwen3 reranker's model + tokenizer paths, returning `None` when
+/// the files are not (yet) on disk (ADR-087).
+///
+/// **Why this exists at all.** Until now `main.rs` hardcoded
+/// `rerank_model_path: None`, justified by a comment reading *"V0.1 Tauri shell
+/// is UI-only (ADR-034, no MCP server bound): no read pipeline, so no
+/// reranker."* That was true when written and stopped being true the moment UI
+/// slice 1 wired a search box to the real retrieval pipeline. The stale `None`
+/// silently put the desktop app on the cosine relevance gate — the very
+/// mechanism the reranker was adopted to replace (ADR-059) — so search quality
+/// in the GUI was quietly worse than over MCP.
+///
+/// **Why absent files yield `None` rather than an error.** `Application::new`
+/// treats `None` as documented graceful degradation. A missing reranker must
+/// leave the vault fully usable — recall is sacrosanct, and refusing to start
+/// because an optional quality component is absent would be a far worse
+/// failure than ranking with cosine.
+///
+/// **Why this does NOT download.** Fetching 1.15 GB unannounced during startup
+/// would freeze first launch behind a silent transfer. The download belongs
+/// behind the first-run progress UI; [`model_fetch::ensure_reranker`] is the
+/// transport that flow will call. Until then this resolves what is already
+/// present — which covers dev fixtures via the env overrides, and any install
+/// where the files have been fetched or placed by hand.
+fn resolve_reranker_paths(data_dir: &std::path::Path) -> Option<(PathBuf, PathBuf)> {
+    // Dev override: both must be set together. A half-configured pair is
+    // treated as unset rather than silently pairing an override with a
+    // default — mismatched model/tokenizer is the insidious failure class
+    // called out in `vault_embedding::integrity`.
+    if let (Some(model), Some(tokenizer)) = (
+        env_override_for("VAULT_RERANK_MODEL_PATH"),
+        env_override_for("VAULT_RERANK_TOKENIZER_PATH"),
+    ) {
+        return Some((model, tokenizer));
+    }
+
+    let paths = model_fetch::reranker_paths_in(&data_dir.join("models"));
+    if paths.model.exists() && paths.tokenizer.exists() {
+        Some((paths.model, paths.tokenizer))
+    } else {
+        tracing::info!(
+            "reranker model files not present — search runs on the cosine gate \
+             until first-run download completes (ADR-087)"
+        );
+        None
+    }
 }
 
 /// Resolve bundled tokenizer.json path. Dev-mode override via

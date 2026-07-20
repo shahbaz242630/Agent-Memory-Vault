@@ -29,8 +29,8 @@
 
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
-use std::path::Path;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::path::{Path, PathBuf};
+use tokio::io::AsyncWriteExt;
 
 use crate::error::{VaultLlmError, VaultLlmResult};
 
@@ -41,12 +41,55 @@ const HASH_READ_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 /// Compute the SHA-256 of a file by streaming + hashing in 8 MB chunks.
 /// Used for both post-download integrity verification AND cache-hit
 /// re-verification when a model file already exists on disk.
+///
+/// # Why this offloads to `spawn_blocking` (ADR-087 follow-up)
+///
+/// This previously read the file through `tokio::fs` directly inside the async
+/// fn. Two problems, both measured on the 1.15 GB reranker ONNX (2026-07-20):
+///
+/// 1. **~32x slower than the hardware.** The old form hashed at ~17 MB/s
+///    (67s for 1.15 GB). The same file on the same machine hashes at
+///    545 MB/s cold / 717 MB/s page-cached via .NET's `Get-FileHash` — and
+///    17 MB/s is below even unaccelerated software SHA-256 (~150-250 MB/s),
+///    so the hash function was never the bottleneck. `tokio::fs` caps each
+///    read at its internal max buffer and round-trips every one through the
+///    blocking pool, so a 1.15 GB file became hundreds of scheduler hops.
+///    Reading synchronously inside ONE blocking task removes the hops.
+///
+/// 2. **It stalled the runtime.** Hashing gigabytes is CPU-bound work, and it
+///    was running on the async runtime rather than off it. BRD §2 is explicit:
+///    all I/O is async, CPU-bound work is sync and called via `spawn_blocking`.
+///    This was a standing violation of that rule, not merely a slow path.
+///
+/// The buffer size and chunking behaviour are unchanged; only where the work
+/// runs changed.
 pub async fn compute_sha256_of_file(path: &Path) -> VaultLlmResult<[u8; 32]> {
-    let mut file = tokio::fs::File::open(path).await?;
+    let owned = path.to_path_buf();
+    tokio::task::spawn_blocking(move || compute_sha256_of_file_blocking(&owned))
+        .await
+        .map_err(|e| {
+            // A JoinError means the blocking task panicked or was cancelled.
+            // Surfacing it as Io keeps the error surface unchanged for callers
+            // (fail-closed either way — no caller treats Io as recoverable).
+            VaultLlmError::Io(std::io::Error::other(format!(
+                "sha256 hashing task failed: {e}"
+            )))
+        })?
+}
+
+/// Synchronous SHA-256 of a file, hashed in 8 MB chunks.
+///
+/// Runs on a blocking thread — see [`compute_sha256_of_file`] for why. Kept
+/// separate (rather than inlined into the closure) so it stays directly
+/// testable without a runtime.
+fn compute_sha256_of_file_blocking(path: &Path) -> VaultLlmResult<[u8; 32]> {
+    use std::io::Read as _;
+
+    let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; HASH_READ_CHUNK_SIZE];
     loop {
-        let n = file.read(&mut buf).await?;
+        let n = file.read(&mut buf)?;
         if n == 0 {
             break;
         }
@@ -128,7 +171,7 @@ async fn download_with_verify(
     }
 
     // Restart-not-resume: create truncates any pre-existing .partial.
-    let partial_path = path.with_extension("gguf.partial");
+    let partial_path = partial_path_for(path);
     let mut file = tokio::fs::File::create(&partial_path).await?;
     let mut hasher = Sha256::new();
     let mut stream = resp.bytes_stream();
@@ -160,6 +203,26 @@ async fn download_with_verify(
         "model downloaded + integrity verified"
     );
     Ok(())
+}
+
+/// Build the in-flight download path by APPENDING `.partial` to the full file
+/// name, rather than replacing the extension.
+///
+/// **Why this is not `path.with_extension("gguf.partial")`** (the form this
+/// carried until ADR-087): `with_extension` REPLACES the final extension, so
+/// that form silently rewrote any non-GGUF target — `model.onnx` became
+/// `model.gguf.partial`. Harmless while Phi-4 was the only caller, actively
+/// wrong once the Qwen3 reranker ONNX downloads through the same path. The
+/// `.partial` file would carry a misleading extension and, more importantly,
+/// two different models sharing a directory could collide on one partial name.
+///
+/// Appending preserves the pre-existing behaviour for `.gguf` inputs exactly
+/// (`model.gguf` → `model.gguf.partial`), so Phi-4's download path is
+/// byte-for-byte unchanged by this fix.
+fn partial_path_for(path: &Path) -> PathBuf {
+    let mut raw = path.as_os_str().to_os_string();
+    raw.push(".partial");
+    PathBuf::from(raw)
 }
 
 fn display_label(path: &Path) -> String {
@@ -214,6 +277,41 @@ mod tests {
             result.is_ok(),
             "cache hit must short-circuit before HTTP — got {result:?}"
         );
+    }
+
+    // ─── ADR-087: `.partial` naming generalised beyond GGUF ─────────────
+
+    #[test]
+    fn partial_path_appends_rather_than_replacing_extension() {
+        // The ONNX case is the whole point of the fix: the previous
+        // `with_extension("gguf.partial")` form produced `model.gguf.partial`
+        // here, mislabelling an ONNX download as a GGUF one.
+        assert_eq!(
+            partial_path_for(Path::new("/models/model.onnx")),
+            PathBuf::from("/models/model.onnx.partial")
+        );
+    }
+
+    #[test]
+    fn partial_path_preserves_prior_gguf_behaviour_exactly() {
+        // Regression guard on the EXISTING Phi-4 path: this fix must not
+        // change the partial filename for GGUF downloads, or an interrupted
+        // pre-fix download would be orphaned rather than clobbered.
+        assert_eq!(
+            partial_path_for(Path::new("/models/Phi-4-mini-instruct-Q4_K_M.gguf")),
+            PathBuf::from("/models/Phi-4-mini-instruct-Q4_K_M.gguf.partial")
+        );
+    }
+
+    #[test]
+    fn partial_paths_of_two_models_in_one_dir_do_not_collide() {
+        // The failure this prevents: reranker model + tokenizer (or any two
+        // models) sharing a directory and racing on ONE partial file — the
+        // same class of bug that took down the weekly CI smoke job, where
+        // three tests shared a single `.partial` path.
+        let a = partial_path_for(Path::new("/m/model.onnx"));
+        let b = partial_path_for(Path::new("/m/tokenizer.json"));
+        assert_ne!(a, b, "distinct models must claim distinct partial paths");
     }
 
     // ─── floor 7: SHA-256 mismatch on cached file deletes + re-downloads
