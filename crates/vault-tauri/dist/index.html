@@ -155,5 +155,21 @@
       </div>
 
     </div>
+
+    <!-- Confirmation dialog. Replaces window.confirm(), which the webview
+         renders as an OK-only message box: the user cannot decline, so the
+         destructive action proceeds no matter what they click. This dialog
+         resolves a promise with the real answer and defaults to Cancel. -->
+    <div id="confirm-overlay" class="confirm-overlay hidden" role="presentation">
+      <div class="confirm-box" role="alertdialog" aria-modal="true"
+           aria-labelledby="confirm-title" aria-describedby="confirm-body">
+        <div id="confirm-title" class="confirm-title"></div>
+        <p id="confirm-body" class="confirm-body"></p>
+        <div class="confirm-actions">
+          <button id="confirm-cancel" class="btn-ghost">Cancel</button>
+          <button id="confirm-go" class="btn-danger"></button>
+        </div>
+      </div>
+    </div>
   </body>
 </html>

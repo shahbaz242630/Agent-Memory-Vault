@@ -1,0 +1,317 @@
+//! Frontend↔backend contract guards for the desktop UI.
+//!
+//! The UI in `dist/` has no automated behaviour coverage — it is vanilla JS
+//! with no toolchain (deliberate: no node build, CSP `default-src 'self'`).
+//! These tests close the two gaps that actually bit us, using nothing but
+//! string analysis of the checked-in sources, so they need no JS runtime, no
+//! DOM, and no new dependencies.
+//!
+//! ## Why these specific guards (UI slice 2, 2026-07-20)
+//!
+//! **1. The dialog trap.** `forget` (permanent delete) and `revoke` gated
+//! themselves on `window.confirm`, which this webview renders as an OK-only
+//! message box: the user cannot decline, so the destructive action ran
+//! whatever they clicked. Found by hand during founder live-verification —
+//! and note that a DOM-simulation test would NOT have caught it, because a
+//! simulated browser implements `confirm` correctly. A source-level ban is
+//! the honest guard for this class of bug.
+//!
+//! **2. Command wiring.** Registering a Tauri command touches FOUR files, and
+//! getting any one wrong fails late and cryptically. Both build failures in
+//! this session were exactly this:
+//!   - `permissions/default.toml` missing an `allow-*` definition →
+//!     *"Permission allow-X not found, expected one of …"* from the build
+//!     script, nowhere near the code at fault.
+//!   - `generate_handler!` referencing a re-exported path instead of the
+//!     defining module → 20 macro-resolution errors, including for commands
+//!     that previously worked.
+//!
+//! These tests fail fast, in the crate under test, naming the exact command
+//! and the exact file that needs the entry.
+
+/// The frontend script that calls into the backend.
+const APP_JS: &str = include_str!("../dist/app.js");
+
+/// Command modules, in `generate_handler!` registration order.
+const COMMAND_SOURCES: &[(&str, &str)] = &[
+    ("memory.rs", include_str!("../src/commands/memory.rs")),
+    ("boundary.rs", include_str!("../src/commands/boundary.rs")),
+    ("agent.rs", include_str!("../src/commands/agent.rs")),
+    ("settings.rs", include_str!("../src/commands/settings.rs")),
+];
+
+const MAIN_RS: &str = include_str!("../src/main.rs");
+const PERMISSIONS_TOML: &str = include_str!("../permissions/default.toml");
+const CAPABILITIES_JSON: &str = include_str!("../capabilities/default.json");
+
+// ---------------------------------------------------------------------------
+// Tiny extraction helpers (plain `std` — no regex dependency).
+// ---------------------------------------------------------------------------
+
+/// Collect every substring that appears between `open` and the next `close`.
+fn collect_between(haystack: &str, open: &str, close: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = haystack;
+    while let Some(start) = rest.find(open) {
+        let after = &rest[start + open.len()..];
+        match after.find(close) {
+            Some(end) => {
+                out.push(after[..end].to_string());
+                rest = &after[end..];
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+/// Command names the frontend invokes: `invoke("name"` / `invoke('name'`.
+fn frontend_invoked_commands() -> Vec<String> {
+    let mut names = collect_between(APP_JS, "invoke(\"", "\"");
+    names.extend(collect_between(APP_JS, "invoke('", "'"));
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Command names defined with `#[tauri::command]` across the command modules.
+///
+/// The attribute is always followed by the `pub async fn <name>(` wrapper, so
+/// we take the first `fn ` after each attribute occurrence.
+fn defined_commands() -> Vec<String> {
+    let mut out = Vec::new();
+    for (_file, src) in COMMAND_SOURCES {
+        let mut rest = *src;
+        while let Some(at) = rest.find("#[tauri::command]") {
+            let after = &rest[at + "#[tauri::command]".len()..];
+            if let Some(fn_at) = after.find("fn ") {
+                let sig = &after[fn_at + 3..];
+                let name: String = sig
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if !name.is_empty() {
+                    out.push(name);
+                }
+            }
+            rest = after;
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Command names registered in `main.rs`'s `generate_handler!` block, taken
+/// from the `commands::<module>::<name>,` lines.
+fn registered_commands() -> Vec<String> {
+    let block_start = MAIN_RS
+        .find("generate_handler![")
+        .expect("main.rs must contain a generate_handler! block");
+    let block = &MAIN_RS[block_start..];
+    let block_end = block
+        .find("])")
+        .expect("generate_handler! block must close");
+    let block = &block[..block_end];
+
+    let mut out = Vec::new();
+    for line in block.lines() {
+        let line = line.trim();
+        if line.starts_with("//") || !line.contains("commands::") {
+            continue;
+        }
+        // Take the final `::`-separated segment, minus the trailing comma.
+        let name = line.trim_end_matches(',').rsplit("::").next().unwrap_or("");
+        let name: String = name
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() {
+            out.push(name);
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Command names granted by a `commands.allow = ["name"]` entry in
+/// `permissions/default.toml`.
+fn permitted_commands() -> Vec<String> {
+    let mut out = Vec::new();
+    for entry in collect_between(PERMISSIONS_TOML, "commands.allow = [", "]") {
+        out.extend(collect_between(&entry, "\"", "\""));
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Convert a snake_case command name to its Tauri permission identifier.
+fn permission_identifier(command: &str) -> String {
+    format!("allow-{}", command.replace('_', "-"))
+}
+
+// ---------------------------------------------------------------------------
+// Guard 1 — no native dialog may gate an action
+// ---------------------------------------------------------------------------
+
+#[test]
+fn frontend_never_gates_an_action_on_a_native_dialog() {
+    // `confirmAction(` is OUR promise-based in-app dialog and is the intended
+    // replacement; strip it before looking for the native call so the check
+    // is a plain substring search with no false positive on our own helper.
+    let scrubbed = APP_JS.replace("confirmAction(", "");
+
+    for banned in ["confirm(", "prompt("] {
+        assert!(
+            !scrubbed.contains(banned),
+            "dist/app.js uses the native `{banned}` dialog.\n\
+             This webview renders it as an OK-only message box: the user \
+             CANNOT decline, so the guarded action runs no matter what they \
+             click. This shipped in UI slice 1 on `forget` (PERMANENT delete) \
+             and was only caught by hand.\n\
+             Use `confirmAction({{ title, body, confirmLabel }})` instead — it \
+             resolves true only on a real choice."
+        );
+    }
+}
+
+#[test]
+fn frontend_confirm_helper_is_present_and_used_by_destructive_actions() {
+    // The ban above is only meaningful while the replacement exists and the
+    // two destructive surfaces actually route through it.
+    assert!(
+        APP_JS.contains("function confirmAction("),
+        "dist/app.js must define confirmAction() — the native-dialog ban \
+         assumes a working in-app replacement exists"
+    );
+    let uses = APP_JS.matches("await confirmAction(").count();
+    assert!(
+        uses >= 2,
+        "expected both destructive actions (forget, revoke) to await \
+         confirmAction(); found {uses} call site(s)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Guard 2 — the four-file command wiring must agree
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_frontend_invoked_command_is_defined_in_rust() {
+    let defined = defined_commands();
+    for cmd in frontend_invoked_commands() {
+        assert!(
+            defined.contains(&cmd),
+            "dist/app.js calls invoke(\"{cmd}\") but no `#[tauri::command] \
+             fn {cmd}` exists in src/commands/.\nDefined commands: {defined:?}"
+        );
+    }
+}
+
+#[test]
+fn every_frontend_invoked_command_is_registered_in_generate_handler() {
+    let registered = registered_commands();
+    for cmd in frontend_invoked_commands() {
+        assert!(
+            registered.contains(&cmd),
+            "dist/app.js calls invoke(\"{cmd}\") but it is not registered in \
+             main.rs's generate_handler!.\nAn unregistered command fails at \
+             RUNTIME with a confusing error, not at build time.\nRegistered: \
+             {registered:?}"
+        );
+    }
+}
+
+#[test]
+fn every_registered_command_has_a_permission_definition() {
+    // The failure this prevents: session 21's first build failure, where the
+    // capability referenced `allow-list-recent-memories` but no such
+    // permission was DEFINED. The build script's error names the permission,
+    // not the file that should have declared it.
+    let permitted = permitted_commands();
+    for cmd in registered_commands() {
+        assert!(
+            permitted.contains(&cmd),
+            "command `{cmd}` is registered in generate_handler! but has no \
+             `commands.allow = [\"{cmd}\"]` entry in \
+             permissions/default.toml.\nAdding a command is a TWO-file \
+             permission change: permissions/default.toml DEFINES the \
+             allow-* permission, capabilities/default.json only REFERENCES \
+             it.\nPermitted: {permitted:?}"
+        );
+    }
+}
+
+#[test]
+fn every_registered_command_is_referenced_by_the_default_capability() {
+    // A permission that exists but is not granted to the window means the
+    // command is silently unreachable from the UI at runtime.
+    for cmd in registered_commands() {
+        let identifier = permission_identifier(&cmd);
+        assert!(
+            CAPABILITIES_JSON.contains(&identifier),
+            "command `{cmd}` has no `\"{identifier}\"` entry in \
+             capabilities/default.json, so the webview cannot invoke it at \
+             runtime even though it compiles."
+        );
+    }
+}
+
+#[test]
+fn every_defined_command_is_registered() {
+    // A defined-but-unregistered command is dead code that still carries a
+    // permission surface. If one is ever intentionally withheld, this test is
+    // the right place to record why.
+    let registered = registered_commands();
+    for cmd in defined_commands() {
+        assert!(
+            registered.contains(&cmd),
+            "`#[tauri::command] fn {cmd}` is defined but never registered in \
+             generate_handler! — either register it or delete it"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Meta — the extractors themselves must not silently return nothing
+// ---------------------------------------------------------------------------
+
+#[test]
+fn extractors_find_the_expected_command_surface() {
+    // Without this, a parsing regression would turn every guard above into a
+    // vacuous pass over an empty set — the classic "green because it tested
+    // nothing" failure.
+    let invoked = frontend_invoked_commands();
+    let defined = defined_commands();
+    let registered = registered_commands();
+    let permitted = permitted_commands();
+
+    assert!(
+        invoked.len() >= 6,
+        "expected the UI to invoke at least the 6 slice-1/2 commands, \
+         found {invoked:?}"
+    );
+    assert!(
+        defined.len() >= 10,
+        "expected at least 10 defined commands after slice 2, found {defined:?}"
+    );
+    assert_eq!(
+        defined, registered,
+        "defined and registered command sets must match exactly"
+    );
+    assert_eq!(
+        registered, permitted,
+        "registered and permitted command sets must match exactly"
+    );
+}
+
+#[test]
+fn permission_identifier_maps_snake_case_to_kebab_case() {
+    assert_eq!(
+        permission_identifier("list_recent_memories"),
+        "allow-list-recent-memories"
+    );
+    assert_eq!(permission_identifier("add_memory"), "allow-add-memory");
+}

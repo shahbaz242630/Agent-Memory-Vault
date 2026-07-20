@@ -66,6 +66,57 @@ async function copyText(text, btn) {
   }
 }
 
+// -- confirmation ------------------------------------------------------------
+
+// Ask the user to confirm a destructive action; resolves true only if they
+// actively choose to proceed.
+//
+// Why this exists: the webview renders the native `window.confirm` dialog as
+// an OK-only message box — there is no Cancel, so the user CANNOT decline and
+// the action goes ahead whatever they click. Found in live verification
+// 2026-07-20 on both `forget` (permanent delete) and `revoke`. A gate that
+// cannot say no is not a gate. `tests/frontend_contract.rs` now fails the
+// build if a native gating dialog is reintroduced anywhere in this file.
+//
+// Cancel is the visually dominant button and takes initial focus, so Enter
+// and Esc both mean "don't". Text is set via textContent, never innerHTML —
+// the agent name interpolated into the revoke prompt is untrusted input.
+function confirmAction({ title, body, confirmLabel }) {
+  return new Promise((resolve) => {
+    const overlay = $("confirm-overlay");
+    const go = $("confirm-go");
+    const cancel = $("confirm-cancel");
+
+    $("confirm-title").textContent = title;
+    $("confirm-body").textContent = body;
+    go.textContent = confirmLabel;
+    overlay.classList.remove("hidden");
+    cancel.focus();
+
+    function settle(answer) {
+      overlay.classList.add("hidden");
+      go.removeEventListener("click", onGo);
+      cancel.removeEventListener("click", onCancel);
+      overlay.removeEventListener("mousedown", onBackdrop);
+      document.removeEventListener("keydown", onKey);
+      resolve(answer);
+    }
+    function onGo() { settle(true); }
+    function onCancel() { settle(false); }
+    // Backdrop click dismisses — but only when the press STARTED on the
+    // backdrop, so a drag that ends outside the box doesn't cancel.
+    function onBackdrop(e) { if (e.target === overlay) settle(false); }
+    function onKey(e) {
+      if (e.key === "Escape") { e.preventDefault(); settle(false); }
+    }
+
+    go.addEventListener("click", onGo);
+    cancel.addEventListener("click", onCancel);
+    overlay.addEventListener("mousedown", onBackdrop);
+    document.addEventListener("keydown", onKey);
+  });
+}
+
 // ---------------------------------------------------------------- app state
 
 // Every fact shown in onboarding is real: the engine performed these steps
@@ -428,7 +479,13 @@ function renderMemRows(rows, emptyText) {
     btn.addEventListener("click", async () => {
       const row = btn.closest(".mem-row");
       const id = row.dataset.id;
-      if (!confirm("Forget this memory? This cannot be undone.")) return;
+      const ok = await confirmAction({
+        title: "Forget this memory?",
+        body: "It will be permanently deleted from your vault straight away. "
+            + "There is no undo and no recovery period.",
+        confirmLabel: "Forget it",
+      });
+      if (!ok) return;
       try {
         await invoke("delete_memory", { id });
         row.remove();
@@ -574,7 +631,14 @@ async function renderAgents() {
       btn.addEventListener("click", async () => {
         const row = btn.closest(".a-row");
         const name = row.dataset.name;
-        if (!confirm(`Revoke ${name}'s access? It won't be able to read or write memories until you connect it again.`)) return;
+        const ok = await confirmAction({
+          title: `Revoke ${name}'s access?`,
+          body: `${name} won't be able to read or write memories until you `
+              + `connect it again. It stays listed here, and everything it `
+              + `did before stays in the audit log.`,
+          confirmLabel: "Revoke access",
+        });
+        if (!ok) return;
         try {
           await invoke("revoke_agent", { agentName: name });
           renderAgents();

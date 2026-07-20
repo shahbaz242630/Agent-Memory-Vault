@@ -551,3 +551,54 @@ textarea.mv-input { resize: none; }
   flex: none;
 }
 .statusbar .st { width: 6px; height: 6px; border-radius: 50%; background: var(--green); }
+
+/* -- confirmation dialog ---------------------------------------------------
+   Replaces window.confirm(): the webview renders that as an OK-only box, so
+   the user has no way to decline a destructive action. Cancel is the visually
+   dominant choice and holds initial focus; the destructive button is the
+   quieter one. Esc cancels. */
+.confirm-overlay {
+  position: fixed; inset: 0; z-index: 100;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(38, 34, 28, .34);
+  animation: mvFade .16s ease both;
+}
+.confirm-box {
+  width: 420px; max-width: calc(100vw - 48px);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 26px 28px 22px;
+  box-shadow: 0 18px 48px rgba(38, 34, 28, .18);
+}
+.confirm-title {
+  font: 500 17px var(--serif);
+  color: var(--ink);
+  margin-bottom: 9px;
+}
+.confirm-body {
+  font: 400 13.5px var(--sans);
+  color: var(--muted);
+  line-height: 1.55;
+  margin: 0 0 22px;
+}
+.confirm-actions { display: flex; align-items: center; justify-content: flex-end; gap: 14px; }
+.btn-ghost {
+  font: 500 13px var(--sans);
+  color: var(--paper);
+  background: var(--ink);
+  border: none;
+  padding: 10px 22px;
+  border-radius: 999px;
+  cursor: pointer;
+}
+.btn-ghost:hover { background: var(--ink-hover); }
+.btn-danger {
+  font: 400 13px var(--sans);
+  color: var(--red);
+  background: none;
+  border: none;
+  padding: 10px 4px;
+  cursor: pointer;
+}
+.btn-danger:hover { text-decoration: underline; }
