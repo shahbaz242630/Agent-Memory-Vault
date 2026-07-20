@@ -517,6 +517,10 @@ textarea.mv-input { resize: none; }
   border: none; background: none; padding: 0;
 }
 .a-row .revoke:hover { color: var(--red); }
+/* A revoked agent stays listed — revocation is soft so the history remains
+   auditable — but reads as inactive: grey dot, dimmed row. */
+.a-row.revoked { opacity: .55; }
+.a-row.revoked .st { background: var(--faint-2); }
 
 .center-link { text-align: center; margin: 24px 0 0; }
 .agents-panel { width: 560px; margin: 20px auto 40px; animation: mvFade .3s ease both; }

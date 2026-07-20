@@ -2,13 +2,51 @@
 
 **Current version:** V0.2 Closed Beta (BRD §6.2 — sleep consolidator, boundaries hardening, cross-device sync, 30 beta users)
 
-**Last updated:** 2026-07-12 (session 20) — **🖥️ BETA UI SLICE 1 SHIPPED + LIVE-VERIFIED.** The Claude-Design "Quiet" direction (founder's design project "Agent Memory Vault UI/UX" → `Memory Vault App.dc.html`) is implemented in `crates/vault-tauri/dist/` — vanilla JS/CSS, no framework, fonts bundled locally. 3-step onboarding (sequential boot-check animation → connect-agent with REAL `vault-cli mcp serve` snippets → first memory) + home shell (Memories tab fully live on the real Tauri commands; Boundaries/Agents/Settings honest-static until slice 2). Founder ran the full loop live against the real engine (onboard → keep memory → recall in different words → forget) — verified working. ADR-086 (UI content policy: white-label / plain-English taxonomy / honest-UI) in §1. **NEXT = UI slice 2 (backend commands so every tab is live), then packaging/installer.** See §1.
+**Last updated:** 2026-07-20 (session 21) — **🖥️ BETA UI SLICE 2 SHIPPED (gates green, live-verification PENDING).** All four honest-static surfaces are now live on real backend commands: Boundaries (list + create, backed by new migration 0008 `boundaries` table), Agents (real ADR-SEC-001 capability-token registry + revoke), Settings (real path / version / counts / audit-chain result), and the home "recently remembered" list (now reads the vault, so **agent-written memories finally appear**). ADR-SEC-003 (desktop UI reads across all boundaries) in §1. Gates: build 0 warnings · 387 tests 0 failed · clippy 0 warnings · fmt clean. **NEXT = founder live-verify slice 2, then packaging/installer.** See §1.
+
+**Prior (session 20):** **🖥️ BETA UI SLICE 1 SHIPPED + LIVE-VERIFIED.** The Claude-Design "Quiet" direction (founder's design project "Agent Memory Vault UI/UX" → `Memory Vault App.dc.html`) is implemented in `crates/vault-tauri/dist/` — vanilla JS/CSS, no framework, fonts bundled locally. 3-step onboarding (sequential boot-check animation → connect-agent with REAL `vault-cli mcp serve` snippets → first memory) + home shell (Memories tab fully live on the real Tauri commands; Boundaries/Agents/Settings honest-static until slice 2). Founder ran the full loop live against the real engine (onboard → keep memory → recall in different words → forget) — verified working. ADR-086 (UI content policy: white-label / plain-English taxonomy / honest-UI) in §1. **NEXT = UI slice 2 (backend commands so every tab is live), then packaging/installer.** See §1.
 
 > **How to read this file:** §1 is the only thing you must act on. §2–§5 are current ground truth (incl. the post-scale roadmap in §5). §6 onward is reference you pull from when planning. Deep detail (full ADR text, session-by-session history, tuning evidence) lives in the four archives — cross-linked by ADR number. **Do not paraphrase archived ADRs — quote them.**
 
 ---
 
-## 1 · 🟢 NEXT SESSION OPENER — 🖥️ UI SLICE 2: backend commands so Boundaries / Agents / Settings go live. Slice 1 (the product face) is SHIPPED + founder-verified. Sessions 2–18 detail is archived → `HANDOFF_V0.2_PART3_ARCHIVE.md`.
+## 1 · 🟢 NEXT SESSION OPENER — 🖥️ FOUNDER LIVE-VERIFY UI SLICE 2, then the PACKAGING/INSTALLER arc. Slices 1 + 2 are code-complete and gate-green. Sessions 2–18 detail is archived → `HANDOFF_V0.2_PART3_ARCHIVE.md`.
+
+> ### ▶️ START HERE — current state (2026-07-20, session 21 close)
+>
+> **In one line:** the desktop UI is now fully live on the real engine — no honest-static placeholders left — but slice 2 has NOT yet been run by a human against a real vault, so live-verify is the first act next session.
+>
+> **Banked this session (session 21) — UI slice 2:**
+> - **Migration `0008_boundaries.sql`** — boundaries become first-class rows instead of a value implied by `memories.boundary`. Backfilled from existing memories (`created_at` = `MIN(created_at)` of that boundary's memories, i.e. when the boundary actually came into being); `default` always seeded so the list is never empty. **No FK** from `memories.boundary` → `boundaries.name`: a failed registry write must never block a memory write (recall is sacrosanct).
+> - **`vault-storage/src/boundary_store.rs`** — `list_boundaries` (LEFT JOIN so empty boundaries survive; counts exclude superseded + cold-archived) + `create_boundary` (idempotent: `Ok(false)` = already existed).
+> - **Six `VaultAdapter` methods** (`list_recent_memories` / `list_boundaries` / `create_boundary` / `list_agents` / `revoke_agent` / `verify_audit_chain` / `total_memory_count`) on the CONCRETE type, deliberately NOT on the `vault_mcp::Adapter` trait — that trait is the surface every connected agent reaches, and vault-wide boundary enumeration there would be a least-privilege regression (§11.2 SP-2). Same rationale as the existing `append_tauri_command_audit`.
+> - **`commands.rs` → `commands/` directory** (`memory.rs` / `boundary.rs` / `agent.rs` / `settings.rs` + `mod.rs`) per BRD §5.11's stated file list; the flat file would have hit ~700 lines.
+> - **Frontend** — `renderBoundaries` / `renderAgents` / `renderSettings` / `renderMemList` all read real commands; the `mv_recent` localStorage cache is DELETED and cleared on upgrade.
+>
+> **📐 ADR-SEC-003 (session 21) — the desktop UI reads across all boundaries.**
+> - **Context:** `search_memories` hardcoded `vec![Boundary::default_name()]`. Once the Boundaries tab can list `work` / `personal`, a UI that cannot search them makes the tab decorative.
+> - **Decision:** Tauri-layer reads are OWNER-scoped, spanning every registered boundary. `list_recent_memories` uses an unfiltered `MemoryFilter`; `search_memories` resolves its slice from `list_boundaries()`.
+> - **Reasoning:** boundaries are mandatory access control scoping *agents* — BRD §11.4.3 rule 5: *"The LLM/agent never sees memories outside its authorized boundary."* The Tauri layer acts as `ActorKind::User`, the vault owner, who is the party that GRANTS agents their scope. Fencing the owner out of their own boundaries protects nothing.
+> - **Does NOT weaken §11.4.3:** agent-facing paths still resolve their authorized slice per-request from the capability token (ADR-SEC-001 D4) and none route through these methods. Rules 3/4 (filtering at the storage layer, unbypassable) are untouched — the `boundaries` table is a name registry, never consulted on a read path.
+> - **Fail-secure:** if the registry read fails, `search_memories` falls back to `default` alone (SP-4) rather than widening.
+>
+> **🚦 Gates (all green, 2026-07-20):** `cargo build --workspace` 0 warnings (1m21s) · `cargo test -p vault-storage -p vault-app -p vault-tauri` **387 passed / 0 failed** · `cargo clippy --workspace --all-targets -- -D warnings` 0 warnings (27m29s) · `cargo fmt --all --check` clean. **+14 tests** (3 migration, 6 boundary-store validation, 5 command-layer incl. boundary-name injection cases + the ADR-086 white-label pin) — above the "security tests first" floor; the extras are surfaced, not trimmed.
+>
+> **⚠️ TWO TAURI GOTCHAS THAT COST TWO FAILED BUILDS — read before touching commands:**
+> 1. **Adding a command is a TWO-file permission change.** `permissions/default.toml` DEFINES each `allow-*` (identifier + `commands.allow`); `capabilities/default.json` only REFERENCES it. Session 20's work order said "add `allow-*` permission in `capabilities/default.json`" — that instruction is INCOMPLETE and following it literally fails the build with *"Permission allow-X not found, expected one of …"*. Confirmed by reading `tauri-build-2.6.0/src/acl.rs`: with no explicit `AppManifest::commands` in `build.rs` (ours has none), Tauri falls back to reading the `permissions/` directory.
+> 2. **`generate_handler!` cannot see through a `pub use`.** `#[tauri::command]` emits hidden companion items (`__cmd__<name>`, `__tauri_command_name_<name>`) beside the function; a re-export does not carry them. Register by DEFINING module path — `commands::memory::add_memory`, not `commands::add_memory`. Getting this wrong breaks EVERY command, including ones that previously worked.
+>
+> **▶️ DO FIRST next session — founder live-verify slice 2** (slice 1 was live-verified before being called done; slice 2 has not been). Boot the app with the one-profile recipe and check: Boundaries lists real counts + create works + a rejected name shows a plain-English error; Agents shows real grants (empty is CORRECT if no capability tokens are minted — mint one via `vault-cli agent add` to see a row) + revoke works; Settings shows the real data dir / count / version and `history verified`; home list shows a memory written by an AGENT, not just UI-added ones (the headline slice-2 fix).
+>
+> **▶️ THEN — packaging/installer arc (the real beta blocker).** Unchanged from session 20; see the block further down this section.
+>
+> **⚠️ Carried open threads:** weekly scheduled CI "real-model smoke" now failing THREE Sundays running (`28385029636`, `28803916921`, `29259145088`) while every push run is green — no longer comfortably a flake, worth reading the run logs. Welcome-animation replay length still undecided (founder call). File upload/import still deferred to V1.0.
+>
+> **🧹 Tech debt noted (not fixed — no drive-by):** `CLAUDE.md` refers to the spec as `Agent Build Specification.txt` (spaces); the real filename is `Agent_Build_Specification.txt` (underscores). Costs a failed lookup at every session start.
+
+---
+
+## 1a · 📦 Session 20 opener (slice 1) — retained for context
 
 > ### ▶️ START HERE — current state (2026-07-12, session 20 close)
 >
@@ -21,12 +59,32 @@
 > 2. **Plain-English taxonomy:** semantic/episodic/procedural is write-side metadata that never gates recall (RetrievalQuery has no type filter), so the UI maps it to "a fact about me / something that happened / how I do things" (rows show fact/event/how-to); onboarding doesn't ask at all. Backend values + agent-facing MCP contract unchanged.
 > 3. **Honest UI:** no fake data or claims. Boot checks state only what really happened at startup — third line is the audit log, NOT "mcp endpoint ready" (no MCP server runs in the Tauri process, ADR-034). No seeded fake memories, no fabricated counts; dead buttons (Lock vault / View audit log) dropped, not shipped broken. **File upload/import DEFERRED to V1.0 connectors arc** — dogfood-proven that document dumps fail the 512-token atomic-fact save contract.
 >
-> **▶️ DO FIRST next session (slice 2 — touches `commands.rs` = §11 security surface → re-read BRD §11 IN FULL first):**
->   1. **New Tauri commands** (security tests before impl per §11.12; BRD §5.11 already specs `list_boundaries`): `list_recent_memories` (home default list — currently localStorage-cached UI adds only), `list_boundaries` + create, `get_settings_info` (real vault path / version / audit status), agents registry read (ADR-SEC-001 capability tokens → Agents tab live).
->   2. **Wire the honest-static tabs** to those commands — the frontend render functions are already shaped for it (`renderBoundaries` / `renderAgents` / `renderSettings` in `dist/app.js`).
->   3. Then: **packaging/installer arc** — Tauri bundler MSI, model download on first run (white-label the progress UI per ADR-086), code-signing question, where the download lives.
+> ### ✅ ALREADY DONE (don't redo — verified live 2026-07-12)
 >
-> **⚠️ Open thread (pre-existing, NOT from this session's change):** the WEEKLY scheduled CI job "real-model smoke" (`cargo test -p vault-llm -- --ignored`) failed on the last two Sundays (runs `28385029636`, `28803916921`) while every push run is green — the schedule trigger runs only the smoke job. Investigate from the run logs next session (suspect runner model-download/disk flake; confirm, don't guess).
+> - **Engine (sessions 1–19):** storage/crypto/retrieval/consolidation/multi-agent daemon — built, tested, live-proven, all committed. Details §2; archives for history.
+> - **UI slice 1 (session 20, commit `ff19570`):** the full "Quiet" beta UI in `crates/vault-tauri/dist/` (index.html / styles.css / app.js / fonts/). Onboarding (welcome animation → agent connect → first memory) + home shell. **Memories tab is FULLY LIVE** on existing commands: `search_memories` (debounced), `add_memory` (onboarding + add panel), `delete_memory` (hover-forget). Founder ran the whole loop against the real encrypted vault — works. Boot recipe that worked: `CARGO_PROFILE_DEV_DEBUG='line-tables-only'` + `-j 2` + the three `VAULT_*_PATH` env vars → bge fixtures (cold 27m58s / warm seconds; ~15 GB target/).
+> - **Deliberately static until slice 2 (honest placeholders, not bugs):** Boundaries tab (shows only `default`), Agents tab (shows locally-configured picks from localStorage, not the daemon registry), Settings (true-but-partly-hardcoded values), home "Recently remembered" list (localStorage cache of UI-added memories only — agent-written memories DON'T appear in it yet; search finds them fine).
+>
+> **🚦 CI state at session-20 close:** slice-1 push CI run `29167300494` was **in_progress** when the session ended. **FIRST ACT next session: `gh run list --workflow=ci.yml -L 1` and confirm it went green** before staging anything (per the documented CI-gate default). Frontend-only change, so failure is unlikely — but verify, don't assume.
+>
+> **▶️ NEXT STEP — UI slice 2: make the three static tabs + recent list real (touches `commands.rs` = §11 security surface).**
+> Work order:
+>   1. **Re-read BRD §11 IN FULL + §5.11** (project rule — any `commands.rs` / capabilities / permissions change is a security surface). Then write security tests BEFORE impl per §11.12 (IPC validation; boundary leakage where relevant).
+>   2. **New Tauri commands** (each mirrors the existing pattern in `commands.rs`: `*_inner` testable fn + thin `#[tauri::command]` wrapper + `append_tauri_command_audit` row + register in `main.rs` `generate_handler!` + add `allow-*` permission in `capabilities/default.json`):
+>      - `list_recent_memories(limit)` — newest-first across boundaries the UI can see; replaces the localStorage cache so agent-written memories appear on home.
+>      - `list_boundaries()` (+ `create_boundary(name)` if the storage layer supports boundary creation without a memory — CHECK first; BRD §5.11 specs `list_boundaries`).
+>      - `get_settings_info()` — real data dir path, version, audit-chain status, memory count.
+>      - `list_agents()` — read ADR-SEC-001 capability-token registry so the Agents tab shows real grants (+ decide with founder whether revoke-token lands in slice 2 or later).
+>   3. **Wire the frontend** — `renderBoundaries` / `renderAgents` / `renderSettings` / `renderMemList` in `dist/app.js` are already shaped to consume these; replace their static/localStorage branches.
+>   4. **Gates:** frontend files don't need cargo, but the new commands do — full DoD on vault-tauri + the one-profile recipe above; founder confirms before any cargo invocation ([[feedback_confirm_before_cargo_build_and_check_disk]]).
+>
+> **▶️ THEN — packaging/installer arc (the real beta blocker, discussed with founder 2026-07-12):**
+>   (a) Tauri bundler MSI (config half-exists in `tauri.conf.json` `bundle` block; currently points at test-fixture resources — real packaging must bundle or download models); (b) **first-run model download** with progress UI (models too big to ship in the MSI; per ADR-086 the UI says "downloading recall engine", never model names); (c) **`vault-cli` placement** — the onboarding MCP snippet says `"command": "vault-cli"`, which is only true if the installer puts vault-cli on PATH — installer must make the snippet honest; (d) **code-signing decision** = founder's (unsigned MSI → Windows SmartScreen warnings; signing costs money); (e) ADR-038 reminder: the MSI launcher must set `LANCE_MEM_POOL_SIZE=268435456` (WiX pre-args) — dev runs get it from `.cargo/config.toml`, installed builds do NOT.
+>
+> **⚠️ Open threads (parked, not blockers):**
+>   - **Weekly scheduled CI "real-model smoke" job failing** (pre-existing): `cargo test -p vault-llm -- --ignored` failed the last two Sundays (runs `28385029636`, `28803916921`) while every push run is green (schedule trigger runs ONLY the smoke job). Investigate from run logs; suspect runner model-download/disk flake — confirm, don't guess.
+>   - **Welcome animation plays full ~9s on every fresh first-run** (once per install; Replay via Settings). Pre-beta idea, founder hasn't decided: full theatre first run, ~1s quick version after. Do NOT build without founder sign-off.
+>   - **File upload/import**: founder asked, deliberately DEFERRED to V1.0 connectors arc (ADR-086 — document dumps fail the atomic-fact contract). Don't re-propose for V0.2.
 >
 > **🅿️ GRAPH READ-CHANNEL VERDICT (why it's parked — tech-debt #9).** Hard 40-distractor dogfood (2026-06-29) showed **no graph win**: on the 2-hop probe graph-ON == graph-OFF, byte-identical; the true word-mismatched answer never reached top-10 either way. Three independent root causes, none a quick fix: (1) the reranker ranks lexical lookalikes ("is known for") above the true "specializes in" answer; (2) per-fact enrichment made **duplicate entity nodes** that break the multi-hop chain (needs real entity resolution); (3) extraction **missed edges**. The agent can already multi-hop via follow-up queries ([[project_architectural_lock_llm_out_of_read_path]]), so this is NOT a beta blocker. **Revisit ONLY if real agent/beta dogfood shows users genuinely need word-mismatched multi-hop answers the agent can't compose itself; otherwise drop it.** The pool-truncation BUG it surfaced is fixed + banked (above). Do NOT manufacture a win (founder posture). Full ADR text (ADR-SEC-002 Part 2 + Amendment 1) + the session 14–18 graph arc → `HANDOFF_V0.2_PART3_ARCHIVE.md`.
 >

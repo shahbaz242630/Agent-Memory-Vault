@@ -12,6 +12,12 @@ permissions = [
   "allow-search-memories",
   "allow-update-memory",
   "allow-delete-memory",
+  "allow-list-recent-memories",
+  "allow-list-boundaries",
+  "allow-create-boundary",
+  "allow-list-agents",
+  "allow-revoke-agent",
+  "allow-get-settings-info",
 ]
 
 [[permission]]
@@ -33,3 +39,36 @@ commands.allow = ["update_memory"]
 identifier = "allow-delete-memory"
 description = "Allow invoking the delete_memory command (delete a memory by id)."
 commands.allow = ["delete_memory"]
+
+# UI slice 2 — vault administration surface (Boundaries / Agents / Settings
+# tabs + the home "recently remembered" list).
+
+[[permission]]
+identifier = "allow-list-recent-memories"
+description = "Allow invoking the list_recent_memories command (newest-first memories for the home list, including agent-written ones)."
+commands.allow = ["list_recent_memories"]
+
+[[permission]]
+identifier = "allow-list-boundaries"
+description = "Allow invoking the list_boundaries command (registered boundaries with their active-memory counts)."
+commands.allow = ["list_boundaries"]
+
+[[permission]]
+identifier = "allow-create-boundary"
+description = "Allow invoking the create_boundary command (register a named boundary before any memory is stored in it)."
+commands.allow = ["create_boundary"]
+
+[[permission]]
+identifier = "allow-list-agents"
+description = "Allow invoking the list_agents command (read the ADR-SEC-001 capability-token registry; never exposes a token or its hash)."
+commands.allow = ["list_agents"]
+
+[[permission]]
+identifier = "allow-revoke-agent"
+description = "Allow invoking the revoke_agent command (soft-revoke an agent's capability token, preserving the audit trail)."
+commands.allow = ["revoke_agent"]
+
+[[permission]]
+identifier = "allow-get-settings-info"
+description = "Allow invoking the get_settings_info command (vault path, version, counts, audit-chain verification result)."
+commands.allow = ["get_settings_info"]

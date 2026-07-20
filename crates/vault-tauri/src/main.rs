@@ -103,10 +103,21 @@ fn main() {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
-            vault_tauri::commands::add_memory,
-            vault_tauri::commands::search_memories,
-            vault_tauri::commands::update_memory,
-            vault_tauri::commands::delete_memory,
+            // Commands are referenced by their DEFINING module, not through
+            // the `commands` re-exports: `#[tauri::command]` emits hidden
+            // companion items (`__cmd__<name>`) beside each function, and a
+            // plain `pub use` does not carry those, so `generate_handler!`
+            // cannot resolve a re-exported path.
+            vault_tauri::commands::memory::add_memory,
+            vault_tauri::commands::memory::search_memories,
+            vault_tauri::commands::memory::update_memory,
+            vault_tauri::commands::memory::delete_memory,
+            vault_tauri::commands::memory::list_recent_memories,
+            vault_tauri::commands::boundary::list_boundaries,
+            vault_tauri::commands::boundary::create_boundary,
+            vault_tauri::commands::agent::list_agents,
+            vault_tauri::commands::agent::revoke_agent,
+            vault_tauri::commands::settings::get_settings_info,
         ])
         .setup(|app| {
             // 1. Resolve libonnxruntime dylib path per ADR-019.

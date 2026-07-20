@@ -15,6 +15,7 @@
 
 pub mod agent_token_store;
 pub mod audit;
+pub mod boundary_store;
 pub mod cascading;
 pub mod checkpoint;
 pub mod consolidation_state;
@@ -38,6 +39,7 @@ pub use audit::{
     seal, verify_chain, ActorKind, AuditEvent, AuditEventType, AuditResult, PendingAuditEvent,
     AUDIT_GENESIS_HASH,
 };
+pub use boundary_store::{BoundaryInfo, MAX_BOUNDARY_DESCRIPTION_LEN};
 pub use cascading::{Ack, DegradedMode, StorageBackend, MAX_RETRY_QUEUE_DEPTH};
 pub use checkpoint::{
     ChangeType, CheckpointEntry, CheckpointId, CheckpointStatus, CheckpointSummary, RollbackReport,

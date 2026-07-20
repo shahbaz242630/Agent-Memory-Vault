@@ -121,12 +121,19 @@ const state = {
   addType: "semantic",
   tab: "memories",
   query: "",
-  recent: store.get("mv_recent", []),        // memories added via this UI
-  agents: store.get("mv_agents", []),        // agents configured via this UI
+  // `agents` is the local record of which agent the user set up a config
+  // snippet for during onboarding — it drives the connect UI only. The
+  // authoritative list of agents holding vault access is `grantedAgents`,
+  // read from the backend registry (slice 2).
+  agents: store.get("mv_agents", []),
+  grantedAgents: [],                         // from list_agents (authoritative)
+  boundaries: [],                            // from list_boundaries
   showConnectPanel: false,
   showInlineAdd: false,
+  showBoundaryAdd: false,
   toastTimer: null,
   searchSeq: 0,
+  recentSeq: 0,
 };
 
 // ---------------------------------------------------------------- screens
@@ -293,12 +300,11 @@ async function saveFirstMemory() {
   $("mem-save").classList.add("disabled");
   $("mem-err").textContent = "";
   try {
-    const id = await invoke("add_memory", {
+    await invoke("add_memory", {
       content: text,
       memoryType: state.memType,
       boundary: "default",
     });
-    rememberLocally(id, state.memType, text);
     finishOnboarding(true);
   } catch (err) {
     $("mem-err").textContent = `Couldn't keep that memory: ${err}`;
@@ -316,11 +322,11 @@ function finishOnboarding(withToast) {
   }
 }
 
-function rememberLocally(id, type, text) {
-  state.recent.unshift({ id: String(id), type, text, when: Date.now() });
-  state.recent = state.recent.slice(0, 20);
-  store.set("mv_recent", state.recent);
-}
+// Slice 2 removed the browser-local `mv_recent` cache: the home list now
+// reads `list_recent_memories` from the vault itself, so memories an AGENT
+// wrote show up alongside the ones added here. Clear the stale cache once so
+// upgrading installs don't leave dead data in localStorage.
+try { localStorage.removeItem("mv_recent"); } catch { /* non-fatal */ }
 
 // -- home -------------------------------------------------------------------
 
@@ -328,6 +334,17 @@ function renderHome() {
   renderNav();
   renderTab();
   renderFooter();
+  // The footer reports how many agents hold access, so it needs the registry
+  // even when the user never opens the Agents tab. Fire-and-forget: a failed
+  // read leaves the footer at its last known value rather than blocking home.
+  refreshGrantedAgents();
+}
+
+async function refreshGrantedAgents() {
+  try {
+    state.grantedAgents = await invoke("list_agents");
+    renderFooter();
+  } catch { /* footer keeps its last known value */ }
 }
 
 function renderNav() {
@@ -367,9 +384,17 @@ async function renderMemList() {
   const seq = ++state.searchSeq;
   if (!q) {
     $("mem-list-title").textContent = "Recently remembered";
-    renderMemRows(state.recent.map((m) => ({
-      id: m.id, memory_type: m.type, content: m.text, when: relTime(m.when),
-    })), "Nothing here yet — keep a memory below, or connect an agent and let it remember for you.");
+    const rseq = ++state.recentSeq;
+    try {
+      const recent = await invoke("list_recent_memories", { limit: 20 });
+      if (rseq !== state.recentSeq || state.query.trim()) return; // superseded
+      renderMemRows(recent.map((m) => ({
+        id: m.id, memory_type: m.memory_type, content: m.content, when: relTime(m.created_at),
+      })), "Nothing here yet — keep a memory below, or connect an agent and let it remember for you.");
+    } catch (err) {
+      if (rseq !== state.recentSeq) return;
+      $("mem-rows").innerHTML = `<div class="empty-note">Couldn't load your memories: ${esc(String(err))}</div>`;
+    }
     return;
   }
   $("mem-list-title").textContent = "Recalling…";
@@ -406,8 +431,6 @@ function renderMemRows(rows, emptyText) {
       if (!confirm("Forget this memory? This cannot be undone.")) return;
       try {
         await invoke("delete_memory", { id });
-        state.recent = state.recent.filter((m) => m.id !== id);
-        store.set("mv_recent", state.recent);
         row.remove();
       } catch (err) {
         alert(`Couldn't forget it: ${err}`);
@@ -430,12 +453,11 @@ async function saveInlineMemory() {
   if (!text) return;
   $("add-err").textContent = "";
   try {
-    const id = await invoke("add_memory", {
+    await invoke("add_memory", {
       content: text,
       memoryType: state.addType,
       boundary: "default",
     });
-    rememberLocally(id, state.addType, text);
     $("add-text").value = "";
     toggleInlineAdd(false);
     state.query = "";
@@ -448,40 +470,117 @@ async function saveInlineMemory() {
 
 // -- boundaries tab --
 
-function renderBoundaries() {
-  // Slice 1 honesty: the engine enforces boundaries (mandatory access
-  // control), but the UI has no list/create commands yet — the one
-  // boundary guaranteed to exist is `default`, which this UI writes to.
-  $("boundary-rows").innerHTML = `
-    <div class="b-row">
-      <span class="nm">default</span>
-      <span class="ds">Everything this app remembers — agents read it once you grant access</span>
-      <span class="mt">active</span>
-    </div>`;
+async function renderBoundaries() {
+  $("boundary-rows").innerHTML = `<div class="empty-note">Loading…</div>`;
+  try {
+    const rows = await invoke("list_boundaries");
+    state.boundaries = rows;
+    $("boundary-rows").innerHTML = rows.map((b) => {
+      const n = Number(b.memory_count) || 0;
+      const count = n === 1 ? "1 memory" : `${n} memories`;
+      const desc = b.description
+        || (b.name === "default" ? "Everything this app remembers by default" : "");
+      return `
+      <div class="b-row">
+        <span class="nm">${esc(b.name)}</span>
+        <span class="ds">${esc(desc)}</span>
+        <span class="mt">${esc(count)}</span>
+      </div>`;
+    }).join("");
+  } catch (err) {
+    $("boundary-rows").innerHTML = `<div class="empty-note">Couldn't load boundaries: ${esc(String(err))}</div>`;
+  }
+  $("boundary-add-label").textContent = state.showBoundaryAdd ? "cancel" : "+ New boundary";
+  $("boundary-add").classList.toggle("hidden", !state.showBoundaryAdd);
+}
+
+function toggleBoundaryAdd(show) {
+  state.showBoundaryAdd = show ?? !state.showBoundaryAdd;
+  $("boundary-err").textContent = "";
+  $("boundary-add").classList.toggle("hidden", !state.showBoundaryAdd);
+  $("boundary-add-label").textContent = state.showBoundaryAdd ? "cancel" : "+ New boundary";
+  if (state.showBoundaryAdd) $("boundary-name").focus();
+}
+
+async function saveBoundary() {
+  const name = $("boundary-name").value.trim();
+  const description = $("boundary-desc").value.trim();
+  if (!name) return;
+  $("boundary-err").textContent = "";
+  try {
+    const created = await invoke("create_boundary", {
+      name,
+      description: description || null,
+    });
+    if (!created) {
+      $("boundary-err").textContent = "You already have a boundary with that name.";
+      return;
+    }
+    $("boundary-name").value = "";
+    $("boundary-desc").value = "";
+    toggleBoundaryAdd(false);
+    renderBoundaries();
+  } catch (err) {
+    // The backend rejects anything outside letters, digits, - and _ ; say so
+    // in plain language rather than surfacing the validation error verbatim.
+    $("boundary-err").textContent =
+      `Couldn't create that boundary: ${String(err).replace(/^invalid boundary name: /, "")}`;
+  }
 }
 
 // -- agents tab --
 
-function renderAgents() {
-  if (!state.agents.length) {
+async function renderAgents() {
+  // Slice 2: the registry of agents that actually hold vault access, not the
+  // browser-local list of cards the user clicked during onboarding. An agent
+  // appears here once it has been granted a connection token.
+  let agents = [];
+  try {
+    agents = await invoke("list_agents");
+    state.grantedAgents = agents;
+    renderFooter();
+  } catch (err) {
+    $("agent-rows").innerHTML = `<div class="empty-note">Couldn't load agents: ${esc(String(err))}</div>`;
+    $("no-agents").classList.add("hidden");
+    $("connect-panel-label").textContent = state.showConnectPanel
+      ? "hide connection details" : "+ Connect an agent";
+    $("agents-panel").classList.toggle("hidden", !state.showConnectPanel);
+    $("agents-snippet").textContent = SNIPPET_JSON;
+    return;
+  }
+
+  if (!agents.length) {
     $("agent-rows").innerHTML = "";
     $("no-agents").classList.remove("hidden");
   } else {
     $("no-agents").classList.add("hidden");
-    $("agent-rows").innerHTML = state.agents.map((a, i) => `
-      <div class="a-row">
+    $("agent-rows").innerHTML = agents.map((a) => {
+      const scope = a.boundaries.length
+        ? `can read: ${a.boundaries.join(", ")}`
+        : "no boundaries granted";
+      const when = a.active
+        ? `connected ${relTime(a.created_at)}`
+        : `revoked ${relTime(a.revoked_at)}`;
+      return `
+      <div class="a-row${a.active ? "" : " revoked"}" data-name="${esc(a.name)}">
         <span class="st"></span>
         <span class="nm">${esc(a.name)}</span>
-        <span class="tr">${esc(a.transport)}</span>
-        <span class="ac">configured ${esc(relTime(a.when))}</span>
-        <button class="revoke" data-i="${i}">remove</button>
-      </div>`).join("");
+        <span class="tr">${esc(scope)}</span>
+        <span class="ac">${esc(when)}</span>
+        ${a.active ? `<button class="revoke">revoke</button>` : `<span class="ac">—</span>`}
+      </div>`;
+    }).join("");
     [...$("agent-rows").querySelectorAll(".revoke")].forEach((btn) => {
-      btn.addEventListener("click", () => {
-        state.agents.splice(Number(btn.dataset.i), 1);
-        store.set("mv_agents", state.agents);
-        renderAgents();
-        renderFooter();
+      btn.addEventListener("click", async () => {
+        const row = btn.closest(".a-row");
+        const name = row.dataset.name;
+        if (!confirm(`Revoke ${name}'s access? It won't be able to read or write memories until you connect it again.`)) return;
+        try {
+          await invoke("revoke_agent", { agentName: name });
+          renderAgents();
+        } catch (err) {
+          alert(`Couldn't revoke access: ${err}`);
+        }
       });
     });
   }
@@ -494,18 +593,32 @@ function renderAgents() {
 // -- settings tab --
 
 async function renderSettings() {
-  let vaultLocation = "per-user app data folder";
+  $("settings-rows").innerHTML = `<div class="empty-note">Loading…</div>`;
+  let info = null;
   try {
-    if (window.__TAURI__.path && window.__TAURI__.path.appDataDir) {
-      vaultLocation = await window.__TAURI__.path.appDataDir();
-    }
-  } catch { /* keep fallback label */ }
+    info = await invoke("get_settings_info");
+  } catch (err) {
+    $("settings-rows").innerHTML = `<div class="empty-note">Couldn't read vault details: ${esc(String(err))}</div>`;
+    return;
+  }
+
+  const n = Number(info.memory_count) || 0;
+  const b = Number(info.boundary_count) || 0;
   const rows = [
     { label: "Encryption", value: "AES-256 · key in Windows Credential Manager", good: true },
-    { label: "Vault location", value: vaultLocation },
+    { label: "Vault location", value: info.data_dir },
+    {
+      label: "Stored",
+      value: `${n === 1 ? "1 memory" : `${n} memories`} across ${b === 1 ? "1 boundary" : `${b} boundaries`}`,
+    },
     { label: "Recall engine", value: "on-device · works offline", good: true },
-    { label: "Audit log", value: "recorded locally · UI + agent operations", good: true },
-    { label: "Version", value: "memory-vault 0.1.0 · V0.2 beta" },
+    // Honest UI: report what the chain check actually returned. A broken
+    // chain means something modified the history outside the app, and the
+    // user needs to know rather than see a reassuring constant.
+    info.audit_chain_verified
+      ? { label: "Audit log", value: "recorded locally · history verified", good: true }
+      : { label: "Audit log", value: "history could not be verified — the record may have been altered", good: false },
+    { label: "Version", value: `memory-vault ${info.version} · V0.2 beta` },
   ];
   $("settings-rows").innerHTML = rows.map((r) => `
     <div class="s-row">
@@ -522,9 +635,11 @@ function replayWelcome() {
 // -- footer --
 
 function renderFooter() {
-  const n = state.agents.length;
+  // Counts agents that actually hold vault access (the backend registry),
+  // not agents the user merely copied a config snippet for.
+  const n = state.grantedAgents.filter((a) => a.active).length;
   $("footer-status").textContent = "Encrypted on this device · " +
-    (n > 0 ? `${n} agent${n > 1 ? "s" : ""} configured` : "no agents configured yet");
+    (n > 0 ? `${n} agent${n > 1 ? "s" : ""} connected` : "no agents connected yet");
 }
 
 // ---------------------------------------------------------------- wiring
@@ -585,6 +700,17 @@ function init() {
   $("add-toggle").addEventListener("click", () => toggleInlineAdd());
   $("add-save").addEventListener("click", saveInlineMemory);
   $("add-cancel").addEventListener("click", () => toggleInlineAdd(false));
+
+  // home — boundaries
+  $("boundary-add-label").addEventListener("click", () => toggleBoundaryAdd());
+  $("boundary-save").addEventListener("click", saveBoundary);
+  $("boundary-cancel").addEventListener("click", () => toggleBoundaryAdd(false));
+  $("boundary-name").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); saveBoundary(); }
+  });
+  $("boundary-desc").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); saveBoundary(); }
+  });
 
   // home — agents
   $("connect-panel-label").addEventListener("click", () => {

@@ -1,36 +1,7 @@
-//! Tauri command surface — BRD §5.11.
+//! Memory CRUD commands — BRD §5.11 `commands/memory.rs`.
 //!
-//! Commands dispatch through `Application::adapter()` (the wired
-//! `VaultAdapter` from Phase 4a) per ADR-030 outcome (a) single-process
-//! MCP architecture.
-//!
-//! ## ADR-024 amendment 2026-05-05 (Decision 5(γ)) — TauriCommandInvoke audit
-//!
-//! Each Tauri CRUD command writes a `TauriCommandInvoke` audit row via
-//! `VaultAdapter::append_tauri_command_audit` after the operation. The
-//! row carries the same `ToolInvokeDetails` shape as `mcp.tool_invoke`
-//! but the event_type discriminator distinguishes UI-origin from
-//! MCP-origin. Per ADR-024: "audit chain is the authoritative record of
-//! vault-state changes" — Tauri commands ARE vault-state changes.
-//!
-//! ## Auth-gating posture vs MCP commands
-//!
-//! Tauri commands operate as `actor_kind = User` (founder is the actor),
-//! NOT as `Agent` (which is the ADR-025-locked actor for MCP commands).
-//! For V0.1 founder-only dogfood, the founder owns all vault state and
-//! auth-gating doesn't apply at the Tauri layer. The ADR-025 amendment
-//! auth-gate from Phase 4a remains in place at the MCP/StdioServer layer
-//! to protect against untrusted MCP agents — different trust contexts,
-//! different auth needs.
-//!
-//! ## Testability pattern
-//!
-//! Each `#[tauri::command]` wrapper delegates to a sibling `*_inner`
-//! async fn that takes `&Application` directly (not wrapped in
-//! `State<'_, Application>`). Tests exercise the inner function with a
-//! real Application from a test fixture; the `#[tauri::command]`
-//! wrapper is a thin glue that converts errors to user-friendly Strings
-//! and cannot be tested without the full Tauri runtime.
+//! Shared context (audit posture, auth-gating, testability pattern) is
+//! documented on the parent module.
 
 use std::time::Instant;
 
@@ -39,6 +10,12 @@ use vault_app::Application;
 use vault_core::{Boundary, MemoryId, MemoryType, NewMemory};
 use vault_mcp::{Adapter, ToolInvokeDetails};
 use vault_retrieval::{RetrievalOptions, RetrievalQuery};
+
+/// Upper bound on `list_recent_memories`' page size.
+///
+/// BRD §11.7.1 requires a bound on every input; without one, a caller could
+/// ask for the entire vault and force an unbounded row materialization.
+pub const MAX_RECENT_MEMORIES: usize = 200;
 
 /// Inner add_memory implementation. Pure async fn over `&Application`
 /// for testability.
@@ -176,9 +153,17 @@ pub async fn search_memories(
     query: String,
     limit: usize,
 ) -> Result<Vec<serde_json::Value>, String> {
-    // V0.1 founder-only: founder has implicit access to default boundary.
-    // Multi-boundary management UI deferred to V0.2 alpha-distribution.
-    let boundaries = vec![Boundary::default_name()];
+    // ADR-SEC-003: the desktop UI acts as the vault OWNER, so search spans
+    // every registered boundary rather than the hardcoded `default` it used
+    // before UI slice 2. A boundary the owner cannot search is a boundary the
+    // Boundaries tab can only decorate. Agent-facing paths are unaffected —
+    // they resolve their slice per-request from the capability token.
+    let boundaries = match state.inner().adapter().list_boundaries().await {
+        Ok(infos) => infos.into_iter().map(|i| i.boundary).collect(),
+        // SP-4 fail securely: if the registry read fails, fall back to the
+        // narrowest slice that keeps search working rather than widening.
+        Err(_) => vec![Boundary::default_name()],
+    };
     search_memories_inner(state.inner(), query, limit, boundaries).await
 }
 
@@ -295,8 +280,98 @@ pub async fn delete_memory(state: State<'_, Application>, id: String) -> Result<
     delete_memory_inner(state.inner(), id).await
 }
 
+/// Inner list_recent_memories implementation.
+///
+/// Replaces the home tab's browser-local cache, which only ever held
+/// UI-added memories — anything an agent wrote through MCP was invisible on
+/// the home screen even though search found it fine.
+pub async fn list_recent_memories_inner(
+    app: &Application,
+    limit: usize,
+) -> Result<Vec<serde_json::Value>, String> {
+    let adapter = app.adapter();
+    let start = Instant::now();
+
+    // Clamp rather than reject: a too-large page is a UI bug, not an attack,
+    // and silently serving 200 is friendlier than an error the user can't act
+    // on. Zero is meaningless here, so it also floors at 1.
+    let effective_limit = limit.clamp(1, MAX_RECENT_MEMORIES);
+
+    let result = adapter.list_recent_memories(effective_limit).await;
+    let duration_ms = start.elapsed().as_millis() as u64;
+
+    let (count, error_for_audit) = match &result {
+        Ok(memories) => (memories.len() as u32, None),
+        Err(e) => (0, Some(vault_mcp::ToolInvokeError::from_vault_error(e))),
+    };
+
+    let _ = adapter
+        .append_tauri_command_audit(ToolInvokeDetails {
+            tool: "list_recent_memories",
+            duration_ms,
+            result_count: count,
+            boundary_count: 0,
+            max_results: Some(effective_limit as u32),
+            score_threshold: None,
+            include_archived: Some(false),
+            query_length: None,
+            error: error_for_audit,
+        })
+        .await;
+
+    result
+        .map(|memories| {
+            memories
+                .into_iter()
+                .map(|m| {
+                    serde_json::json!({
+                        "id": m.id.to_string(),
+                        "content": m.content,
+                        "memory_type": format!("{:?}", m.memory_type).to_lowercase(),
+                        "boundary": m.boundary.as_str(),
+                        "created_at": m.created_at.to_rfc3339(),
+                    })
+                })
+                .collect()
+        })
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn list_recent_memories(
+    state: State<'_, Application>,
+    limit: usize,
+) -> Result<Vec<serde_json::Value>, String> {
+    list_recent_memories_inner(state.inner(), limit).await
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn recent_limit_clamps_to_the_documented_maximum() {
+        assert_eq!(
+            usize::MAX.clamp(1, MAX_RECENT_MEMORIES),
+            MAX_RECENT_MEMORIES,
+            "an unbounded page request must clamp, never materialize the vault"
+        );
+    }
+
+    #[test]
+    fn recent_limit_floors_at_one() {
+        assert_eq!(
+            0_usize.clamp(1, MAX_RECENT_MEMORIES),
+            1,
+            "a zero page size is meaningless and must floor at 1"
+        );
+    }
+
+    #[test]
+    fn recent_limit_passes_through_a_normal_page_size() {
+        assert_eq!(20_usize.clamp(1, MAX_RECENT_MEMORIES), 20);
+    }
+
     // Test fixture construction for vault-tauri commands requires a
     // real Application (SqlCipher + LanceDB + DuckDB + ORT). This is
     // the same constraint as vault-app/tests/integration_smoke.rs —
@@ -346,5 +421,14 @@ mod tests {
     #[ignore = "Phase 4b deferred — same fixture-sharing constraint"]
     async fn tauri_command_invoke_audit_row_written_per_adr_024_amendment() {
         unimplemented!("Phase 4b ignored placeholder");
+    }
+
+    /// UI slice 2 counterpart to the placeholders above: the home tab's
+    /// recent list must surface AGENT-written memories, which is the whole
+    /// reason it stopped reading the browser-local cache.
+    #[tokio::test]
+    #[ignore = "UI slice 2 — same Application test-fixture constraint as the Phase 4b placeholders"]
+    async fn list_recent_memories_includes_agent_written_memories_not_just_ui_added() {
+        unimplemented!("UI slice 2 ignored placeholder — needs shared Application fixture");
     }
 }

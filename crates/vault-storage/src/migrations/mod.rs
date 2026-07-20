@@ -61,6 +61,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "ADR-SEC-001 multi-agent daemon: agent_tokens (per-agent capability tokens)",
         up: include_str!("0007_agent_tokens.sql"),
     },
+    Migration {
+        version: 8,
+        description: "UI slice 2: boundaries registry (first-class rows, backfilled from memories)",
+        up: include_str!("0008_boundaries.sql"),
+    },
 ];
 
 /// Apply any pending migrations to the open connection. Uses the
@@ -421,6 +426,135 @@ mod tests {
         assert_eq!(
             index, 1,
             "expected idx_agent_tokens_hash unique index to exist"
+        );
+    }
+
+    /// Insert a bare memory row directly, for migration-level tests that need
+    /// pre-existing `memories.boundary` values without the full store stack.
+    fn insert_bare_memory(conn: &Connection, id: &str, boundary: &str, created_at: &str) {
+        conn.execute(
+            "INSERT INTO memories \
+             (id, content, memory_type, boundary, created_at, valid_from, \
+              confidence, last_accessed) \
+             VALUES (?1, 'c', 'semantic', ?2, ?3, ?3, 0.9, ?3)",
+            rusqlite::params![id, boundary, created_at],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn migration_0008_creates_boundaries_table_and_always_seeds_default() {
+        // The UI must never render an empty boundary list, so `default` exists
+        // even in a vault that has never stored a memory.
+        let mut conn = open_memory();
+        run(&mut conn).unwrap();
+
+        let table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='boundaries'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table, 1, "expected boundaries table to exist");
+
+        let default_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM boundaries WHERE name = 'default'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            default_rows, 1,
+            "migration 0008 must seed the conventional `default` boundary"
+        );
+    }
+
+    #[test]
+    fn migration_0008_backfills_boundaries_from_existing_memories() {
+        // An upgrading vault already has boundaries implied by memory rows.
+        // Those must appear in the registry immediately — otherwise the
+        // Boundaries tab would look empty on a vault full of memories.
+        // Apply 0001..=0007 first so memories exist BEFORE 0008 backfills.
+        let mut conn = open_memory();
+        run_with_migrations(&mut conn, &MIGRATIONS[..7]).unwrap();
+
+        insert_bare_memory(&conn, "m1", "work", "2026-03-01T00:00:00+00:00");
+        insert_bare_memory(&conn, "m2", "work", "2026-01-15T00:00:00+00:00");
+        insert_bare_memory(&conn, "m3", "personal", "2026-02-01T00:00:00+00:00");
+
+        run(&mut conn).unwrap();
+
+        let mut names: Vec<String> = conn
+            .prepare("SELECT name FROM boundaries")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "default".to_string(),
+                "personal".to_string(),
+                "work".to_string()
+            ],
+            "0008 must backfill every distinct memories.boundary plus `default`"
+        );
+
+        // created_at is the EARLIEST memory in that boundary — when the
+        // boundary actually came into existence, not when we migrated.
+        let work_created: String = conn
+            .query_row(
+                "SELECT created_at FROM boundaries WHERE name = 'work'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            work_created, "2026-01-15T00:00:00+00:00",
+            "backfilled created_at must be MIN(created_at) of that boundary's memories"
+        );
+    }
+
+    #[test]
+    fn migration_0008_is_idempotent_and_preserves_user_edits() {
+        // Re-running migrations must not clobber a description the user set.
+        let mut conn = open_memory();
+        run(&mut conn).unwrap();
+        conn.execute(
+            "UPDATE boundaries SET description = 'my stuff' WHERE name = 'default'",
+            [],
+        )
+        .unwrap();
+
+        run(&mut conn).unwrap();
+
+        let description: Option<String> = conn
+            .query_row(
+                "SELECT description FROM boundaries WHERE name = 'default'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            description.as_deref(),
+            Some("my stuff"),
+            "0008's INSERT OR IGNORE must not overwrite an existing row"
+        );
+
+        let default_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM boundaries WHERE name = 'default'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            default_rows, 1,
+            "re-running must not duplicate the seed row"
         );
     }
 

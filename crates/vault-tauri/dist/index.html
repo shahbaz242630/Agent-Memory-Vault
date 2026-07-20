@@ -105,7 +105,21 @@
           <div class="headline">Who can see what.</div>
           <p class="sub">Boundaries keep memories separated. An agent only reads the boundaries you grant it.</p>
           <div id="boundary-rows" class="tab-rows"></div>
-          <p class="boundary-note">Everything currently lives in <b>default</b>. Creating more boundaries — like <i>personal</i>, <i>work</i>, or <i>health</i> — and granting agents per-boundary access arrives in the next update.</p>
+          <div class="center-link">
+            <button id="boundary-add-label" class="link-underline">+ New boundary</button>
+          </div>
+          <div id="boundary-add" class="inline-add hidden">
+            <input id="boundary-name" class="mv-input" type="text" maxlength="64"
+                   placeholder="personal, work, health…" autocomplete="off" />
+            <input id="boundary-desc" class="mv-input" type="text" maxlength="256"
+                   placeholder="What goes in here? (optional)" autocomplete="off" />
+            <div class="actions">
+              <button id="boundary-save" class="btn-pill">Create boundary</button>
+              <button id="boundary-cancel" class="link-quiet">cancel</button>
+              <span id="boundary-err" class="err-note"></span>
+            </div>
+          </div>
+          <p class="boundary-note">Granting an agent access to a specific boundary arrives in the next update — for now an agent reads the boundaries its connection was set up with.</p>
         </div>
 
         <!-- agents tab -->

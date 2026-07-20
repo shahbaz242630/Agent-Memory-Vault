@@ -38,7 +38,7 @@
 //! `trigger_b_audit_chain_consistent_across_composition` in
 //! `tests/integration_smoke.rs`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -588,6 +588,14 @@ impl Application {
     /// tests in `tests/integration_smoke.rs` use it for direct dispatch.
     pub fn adapter(&self) -> &Arc<VaultAdapter> {
         &self.adapter
+    }
+
+    /// Borrow the vault root directory (the parent of the SQLCipher file).
+    /// Surfaced so the desktop UI's Settings tab can show the user where
+    /// their data actually lives — a local-first product should never make
+    /// that a mystery.
+    pub fn vault_root(&self) -> &Path {
+        &self.vault_root
     }
 
     /// **Test-focused entry point.** Spawn the cascading retry worker only;

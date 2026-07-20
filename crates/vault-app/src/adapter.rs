@@ -67,7 +67,8 @@ use vault_retrieval::{
     StructuredReadResponse,
 };
 use vault_storage::{
-    ActorKind, AuditEventType, AuditResult, MetadataStore, PendingAuditEvent, StorageBackend,
+    ActorKind, AgentToken, AuditEventType, AuditResult, BoundaryInfo, MemoryFilter, MetadataStore,
+    PendingAuditEvent, StorageBackend,
 };
 
 /// Production `vault_mcp::Adapter` impl. Constructed by
@@ -358,6 +359,85 @@ impl VaultAdapter {
             ActorKind::User,
         )
         .await
+    }
+
+    // ---------------------------------------------------------------------
+    // UI-facing reads (desktop UI slice 2)
+    //
+    // These deliberately live on the concrete `VaultAdapter`, NOT on the
+    // `vault_mcp::Adapter` trait. The trait is the surface every connected AI
+    // agent can reach; these are desktop-shell reads for the vault OWNER.
+    // Widening the agent-facing trait to carry them would hand every agent a
+    // vault-wide boundary enumeration for no benefit — a least-privilege
+    // regression (BRD §11.2 SP-2). `append_tauri_command_audit` above sits
+    // here for the same reason.
+    //
+    // ## ADR-SEC-003 — the desktop UI reads across all boundaries
+    //
+    // Boundaries are a mandatory-access-control mechanism scoping *agents*
+    // (BRD §11.4.3 rule 5: "the LLM/agent never sees memories outside its
+    // authorized boundary"). The Tauri layer acts as `ActorKind::User` — the
+    // vault owner, who is the party that GRANTS boundary access to agents in
+    // the first place. Fencing the owner out of their own boundaries would
+    // protect nothing and make the Boundaries tab decorative. So these reads
+    // are owner-scoped, not agent-scoped.
+    //
+    // This does NOT weaken §11.4.3: agent-facing paths still resolve their
+    // authorized slice per-request from the capability token (ADR-SEC-001 D4),
+    // and none of them route through here.
+    // ---------------------------------------------------------------------
+
+    /// Newest-first memories across every boundary, capped at `limit`.
+    ///
+    /// Backs the home tab's "recently remembered" list, which previously read
+    /// a browser-local cache and therefore showed only UI-added memories —
+    /// anything an agent wrote was invisible. Excludes superseded and
+    /// cold-archived rows (the `MemoryFilter` defaults), matching what default
+    /// retrieval considers active.
+    pub async fn list_recent_memories(&self, limit: usize) -> VaultResult<Vec<Memory>> {
+        self.metadata
+            .list_memories(MemoryFilter::default(), Some(limit))
+            .await
+    }
+
+    /// Every registered boundary with its active-memory count (name-ordered).
+    pub async fn list_boundaries(&self) -> VaultResult<Vec<BoundaryInfo>> {
+        self.storage.list_boundaries().await
+    }
+
+    /// Register a named boundary. `Ok(false)` means it already existed.
+    pub async fn create_boundary(
+        &self,
+        boundary: &Boundary,
+        description: Option<&str>,
+    ) -> VaultResult<bool> {
+        self.storage.create_boundary(boundary, description).await
+    }
+
+    /// Every registered agent (active and revoked) — the ADR-SEC-001
+    /// capability-token registry. Carries no secret: only the token's hash is
+    /// ever stored, and `AgentToken` does not expose even that.
+    pub async fn list_agents(&self) -> VaultResult<Vec<AgentToken>> {
+        self.storage.list_agent_tokens().await
+    }
+
+    /// Revoke an agent's capability token. `Ok(false)` means no ACTIVE agent
+    /// of that name existed. Revocation is soft, so the audit trail survives.
+    pub async fn revoke_agent(&self, agent_name: &str) -> VaultResult<bool> {
+        self.storage.revoke_agent_token(agent_name).await
+    }
+
+    /// Verify the tamper-evident audit chain end to end (BRD §11.9.2).
+    /// `Ok(())` means every link validated.
+    pub async fn verify_audit_chain(&self) -> VaultResult<()> {
+        self.metadata.verify_audit_chain().await
+    }
+
+    /// Count of active memories across all boundaries — the number the
+    /// Settings tab reports.
+    pub async fn total_memory_count(&self) -> VaultResult<u64> {
+        let boundaries = self.storage.list_boundaries().await?;
+        Ok(boundaries.iter().map(|b| b.memory_count).sum())
     }
 }
 
