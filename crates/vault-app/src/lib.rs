@@ -34,7 +34,7 @@ pub mod process_exit;
 pub mod signal_source;
 
 pub use adapter::VaultAdapter;
-pub use application::{Application, ApplicationHandle};
+pub use application::{Application, ApplicationHandle, RerankerState};
 pub use config::AppConfig;
 pub use consolidator_lock::{ConsolidatorLock, VAULT_LOCKFILE_NAME};
 pub use process_exit::{LiveProcessExit, ProcessExit};

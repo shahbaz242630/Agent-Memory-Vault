@@ -16,6 +16,8 @@
     "allow-list-agents",
     "allow-revoke-agent",
     "allow-get-settings-info",
-    "allow-ensure-recall-engine"
+    "allow-ensure-recall-engine",
+    "allow-recall-engine-state",
+    "allow-warm-recall-engine"
   ]
 }

@@ -134,6 +134,46 @@ impl LazyQwen3Reranker {
             .cloned()
     }
 
+    /// Whether both DOWNLOADED components are on disk (ADR-089's "absent"
+    /// test, without attempting a load).
+    ///
+    /// Lets a caller distinguish *"the first-run download has not landed yet"*
+    /// from *"the model is present and still loading"* — two states that look
+    /// identical through [`Self::is_loaded`] alone but mean opposite things to
+    /// a user: the first is a pending fetch, the second is a few seconds of
+    /// patience. The desktop UI needs that distinction to say something honest
+    /// (ADR-090).
+    ///
+    /// Deliberately mirrors the absent-check inside [`Self::provider`] — the
+    /// same two paths, for the same reason. The ORT dylib is excluded here
+    /// exactly as it is there: it is installer-bundled, so its absence is a
+    /// corrupt install rather than a pending download.
+    ///
+    /// Cheap (two `stat` calls) but NOT free — this is a status query, not
+    /// something to call per rerank.
+    pub fn files_present(&self) -> bool {
+        self.model_path.exists() && self.tokenizer_path.exists()
+    }
+
+    /// Load the model now, awaiting completion.
+    ///
+    /// Same work [`Self::spawn_warmup`] does in the background, but awaitable
+    /// so a caller can act on the outcome — which is what lets the desktop app
+    /// report a truthful "ready" instead of guessing at a duration (ADR-090).
+    ///
+    /// Idempotent: returns immediately once the model is loaded. On failure
+    /// the [`OnceCell`] stays cold, so a later call (or the first real read)
+    /// retries.
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::ModelUnavailable`] when a downloaded component is absent
+    /// (degrade, per ADR-089); any other [`VaultError`] is a genuine load
+    /// failure such as a failed integrity check.
+    pub async fn warm_up(&self) -> VaultResult<()> {
+        self.provider().await.map(|_| ())
+    }
+
     /// Kick off the model load as a detached background task. Returns
     /// immediately — call right after the MCP transport binds so the model
     /// warms while the handshake completes and the user types their first
@@ -199,6 +239,40 @@ mod tests {
         assert!(
             !lazy.is_loaded(),
             "reading the floor must NOT load the model"
+        );
+    }
+
+    #[test]
+    fn files_present_is_false_for_absent_components_and_loads_nothing() {
+        // ADR-090: the status query must answer without warming the cell —
+        // otherwise asking "are we ready?" would itself trigger the 1.2 GB
+        // load it is meant to be reporting on.
+        let lazy = bogus();
+        assert!(
+            !lazy.files_present(),
+            "absent components must report not-present"
+        );
+        assert!(!lazy.is_loaded(), "a status query must NOT load the model");
+    }
+
+    #[tokio::test]
+    async fn warm_up_reports_absent_components_as_model_unavailable() {
+        // ADR-089 classification, reached through the ADR-090 entry point: an
+        // absent download is degrade-able, NOT a hard failure. If this ever
+        // returns a different variant the desktop app would stop degrading and
+        // start erroring on a vault whose download has not landed.
+        let lazy = bogus();
+        let err = lazy
+            .warm_up()
+            .await
+            .expect_err("absent components must not warm successfully");
+        assert!(
+            matches!(err, VaultError::ModelUnavailable { .. }),
+            "expected ModelUnavailable so callers can degrade; got {err:?}"
+        );
+        assert!(
+            !lazy.is_loaded(),
+            "a failed warm-up must leave the cell cold for retry"
         );
     }
 

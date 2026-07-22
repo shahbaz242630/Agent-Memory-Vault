@@ -80,3 +80,15 @@ commands.allow = ["get_settings_info"]
 identifier = "allow-ensure-recall-engine"
 description = "Allow invoking the ensure_recall_engine command (fetch and integrity-verify the recall engine's files on first run). Takes no parameters — the destination, source and expected hashes are all fixed at build time."
 commands.allow = ["ensure_recall_engine"]
+
+# Readiness reporting + warm-up (ADR-090).
+
+[[permission]]
+identifier = "allow-recall-engine-state"
+description = "Allow invoking the recall_engine_state command (report whether the recall engine is ready, still preparing, not yet acquired, or not configured). Takes no parameters and is side-effect free."
+commands.allow = ["recall_engine_state"]
+
+[[permission]]
+identifier = "allow-warm-recall-engine"
+description = "Allow invoking the warm_recall_engine command (request a background load of the recall engine so the first recall is not slowed by it). Takes no parameters; idempotent."
+commands.allow = ["warm_recall_engine"]

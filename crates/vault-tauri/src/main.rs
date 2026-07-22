@@ -119,6 +119,8 @@ fn main() {
             vault_tauri::commands::agent::revoke_agent,
             vault_tauri::commands::settings::get_settings_info,
             vault_tauri::commands::engine::ensure_recall_engine,
+            vault_tauri::commands::engine::recall_engine_state,
+            vault_tauri::commands::engine::warm_recall_engine,
         ])
         .setup(|app| {
             // 1. Resolve libonnxruntime dylib path per ADR-019.
@@ -338,6 +340,38 @@ fn main() {
                 };
 
                 let shutdown_sender = application.start();
+
+                // ADR-090: warm the ranking model NOW, in the background.
+                //
+                // `start()` is `Application`'s TEST-focused entry point — it
+                // spawns the retry worker and nothing else. The warm-up lives
+                // in `start_with_mcp` (step 3b), which a GUI can never call
+                // because it blocks on an MCP handshake that never arrives
+                // (ADR-034). So the desktop app had NO warm-up at all and paid
+                // the full ~24 s model load on the user's FIRST search —
+                // measured live 2026-07-22.
+                //
+                // Must stay INSIDE this `block_on`: `spawn_reranker_warmup`
+                // calls `tokio::spawn`, which panics outside a runtime
+                // context. Same reason `start()` is called here.
+                //
+                // Fire-and-forget by design, and deliberately NOT a gate on
+                // the window: founder decision 2026-07-22 chose "open
+                // instantly and say honestly that the engine is still getting
+                // ready" over blocking every launch for ~40 s. ADR-089's
+                // degrade keeps search working throughout.
+                //
+                // A no-op when the first-run download has not landed (fails
+                // fast with ModelUnavailable, leaving the cell cold); the
+                // frontend calls `warm_recall_engine` again once acquisition
+                // completes, which is what covers a genuine first run.
+                let warming = application.spawn_reranker_warmup();
+                tracing::info!(
+                    warming,
+                    state = application.reranker_state().as_wire_str(),
+                    "ranking model warm-up requested at startup (ADR-090)"
+                );
+
                 (application, shutdown_sender)
             });
 

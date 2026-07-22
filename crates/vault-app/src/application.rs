@@ -170,6 +170,46 @@ pub struct Application {
     reranker_warmup: Option<Arc<LazyQwen3Reranker>>,
 }
 
+/// What the ranking model is currently doing, for a UI that has to say
+/// something truthful about it (ADR-090).
+///
+/// Exists because [`LazyQwen3Reranker::is_loaded`] alone cannot tell a user
+/// which of three very different situations they are in: nothing to wait for,
+/// a pending download, or a load in progress. Reporting "not ready" for all
+/// three would either invent a wait that will never end or hide one that is
+/// genuinely happening.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RerankerState {
+    /// No reranker configured — the vault ranks with its retriever order and
+    /// there is nothing to wait for. NOT an error, and NOT a wait.
+    NotConfigured,
+    /// Configured, but a downloaded component is absent — the first-run fetch
+    /// has not landed (or failed). Reads degrade per ADR-089.
+    Unavailable,
+    /// Files are present and the model is loading (or has not been asked for
+    /// yet). This is the only state that represents a genuine, finite wait.
+    Preparing,
+    /// Loaded and serving. Reads are at full ranking quality.
+    Ready,
+}
+
+impl RerankerState {
+    /// Stable wire string for the IPC boundary.
+    ///
+    /// Pinned by a test and by the frontend contract guard: the frontend
+    /// branches on these exact strings, and a silent rename here would leave
+    /// the UI stuck on a wait that never resolves. Deliberately says nothing
+    /// about the model, runtime or vendor (ADR-086 white-label).
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::NotConfigured => "not_configured",
+            Self::Unavailable => "unavailable",
+            Self::Preparing => "preparing",
+            Self::Ready => "ready",
+        }
+    }
+}
+
 impl Application {
     /// Construct the full V0.1 dependency graph and wire it into a
     /// [`VaultAdapter`].
@@ -596,6 +636,61 @@ impl Application {
     /// that a mystery.
     pub fn vault_root(&self) -> &Path {
         &self.vault_root
+    }
+
+    /// Kick off the ranking model's background load, returning whether there
+    /// was anything to warm.
+    ///
+    /// # Why this is public rather than folded into [`Self::start`]
+    ///
+    /// [`Self::start_with_mcp`] already warms the model (step 3b). The desktop
+    /// app cannot call it — `start_with_mcp` blocks on an MCP handshake that
+    /// never arrives in a GUI (ADR-034) — so it calls [`Self::start`], which
+    /// is documented as the **test-focused** entry point and spawns only the
+    /// retry worker. The result was that the desktop app silently never warmed
+    /// the model and paid the full ~24 s load on the user's first search
+    /// (measured live 2026-07-22).
+    ///
+    /// Folding the warm-up into `start()` would have fixed that by making
+    /// every test that configures a reranker load a 1.2 GB model as a side
+    /// effect of starting. So the warm-up stays **explicit at the call site**,
+    /// matching the Path α discipline that keeps `start` and `start_with_mcp`
+    /// separate and named rather than flag-switched.
+    ///
+    /// Safe to call when the first-run download has not landed: the load fails
+    /// fast with [`VaultError::ModelUnavailable`], logs, and leaves the cell
+    /// cold so a later call retries (ADR-089). That is exactly why the Tauri
+    /// layer calls this again after acquisition completes.
+    ///
+    /// Returns `false` when no reranker is configured — nothing was spawned.
+    pub fn spawn_reranker_warmup(&self) -> bool {
+        match &self.reranker_warmup {
+            Some(reranker) => {
+                reranker.spawn_warmup();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Report what the ranking model is currently doing (ADR-090).
+    ///
+    /// Cheap: at worst two `stat` calls. Never triggers a load — asking
+    /// whether the model is ready must not itself start the work being asked
+    /// about.
+    pub fn reranker_state(&self) -> RerankerState {
+        match &self.reranker_warmup {
+            None => RerankerState::NotConfigured,
+            Some(reranker) => {
+                if reranker.is_loaded() {
+                    RerankerState::Ready
+                } else if reranker.files_present() {
+                    RerankerState::Preparing
+                } else {
+                    RerankerState::Unavailable
+                }
+            }
+        }
     }
 
     /// **Test-focused entry point.** Spawn the cascading retry worker only;
@@ -1222,6 +1317,63 @@ mod tests {
     use super::*;
     use crate::process_exit::CapturingProcessExit;
     use crate::signal_source::MockSignalSource;
+
+    // =========================================================================
+    // RerankerState wire contract (ADR-090)
+    //
+    // The desktop frontend branches on these exact strings to decide whether to
+    // show a "getting ready" state at all. A rename here with no matching
+    // frontend change leaves the UI waiting forever on a model that is already
+    // serving — silent, and only visible by running the app. Pinned here and
+    // cross-checked in vault-tauri's frontend_contract.rs.
+    // =========================================================================
+
+    #[test]
+    fn reranker_state_wire_strings_are_stable() {
+        assert_eq!(RerankerState::NotConfigured.as_wire_str(), "not_configured");
+        assert_eq!(RerankerState::Unavailable.as_wire_str(), "unavailable");
+        assert_eq!(RerankerState::Preparing.as_wire_str(), "preparing");
+        assert_eq!(RerankerState::Ready.as_wire_str(), "ready");
+    }
+
+    #[test]
+    fn reranker_state_wire_strings_are_distinct() {
+        // Two states collapsing to one string would make "pending download"
+        // and "loading" indistinguishable to the UI — the exact confusion
+        // RerankerState exists to remove.
+        let all = [
+            RerankerState::NotConfigured,
+            RerankerState::Unavailable,
+            RerankerState::Preparing,
+            RerankerState::Ready,
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for s in all {
+            assert!(
+                seen.insert(s.as_wire_str()),
+                "duplicate wire string for {s:?}"
+            );
+        }
+        assert_eq!(seen.len(), 4);
+    }
+
+    #[test]
+    fn reranker_state_wire_strings_name_no_stack_component_per_adr_086() {
+        for s in [
+            RerankerState::NotConfigured,
+            RerankerState::Unavailable,
+            RerankerState::Preparing,
+            RerankerState::Ready,
+        ] {
+            let w = s.as_wire_str();
+            for forbidden in ["qwen", "onnx", "bge", "phi", "gguf", "rerank", "llama"] {
+                assert!(
+                    !w.contains(forbidden),
+                    "ADR-086: wire string must not name the stack ('{forbidden}'); got {w}"
+                );
+            }
+        }
+    }
 
     // =========================================================================
     // Consolidator safety wrapper — timeout helper unit tests (T0.3.x Batch A)

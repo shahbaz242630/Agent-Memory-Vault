@@ -362,3 +362,94 @@ fn permission_identifier_maps_snake_case_to_kebab_case() {
     );
     assert_eq!(permission_identifier("add_memory"), "allow-add-memory");
 }
+
+// ---------------------------------------------------------------------------
+// Guard 4 — the engine-readiness states must agree across the language
+// boundary (ADR-090)
+// ---------------------------------------------------------------------------
+
+/// `RerankerState::as_wire_str` in `vault-app` and the string the frontend
+/// compares against in `app.js` are connected by nothing at compile time.
+///
+/// The failure this prevents is specifically nasty: rename the Rust side and
+/// the engine still loads, search still works, and the "getting your recall
+/// engine ready" line simply **never clears** — the app sits there claiming a
+/// wait that finished minutes ago. That is worse than the bug ADR-090 set out
+/// to fix, because it is a permanent lie rather than a temporary silence.
+#[test]
+fn engine_ready_state_matches_between_rust_and_the_frontend() {
+    const APPLICATION_RS: &str = include_str!("../../vault-app/src/application.rs");
+    const APP_JS: &str = include_str!("../dist/app.js");
+
+    // The one state the UI branches on. If Rust stops emitting it, the note
+    // can never be shown; if the frontend stops checking it, it can never be
+    // hidden.
+    assert!(
+        APPLICATION_RS.contains(r#"Self::Preparing => "preparing""#),
+        "vault-app must map RerankerState::Preparing to the wire string \
+         \"preparing\" — the frontend branches on exactly that value"
+    );
+    assert!(
+        APP_JS.contains(r#"engineReady.state === "preparing""#),
+        "app.js must branch on the \"preparing\" wire string; without it the \
+         readiness note can never be shown or cleared"
+    );
+
+    // The two terminal states must NOT be treated as a wait. A spinner shown
+    // for these would never resolve — the dishonesty ADR-090 exists to remove.
+    for terminal in ["not_configured", "unavailable"] {
+        assert!(
+            APPLICATION_RS.contains(&format!(r#"=> "{terminal}""#)),
+            "vault-app must declare the \"{terminal}\" wire string"
+        );
+    }
+}
+
+/// The readiness states cross into user-visible logic, so they fall under the
+/// same white-label rule as every other string the UI can branch on.
+#[test]
+fn engine_ready_states_do_not_leak_the_stack() {
+    const APPLICATION_RS: &str = include_str!("../../vault-app/src/application.rs");
+
+    for state in ["not_configured", "unavailable", "preparing", "ready"] {
+        assert!(
+            APPLICATION_RS.contains(&format!(r#"=> "{state}""#)),
+            "expected wire string \"{state}\" to be declared"
+        );
+        for banned in ["qwen", "onnx", "bge", "phi", "gguf", "llama", "rerank"] {
+            assert!(
+                !state.contains(banned),
+                "ADR-086: readiness state must not name the stack ('{banned}'); \
+                 got \"{state}\""
+            );
+        }
+    }
+}
+
+/// The user-facing readiness copy must not name the stack either (ADR-086),
+/// and must not promise that recall is unavailable — it is not. Search works
+/// throughout, on the retriever's own order (ADR-089).
+#[test]
+fn engine_ready_note_is_white_label_and_does_not_claim_search_is_broken() {
+    const APP_JS: &str = include_str!("../dist/app.js");
+
+    let note = APP_JS
+        .split("Getting your recall engine ready")
+        .nth(1)
+        .expect("app.js must contain the readiness note copy");
+    let sentence = note.split('"').next().unwrap_or("").to_lowercase();
+
+    for banned in [
+        "qwen", "onnx", "bge", "phi", "gguf", "llama", "rerank", "model",
+    ] {
+        assert!(
+            !sentence.contains(banned),
+            "ADR-086: readiness copy must not name the stack ('{banned}')"
+        );
+    }
+    assert!(
+        sentence.contains("you can search now"),
+        "the readiness note must tell the user search still works — ADR-089 \
+         degrades rather than failing, and the copy must not imply otherwise"
+    );
+}

@@ -176,6 +176,45 @@ pub async fn ensure_recall_engine(
     }
 }
 
+/// Report what the ranking model is currently doing (ADR-090).
+///
+/// Returns one of [`vault_app::RerankerState`]'s wire strings. The frontend
+/// branches on these to decide whether to show a "getting ready" state at all
+/// — which is why `not_configured` and `unavailable` are distinct from
+/// `preparing`: only the last is a wait that ends.
+///
+/// Cheap and side-effect free. Notably it does NOT trigger a load: asking
+/// whether the engine is ready must not start the very work being asked about,
+/// or a status poll would kick off a 1.2 GB read on every call.
+///
+/// No audit row, for the same reason [`ensure_recall_engine`] writes none —
+/// this touches no vault state and reads no memory (BRD §11.9.1).
+#[tauri::command]
+pub async fn recall_engine_state(app: State<'_, vault_app::Application>) -> Result<String, String> {
+    Ok(app.reranker_state().as_wire_str().to_string())
+}
+
+/// Request a background load of the ranking model (ADR-090).
+///
+/// Idempotent and safe to call repeatedly: the load runs at most once, and a
+/// failed attempt leaves the cell cold so a later call retries.
+///
+/// The frontend calls this after [`ensure_recall_engine`] resolves. That is
+/// the case `main.rs`'s startup warm-up cannot cover: on a genuine first run
+/// the files are still downloading when the app boots, so the startup attempt
+/// correctly fails fast and the model would otherwise stay cold until the
+/// user's first search — the exact ~24 s stall this ADR removes.
+///
+/// Returns immediately; the caller polls [`recall_engine_state`] for the
+/// outcome. Infallible by design — "no reranker configured" is a legitimate
+/// vault shape, not an error.
+#[tauri::command]
+pub async fn warm_recall_engine(app: State<'_, vault_app::Application>) -> Result<bool, String> {
+    let warming = app.spawn_reranker_warmup();
+    tracing::info!(warming, "ranking model warm-up requested (ADR-090)");
+    Ok(warming)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -193,6 +193,69 @@ function startEngineFetch() {
   return engineFetch.promise;
 }
 
+// ── Engine readiness (ADR-090) ───────────────────────────────────────────
+//
+// Acquisition (bytes on disk) and readiness (model loaded and serving) are
+// DIFFERENT things, and conflating them is what made the first search after a
+// download take ~24 s with no explanation. `ensure_recall_engine` finishing
+// means the files arrived; the model still has to be read and prepared.
+//
+// The founder's call (2026-07-22) was: open the window instantly and say
+// honestly that the engine is still getting ready — rather than gate the
+// window for ~40 s on every launch. Recall keeps working throughout, on the
+// retriever's own order (ADR-089).
+//
+// `preparing` is the ONLY state that represents a wait that ends. `unavailable`
+// (files not fetched) and `not_configured` (no engine at all) must never show
+// a spinner: promising a wait that will not end is exactly the dishonesty this
+// is meant to avoid.
+const engineReady = {
+  state: "preparing", // pessimistic until the backend says otherwise
+  polling: false,
+};
+
+function engineIsPreparing() {
+  return engineReady.state === "preparing";
+}
+
+async function refreshEngineState() {
+  try {
+    engineReady.state = await invoke("recall_engine_state");
+  } catch {
+    // A failed status read must not invent a wait. Treat it as "nothing to
+    // report" so the UI stays quiet rather than spinning forever.
+    engineReady.state = "unavailable";
+  }
+  renderEngineReady();
+  return engineReady.state;
+}
+
+// Poll only while there is a genuine wait in progress. Stops on `ready` and on
+// any terminal state, so an idle app is not calling into Rust forever.
+function pollEngineReady() {
+  if (engineReady.polling) return;
+  engineReady.polling = true;
+  const tick = async () => {
+    const s = await refreshEngineState();
+    if (s === "preparing") {
+      setTimeout(tick, 1500);
+    } else {
+      engineReady.polling = false;
+    }
+  };
+  tick();
+}
+
+// Ask the backend to start preparing the engine, then watch for it to finish.
+// Called after acquisition completes — the case `main.rs`'s startup warm-up
+// cannot cover, because on a real first run the files are still downloading
+// when the app boots.
+function warmEngine() {
+  return invoke("warm_recall_engine")
+    .catch(() => false)
+    .then(() => pollEngineReady());
+}
+
 // MCP connection snippets use the REAL entry point: `vault-cli mcp serve`
 // (stdio, 1:1) — cross-agent proven (Claude / Cursor / Codex).
 const SNIPPET_JSON = `{
@@ -368,6 +431,24 @@ function renderEngineRow() {
   row.className = "check-item active";
   ico.textContent = SPIN[engineFetch.tick % SPIN.length];
   lbl.textContent = `preparing recall engine — ${engineFetch.percent}%`;
+}
+
+// The honest "still getting ready" line on the home screen (ADR-090).
+//
+// Shown ONLY while `preparing` — a finite wait that resolves on its own. Never
+// shown for `unavailable` or `not_configured`, because there is no wait to
+// report there and claiming one would be a lie the UI never resolves.
+//
+// White-label (ADR-086): "recall engine", no model or runtime named.
+function renderEngineReady() {
+  const note = $("engine-note");
+  if (!note) return;
+  const preparing = engineIsPreparing();
+  note.classList.toggle("hidden", !preparing);
+  if (preparing) {
+    note.textContent =
+      "Getting your recall engine ready — you can search now, results sharpen up in a moment.";
+  }
 }
 
 function renderBeginState() {
@@ -878,15 +959,40 @@ function init() {
   $("mem-skip").addEventListener("click", () => finishOnboarding(false));
 
   // home — search
-  let debounce = null;
+  //
+  // ADR-090: a vault search runs on ENTER, not per keystroke.
+  //
+  // The old 350 ms debounce stopped keystroke *spam* but still fired a real
+  // query on every natural typing pause, and each one became a full ranking
+  // pass. Measured live 2026-07-22: typing "work" ran four passes, "keyboard"
+  // three, all queued behind each other — which is why a single search felt
+  // like it took 26 s when one pass is ~5 s. `renderMemList`'s sequence guard
+  // discarded the stale RESPONSES but the work was already paid for.
+  //
+  // That waste is invisible on a local vault (the user's own CPU) and real on
+  // the hosted tier, where every pass is compute we pay for. Agents over MCP
+  // were never affected — they send one query per question rather than typing.
+  //
+  // Clearing the box still updates instantly: returning to the recent list is
+  // a cheap unfiltered read, not a search, so there is nothing to defer.
+  let clearDebounce = null;
   $("search-input").addEventListener("input", () => {
-    state.query = $("search-input").value;
-    clearTimeout(debounce);
-    debounce = setTimeout(renderMemList, 350);
+    const next = $("search-input").value;
+    const wasEmpty = state.query.trim() === "";
+    state.query = next;
+    if (next.trim() === "") {
+      // Fall back to the recent list as soon as the box empties.
+      clearTimeout(clearDebounce);
+      clearDebounce = setTimeout(renderMemList, 120);
+    } else if (wasEmpty) {
+      // Typing has started: cancel a pending "show recent" so it cannot land
+      // after the user has begun a query and blank their in-progress view.
+      clearTimeout(clearDebounce);
+    }
   });
   $("search-input").addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
-      clearTimeout(debounce);
+      clearTimeout(clearDebounce);
       state.query = $("search-input").value;
       renderMemList();
     }
@@ -945,11 +1051,24 @@ function init() {
     renderFinishWait();
   }).catch(() => { /* no event bridge outside Tauri — progress just stays hidden */ });
 
-  startEngineFetch().catch(() => {
-    // Swallowed here on purpose: a background failure must not throw during
-    // init. It is surfaced where it matters — the onboarding gate retries and
-    // reports, and search degrades gracefully meanwhile (ADR-089).
-  });
+  startEngineFetch()
+    .then(() => {
+      // ADR-090: files on disk is not the same as engine ready. Ask for the
+      // load explicitly here — on a genuine first run the files were still
+      // downloading when `main.rs` made its startup attempt, so without this
+      // the model stays cold until the user's first search.
+      warmEngine();
+    })
+    .catch(() => {
+      // Swallowed here on purpose: a background failure must not throw during
+      // init. It is surfaced where it matters — the onboarding gate retries and
+      // reports, and search degrades gracefully meanwhile (ADR-089).
+    });
+
+  // Warm-launch case: the files were already present, so `main.rs` started the
+  // load before the window existed. Nothing to request — just watch for it to
+  // finish so the "getting ready" line clears itself (ADR-090).
+  pollEngineReady();
 
   showScreen(state.screen);
 }

@@ -403,6 +403,10 @@ textarea.mv-input { resize: none; }
   display: block;
 }
 .recall-hero .kbd-hint { margin: 12px 0 0; font: 400 12px var(--sans); color: var(--faint); }
+/* ADR-090: the honest "still preparing" line. Deliberately quiet — it reports
+   a wait that resolves itself and needs no action, so it must not read as an
+   error or pull focus from the search box. */
+.recall-hero .engine-note { margin: 10px 0 0; font: 400 12px var(--sans); color: var(--faint); opacity: .85; }
 .kbd {
   font-family: var(--mono);
   background: var(--chip-bg);
