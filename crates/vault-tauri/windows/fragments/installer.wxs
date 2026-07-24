@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ============================================================================
+  Memory Vault MSI installer fragment — T0.2.14 packaging.
+
+  Referenced from tauri.conf.json:
+    bundle.windows.wix.fragmentPaths = ["./windows/fragments/installer.wxs"]
+    bundle.windows.wix.componentRefs = [
+      "SetLanceMemPoolEnv", "VaultCliBinary", "AddInstallDirToPath"
+    ]
+
+  Processed only at `tauri build` (candle/light) time — never at `cargo build`,
+  so it has zero effect on CI (which compiles + tests but does not bundle).
+
+  ✅ VERIFIED at first bundle (2026-07-23):
+    - Install dir id IS "INSTALLDIR" — confirmed against the generated
+      target/release/wix/x64/main.wxs (the app's own files install there).
+    - File @Source uses an ABSOLUTE path to the built vault-cli.exe. candle
+      resolves relative @Source against its own working dir (not the .wxs
+      location), which is not something we control here — absolute removes the
+      ambiguity. LOCAL-BUILD ASSUMPTION: the repo lives at the path below; a
+      portable/CI bundle would templatize this. Acceptable for the local beta
+      build (the MSI must be built locally anyway — CI ships 0-byte fixtures).
+    - Components that install a file MUST sit under <DirectoryRef Id="..."> and
+      MUST NOT also carry a Component/@Directory attribute (that combination is
+      WiX error CNDL0062). Directory context comes from the enclosing ref.
+
+  Chose a WiX File component over bundle.externalBin deliberately: externalBin
+  is compile-time validated (would need per-triple CI placeholders) AND derives
+  a WiX Component @Id from the binary name — our hyphen ("vault-cli") is an
+  illegal WiX identifier (candle CNDL0014; tauri #14681). Here we set the @Id
+  ourselves, so the natural vault-cli.exe filename ships unchanged.
+  ============================================================================
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+
+    <!-- Environment/registry components are directory-agnostic; keep them under TARGETDIR. -->
+    <DirectoryRef Id="TARGETDIR">
+
+      <!--
+        ADR-038 — LANCE_MEM_POOL_SIZE (256 MiB) in the installed user's
+        environment so lance/datafusion's merge_insert JOIN path is bounded on
+        every launch of BOTH the desktop app AND vault-cli.exe (the MCP server
+        an AI client spawns opens the same lance store and needs the same
+        bound). Cannot be set in Rust: ADR-002 forbids unsafe_code and
+        std::env::set_var is unsafe. Per-user (no elevation), removed on
+        uninstall. The HKCU RegistryValue is the component KeyPath (an
+        Environment element cannot itself be a KeyPath under WiX v3 ICE rules).
+      -->
+      <Component Id="SetLanceMemPoolEnv" Guid="7E9C1F2A-4B6D-4E3F-9A1C-2D5E8F0B3C7A">
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\com.shahbaz242630.memory-vault\Install"
+          Name="LanceEnvKeyPath"
+          Type="integer"
+          Value="1"
+          KeyPath="yes" />
+        <Environment
+          Id="LanceMemPoolSize"
+          Name="LANCE_MEM_POOL_SIZE"
+          Value="268435456"
+          Action="set"
+          Part="all"
+          System="no"
+          Permanent="no" />
+      </Component>
+
+      <!--
+        Put the app install dir on the user's PATH so the UNCHANGED, cross-agent
+        proven snippet `command = "vault-cli"` resolves. Keeping the bare name
+        (vs an absolute backslash path in the JSON/TOML snippet) is the more
+        portable choice across MCP clients. Part="last" appends; per-user; the
+        entry is removed on uninstall. Users are already told to restart their
+        agent after adding the config, which is also when the new PATH is seen.
+        Value="[INSTALLDIR]" references the install-dir PROPERTY, so this
+        component's own directory does not matter — hence TARGETDIR.
+      -->
+      <Component Id="AddInstallDirToPath" Guid="9B7D5F3A-2E4C-4B6D-8A1F-3C5E7A9B1D3F">
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\com.shahbaz242630.memory-vault\Install"
+          Name="PathKeyPath"
+          Type="integer"
+          Value="1"
+          KeyPath="yes" />
+        <Environment
+          Id="AddVaultToPath"
+          Name="PATH"
+          Value="[INSTALLDIR]"
+          Action="set"
+          Part="last"
+          System="no"
+          Permanent="no" />
+      </Component>
+
+    </DirectoryRef>
+
+    <!--
+      Ship vault-cli.exe INTO the app directory so MCP works in an installed
+      build (blocker (c)). Without it, onboarding's `vault-cli mcp serve`
+      snippet is a promise nothing keeps and no AI client can connect.
+      Consolidation is intentionally out of scope for this beta (Phi-4 not
+      wired) — this binary's job here is MCP only. Sits beside vault-tauri.exe
+      via the INSTALLDIR directory ref (NO Component/@Directory — CNDL0062).
+    -->
+    <DirectoryRef Id="INSTALLDIR">
+      <Component Id="VaultCliBinary" Guid="2C4A6E8B-1D3F-4A5C-9E7B-0F2A4C6E8B1D">
+        <File
+          Id="VaultCliExe"
+          Name="vault-cli.exe"
+          Source="C:\Projects\GitHub\Memory Vault\target\release\vault-cli.exe"
+          KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+  </Fragment>
+</Wix>
