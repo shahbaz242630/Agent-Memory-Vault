@@ -61,6 +61,7 @@
 pub mod agent;
 pub mod boundary;
 pub mod engine;
+pub mod maintenance;
 pub mod memory;
 pub mod settings;
 
@@ -69,6 +70,7 @@ pub use boundary::{
     create_boundary, create_boundary_inner, list_boundaries, list_boundaries_inner,
 };
 pub use engine::{ensure_recall_engine, RecallEngineFetch};
+pub use maintenance::{MaintenanceContext, MaintenanceEngineFetch};
 pub use memory::{
     add_memory, add_memory_inner, delete_memory, delete_memory_inner, list_recent_memories,
     list_recent_memories_inner, search_memories, search_memories_inner, update_memory,

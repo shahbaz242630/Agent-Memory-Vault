@@ -121,6 +121,10 @@ fn main() {
             vault_tauri::commands::engine::ensure_recall_engine,
             vault_tauri::commands::engine::recall_engine_state,
             vault_tauri::commands::engine::warm_recall_engine,
+            vault_tauri::commands::maintenance::ensure_maintenance_engine,
+            vault_tauri::commands::maintenance::get_maintenance_schedule,
+            vault_tauri::commands::maintenance::set_maintenance_schedule,
+            vault_tauri::commands::maintenance::run_maintenance_now,
         ])
         .setup(|app| {
             // 1. Resolve libonnxruntime dylib path per ADR-019.
@@ -291,6 +295,23 @@ fn main() {
                 "reranker paths bound (loaded lazily on first query)"
             );
 
+            // ADR-092/093: assemble the context the automatic-maintenance
+            // commands need to invoke the bundled `vault-cli consolidate run`
+            // against THIS app's own vault. Built from clones before the paths
+            // are moved into `AppConfig` below, and managed after `Application`.
+            let models_dir = data_dir.join("models");
+            let maintenance_ctx = vault_tauri::commands::maintenance::MaintenanceContext {
+                vault_cli: resolve_vault_cli_path(),
+                vault_db: metadata_path.clone(),
+                vector_dir: vector_dir.clone(),
+                graph_db: graph_path.clone(),
+                bge_model: model_path.clone(),
+                bge_tokenizer: tokenizer_path.clone(),
+                ort_lib: ort_lib_path.clone(),
+                phi4_model: model_fetch::phi4_path_in(&models_dir),
+                config_path: data_dir.join("maintenance.json"),
+            };
+
             let config = AppConfig {
                 metadata_path,
                 vector_dir,
@@ -393,6 +414,13 @@ fn main() {
                 data_dir.join("models"),
             ));
 
+            // 9. Automatic-maintenance state (ADR-092/093): the resolved
+            //    context for building the `vault-cli` invocation, plus the
+            //    first-run Phi-4 download deduper (bound to the same models
+            //    dir so what onboarding fetches is what a run later loads).
+            app.manage(maintenance_ctx);
+            app.manage(vault_tauri::commands::maintenance::MaintenanceEngineFetch::new(models_dir));
+
             Ok(())
         });
 
@@ -482,6 +510,28 @@ fn resolve_reranker_paths(data_dir: &std::path::Path) -> (PathBuf, PathBuf) {
 
     let paths = model_fetch::reranker_paths_in(&data_dir.join("models"));
     (paths.model, paths.tokenizer)
+}
+
+/// Resolve the bundled `vault-cli` executable that automatic maintenance runs
+/// (ADR-091 ships it into the install dir; ADR-093 spawns it for consolidation).
+///
+/// Dev-mode override via `VAULT_CLI_PATH`. Otherwise it sits beside the running
+/// executable — the install directory on an installed build, `target/<profile>`
+/// during development. Falls back to the bare name (resolved via PATH, which the
+/// installer also puts the install dir on) if the current-exe lookup fails.
+fn resolve_vault_cli_path() -> PathBuf {
+    if let Some(p) = env_override_for("VAULT_CLI_PATH") {
+        return p;
+    }
+    let exe_name = if cfg!(windows) {
+        "vault-cli.exe"
+    } else {
+        "vault-cli"
+    };
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(exe_name)))
+        .unwrap_or_else(|| PathBuf::from(exe_name))
 }
 
 /// Resolve bundled tokenizer.json path. Dev-mode override via

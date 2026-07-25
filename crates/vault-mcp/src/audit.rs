@@ -209,6 +209,13 @@ impl ToolInvokeError {
                 category: "Consolidation".to_string(),
                 message: message.clone(),
             },
+            // ADR-092: automatic-maintenance scheduling is a Tauri-layer
+            // concern and never reaches MCP tool dispatch; recorded with its
+            // own category for audit completeness if it ever does.
+            VaultError::Scheduler(message) => Self::Internal {
+                category: "Scheduler".to_string(),
+                message: message.clone(),
+            },
             VaultError::Mcp(message) => Self::Internal {
                 category: "Mcp".to_string(),
                 message: message.clone(),

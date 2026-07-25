@@ -23,7 +23,7 @@
 
       <!-- ================= CONNECT AGENT ================= -->
       <div id="screen-connect" class="screen onboard hidden">
-        <div class="kicker">STEP 2 OF 3</div>
+        <div class="kicker">STEP 2 OF 4</div>
         <h1>Introduce your first agent.</h1>
         <p class="sub">Any MCP-compatible agent can read and write your vault. Choose one to see how.</p>
         <div id="agent-grid" class="agent-grid"></div>
@@ -40,9 +40,33 @@
         </div>
       </div>
 
+      <!-- ================= AUTOMATIC MAINTENANCE (onboarding) ================= -->
+      <div id="screen-maintenance" class="screen onboard hidden">
+        <div class="kicker">STEP 4 OF 4</div>
+        <h1>Keep your memory sharp — on its own.</h1>
+        <p class="sub">Every so often, Memory Vault can quietly tidy what it has learned — merging duplicates, resolving contradictions, and letting stale details fade. It runs on this device while you are away. You can change this or turn it off anytime.</p>
+        <div class="maint-onboard">
+          <label class="maint-choice">
+            <input type="radio" name="maint-onboard-choice" id="maint-onboard-on" value="on" />
+            <span><strong>Yes, tidy automatically</strong><br />every day at a quiet hour</span>
+          </label>
+          <label id="maint-onboard-time-wrap" class="maint-onboard-time hidden">Run at
+            <input type="time" id="maint-onboard-time" value="03:00" />
+          </label>
+          <label class="maint-choice">
+            <input type="radio" name="maint-onboard-choice" id="maint-onboard-off" value="off" checked />
+            <span><strong>Not now</strong><br />I'll decide later in Consolidation</span>
+          </label>
+        </div>
+        <div id="maint-onboard-note" class="maint-onboard-note"></div>
+        <div class="onboard-foot">
+          <button id="maint-onboard-cta" class="btn-pill">Finish setup</button>
+        </div>
+      </div>
+
       <!-- ================= FIRST MEMORY ================= -->
       <div id="screen-memory" class="screen onboard memory-screen hidden">
-        <div class="kicker">STEP 3 OF 3</div>
+        <div class="kicker">STEP 3 OF 4</div>
         <h1>What should they remember first?</h1>
         <p class="sub">Something true about you. Your agents will recall it whenever it helps.</p>
         <textarea id="mem-text" class="mv-input" placeholder="e.g. I run a small design studio in London. I prefer short, direct answers."></textarea>
@@ -55,7 +79,7 @@
 
       <!-- onboarding progress dots -->
       <div id="progress-dots" class="progress-dots hidden">
-        <span></span><span></span><span></span>
+        <span></span><span></span><span></span><span></span>
       </div>
 
       <!-- ================= HOME ================= -->
@@ -139,6 +163,74 @@
             </div>
             <div id="agents-snippet" class="snippet-code"></div>
           </div>
+        </div>
+
+        <!-- consolidation tab -->
+        <div id="tab-maintenance" class="tab-pane tab-body hidden">
+          <div class="headline">Consolidation.</div>
+          <p class="sub">Consolidation is how Memory Vault keeps what it knows about you clean — merging duplicates, resolving contradictions, and letting stale detail fade. It runs on this device and never leaves it.</p>
+          <div id="maint-engine-note" class="engine-note hidden"></div>
+
+          <section class="maint-card">
+            <div class="maint-card-head">
+              <span class="maint-step">1</span>
+              <h2>Consolidate automatically</h2>
+            </div>
+            <p class="maint-explain">When this is on, Memory Vault reviews your memories on a schedule and cleans them up. Near-duplicates get merged into one. Facts that contradict each other are resolved in favour of the newer one. Older memories you never use are archived out of everyday recall — never deleted. All of it happens on this device.</p>
+            <label class="maint-toggle">
+              <input type="checkbox" id="maint-enabled" />
+              <span>Keep my vault tidy automatically</span>
+            </label>
+          </section>
+
+          <section class="maint-card">
+            <div class="maint-card-head">
+              <span class="maint-step">2</span>
+              <h2>When it runs</h2>
+            </div>
+            <p class="maint-explain">Pick how often and what time. Choose a time your computer is usually on but you're not using it — the middle of the night is ideal, since a tidy-up uses real processing power for a few minutes. If your computer is asleep or off at that time, it catches up next time you open the app.</p>
+            <div id="maint-when" class="maint-when">
+              <label>How often
+                <select id="maint-frequency">
+                  <option value="daily">Every day</option>
+                  <option value="weekly">Once a week</option>
+                </select>
+              </label>
+              <label id="maint-weekday-wrap" class="hidden">On
+                <select id="maint-weekday">
+                  <option value="0">Sunday</option>
+                  <option value="1">Monday</option>
+                  <option value="2">Tuesday</option>
+                  <option value="3">Wednesday</option>
+                  <option value="4">Thursday</option>
+                  <option value="5">Friday</option>
+                  <option value="6">Saturday</option>
+                </select>
+              </label>
+              <label>At
+                <input type="time" id="maint-time" value="03:00" />
+              </label>
+            </div>
+            <div class="maint-actions">
+              <button id="maint-save" class="btn-pill">Save schedule</button>
+              <span id="maint-save-note" class="maint-save-note"></span>
+            </div>
+            <div id="maint-status" class="maint-status"></div>
+          </section>
+
+          <section class="maint-card">
+            <div class="maint-card-head">
+              <span class="maint-step">3</span>
+              <h2>Run one now</h2>
+            </div>
+            <p class="maint-explain">Runs a consolidation immediately instead of waiting for the schedule. Useful right after you've added a lot of memories. If one of your AI agents is connected and using the vault, this waits and runs later rather than interrupting it.</p>
+            <div class="maint-actions">
+              <button id="maint-run" class="btn-quiet">Run consolidation now</button>
+              <span id="maint-run-note" class="maint-save-note"></span>
+            </div>
+          </section>
+
+          <p class="boundary-note">Consolidation runs even when this window is closed. On a laptop that was asleep at the scheduled time, it catches up the next time you open the app.</p>
         </div>
 
         <!-- settings tab -->

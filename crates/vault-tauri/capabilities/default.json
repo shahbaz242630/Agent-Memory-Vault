@@ -18,6 +18,10 @@
     "allow-get-settings-info",
     "allow-ensure-recall-engine",
     "allow-recall-engine-state",
-    "allow-warm-recall-engine"
+    "allow-warm-recall-engine",
+    "allow-ensure-maintenance-engine",
+    "allow-get-maintenance-schedule",
+    "allow-set-maintenance-schedule",
+    "allow-run-maintenance-now"
   ]
 }

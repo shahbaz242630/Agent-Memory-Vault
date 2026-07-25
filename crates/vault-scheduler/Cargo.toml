@@ -1,0 +1,34 @@
+[package]
+name = "vault-scheduler"
+description = "Cross-platform OS-level task scheduler: registers a per-user scheduled task (Windows Task Scheduler / macOS launchd / Linux systemd) that runs the bundled vault-cli for nightly maintenance. See BRD §5.6 scheduling + ADR-092."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Workspace-internal: the shared error catalogue only. This crate deliberately
+# depends on nothing else in the workspace — it is a leaf capability that builds
+# and registers an OS task from a self-contained spec (ADR-092). No tokio: the
+# trait is synchronous (short subprocess calls), invoked via spawn_blocking by
+# the async Tauri layer.
+vault-core = { path = "../vault-core" }
+
+# Per-crate thiserror error enum, converted to VaultError at the workspace
+# boundary (BRD §2.4).
+thiserror = { workspace = true }
+
+# NaiveTime (time-of-day) + Weekday (weekly schedule day). serde feature is on
+# in the workspace pin, so the public types can derive Serialize/Deserialize
+# for the Tauri IPC boundary.
+chrono = { workspace = true }
+
+# Serialize/Deserialize on the public spec/status types so vault-tauri can hand
+# them across the IPC boundary without a parallel DTO.
+serde = { workspace = true }
+
+[dev-dependencies]
+# Round-trip tests for the serde representation of the public IPC types.
+serde_json = { workspace = true }

@@ -10105,6 +10105,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vault-scheduler"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "vault-core",
+]
+
+[[package]]
 name = "vault-storage"
 version = "0.1.0"
 dependencies = [
@@ -10149,6 +10160,7 @@ dependencies = [
 name = "vault-tauri"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "serde",
  "serde_json",
  "tauri",
@@ -10165,6 +10177,7 @@ dependencies = [
  "vault-llm",
  "vault-mcp",
  "vault-retrieval",
+ "vault-scheduler",
  "vault-storage",
 ]
 

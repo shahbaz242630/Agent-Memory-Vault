@@ -92,3 +92,25 @@ commands.allow = ["recall_engine_state"]
 identifier = "allow-warm-recall-engine"
 description = "Allow invoking the warm_recall_engine command (request a background load of the recall engine so the first recall is not slowed by it). Takes no parameters; idempotent."
 commands.allow = ["warm_recall_engine"]
+
+# Automatic maintenance (ADR-092/093) — the scheduler + the Phi-4 download.
+
+[[permission]]
+identifier = "allow-ensure-maintenance-engine"
+description = "Allow invoking the ensure_maintenance_engine command (first-run download + integrity-verify of the maintenance model). Takes no parameters; the destination, source and expected hash are fixed at build time. Non-gating."
+commands.allow = ["ensure_maintenance_engine"]
+
+[[permission]]
+identifier = "allow-get-maintenance-schedule"
+description = "Allow invoking the get_maintenance_schedule command (read the current automatic-maintenance schedule, OS registration state, engine readiness, and last-run outcome). Side-effect free."
+commands.allow = ["get_maintenance_schedule"]
+
+[[permission]]
+identifier = "allow-set-maintenance-schedule"
+description = "Allow invoking the set_maintenance_schedule command (turn automatic maintenance on/off and set its daily/weekly time by registering or removing a per-user OS task)."
+commands.allow = ["set_maintenance_schedule"]
+
+[[permission]]
+identifier = "allow-run-maintenance-now"
+description = "Allow invoking the run_maintenance_now command (run one consolidation immediately by spawning the bundled vault-cli; skips cleanly if the vault is in use)."
+commands.allow = ["run_maintenance_now"]

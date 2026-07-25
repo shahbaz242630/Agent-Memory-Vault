@@ -1,0 +1,684 @@
+//! Automatic-maintenance commands — the scheduler + the Phi-4 download.
+//!
+//! "Automatic maintenance" is the user-facing (ADR-086 white-label) name for
+//! the nightly sleep consolidator. This module exposes:
+//!
+//! - [`ensure_maintenance_engine`] — first-run download of Phi-4 (the model the
+//!   consolidation runs on). It downloads for every user during onboarding but
+//!   does NOT gate onboarding: recall never needs Phi-4, only maintenance does.
+//! - [`get_maintenance_schedule`] / [`set_maintenance_schedule`] — read and
+//!   change the schedule. `set` registers (or removes) a per-user OS task via
+//!   `vault-scheduler` that runs the bundled `vault-cli consolidate run`
+//!   (ADR-093), and persists the user's choice.
+//! - [`run_maintenance_now`] — run a consolidation immediately by spawning the
+//!   same bundled `vault-cli` as a subprocess (one code path with the schedule).
+//!
+//! ## Why the desktop app never loads Phi-4 (ADR-093)
+//!
+//! Both the scheduled run and "Run now" launch `vault-cli` in its own
+//! short-lived process. The desktop app therefore never loads the 2.5 GB model
+//! into its own address space, and there is exactly one consolidation code
+//! path. The scheduled/subprocess command is pointed at the desktop app's exact
+//! vault paths so it operates on the same vault.
+//!
+//! ## Single-writer safety
+//!
+//! `vault-cli consolidate` takes the vault-owner lock. If an MCP agent is
+//! connected (it holds that lock), the run fails fast with a "busy" signal,
+//! which [`run_maintenance_now`] surfaces as [`ERR_MAINTENANCE_BUSY`] rather
+//! than an error — maintenance simply runs at the next opportunity.
+//!
+//! ## Error shape (§11.7.2) + white-label (ADR-086)
+//!
+//! Commands return short stable codes, never a message built from an
+//! underlying error; details go to the local log. Nothing user-visible names a
+//! model, a repository, or a runtime.
+
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+use serde::{Deserialize, Serialize};
+use tauri::{Emitter, State};
+use vault_app::Application;
+use vault_mcp::ToolInvokeDetails;
+use vault_scheduler::{platform_scheduler, Frequency, ScheduleSpec, SchedulerError, TaskId};
+
+use crate::model_fetch;
+
+/// Stable OS task id for the maintenance schedule (safe charset per
+/// `vault_scheduler::TaskId`).
+pub const MAINTENANCE_TASK_ID: &str = "com.memoryvault.maintenance";
+
+/// White-label description the OS scheduler may show (ADR-086).
+pub const MAINTENANCE_LABEL: &str = "Memory Vault automatic maintenance";
+
+/// The LANCE memory-pool env var the run needs (ADR-038). The Windows installer
+/// sets it per-user (ADR-091) and Task Scheduler inherits it; we still put it in
+/// the spec so macOS/Linux, whose backends inject env directly, are covered.
+const LANCE_MEM_POOL_ENV: (&str, &str) = ("LANCE_MEM_POOL_SIZE", "268435456");
+
+/// Progress event channel for the Phi-4 (maintenance-engine) download.
+pub const MAINTENANCE_PROGRESS_EVENT: &str = "maintenance-engine://progress";
+
+/// Opaque error codes (§11.7.2 — no internals cross the IPC boundary).
+pub const ERR_MAINTENANCE_ENGINE_FAILED: &str = "maintenance_engine_unavailable";
+/// Registering/removing the schedule failed.
+pub const ERR_SCHEDULE_FAILED: &str = "maintenance_schedule_failed";
+/// The vault was in use (an agent held the lock) — maintenance was skipped.
+pub const ERR_MAINTENANCE_BUSY: &str = "maintenance_vault_busy";
+/// A manual maintenance run failed for a reason other than busy.
+pub const ERR_MAINTENANCE_FAILED: &str = "maintenance_run_failed";
+
+/// Resolved paths the maintenance commands need to build the `vault-cli`
+/// invocation. Constructed once in `main.rs` setup and managed as Tauri state.
+pub struct MaintenanceContext {
+    /// Absolute path to the bundled `vault-cli` executable.
+    pub vault_cli: PathBuf,
+    /// The desktop app's SQLCipher metadata DB (`<data>/vault.db`).
+    pub vault_db: PathBuf,
+    /// The desktop app's LanceDB dir (`<data>/lance`).
+    pub vector_dir: PathBuf,
+    /// The desktop app's DuckDB graph file (`<data>/graph.duckdb`).
+    pub graph_db: PathBuf,
+    /// BGE embedder model.
+    pub bge_model: PathBuf,
+    /// BGE tokenizer.
+    pub bge_tokenizer: PathBuf,
+    /// ONNX Runtime dylib.
+    pub ort_lib: PathBuf,
+    /// Phi-4 GGUF (may not exist yet on a first run).
+    pub phi4_model: PathBuf,
+    /// Where the persisted schedule config lives (`<data>/maintenance.json`).
+    pub config_path: PathBuf,
+}
+
+/// Build the full `vault-cli` argument vector (after the program) for a
+/// consolidation run against the desktop app's own vault.
+fn consolidate_args(ctx: &MaintenanceContext) -> Vec<String> {
+    let s = |p: &Path| p.to_string_lossy().into_owned();
+    vec![
+        "--vault-db".into(),
+        s(&ctx.vault_db),
+        "--vector-dir".into(),
+        s(&ctx.vector_dir),
+        "--graph-db".into(),
+        s(&ctx.graph_db),
+        "consolidate".into(),
+        "--bge-model".into(),
+        s(&ctx.bge_model),
+        "--bge-tokenizer".into(),
+        s(&ctx.bge_tokenizer),
+        "--ort-lib".into(),
+        s(&ctx.ort_lib),
+        "--phi4-model".into(),
+        s(&ctx.phi4_model),
+        "run".into(),
+    ]
+}
+
+/// Managed state for the first-run Phi-4 download. Mirrors
+/// `engine::RecallEngineFetch`: a `OnceCell` dedupes concurrent callers onto one
+/// transfer and leaves the cell cold on failure so a retry is possible.
+pub struct MaintenanceEngineFetch {
+    models_dir: PathBuf,
+    once: tokio::sync::OnceCell<()>,
+}
+
+impl MaintenanceEngineFetch {
+    /// Bind acquisition to `models_dir` (`<data>/models`).
+    pub fn new(models_dir: PathBuf) -> Self {
+        Self {
+            models_dir,
+            once: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// Whether the Phi-4 acquisition has completed successfully this session.
+    pub fn is_complete(&self) -> bool {
+        self.once.initialized()
+    }
+}
+
+/// Progress payload for [`MAINTENANCE_PROGRESS_EVENT`].
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct MaintenanceEngineProgress {
+    /// Bytes transferred so far.
+    pub downloaded_bytes: u64,
+    /// Total bytes the acquisition covers.
+    pub total_bytes: u64,
+    /// Whole-number percent, pre-computed so the UI cannot divide by zero.
+    pub percent: u8,
+}
+
+impl MaintenanceEngineProgress {
+    fn new(downloaded_bytes: u64, total_bytes: u64) -> Self {
+        let percent = if total_bytes == 0 {
+            100
+        } else {
+            (downloaded_bytes.saturating_mul(100) / total_bytes).min(100) as u8
+        };
+        Self {
+            downloaded_bytes,
+            total_bytes,
+            percent,
+        }
+    }
+}
+
+/// The persisted schedule choice (`<data>/maintenance.json`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaintenanceConfig {
+    /// Whether automatic maintenance is turned on.
+    pub enabled: bool,
+    /// `"daily"` or `"weekly"`.
+    pub frequency: String,
+    /// Day of week for a weekly schedule, 0 = Sunday .. 6 = Saturday.
+    pub weekday: u8,
+    /// Hour of day (0-23).
+    pub hour: u8,
+    /// Minute of hour (0-59).
+    pub minute: u8,
+    /// Outcome of the most recent run, if any.
+    #[serde(default)]
+    pub last_run: Option<LastRun>,
+}
+
+impl Default for MaintenanceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            frequency: "daily".to_string(),
+            weekday: 0,
+            hour: 3,
+            minute: 0,
+            last_run: None,
+        }
+    }
+}
+
+/// The outcome of a maintenance run, shown in the tab.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastRun {
+    /// RFC-3339 timestamp of completion.
+    pub finished_at: String,
+    /// Whether it succeeded.
+    pub ok: bool,
+    /// A short human-readable summary (the consolidation report, truncated) or
+    /// an error code.
+    pub summary: String,
+}
+
+/// What the Maintenance tab renders.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScheduleView {
+    /// Whether automatic maintenance is turned on.
+    pub enabled: bool,
+    /// `"daily"` or `"weekly"`.
+    pub frequency: String,
+    /// Day of week for a weekly schedule (0-6).
+    pub weekday: u8,
+    /// Hour of day (0-23).
+    pub hour: u8,
+    /// Minute of hour (0-59).
+    pub minute: u8,
+    /// Whether the OS currently has the task registered.
+    pub registered: bool,
+    /// Whether the maintenance engine (Phi-4) is present and ready.
+    pub engine_ready: bool,
+    /// The most recent run's outcome, if any.
+    pub last_run: Option<LastRun>,
+}
+
+/// Load the persisted config, falling back to the default when absent or
+/// unreadable (a corrupt file must not brick the tab).
+fn load_config(path: &Path) -> MaintenanceConfig {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Persist the config as pretty JSON.
+fn save_config(path: &Path, config: &MaintenanceConfig) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(config).map_err(|_| ERR_SCHEDULE_FAILED.to_string())?;
+    std::fs::write(path, json).map_err(|_| ERR_SCHEDULE_FAILED.to_string())
+}
+
+/// Map a 0-6 index (Sunday-based) to a [`chrono::Weekday`].
+fn weekday_from_index(index: u8) -> Result<chrono::Weekday, String> {
+    use chrono::Weekday::*;
+    Ok(match index {
+        0 => Sun,
+        1 => Mon,
+        2 => Tue,
+        3 => Wed,
+        4 => Thu,
+        5 => Fri,
+        6 => Sat,
+        _ => return Err(ERR_SCHEDULE_FAILED.to_string()),
+    })
+}
+
+/// Parse a wire frequency + weekday index into a [`Frequency`].
+fn parse_frequency(frequency: &str, weekday: u8) -> Result<Frequency, String> {
+    match frequency {
+        "daily" => Ok(Frequency::Daily),
+        "weekly" => Ok(Frequency::Weekly {
+            day: weekday_from_index(weekday)?,
+        }),
+        _ => Err(ERR_SCHEDULE_FAILED.to_string()),
+    }
+}
+
+/// Build the `ScheduleSpec` for the current config. Validates the frequency and
+/// time of day.
+fn build_spec(
+    ctx: &MaintenanceContext,
+    config: &MaintenanceConfig,
+) -> Result<ScheduleSpec, String> {
+    let task_id = TaskId::new(MAINTENANCE_TASK_ID).map_err(|_| ERR_SCHEDULE_FAILED.to_string())?;
+    let frequency = parse_frequency(&config.frequency, config.weekday)?;
+    let time_of_day = chrono::NaiveTime::from_hms_opt(config.hour as u32, config.minute as u32, 0)
+        .ok_or_else(|| ERR_SCHEDULE_FAILED.to_string())?;
+    Ok(ScheduleSpec {
+        task_id,
+        label: MAINTENANCE_LABEL.to_string(),
+        frequency,
+        time_of_day,
+        program: ctx.vault_cli.clone(),
+        args: consolidate_args(ctx),
+        env: vec![(
+            LANCE_MEM_POOL_ENV.0.to_string(),
+            LANCE_MEM_POOL_ENV.1.to_string(),
+        )],
+    })
+}
+
+/// Truncate `s` to at most `max` characters, appending an ellipsis when cut.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max).collect();
+        out.push('…');
+        out
+    }
+}
+
+/// Download Phi-4 (the maintenance engine) if absent, reporting progress.
+///
+/// Non-gating: the frontend fires this during onboarding but never blocks
+/// completion on it. Idempotent and deduped via the managed `OnceCell`.
+#[tauri::command]
+pub async fn ensure_maintenance_engine(
+    app: tauri::AppHandle,
+    state: State<'_, MaintenanceEngineFetch>,
+) -> Result<(), String> {
+    let models_dir = state.models_dir.clone();
+    let result = state
+        .once
+        .get_or_try_init(|| async {
+            tracing::info!("maintenance engine acquisition starting");
+            model_fetch::ensure_phi4_with_progress(&models_dir, |p| {
+                if let Err(e) = app.emit(
+                    MAINTENANCE_PROGRESS_EVENT,
+                    MaintenanceEngineProgress::new(p.downloaded_bytes, p.total_bytes),
+                ) {
+                    tracing::debug!(error = %e, "maintenance progress emit failed (no listener?)");
+                }
+            })
+            .await
+            .map(|_| ())
+        })
+        .await;
+
+    match result {
+        Ok(()) => {
+            tracing::info!("maintenance engine ready");
+            Ok(())
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "maintenance engine acquisition failed");
+            Err(ERR_MAINTENANCE_ENGINE_FAILED.to_string())
+        }
+    }
+}
+
+/// Report the current schedule + engine readiness for the Maintenance tab.
+#[tauri::command]
+pub async fn get_maintenance_schedule(
+    ctx: State<'_, MaintenanceContext>,
+    engine: State<'_, MaintenanceEngineFetch>,
+) -> Result<ScheduleView, String> {
+    let config = load_config(&ctx.config_path);
+
+    let task_id = TaskId::new(MAINTENANCE_TASK_ID).map_err(|_| ERR_SCHEDULE_FAILED.to_string())?;
+    // The scheduler trait is synchronous — query the OS off the async runtime.
+    let registered = tokio::task::spawn_blocking(move || {
+        platform_scheduler()
+            .and_then(|s| s.status(&task_id))
+            .map(|s| s.registered)
+            .unwrap_or(false)
+    })
+    .await
+    .unwrap_or(false);
+
+    let engine_ready = engine.is_complete() || ctx.phi4_model.exists();
+
+    Ok(ScheduleView {
+        enabled: config.enabled,
+        frequency: config.frequency,
+        weekday: config.weekday,
+        hour: config.hour,
+        minute: config.minute,
+        registered,
+        engine_ready,
+        last_run: config.last_run,
+    })
+}
+
+/// Turn automatic maintenance on/off and set its schedule.
+///
+/// Registers (or removes) the per-user OS task and persists the choice. A
+/// settings change per §11.9.1, so it writes an audit row.
+#[tauri::command]
+pub async fn set_maintenance_schedule(
+    app: State<'_, Application>,
+    ctx: State<'_, MaintenanceContext>,
+    enabled: bool,
+    frequency: String,
+    weekday: u8,
+    hour: u8,
+    minute: u8,
+) -> Result<(), String> {
+    let start = Instant::now();
+
+    let mut config = load_config(&ctx.config_path);
+    config.enabled = enabled;
+    config.frequency = frequency;
+    config.weekday = weekday;
+    config.hour = hour;
+    config.minute = minute;
+
+    let spec = build_spec(&ctx, &config)?;
+    let task_id = spec.task_id.clone();
+
+    // Register/unregister off the async runtime (the trait is synchronous).
+    let join = tokio::task::spawn_blocking(move || -> Result<(), SchedulerError> {
+        let scheduler = platform_scheduler()?;
+        if enabled {
+            scheduler.register(&spec)
+        } else {
+            scheduler.unregister(&task_id)
+        }
+    })
+    .await;
+
+    let scheduler_result: Result<(), String> = match join {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "scheduler operation failed");
+            Err(ERR_SCHEDULE_FAILED.to_string())
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "scheduler task panicked");
+            Err(ERR_SCHEDULE_FAILED.to_string())
+        }
+    };
+
+    // Persist only when the OS op succeeded, so the tab never claims a state the
+    // OS does not actually hold.
+    if scheduler_result.is_ok() {
+        save_config(&ctx.config_path, &config)?;
+    }
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+    let error_for_audit = scheduler_result.as_ref().err().map(|_| {
+        vault_mcp::ToolInvokeError::from_vault_error(&vault_core::VaultError::Scheduler(
+            "schedule change failed".to_string(),
+        ))
+    });
+    let _ = app
+        .adapter()
+        .append_tauri_command_audit(ToolInvokeDetails {
+            tool: "set_maintenance_schedule",
+            duration_ms,
+            result_count: u32::from(enabled),
+            boundary_count: 0,
+            max_results: None,
+            score_threshold: None,
+            include_archived: None,
+            query_length: None,
+            error: error_for_audit,
+        })
+        .await;
+
+    scheduler_result
+}
+
+/// Run a consolidation immediately by spawning the bundled `vault-cli`.
+///
+/// Returns the run's summary on success, or a stable code — notably
+/// [`ERR_MAINTENANCE_BUSY`] when the vault is in use (an agent holds the lock),
+/// which the UI presents as "will run at the next opportunity" rather than a
+/// failure. Records the outcome as the last run and writes an audit row (a
+/// consolidation run per §11.9.1).
+#[tauri::command]
+pub async fn run_maintenance_now(
+    app: State<'_, Application>,
+    ctx: State<'_, MaintenanceContext>,
+) -> Result<String, String> {
+    let start = Instant::now();
+    let args = consolidate_args(&ctx);
+
+    let output = tokio::process::Command::new(&ctx.vault_cli)
+        .args(&args)
+        .env(LANCE_MEM_POOL_ENV.0, LANCE_MEM_POOL_ENV.1)
+        .output()
+        .await;
+
+    let (result, result_count): (Result<String, String>, u32) = match output {
+        Ok(out) if out.status.success() => {
+            let summary = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            (Ok(summary), 1)
+        }
+        Ok(out) => {
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stderr),
+                String::from_utf8_lossy(&out.stdout)
+            )
+            .to_lowercase();
+            if combined.contains("busy") || combined.contains("already in use") {
+                tracing::warn!("maintenance run skipped: vault in use by another writer");
+                (Err(ERR_MAINTENANCE_BUSY.to_string()), 0)
+            } else {
+                tracing::error!(status = %out.status, "maintenance run failed");
+                (Err(ERR_MAINTENANCE_FAILED.to_string()), 0)
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "failed to spawn vault-cli for maintenance");
+            (Err(ERR_MAINTENANCE_FAILED.to_string()), 0)
+        }
+    };
+
+    let mut config = load_config(&ctx.config_path);
+    config.last_run = Some(LastRun {
+        finished_at: chrono::Utc::now().to_rfc3339(),
+        ok: result.is_ok(),
+        summary: match &result {
+            Ok(s) => truncate(s, 500),
+            Err(code) => code.clone(),
+        },
+    });
+    let _ = save_config(&ctx.config_path, &config);
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+    let error_for_audit = result.as_ref().err().map(|_| {
+        vault_mcp::ToolInvokeError::from_vault_error(&vault_core::VaultError::Consolidation(
+            "maintenance run failed".to_string(),
+        ))
+    });
+    let _ = app
+        .adapter()
+        .append_tauri_command_audit(ToolInvokeDetails {
+            tool: "run_maintenance_now",
+            duration_ms,
+            result_count,
+            boundary_count: 0,
+            max_results: None,
+            score_threshold: None,
+            include_archived: None,
+            query_length: None,
+            error: error_for_audit,
+        })
+        .await;
+
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx() -> MaintenanceContext {
+        MaintenanceContext {
+            vault_cli: PathBuf::from(r"C:\Program Files\Memory Vault\vault-cli.exe"),
+            vault_db: PathBuf::from(r"C:\data\vault.db"),
+            vector_dir: PathBuf::from(r"C:\data\lance"),
+            graph_db: PathBuf::from(r"C:\data\graph.duckdb"),
+            bge_model: PathBuf::from(r"C:\data\models\model.onnx"),
+            bge_tokenizer: PathBuf::from(r"C:\data\models\tokenizer.json"),
+            ort_lib: PathBuf::from(r"C:\data\onnxruntime.dll"),
+            phi4_model: PathBuf::from(r"C:\data\models\phi4.gguf"),
+            config_path: PathBuf::from(r"C:\data\maintenance.json"),
+        }
+    }
+
+    #[test]
+    fn consolidate_args_target_the_apps_own_vault_and_end_in_run() {
+        let args = consolidate_args(&ctx());
+        // The vault paths come first so the run hits the desktop app's vault.
+        let joined = args.join(" ");
+        assert!(joined.contains("--vault-db C:\\data\\vault.db"));
+        assert!(joined.contains("--vector-dir C:\\data\\lance"));
+        assert!(joined.contains("--graph-db C:\\data\\graph.duckdb"));
+        assert!(joined.contains("consolidate"));
+        assert!(joined.contains("--phi4-model C:\\data\\models\\phi4.gguf"));
+        // The action is the last token.
+        assert_eq!(args.last().map(String::as_str), Some("run"));
+    }
+
+    #[test]
+    fn parse_frequency_maps_daily_and_weekly_and_rejects_junk() {
+        assert_eq!(parse_frequency("daily", 0).unwrap(), Frequency::Daily);
+        assert_eq!(
+            parse_frequency("weekly", 0).unwrap(),
+            Frequency::Weekly {
+                day: chrono::Weekday::Sun
+            }
+        );
+        assert_eq!(
+            parse_frequency("weekly", 3).unwrap(),
+            Frequency::Weekly {
+                day: chrono::Weekday::Wed
+            }
+        );
+        assert!(parse_frequency("hourly", 0).is_err());
+        assert!(parse_frequency("weekly", 9).is_err());
+    }
+
+    #[test]
+    fn build_spec_produces_a_valid_injection_safe_spec() {
+        let config = MaintenanceConfig {
+            hour: 3,
+            minute: 30,
+            ..Default::default()
+        };
+        let spec = build_spec(&ctx(), &config).unwrap();
+        // The spec must pass the scheduler's own injection-safety gate.
+        spec.validate().unwrap();
+        assert_eq!(spec.task_id.as_str(), MAINTENANCE_TASK_ID);
+        assert_eq!(
+            spec.time_of_day,
+            chrono::NaiveTime::from_hms_opt(3, 30, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn build_spec_rejects_an_impossible_time() {
+        let config = MaintenanceConfig {
+            hour: 25,
+            ..Default::default()
+        };
+        assert!(build_spec(&ctx(), &config).is_err());
+    }
+
+    #[test]
+    fn config_round_trips_through_json_and_defaults_are_sane() {
+        let config = MaintenanceConfig {
+            enabled: true,
+            frequency: "weekly".to_string(),
+            weekday: 2,
+            hour: 4,
+            minute: 15,
+            last_run: Some(LastRun {
+                finished_at: "2026-07-24T03:00:00Z".to_string(),
+                ok: true,
+                summary: "merged 3 duplicates".to_string(),
+            }),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert_eq!(
+            serde_json::from_str::<MaintenanceConfig>(&json).unwrap(),
+            config
+        );
+
+        // Default is off, daily, 3 AM — the safe pre-opt-in state.
+        let default = MaintenanceConfig::default();
+        assert!(!default.enabled);
+        assert_eq!(default.frequency, "daily");
+        assert_eq!(default.hour, 3);
+    }
+
+    #[test]
+    fn missing_config_file_yields_the_default_not_a_panic() {
+        let cfg = load_config(Path::new("/definitely/not/here/maintenance.json"));
+        assert_eq!(cfg, MaintenanceConfig::default());
+    }
+
+    #[test]
+    fn progress_percent_is_bounded() {
+        assert_eq!(MaintenanceEngineProgress::new(0, 0).percent, 100);
+        assert_eq!(MaintenanceEngineProgress::new(1, 4).percent, 25);
+        assert_eq!(MaintenanceEngineProgress::new(999, 100).percent, 100);
+    }
+
+    #[test]
+    fn error_codes_and_event_leak_no_stack_names() {
+        for s in [
+            ERR_MAINTENANCE_ENGINE_FAILED,
+            ERR_SCHEDULE_FAILED,
+            ERR_MAINTENANCE_BUSY,
+            ERR_MAINTENANCE_FAILED,
+            MAINTENANCE_PROGRESS_EVENT,
+        ] {
+            let lower = s.to_lowercase();
+            for forbidden in [
+                "phi", "gguf", "qwen", "llama", "cron", "schtasks", "launchd",
+            ] {
+                assert!(
+                    !lower.contains(forbidden),
+                    "'{s}' must not leak '{forbidden}'"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn truncate_keeps_short_and_cuts_long() {
+        assert_eq!(truncate("short", 10), "short");
+        assert_eq!(truncate("abcdef", 3), "abc…");
+    }
+}

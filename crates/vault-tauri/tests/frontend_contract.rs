@@ -39,6 +39,10 @@ const COMMAND_SOURCES: &[(&str, &str)] = &[
     ("agent.rs", include_str!("../src/commands/agent.rs")),
     ("settings.rs", include_str!("../src/commands/settings.rs")),
     ("engine.rs", include_str!("../src/commands/engine.rs")),
+    (
+        "maintenance.rs",
+        include_str!("../src/commands/maintenance.rs"),
+    ),
 ];
 
 const MAIN_RS: &str = include_str!("../src/main.rs");
@@ -349,6 +353,39 @@ fn progress_event_name_does_not_leak_the_stack() {
         assert!(
             !lowered.contains(banned),
             "ADR-086: the progress event name must not name the stack \
+             ('{banned}'); got \"{declared}\""
+        );
+    }
+}
+
+/// The maintenance-engine (Phi-4) download progress event carries the same
+/// silent-failure and white-label risks as the recall one: rename it in Rust
+/// and the Maintenance tab's progress line quietly stops moving; name the stack
+/// in it and a model name leaks into the UI. Guard both (ADR-092/086).
+#[test]
+fn maintenance_progress_event_matches_frontend_and_does_not_leak() {
+    const MAINTENANCE_RS: &str = include_str!("../src/commands/maintenance.rs");
+    let declared = collect_between(
+        MAINTENANCE_RS,
+        "pub const MAINTENANCE_PROGRESS_EVENT: &str = \"",
+        "\"",
+    )
+    .into_iter()
+    .next()
+    .expect("maintenance.rs must declare MAINTENANCE_PROGRESS_EVENT as a string literal");
+
+    assert!(
+        APP_JS.contains(&format!("listenEvent(\"{declared}\"")),
+        "dist/app.js must listen on the maintenance event name Rust emits.\n\
+         Rust declares MAINTENANCE_PROGRESS_EVENT = \"{declared}\", but app.js \
+         does not listen for it — the tab's progress would silently never move."
+    );
+
+    let lowered = declared.to_lowercase();
+    for banned in ["qwen", "onnx", "bge", "phi", "gguf", "llama", "rerank"] {
+        assert!(
+            !lowered.contains(banned),
+            "ADR-086: the maintenance event name must not name the stack \
              ('{banned}'); got \"{declared}\""
         );
     }

@@ -41,6 +41,9 @@ vault-retrieval = { path = "../vault-retrieval" }
 # Neither is new transitive weight — both already arrive via vault-app.
 vault-embedding = { path = "../vault-embedding" }
 vault-llm = { path = "../vault-llm" }
+# ADR-092: the cross-platform OS scheduler for automatic maintenance. Depends
+# only on vault-core; the maintenance commands build a ScheduleSpec from it.
+vault-scheduler = { path = "../vault-scheduler" }
 
 # Async runtime + tracing per workspace deps.
 tokio = { workspace = true }
@@ -48,6 +51,9 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Time-of-day / weekday for the maintenance schedule, and the last-run
+# timestamp. Same pin as the rest of the workspace.
+chrono = { workspace = true }
 
 # Error types for ConfigError per ADR-032 + ADR-019 OS-dispatch errors.
 thiserror = { workspace = true }

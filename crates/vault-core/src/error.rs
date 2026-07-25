@@ -210,6 +210,23 @@ pub enum VaultError {
     /// newly-persisted key.
     #[error("keychain provenance error: {0}")]
     KeychainProvenance(String),
+
+    /// Registering, querying, or removing an OS-level scheduled task failed
+    /// (Windows Task Scheduler, macOS launchd, Linux systemd/cron).
+    ///
+    /// Carried as its own category — scheduling is a first-class subsystem
+    /// (`vault-scheduler`) per BRD §2, not a config or I/O sub-case — so
+    /// vault-tauri / vault-cli can surface a scheduler-specific message
+    /// distinct from generic configuration / I/O failures. The wrapped
+    /// message already carries the failing backend's context via
+    /// `SchedulerError`'s display. See ADR-092.
+    ///
+    /// Spec-validation failures (illegal task id, control character in an
+    /// argument) are deliberately NOT carried here — they map onto
+    /// [`Self::InvalidInput`] because they are input-validation failures at
+    /// the API boundary (ADR-SEC-005), caught before any OS call is made.
+    #[error("scheduler error: {0}")]
+    Scheduler(String),
 }
 
 /// Standard result alias used throughout the workspace.
@@ -314,6 +331,17 @@ mod tests {
         assert!(s.contains("def456"), "display should mention actual: {s}");
         let matched = matches!(err, VaultError::ModelIntegrityFailed { .. });
         assert!(matched);
+    }
+
+    #[test]
+    fn scheduler_error_displays_category_prefix() {
+        assert!(VaultError::Scheduler("schtasks exited 1".into())
+            .to_string()
+            .starts_with("scheduler error:"));
+        assert!(matches!(
+            VaultError::Scheduler("x".into()),
+            VaultError::Scheduler(_)
+        ));
     }
 
     #[test]

@@ -126,6 +126,22 @@ input, textarea { user-select: text; cursor: text; }
 }
 .link-underline:hover { color: var(--ink); }
 
+/* Secondary pill — a real button, but it must not compete with the primary
+   action when both are on screen (Consolidation cards 2 and 3). */
+.btn-quiet {
+  background: none;
+  color: var(--ink);
+  font: 500 13px var(--sans);
+  padding: 10px 24px;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: border-color .25s, color .25s;
+  border: 1px solid var(--border);
+}
+.btn-quiet:hover { border-color: var(--ink); }
+.btn-quiet.disabled { color: var(--disabled); border-color: var(--line); cursor: default; }
+.btn-quiet.disabled:hover { border-color: var(--line); }
+
 .kicker {
   font: 500 11px var(--mono);
   color: var(--faint);
@@ -555,6 +571,117 @@ textarea.mv-input { resize: none; }
   flex: none;
 }
 .statusbar .st { width: 6px; height: 6px; border-radius: 50%; background: var(--green); }
+
+/* ---------------- consolidation tab ---------------- */
+
+/* Three stacked cards — turn it on / when it runs / run one now. Each carries
+   its own explainer so no control is a bare label the user has to guess at. */
+.maint-card {
+  max-width: 520px;
+  margin: 22px auto 0;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px 24px 22px;
+  text-align: left;
+}
+.maint-card-head { display: flex; align-items: center; gap: 11px; }
+.maint-card-head h2 { margin: 0; font: 500 15px var(--sans); color: var(--ink); }
+.maint-step {
+  flex: none;
+  width: 21px; height: 21px;
+  border-radius: 50%;
+  display: grid; place-items: center;
+  background: var(--ink); color: var(--paper);
+  font: 500 11px var(--mono);
+}
+.maint-explain {
+  margin: 10px 0 0;
+  font: 400 12.5px/1.65 var(--sans);
+  color: var(--muted);
+}
+.maint-toggle {
+  display: flex; align-items: center; gap: 11px;
+  margin: 16px 0 0;
+  font: 500 14px var(--sans); color: var(--ink);
+  cursor: pointer;
+}
+.maint-toggle input { width: 16px; height: 16px; accent-color: var(--ink); cursor: pointer; }
+
+.maint-when {
+  display: flex; flex-wrap: wrap; gap: 18px;
+  margin: 18px 0 0;
+  padding: 16px 0 4px;
+  border-top: 1px solid var(--line);
+}
+.maint-when label {
+  display: flex; flex-direction: column; gap: 6px;
+  font: 500 10.5px var(--mono); color: var(--faint);
+  letter-spacing: .06em; text-transform: uppercase;
+}
+.maint-when select,
+.maint-when input[type="time"],
+.maint-onboard-time input[type="time"] {
+  font: 400 13.5px var(--sans);
+  color: var(--ink);
+  background: var(--paper);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+}
+.maint-when select:focus,
+.maint-when input[type="time"]:focus,
+.maint-onboard-time input[type="time"]:focus { outline: none; border-color: var(--ink); }
+
+.maint-actions { display: flex; align-items: center; gap: 18px; margin: 20px 0 0; }
+.maint-actions .btn-pill { padding: 10px 26px; font-size: 13px; }
+.maint-save-note { font: 400 12px var(--sans); color: var(--muted); }
+
+.maint-status { margin: 16px auto 0; max-width: 520px; }
+.maint-status > div { font: 400 13px/1.6 var(--sans); margin-top: 4px; }
+.maint-on { color: var(--green-deep); }
+.maint-off { color: var(--muted); }
+.maint-warn { color: var(--red); }
+.maint-last { color: var(--faint-2); }
+#tab-maintenance .engine-note {
+  margin: 14px auto 0; max-width: 520px; text-align: center;
+  font: 400 12px var(--sans); color: var(--faint);
+}
+
+/* ---------------- maintenance onboarding (step 4) ---------------- */
+
+.maint-onboard {
+  display: flex; flex-direction: column; gap: 12px;
+  margin: 26px 0 0;
+  width: 440px; max-width: 100%;
+  flex: none;
+}
+.maint-choice {
+  display: flex; align-items: flex-start; gap: 12px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 15px 18px;
+  cursor: pointer;
+  font: 400 13.5px/1.45 var(--sans);
+  color: var(--ink-soft);
+  transition: border-color .2s;
+}
+.maint-choice:hover { border-color: var(--ink); }
+.maint-choice input { margin-top: 2px; accent-color: var(--ink); cursor: pointer; }
+.maint-choice strong { color: var(--ink); font-weight: 500; }
+.maint-onboard-time {
+  display: flex; align-items: center; gap: 10px;
+  margin: -4px 0 0 30px;
+  font: 400 12.5px var(--sans); color: var(--muted);
+  animation: mvFade .3s ease both;
+}
+.maint-onboard-note {
+  margin: 16px 0 0; min-height: 18px;
+  text-align: center;
+  font: 400 12.5px var(--sans); color: var(--faint);
+}
 
 /* -- confirmation dialog ---------------------------------------------------
    Replaces window.confirm(): the webview renders that as an OK-only box, so

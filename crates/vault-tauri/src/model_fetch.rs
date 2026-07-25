@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 
 use vault_embedding::integrity::{QWEN3_RERANKER_MODEL_SHA256, QWEN3_RERANKER_TOKENIZER_SHA256};
 use vault_llm::model_loader::ensure_model_at_path_with_progress;
-use vault_llm::VaultLlmResult;
+use vault_llm::{Phi4MiniConfig, VaultLlmResult};
 
 /// Directory name the reranker files live under, inside the app's models dir.
 ///
@@ -243,6 +243,100 @@ where
     Ok(paths)
 }
 
+// ─── Phi-4 (the maintenance / consolidation model) ──────────────────────────
+//
+// Phi-4 is the LLM the nightly consolidation ("automatic maintenance") runs on.
+// Per the founder decision (2026-07-24), it downloads for EVERY user during
+// onboarding so the real product is one toggle away — but, unlike the reranker,
+// it does NOT gate onboarding completion: recall never needs it, only
+// maintenance does, so it streams in the background while the user gets going.
+//
+// The pinned constants (URL, SHA-256, size, filename) live in
+// `vault_llm::Phi4MiniConfig` next to the provider that loads the file. This
+// module references them via `Phi4MiniConfig::v0_2_default` rather than
+// restating them, so — exactly as with the reranker — a hash has one home.
+
+/// Compute where the Phi-4 GGUF belongs under `models_dir`, without touching
+/// the filesystem or the network. The file lives directly under `models_dir`
+/// (no subdirectory), matching how `vault-app` resolves it.
+pub fn phi4_path_in(models_dir: &Path) -> PathBuf {
+    let config = Phi4MiniConfig::v0_2_default(models_dir.to_path_buf());
+    models_dir.join(config.model_filename)
+}
+
+/// Overall progress of the Phi-4 acquisition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Phi4FetchProgress {
+    /// Bytes transferred so far.
+    pub downloaded_bytes: u64,
+    /// Expected total size of the GGUF.
+    pub total_bytes: u64,
+}
+
+/// Ensure the Phi-4 GGUF is present under `models_dir` with verified SHA-256,
+/// downloading it if missing or corrupt.
+///
+/// Inherits ADR-043's semantics via [`ensure_model_at_path_with_progress`]: a
+/// present-and-matching file short-circuits with no HTTP call (also the air-gap
+/// path), a present-but-wrong file is refetched, and a download only lands at
+/// its final name once its hash verifies.
+///
+/// # Errors
+///
+/// Propagates [`vault_llm::VaultLlmError`] on network failure, integrity
+/// mismatch, or I/O failure. Fails closed — a partial or unverified file is
+/// never left at the final path.
+#[tracing::instrument(skip(models_dir), fields(dir = %models_dir.display()))]
+pub async fn ensure_phi4(models_dir: &Path) -> VaultLlmResult<PathBuf> {
+    ensure_phi4_with_progress(models_dir, |_| {}).await
+}
+
+/// As [`ensure_phi4`], but reports transfer progress.
+///
+/// # Errors
+///
+/// As [`ensure_phi4`].
+#[tracing::instrument(skip(models_dir, on_progress), fields(dir = %models_dir.display()))]
+pub async fn ensure_phi4_with_progress<F>(
+    models_dir: &Path,
+    mut on_progress: F,
+) -> VaultLlmResult<PathBuf>
+where
+    F: FnMut(Phi4FetchProgress),
+{
+    let config = Phi4MiniConfig::v0_2_default(models_dir.to_path_buf());
+    let model_path = models_dir.join(&config.model_filename);
+
+    // Create the models dir before the download — `File::create` on the
+    // `.partial` target fails if the parent is absent, and on a fresh install
+    // it always is.
+    if let Some(parent) = model_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    let total_bytes = config.expected_bytes;
+    ensure_model_at_path_with_progress(
+        &model_path,
+        &config.model_url,
+        &config.model_sha256,
+        total_bytes,
+        |p| {
+            on_progress(Phi4FetchProgress {
+                downloaded_bytes: p.downloaded_bytes,
+                total_bytes,
+            })
+        },
+    )
+    .await?;
+    on_progress(Phi4FetchProgress {
+        downloaded_bytes: total_bytes,
+        total_bytes,
+    });
+
+    tracing::info!("maintenance model present + integrity verified");
+    Ok(model_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,5 +438,45 @@ mod tests {
             QWEN3_RERANKER_MODEL_SHA256, QWEN3_RERANKER_TOKENIZER_SHA256,
             "two different files cannot share a hash"
         );
+    }
+
+    // ─── Phi-4 acquisition ──────────────────────────────────────────────
+
+    #[test]
+    fn phi4_path_is_directly_under_the_models_dir() {
+        assert_eq!(
+            phi4_path_in(Path::new("/app/models")),
+            PathBuf::from("/app/models/Phi-4-mini-instruct-Q4_K_M.gguf")
+        );
+    }
+
+    #[test]
+    fn phi4_path_lookup_creates_nothing_on_disk() {
+        // A readiness probe must be safe to call before a 2.49 GB fetch.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert!(!phi4_path_in(tmp.path()).exists());
+    }
+
+    #[test]
+    fn phi4_constants_are_coherent_and_reference_the_pinned_config() {
+        // The URL/hash/size come from vault_llm's pinned config — this pins the
+        // ADR-087 division of responsibility for Phi-4 too, and catches a
+        // filename/URL drift that would present as an infinite re-download.
+        let config = Phi4MiniConfig::v0_2_default(PathBuf::from("/app/models"));
+        assert!(
+            config.model_url.ends_with(&config.model_filename),
+            "URL must fetch the file name we look for on disk"
+        );
+        assert!(config.model_url.starts_with("https://"));
+        assert!(
+            config.model_url.contains("/resolve/"),
+            "must use the /resolve/ file-download endpoint"
+        );
+        assert!(
+            config.expected_bytes > 2_000_000_000,
+            "Phi-4 Q4_K_M is ~2.49 GB"
+        );
+        assert_eq!(config.model_sha256.len(), 64, "hash must be SHA-256 hex");
+        assert!(config.model_sha256.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }

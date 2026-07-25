@@ -8,6 +8,7 @@ members = [
     "crates/vault-llm",
     "crates/vault-retrieval",
     "crates/vault-consolidator",
+    "crates/vault-scheduler",
     "crates/vault-mcp",
     "crates/vault-sync",
     "crates/vault-connectors",

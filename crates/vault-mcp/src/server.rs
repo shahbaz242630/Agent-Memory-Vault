@@ -1224,6 +1224,10 @@ pub(crate) fn vault_error_to_mcp(err: VaultError) -> McpError {
         // §11.4.4 requires a generic error to the client regardless of
         // cause. The audit row keeps the detail (see
         // `ToolInvokeError::from_vault_error`).
+        // ADR-092: scheduling is a Tauri-layer concern (automatic maintenance)
+        // and never reaches MCP dispatch; mapped generically for the same
+        // privacy posture as the other out-of-band variants if it ever leaks.
+        | VaultError::Scheduler(_)
         | VaultError::ModelUnavailable { .. } => McpError::internal_error("internal error", None),
     }
 }

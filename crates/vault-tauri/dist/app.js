@@ -256,6 +256,83 @@ function warmEngine() {
     .then(() => pollEngineReady());
 }
 
+// ------------------------------------------------- maintenance engine (Phi-4)
+//
+// "Automatic maintenance" (the nightly consolidator) runs on a second, larger
+// on-device model. Per the founder decision (2026-07-24) it downloads for
+// EVERY user during onboarding so the real product is one toggle away — but,
+// unlike the recall engine, it NEVER gates onboarding: recall does not need it,
+// only maintenance does, so it streams quietly in the background.
+//
+// White-label (ADR-086): "consolidation engine", never a model name. The
+// user-facing surface is named "Consolidation"; the internal keys, command
+// names, and event names stay `maintenance*` (renaming those buys nothing and
+// would churn the Rust contract in tests/frontend_contract.rs).
+const maintFetch = { percent: 0, active: false, done: false, failed: false, promise: null };
+const maintState = { view: null }; // last ScheduleView from get_maintenance_schedule
+
+function startMaintenanceFetch() {
+  if (maintFetch.done) return Promise.resolve();
+  if (maintFetch.promise) return maintFetch.promise;
+  maintFetch.failed = false;
+  maintFetch.promise = invoke("ensure_maintenance_engine")
+    .then(() => {
+      maintFetch.done = true;
+      maintFetch.percent = 100;
+      renderMaintEngineStatus();
+      // Engine is now ready — a launch-time catch-up that deferred because the
+      // download was still in flight can proceed.
+      catchUpMaintenanceIfDue();
+    })
+    .catch(() => {
+      // Non-gating: a failed fetch must never block the user. Surfaced quietly
+      // on the Maintenance tab; retried on the next launch.
+      maintFetch.failed = true;
+      maintFetch.promise = null;
+      renderMaintEngineStatus();
+    });
+  return maintFetch.promise;
+}
+
+// Is the maintenance engine present and ready to run a manual pass?
+function maintEngineReady() {
+  return maintFetch.done || !!(maintState.view && maintState.view.engine_ready);
+}
+
+// Update whichever maintenance surface is visible with the engine's download
+// state. Called on progress events and on screen/tab entry.
+function renderMaintEngineStatus() {
+  if (state.screen === "maintenance") {
+    const note = $("maint-onboard-note");
+    if (note && !maintFetch.done && !note.textContent.startsWith("Finishing")) {
+      note.textContent = maintFetch.failed
+        ? "The consolidation engine will finish downloading later — you can still turn this on."
+        : (maintFetch.active
+            ? `Preparing the consolidation engine in the background — ${maintFetch.percent}%. You can finish now either way.`
+            : "");
+    }
+  }
+  if (state.screen === "home" && state.tab === "maintenance") {
+    const note = $("maint-engine-note");
+    if (note) {
+      if (maintEngineReady()) {
+        note.classList.add("hidden");
+      } else {
+        note.classList.remove("hidden");
+        if (maintFetch.failed) {
+          note.textContent = "The consolidation engine didn't finish downloading — it will retry when you turn consolidation on, or on the next scheduled run.";
+        } else if (maintFetch.active) {
+          note.textContent = `Preparing the consolidation engine — ${maintFetch.percent}%. Step 3 becomes available once it is ready.`;
+        } else {
+          note.textContent = "Consolidation uses a one-time on-device engine (~2.5 GB). It downloads when you turn consolidation on.";
+        }
+      }
+    }
+    const runBtn = $("maint-run");
+    if (runBtn) runBtn.classList.toggle("disabled", !maintEngineReady() || state.maintRunning);
+  }
+}
+
 // MCP connection snippets use the REAL entry point: `vault-cli mcp serve`
 // (stdio, 1:1) — cross-agent proven (Claude / Cursor / Codex).
 const SNIPPET_JSON = `{
@@ -300,22 +377,25 @@ const state = {
   toastTimer: null,
   searchSeq: 0,
   recentSeq: 0,
+  keptFirstMemory: false,                    // did they save a first memory? (for the finish toast)
+  maintRunning: false,                       // a manual "Run now" is in flight
 };
 
 // ---------------------------------------------------------------- screens
 
 function showScreen(name) {
   state.screen = name;
-  for (const s of ["welcome", "connect", "memory", "home"]) {
+  for (const s of ["welcome", "connect", "memory", "maintenance", "home"]) {
     $(`screen-${s}`).classList.toggle("hidden", s !== name);
   }
-  const steps = ["welcome", "connect", "memory"];
+  const steps = ["welcome", "connect", "memory", "maintenance"];
   const idx = steps.indexOf(name);
   $("progress-dots").classList.toggle("hidden", idx === -1);
   if (idx !== -1) {
     [...$("progress-dots").children].forEach((el, i) => el.classList.toggle("on", i <= idx));
   }
   if (name === "welcome") runChecks();
+  if (name === "maintenance") renderMaintEngineStatus();
   if (name === "home") renderHome();
 }
 
@@ -528,7 +608,9 @@ async function saveFirstMemory() {
       memoryType: state.memType,
       boundary: "default",
     });
-    finishOnboarding(true);
+    // Onboarding now has a 4th step (automatic maintenance) before it finishes.
+    state.keptFirstMemory = true;
+    showScreen("maintenance");
   } catch (err) {
     $("mem-err").textContent = `Couldn't keep that memory: ${err}`;
     $("mem-save").classList.remove("disabled");
@@ -626,6 +708,7 @@ function renderNav() {
     { label: "Memories", key: "memories" },
     { label: "Boundaries", key: "boundaries" },
     { label: "Agents", key: "agents" },
+    { label: "Consolidation", key: "maintenance" },
     { label: "Settings", key: "settings" },
   ];
   $("nav").innerHTML = items.map((n) =>
@@ -637,12 +720,13 @@ function renderNav() {
 
 function renderTab() {
   renderNav2();
-  for (const t of ["memories", "boundaries", "agents", "settings"]) {
+  for (const t of ["memories", "boundaries", "agents", "maintenance", "settings"]) {
     $(`tab-${t}`).classList.toggle("hidden", t !== state.tab);
   }
   if (state.tab === "memories") renderMemList();
   if (state.tab === "boundaries") renderBoundaries();
   if (state.tab === "agents") renderAgents();
+  if (state.tab === "maintenance") renderMaintenance();
   if (state.tab === "settings") renderSettings();
 }
 
@@ -914,6 +998,201 @@ async function renderSettings() {
     </div>`).join("");
 }
 
+// -- maintenance tab --
+
+const WEEKDAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+function pad2(n) { return String(n).padStart(2, "0"); }
+
+// 24h hour+minute → "3:00 AM"
+function friendlyTime(hour, minute) {
+  const h12 = ((hour + 11) % 12) + 1;
+  return `${h12}:${pad2(minute)} ${hour < 12 ? "AM" : "PM"}`;
+}
+
+// Map an opaque backend code (§11.7.2) to plain English.
+function friendlyMaintError(code) {
+  switch (code) {
+    case "maintenance_vault_busy":
+      return "an agent was connected, so it will run at the next opportunity";
+    case "maintenance_engine_unavailable":
+      return "the consolidation engine is still downloading";
+    case "maintenance_run_failed":
+      return "it didn't finish — it will try again on schedule";
+    case "maintenance_schedule_failed":
+      return "the schedule couldn't be updated";
+    default:
+      return code;
+  }
+}
+
+// Turn a run's raw stdout into one plain-English clause.
+//
+// The backend stores `vault-cli`'s output verbatim (truncated to 500 chars), so
+// naively showing its first line reads "starting consolidation run..." — the
+// least informative line in the report. Pull the counts out instead, and say
+// plainly when there was nothing to do.
+function summariseRun(summary) {
+  const text = String(summary || "");
+  const count = (label) => {
+    const m = text.match(new RegExp(label + "\\s*:\\s*(\\d+)"));
+    return m ? Number(m[1]) : null;
+  };
+  const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+
+  const merged = count("merges applied");
+  const archived = count("memories archived");
+  const contradictions = count("contradictions queued");
+  if (merged === null && archived === null && contradictions === null) {
+    return ""; // unrecognised format — say nothing rather than something wrong
+  }
+
+  const parts = [];
+  if (merged) parts.push(`merged ${plural(merged, "duplicate", "duplicates")}`);
+  if (contradictions) parts.push(`flagged ${plural(contradictions, "contradiction", "contradictions")}`);
+  if (archived) parts.push(`archived ${plural(archived, "old memory", "old memories")}`);
+  return parts.length ? parts.join(", ") : "nothing needed tidying";
+}
+
+async function renderMaintenance() {
+  const status = $("maint-status");
+  let view;
+  try {
+    view = await invoke("get_maintenance_schedule");
+    maintState.view = view;
+  } catch (err) {
+    if (status) status.innerHTML = `<div class="empty-note">Couldn't load consolidation settings: ${esc(String(err))}</div>`;
+    return;
+  }
+
+  // Reflect the saved schedule into the controls.
+  $("maint-enabled").checked = !!view.enabled;
+  $("maint-frequency").value = view.frequency === "weekly" ? "weekly" : "daily";
+  $("maint-weekday").value = String(view.weekday || 0);
+  $("maint-time").value = `${pad2(view.hour)}:${pad2(view.minute)}`;
+  $("maint-weekday-wrap").classList.toggle("hidden", $("maint-frequency").value !== "weekly");
+
+  let html = "";
+  if (view.enabled && view.registered) {
+    const when = view.frequency === "weekly"
+      ? `every ${WEEKDAY_NAMES[view.weekday] || "week"} at ${friendlyTime(view.hour, view.minute)}`
+      : `every day at ${friendlyTime(view.hour, view.minute)}`;
+    html += `<div class="maint-on">On — runs ${esc(when)}.</div>`;
+  } else if (view.enabled && !view.registered) {
+    html += `<div class="maint-warn">Turned on, but the scheduled run isn't registered. Try saving again.</div>`;
+  } else {
+    html += `<div class="maint-off">Off — your vault won't be consolidated automatically.</div>`;
+  }
+  if (view.last_run) {
+    const lr = view.last_run;
+    if (lr.ok) {
+      const what = summariseRun(lr.summary);
+      html += `<div class="maint-last">Last run ${esc(relTime(lr.finished_at))}${what ? " — " + esc(what) : ""}.</div>`;
+    } else {
+      html += `<div class="maint-last">Last attempt ${esc(relTime(lr.finished_at))} — ${esc(friendlyMaintError(lr.summary))}.</div>`;
+    }
+  }
+  if (status) status.innerHTML = html;
+
+  renderMaintEngineStatus();
+}
+
+async function saveMaintenance() {
+  const note = $("maint-save-note");
+  const enabled = $("maint-enabled").checked;
+  const frequency = $("maint-frequency").value === "weekly" ? "weekly" : "daily";
+  const weekday = Number($("maint-weekday").value) || 0;
+  const [hour, minute] = ($("maint-time").value || "03:00").split(":").map(Number);
+  if (note) note.textContent = "Saving…";
+  try {
+    await invoke("set_maintenance_schedule", { enabled, frequency, weekday, hour, minute });
+    if (note) note.textContent = enabled ? "Saved ✓" : "Turned off ✓";
+    setTimeout(() => { if (note && (note.textContent === "Saved ✓" || note.textContent === "Turned off ✓")) note.textContent = ""; }, 2400);
+    // A returning user turning maintenance ON is when we fetch the engine (it
+    // short-circuits if already present) — not on every launch.
+    if (enabled) startMaintenanceFetch();
+    renderMaintenance();
+  } catch {
+    if (note) note.textContent = "Couldn't save — please try again.";
+  }
+}
+
+async function runMaintenanceNow() {
+  if (state.maintRunning || !maintEngineReady()) return;
+  state.maintRunning = true;
+  // Card 3 has its own note — sharing card 2's would report a run's outcome
+  // under "Save schedule".
+  const note = $("maint-run-note");
+  renderMaintEngineStatus(); // disables the run button while it runs
+  if (note) note.textContent = "Consolidating now — this can take a few minutes…";
+  try {
+    await invoke("run_maintenance_now");
+    if (note) note.textContent = "Done ✓";
+  } catch (err) {
+    if (note) note.textContent = friendlyMaintError(String(err)) + ".";
+  } finally {
+    state.maintRunning = false;
+    setTimeout(() => { if (note) note.textContent = ""; }, 3200);
+    renderMaintenance();
+  }
+}
+
+// Missed-run catch-up (task 10). The OS scheduler already catches up a run
+// missed while the machine slept (Task Scheduler StartWhenAvailable / launchd
+// wake / systemd Persistent). This is the app-side safety net for the harder
+// case — the machine off for longer, or the OS task never firing: on launch,
+// if maintenance is on and overdue, run one pass in the background.
+//
+// Safe to fire even if a scheduled run already happened: consolidation is
+// idempotent (BRD §5.6), and `run_maintenance_now` skips cleanly if the vault
+// is busy. Runs at most once per session and only when the engine is ready.
+let catchUpDone = false;
+async function catchUpMaintenanceIfDue() {
+  if (catchUpDone) return;
+  let view;
+  try {
+    view = await invoke("get_maintenance_schedule");
+    maintState.view = view;
+  } catch { return; }
+  if (!view.enabled) { catchUpDone = true; return; }
+  // Engine not ready yet — leave the flag unset so a later call (once the
+  // download finishes) can still catch up this session.
+  if (!view.engine_ready && !maintFetch.done) return;
+
+  const intervalMs = view.frequency === "weekly" ? 7 * 864e5 : 864e5;
+  const last = view.last_run && view.last_run.ok ? Date.parse(view.last_run.finished_at) : 0;
+  const overdue = !last || (Date.now() - last) > intervalMs;
+  catchUpDone = true;
+  if (!overdue) return;
+  tracingHint("maintenance overdue on launch — running a catch-up pass");
+  // Fire-and-forget: never block the window, and let the tab reflect the
+  // result on its next render.
+  invoke("run_maintenance_now").catch(() => {});
+}
+
+// A no-op console breadcrumb (kept quiet — the webview console is dev-only).
+function tracingHint(msg) { try { console.debug(`[maintenance] ${msg}`); } catch { /* ignore */ } }
+
+// Onboarding step 4 → finish. Optionally register the schedule the user chose,
+// then hand off to finishOnboarding (which still gates on the recall engine).
+async function finishFromMaintenance() {
+  const cta = $("maint-onboard-cta");
+  if (cta.classList.contains("disabled")) return;
+  cta.classList.add("disabled");
+  const on = $("maint-onboard-on").checked;
+  let ok = true;
+  if (on) {
+    const [hour, minute] = ($("maint-onboard-time").value || "03:00").split(":").map(Number);
+    try {
+      await invoke("set_maintenance_schedule", { enabled: true, frequency: "daily", weekday: 0, hour, minute });
+    } catch { ok = false; }
+  }
+  $("maint-onboard-note").textContent = ok
+    ? "Finishing setup…"
+    : "Couldn't schedule it now — you can turn it on later in Consolidation. Finishing…";
+  await finishOnboarding(state.keptFirstMemory);
+}
+
 function replayWelcome() {
   state.tab = "memories";
   showScreen("welcome");
@@ -956,7 +1235,17 @@ function init() {
   renderMemoryScreen();
   $("mem-text").addEventListener("input", renderMemoryScreen);
   $("mem-save").addEventListener("click", saveFirstMemory);
-  $("mem-skip").addEventListener("click", () => finishOnboarding(false));
+  $("mem-skip").addEventListener("click", () => {
+    state.keptFirstMemory = false;
+    showScreen("maintenance");
+  });
+
+  // onboarding step 4 — automatic maintenance
+  $("maint-onboard-on").addEventListener("change", () =>
+    $("maint-onboard-time-wrap").classList.toggle("hidden", !$("maint-onboard-on").checked));
+  $("maint-onboard-off").addEventListener("change", () =>
+    $("maint-onboard-time-wrap").classList.add("hidden"));
+  $("maint-onboard-cta").addEventListener("click", finishFromMaintenance);
 
   // home — search
   //
@@ -1032,6 +1321,12 @@ function init() {
   $("copy-agents-snippet").addEventListener("click", () =>
     copyText(SNIPPET_JSON, $("copy-agents-snippet")));
 
+  // home — maintenance
+  $("maint-frequency").addEventListener("change", () =>
+    $("maint-weekday-wrap").classList.toggle("hidden", $("maint-frequency").value !== "weekly"));
+  $("maint-save").addEventListener("click", saveMaintenance);
+  $("maint-run").addEventListener("click", runMaintenanceNow);
+
   // home — settings
   $("replay-welcome").addEventListener("click", replayWelcome);
 
@@ -1069,6 +1364,27 @@ function init() {
   // load before the window existed. Nothing to request — just watch for it to
   // finish so the "getting ready" line clears itself (ADR-090).
   pollEngineReady();
+
+  // Maintenance engine (Phi-4) acquisition — downloads for everyone, NEVER
+  // gates onboarding (founder 2026-07-24). Fire-and-forget in the background;
+  // short-circuits once the file is present and verified.
+  listenEvent("maintenance-engine://progress", (event) => {
+    const p = event && event.payload;
+    if (!p) return;
+    maintFetch.percent = typeof p.percent === "number" ? p.percent : 0;
+    maintFetch.active = true;
+    renderMaintEngineStatus();
+  }).catch(() => { /* no event bridge outside Tauri */ });
+  // Phi-4 downloads DURING ONBOARDING for new users (founder 2026-07-24 —
+  // "always during onboarding"). A returning user (already on the home screen)
+  // does NOT auto-download 2.5 GB on every launch; they get the engine when
+  // they turn maintenance on (see saveMaintenance), and a scheduled/catch-up
+  // run self-heals by fetching it if absent.
+  if (state.screen !== "home") startMaintenanceFetch();
+
+  // Missed-run catch-up (task 10): if maintenance is on and overdue, run a
+  // background pass. Also re-checked when the engine download completes.
+  catchUpMaintenanceIfDue();
 
   showScreen(state.screen);
 }
