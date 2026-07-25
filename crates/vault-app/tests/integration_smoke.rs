@@ -113,7 +113,7 @@ struct TestApp {
     /// Fourth `MetadataStore` handle (separate from Application's three)
     /// used for read-back assertions in trigger (b) and elsewhere.
     metadata_for_assert: MetadataStore,
-    /// Phase 1b: Sender returned by `Application::start`. Held so the
+    /// Phase 1b: Sender returned by `Application::spawn_retry_worker`. Held so the
     /// spawned `RetryWorker` lives for the test's duration; on `TestApp`
     /// drop the Sender drops, `cancel.changed()` returns `Err` in the
     /// worker's `select!`, and the worker exits cleanly. Phase 2 will
@@ -176,7 +176,7 @@ async fn setup_application() -> TestApp {
     // through VaultAdapter::write land in SQLite + retry_queue but never
     // reach the vector store - SemanticRetriever queries return empty
     // (the integration finding Phase 1 spike surfaced).
-    let shutdown = application.start();
+    let shutdown = application.spawn_retry_worker();
 
     let metadata_for_assert = MetadataStore::open(&metadata_path, key)
         .await

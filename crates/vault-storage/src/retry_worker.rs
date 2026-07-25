@@ -10,7 +10,10 @@
 //! - [`RetryWorker::run`] is the production loop: alternate
 //!   `step()` + `sleep(poll_interval)` until the supplied
 //!   [`tokio::sync::watch::Receiver<bool>`] flips to `true`. Honors
-//!   graceful shutdown — finishes the current step before exiting.
+//!   graceful shutdown — on cancel it drains the queue (bounded by
+//!   [`DEFAULT_DRAIN_TIMEOUT`]) rather than exiting with work outstanding,
+//!   so a memory written just before disconnect gets its vector now instead
+//!   of at some later session.
 //!
 //! Phase C1b does NOT spawn the worker. T0.1.10 (vault-app) creates the
 //! `watch::channel(false)`, calls `tokio::spawn(worker.run(rx))`, and
@@ -29,7 +32,7 @@
 //! *not* tracked on the entry — the underlying upserts ARE the source of
 //! truth.
 
-#![allow(dead_code)] // RetryWorker is wired by T0.1.10's Application::start.
+#![allow(dead_code)] // RetryWorker is wired by T0.1.10's Application::spawn_retry_worker.
 
 use std::time::Duration;
 
@@ -57,6 +60,24 @@ use crate::fault_injection;
 /// backoff schedule (see `retry_queue::base_backoff_secs`) means a
 /// shorter interval just wastes wakeups on the empty case.
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long [`RetryWorker::run`] keeps working the queue AFTER cancellation
+/// before giving up and exiting.
+///
+/// Before this existed, cancellation broke the loop immediately and every
+/// still-queued cascade was left for whenever a worker next ran — so a memory
+/// written seconds before the client disconnected kept its SQLite row but had
+/// no vector, making it invisible to semantic search and to the consolidator's
+/// clustering until some later session happened to drain it. The entries are
+/// durable (`retry_queue` is a SQLite table), so nothing was ever *lost*; the
+/// defect was that completion time was unbounded.
+///
+/// Measured 2026-07-25 on the founder's machine: a cascade takes ~1.8s
+/// end-to-end, so 24 memories drained in ~43s. 60s therefore covers a normal
+/// burst with margin while keeping a stuck queue from hanging process exit.
+/// Exceeding it is logged at WARN with the remaining count — visible, not
+/// silent.
+pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Outcome of [`RetryWorker::step`].
 #[derive(Debug, PartialEq, Eq)]
@@ -186,7 +207,25 @@ impl RetryWorker {
     /// Production loop. Until `cancel` flips to `true`, alternate
     /// `step().await` + sleep(poll_interval). Sleeps interrupt on cancel
     /// so shutdown doesn't wait the full delay.
-    pub async fn run(mut self, mut cancel: tokio::sync::watch::Receiver<bool>) {
+    ///
+    /// On cancellation the loop does NOT exit immediately: it hands over to
+    /// [`Self::drain`] for up to [`DEFAULT_DRAIN_TIMEOUT`], so cascades queued
+    /// just before shutdown are written now rather than at some unpredictable
+    /// later session. `ApplicationHandle::shutdown` already awaits this task,
+    /// so the drain is what makes its "graceful drain" comment true.
+    pub async fn run(self, cancel: tokio::sync::watch::Receiver<bool>) {
+        self.run_with_drain_timeout(cancel, DEFAULT_DRAIN_TIMEOUT)
+            .await;
+    }
+
+    /// [`Self::run`] with a caller-chosen shutdown drain budget. Tests use a
+    /// short budget to exercise the exhausted-budget path without waiting a
+    /// real minute.
+    pub async fn run_with_drain_timeout(
+        mut self,
+        mut cancel: tokio::sync::watch::Receiver<bool>,
+        drain_timeout: Duration,
+    ) {
         loop {
             if *cancel.borrow() {
                 break;
@@ -204,6 +243,63 @@ impl RetryWorker {
             tokio::select! {
                 _ = tokio::time::sleep(self.poll_interval) => {}
                 _ = cancel.changed() => { break; }
+            }
+        }
+
+        self.drain(drain_timeout).await;
+    }
+
+    /// Work the queue until it is empty or `budget` elapses.
+    ///
+    /// Polls on queue LENGTH rather than stopping at the first
+    /// [`StepResult::Idle`]: `enqueue` sets `next_attempt_at` up to ~1.25s
+    /// ahead, so at the moment of shutdown a freshly-written cascade is
+    /// normally present-but-not-yet-due. Stopping on `Idle` would therefore
+    /// exit instantly and defer exactly the entries this exists to flush.
+    ///
+    /// Entries that keep failing reschedule with backoff and hold the drain
+    /// until the budget expires; that is bounded and preferable to exiting
+    /// while work is outstanding. Whatever remains is still durable in
+    /// `retry_queue` and resumes on the next launch.
+    async fn drain(&mut self, budget: Duration) -> usize {
+        let deadline = tokio::time::Instant::now() + budget;
+        let mut completed = 0usize;
+
+        loop {
+            let remaining = match self.backend.retry_queue().len().await {
+                Ok(n) => n,
+                Err(e) => {
+                    error!(error = %e, "shutdown drain could not read queue depth; exiting");
+                    return completed;
+                }
+            };
+            if remaining == 0 {
+                if completed > 0 {
+                    debug!(completed, "shutdown drain complete; cascade queue empty");
+                }
+                return completed;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                warn!(
+                    remaining,
+                    completed,
+                    budget_secs = budget.as_secs(),
+                    "shutdown drain budget exhausted; cascade entries remain queued and will \
+                     be retried on the next launch (their memories stay searchable by keyword \
+                     but are not yet in the vector store)"
+                );
+                return completed;
+            }
+
+            match self.step().await {
+                // Entries exist but none are due yet — wait for the backoff
+                // rather than spinning, and re-check the deadline.
+                Ok(StepResult::Idle) => tokio::time::sleep(self.poll_interval).await,
+                Ok(_) => completed += 1,
+                Err(e) => {
+                    error!(error = %e, "shutdown drain step failed; exiting");
+                    return completed;
+                }
             }
         }
     }
@@ -748,6 +844,111 @@ mod tests {
 
         // Cascade was drained.
         assert_eq!(backend.retry_queue().len().await.unwrap(), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // Shutdown drain — cascades queued at cancellation are written NOW,
+    // not deferred to whenever a worker next happens to run.
+    // ------------------------------------------------------------------
+
+    /// The regression this exists for. Live-observed 2026-07-25: an MCP client
+    /// wrote 24 memories and disconnected; 13 kept their SQLite row but had no
+    /// vector, so they were invisible to semantic search and to the
+    /// consolidator's clustering until a later session drained them.
+    ///
+    /// Cancel is asserted BEFORE the worker starts, which is the worst case —
+    /// pre-fix, `run` checked `cancel` at the top of the loop and returned
+    /// having done nothing at all.
+    #[tokio::test]
+    async fn run_drains_queued_cascades_after_cancel() {
+        let (_tmp, backend) = make_backend().await;
+        for (i, content) in ["first fact", "second fact", "third fact"]
+            .iter()
+            .enumerate()
+        {
+            let m = sample_memory("work", content);
+            backend
+                .write_memory(&m, &embedding(0.1 * (i + 1) as f32))
+                .await
+                .unwrap();
+        }
+        assert_eq!(backend.retry_queue().len().await.unwrap(), 3);
+
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        tx.send(true).unwrap();
+
+        let worker = make_worker(backend.clone()).with_poll_interval(Duration::from_millis(50));
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            worker.run_with_drain_timeout(rx, Duration::from_secs(15)),
+        )
+        .await
+        .expect("cancelled worker must finish draining, not hang");
+
+        assert_eq!(
+            backend.retry_queue().len().await.unwrap(),
+            0,
+            "every cascade queued at cancellation must be written before the worker exits"
+        );
+    }
+
+    /// The drain must not stop at the first `Idle`. `enqueue` schedules
+    /// `next_attempt_at` up to ~1.25s ahead, so at the instant of shutdown a
+    /// just-written cascade is present-but-not-due; an `Idle`-terminated drain
+    /// would exit immediately and defer precisely the entry it exists to
+    /// flush.
+    #[tokio::test]
+    async fn drain_waits_for_entries_that_are_queued_but_not_yet_due() {
+        let (_tmp, backend) = make_backend().await;
+        let m = sample_memory("work", "written moments before shutdown");
+        backend.write_memory(&m, &embedding(0.4)).await.unwrap();
+
+        // Not due yet: a bare step right now is Idle while the queue is non-empty.
+        let mut probe = make_worker(backend.clone());
+        assert_eq!(probe.step().await.unwrap(), StepResult::Idle);
+        assert_eq!(backend.retry_queue().len().await.unwrap(), 1);
+
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        tx.send(true).unwrap();
+        let worker = make_worker(backend.clone()).with_poll_interval(Duration::from_millis(50));
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            worker.run_with_drain_timeout(rx, Duration::from_secs(15)),
+        )
+        .await
+        .expect("drain must outlast the enqueue backoff");
+
+        assert_eq!(backend.retry_queue().len().await.unwrap(), 0);
+    }
+
+    /// A stuck queue must not hang process exit: the drain gives up at its
+    /// budget and leaves the entries durable for the next launch.
+    #[tokio::test]
+    async fn drain_gives_up_at_its_budget_rather_than_hanging_shutdown() {
+        let (_tmp, backend) = make_backend().await;
+        let m = sample_memory("work", "cascade that cannot succeed");
+        backend.write_memory(&m, &embedding(0.5)).await.unwrap();
+
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        tx.send(true).unwrap();
+
+        // Vector side always fails, so the entry reschedules instead of
+        // clearing — the drain can only end by exhausting its budget.
+        let worker = make_worker_with_fault(
+            backend.clone(),
+            Arc::new(AlwaysFailVector("simulated lance io".into())),
+        )
+        .with_poll_interval(Duration::from_millis(50));
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            worker.run_with_drain_timeout(rx, Duration::from_millis(500)),
+        )
+        .await
+        .expect("drain must respect its budget even when the queue never clears");
+
+        // Still queued — durable, retried next launch. The point is that we
+        // exited, not that the work vanished.
+        assert!(backend.retry_queue().len().await.unwrap() >= 1);
     }
 
     // ------------------------------------------------------------------

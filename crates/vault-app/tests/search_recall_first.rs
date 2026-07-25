@@ -103,7 +103,7 @@ async fn search_surfaces_facts_on_single_token_and_no_overlap_queries() {
     let app = Application::new(&config)
         .await
         .expect("Application::new must compose the search stack (BGE)");
-    let _shutdown = app.start(); // spawn the cascading retry worker
+    let _shutdown = app.spawn_retry_worker(); // spawn the cascading retry worker
     let adapter = app.adapter();
 
     let boundary = Boundary::new("evalsearch").expect("valid boundary");

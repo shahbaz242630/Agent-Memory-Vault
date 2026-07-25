@@ -17,7 +17,7 @@
 //!   chain row. Holding a separate handle (rather than calling
 //!   `StorageBackend::metadata()`) avoids widening StorageBackend's
 //!   public API surface for one consumer; the caller (T0.1.10
-//!   `Application::start`) wires both at startup.
+//!   `Application::spawn_retry_worker`) wires both at startup.
 //!
 //! ## Trust boundary (ADR-025)
 //!
@@ -72,7 +72,7 @@ use vault_storage::{
 };
 
 /// Production `vault_mcp::Adapter` impl. Constructed by
-/// `Application::start` at startup (T0.1.10) with concrete trait deps.
+/// `Application::spawn_retry_worker` at startup (T0.1.10) with concrete trait deps.
 ///
 /// Cheap to clone — the Retriever and EmbeddingProvider are
 /// `Arc`-shared, StorageBackend and MetadataStore both clone via

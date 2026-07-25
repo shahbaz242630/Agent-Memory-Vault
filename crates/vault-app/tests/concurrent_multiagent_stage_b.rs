@@ -197,7 +197,7 @@ async fn two_agents_concurrent_writes_through_daemon_keep_stores_intact() {
         .expect("Application::new MUST compose the real dep graph");
     // Spawns the cascading retry worker (drains SQLite retry_queue → LanceDB).
     // Held to the end of the test so the worker lives long enough to drain.
-    let _shutdown = application.start();
+    let _shutdown = application.spawn_retry_worker();
 
     // Independent handle for read-back assertions (a separate SQLCipher conn).
     let metadata_for_assert = MetadataStore::open(&metadata_path, key.clone())

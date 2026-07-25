@@ -36,7 +36,7 @@
 //!   `rmcp::ServiceExt::serve(server, stdio()).await` which blocks on
 //!   JSON-RPC `initialize` from a non-existent peer when launched as a
 //!   Tauri UI app, hanging Tauri's setup() hook. Phase 5b replaces the
-//!   call with `Application::start()` (worker-only, no MCP transport
+//!   call with `Application::spawn_retry_worker()` (worker-only, no MCP transport
 //!   bind). AI-client MCP integration deferred to V0.2 alpha-distribution
 //!   subcommand-split task. T0.1.12 founder dogfood is UI-only for V0.1.
 //! - **ADR-038 (T0.2.0 Phase 0a fix-forward, 2026-05-07):** the binary's
@@ -337,17 +337,18 @@ fn main() {
             //    `ServiceExt::serve(server, stdio()).await` which blocks
             //    on JSON-RPC `initialize` from a peer that doesn't exist
             //    when launched as a Tauri UI app, hanging Tauri's setup()
-            //    hook indefinitely. `start()` spawns only the retry
+            //    hook indefinitely. `spawn_retry_worker()` spawns only the retry
             //    worker (no rmcp transport bind), keeping the UI
             //    responsive. AI-client MCP integration deferred to V0.2
             //    alpha-distribution task (subcommand-split design per
             //    ADR-034 cross-link).
             //
-            //    `start()` is sync but spawns `tokio::spawn(worker.run)`
-            //    which requires a tokio runtime in scope. Tauri provides
-            //    one inside `tauri::async_runtime::block_on`, which we
-            //    enter just to construct Application::new (async) and
-            //    call start() within the runtime context.
+            //    `spawn_retry_worker()` is sync but spawns
+            //    `tokio::spawn(worker.run)` which requires a tokio runtime in
+            //    scope. Tauri provides one inside
+            //    `tauri::async_runtime::block_on`, which we enter just to
+            //    construct Application::new (async) and spawn the worker
+            //    within the runtime context.
             let app_handle = app.handle().clone();
             let (application, _shutdown_sender) = tauri::async_runtime::block_on(async move {
                 let application = match Application::new(&config).await {
@@ -360,21 +361,26 @@ fn main() {
                     ),
                 };
 
-                let shutdown_sender = application.start();
+                let shutdown_sender = application.spawn_retry_worker();
 
                 // ADR-090: warm the ranking model NOW, in the background.
                 //
-                // `start()` is `Application`'s TEST-focused entry point — it
-                // spawns the retry worker and nothing else. The warm-up lives
-                // in `start_with_mcp` (step 3b), which a GUI can never call
-                // because it blocks on an MCP handshake that never arrives
-                // (ADR-034). So the desktop app had NO warm-up at all and paid
-                // the full ~24 s model load on the user's FIRST search —
-                // measured live 2026-07-22.
+                // `spawn_retry_worker()` starts the worker and nothing else.
+                // The warm-up lives in `start_with_mcp` (step 3b), which a GUI
+                // can never call because it blocks on an MCP handshake that
+                // never arrives (ADR-034). So the desktop app had NO warm-up at
+                // all and paid the full ~24 s model load on the user's FIRST
+                // search — measured live 2026-07-22.
+                //
+                // ADR-095: this method was named `start()` and documented as a
+                // "TEST-focused entry point" until 2026-07-25, which is what
+                // made the gap above easy to miss for so long — the desktop
+                // app's real production lifecycle ran through a method our own
+                // docs said was for tests. Renamed to describe what it does.
                 //
                 // Must stay INSIDE this `block_on`: `spawn_reranker_warmup`
                 // calls `tokio::spawn`, which panics outside a runtime
-                // context. Same reason `start()` is called here.
+                // context. Same reason `spawn_retry_worker()` is called here.
                 //
                 // Fire-and-forget by design, and deliberately NOT a gate on
                 // the window: founder decision 2026-07-22 chose "open

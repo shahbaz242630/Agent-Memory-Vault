@@ -399,7 +399,7 @@ async fn scale_correctness_eval() {
     let app = Application::new(&config)
         .await
         .expect("Application::new must compose the read stack (BGE + reranker)");
-    let _shutdown = app.start(); // spawn the cascading retry worker
+    let _shutdown = app.spawn_retry_worker(); // spawn the cascading retry worker
     let adapter = app.adapter();
 
     // ---- load + parse fixture ----
@@ -912,7 +912,7 @@ async fn seed_live_vault() {
     let app = Application::new(&config)
         .await
         .expect("Application::new (production-keyed live vault)");
-    let _shutdown = app.start(); // spawn the cascading retry worker
+    let _shutdown = app.spawn_retry_worker(); // spawn the cascading retry worker
     let adapter = app.adapter();
 
     // ---- load planted facts + queries ----
@@ -1109,7 +1109,7 @@ async fn probe_live_vault() {
     let app = Application::new(&config)
         .await
         .expect("Application::new over the live vault copy");
-    let _shutdown = app.start();
+    let _shutdown = app.spawn_retry_worker();
     let adapter = app.adapter();
 
     // The live vault seeded everything into `personal`.
@@ -1236,7 +1236,7 @@ async fn probe_family_domain() {
     let app = Application::new(&config)
         .await
         .expect("Application::new over the live vault copy");
-    let _shutdown = app.start();
+    let _shutdown = app.spawn_retry_worker();
     let adapter = app.adapter();
     let boundary = Boundary::new("personal").expect("personal boundary");
     let authorized = vec![boundary.clone()];
@@ -1441,7 +1441,7 @@ async fn probe_enrichment() {
     let app = Application::new(&config)
         .await
         .expect("Application::new over the live vault copy");
-    let _shutdown = app.start();
+    let _shutdown = app.spawn_retry_worker();
     let adapter = app.adapter();
     let boundary = Boundary::new("personal").expect("personal boundary");
     let authorized = vec![boundary.clone()];

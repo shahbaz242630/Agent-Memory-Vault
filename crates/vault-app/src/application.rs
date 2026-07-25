@@ -140,7 +140,7 @@ fn resolve_consolidator_timeout() -> Duration {
 /// lifecycle (shutdown handling, MCP server bind, signal handlers).
 pub struct Application {
     adapter: Arc<VaultAdapter>,
-    /// Held for [`Self::start`] to clone into the spawned [`RetryWorker`].
+    /// Held for [`Self::spawn_retry_worker`] to clone into the spawned [`RetryWorker`].
     /// `StorageBackend` is `#[derive(Clone)]` with `Arc<Inner>` semantics
     /// (per `cascading.rs:149`), so this clone is cheap and shares state
     /// with the [`VaultAdapter`]'s clone — both see the same retry_queue.
@@ -519,7 +519,7 @@ impl Application {
         // 10. VaultAdapter — composes the trait deps + optional read
         //    pipeline into the MCP Adapter surface. Clone the
         //    StorageBackend so Application retains a handle for
-        //    `start()` to construct the worker against. The
+        //    `spawn_retry_worker()` to construct the worker against. The
         //    `#[derive(Clone)]` on StorageBackend is `Arc<Inner>`-
         //    shallow per cascading.rs:149 — both clones share the
         //    same retry_queue so writes via the adapter are drained
@@ -623,7 +623,7 @@ impl Application {
         })
     }
 
-    /// Borrow the wired adapter. Phase 2 `Application::start` clones
+    /// Borrow the wired adapter. Phase 2 `Application::spawn_retry_worker` clones
     /// this `Arc` into the `StdioServer`'s constructor; integration
     /// tests in `tests/integration_smoke.rs` use it for direct dispatch.
     pub fn adapter(&self) -> &Arc<VaultAdapter> {
@@ -641,21 +641,23 @@ impl Application {
     /// Kick off the ranking model's background load, returning whether there
     /// was anything to warm.
     ///
-    /// # Why this is public rather than folded into [`Self::start`]
+    /// # Why this is public rather than folded into [`Self::spawn_retry_worker`]
     ///
     /// [`Self::start_with_mcp`] already warms the model (step 3b). The desktop
     /// app cannot call it — `start_with_mcp` blocks on an MCP handshake that
-    /// never arrives in a GUI (ADR-034) — so it calls [`Self::start`], which
-    /// is documented as the **test-focused** entry point and spawns only the
-    /// retry worker. The result was that the desktop app silently never warmed
-    /// the model and paid the full ~24 s load on the user's first search
-    /// (measured live 2026-07-22).
+    /// never arrives in a GUI (ADR-034) — so it calls
+    /// [`Self::spawn_retry_worker`], which spawns only the retry worker. The
+    /// result was that the desktop app silently never warmed the model and paid
+    /// the full ~24 s load on the user's first search (measured live
+    /// 2026-07-22). That method was then named `start()` and labelled
+    /// "test-focused", which is a large part of why the gap went unnoticed
+    /// (ADR-095).
     ///
-    /// Folding the warm-up into `start()` would have fixed that by making
-    /// every test that configures a reranker load a 1.2 GB model as a side
-    /// effect of starting. So the warm-up stays **explicit at the call site**,
-    /// matching the Path α discipline that keeps `start` and `start_with_mcp`
-    /// separate and named rather than flag-switched.
+    /// Folding the warm-up into [`Self::spawn_retry_worker`] would have fixed
+    /// that by making every test that configures a reranker load a 1.2 GB model
+    /// as a side effect of starting. So the warm-up stays **explicit at the call
+    /// site**, matching the discipline that keeps the two entry points separate
+    /// and named rather than flag-switched.
     ///
     /// Safe to call when the first-run download has not landed: the load fails
     /// fast with [`VaultError::ModelUnavailable`], logs, and leaves the cell
@@ -693,25 +695,47 @@ impl Application {
         }
     }
 
-    /// **Test-focused entry point.** Spawn the cascading retry worker only;
-    /// return the [`tokio::sync::watch::Sender<bool>`] that signals
-    /// shutdown when dropped or when `send(true)` is called.
+    /// Spawn the cascading retry worker on its own; return the
+    /// [`tokio::sync::watch::Sender<bool>`] that signals shutdown when dropped
+    /// or when `send(true)` is called.
     ///
-    /// Production callers should use [`Self::start_with_mcp`] instead —
-    /// it composes `start()`'s worker spawn with MCP server bind + signal
-    /// handlers + the await-aware [`ApplicationHandle::shutdown`] path.
+    /// # This is a PRODUCTION entry point (renamed 2026-07-25, ADR-095)
     ///
-    /// # Phase 1b scope (kept stable in Phase 2 per Path α decision)
+    /// It was called `start()` and documented as a **"test-focused entry
+    /// point"** for most of the project's life. That label was wrong, and
+    /// believing it cost us four separate defects: a GUI cannot call
+    /// [`Self::start_with_mcp`] (that blocks on an MCP handshake which never
+    /// arrives — ADR-034), so the desktop app has ALWAYS started its lifecycle
+    /// here, as does `vault-cli daemon`. Three of the four are catalogued in
+    /// ADR-090; the fourth was the shutdown-drain gap (ADR-095), where the
+    /// question "does the desktop drain its queue on close?" was hard to even
+    /// ask while the method claimed to be for tests.
     ///
-    /// This is the **minimum lifecycle** needed for write→search round-trips
-    /// through the cascading orchestrator. `StorageBackend::write_memory`
-    /// writes to SQLite + `retry_queue` only; the vector store is updated
-    /// asynchronously by the worker draining `retry_queue` → `vector.upsert`.
-    /// Without `start()` (or `start_with_mcp()`) called, writes never
-    /// propagate to the vector store and `SemanticRetriever` queries return
-    /// empty (Phase 1 spike surfaced this — triggers (b) and (d) failed
-    /// deterministically until Phase 1b added this method).
-    pub fn start(&self) -> tokio::sync::watch::Sender<bool> {
+    /// The honest split is by COMPOSITION, not by test-vs-production:
+    /// - this method — the worker alone, for hosts that own their own
+    ///   event loop (Tauri, the HTTP daemon) and for tests;
+    /// - [`Self::start_with_mcp`] — the same worker plus stdio-MCP bind,
+    ///   signal handlers, and the await-aware
+    ///   [`ApplicationHandle::shutdown`].
+    ///
+    /// # Why calling one of them is mandatory
+    ///
+    /// `StorageBackend::write_memory` writes SQLite + `retry_queue` only; the
+    /// vector store is updated asynchronously by the worker draining
+    /// `retry_queue` → `vector.upsert`. With no worker running, writes never
+    /// reach the vector store and `SemanticRetriever` returns empty (the Phase
+    /// 1 spike surfaced this; triggers (b) and (d) failed deterministically
+    /// until this method existed).
+    ///
+    /// # Shutdown caveat (ADR-095)
+    ///
+    /// The spawned task's `JoinHandle` is dropped, so callers can signal the
+    /// worker but cannot AWAIT its drain. `start_with_mcp` keeps the handle and
+    /// awaits it in `ApplicationHandle::shutdown`; callers of this method
+    /// (Tauri, daemon) therefore leave any still-queued cascades to the next
+    /// launch. That is safe — `retry_queue` is durable and the worker resumes
+    /// on the next start — but it is a deferral, not a flush.
+    pub fn spawn_retry_worker(&self) -> tokio::sync::watch::Sender<bool> {
         let (tx, rx) = tokio::sync::watch::channel(false);
         let worker = RetryWorker::new(self.storage.clone());
         tokio::spawn(worker.run(rx));
@@ -727,11 +751,16 @@ impl Application {
     ///
     /// # Path α discipline (T0.1.10 Phase 2)
     ///
-    /// This method is **separate from** [`Self::start`] (which stays
-    /// worker-only for tests). The two methods diverge at the API
+    /// This method is **separate from** [`Self::spawn_retry_worker`], which
+    /// spawns the worker alone for hosts that own their own event loop (the
+    /// Tauri app, the HTTP daemon) and for tests. The two diverge at the API
     /// surface — explicitly named, no bool flag — so caller intent is
     /// clear from the call site. See HANDOFF.md Phase 2 plan paragraph
     /// for the Path α reasoning.
+    ///
+    /// Unlike [`Self::spawn_retry_worker`], this one KEEPS the worker's
+    /// `JoinHandle`, which is what lets [`ApplicationHandle::shutdown`] await
+    /// the shutdown drain rather than merely signalling it (ADR-095).
     ///
     /// # Errors
     ///
@@ -755,7 +784,7 @@ impl Application {
     ) -> VaultResult<ApplicationHandle> {
         use rmcp::ServiceExt;
 
-        // 1. Spawn cascading retry worker — same as Self::start().
+        // 1. Spawn cascading retry worker — same as Self::spawn_retry_worker().
         let (shutdown_signal, rx) = tokio::sync::watch::channel(false);
         let worker = RetryWorker::new(self.storage.clone());
         let worker_handle = tokio::spawn(worker.run(rx));
@@ -1198,8 +1227,11 @@ impl ApplicationHandle {
     /// V0.1 internal alpha (single-user, single-agent); revisit at V0.2
     /// multi-agent task if concrete consumer surfaces.
     pub async fn shutdown(self) -> VaultResult<()> {
-        // 1. Signal the retry worker to stop polling. Worker will finish
-        //    its current step (drain in-flight cascade entry) and exit.
+        // 1. Signal the retry worker to wind down. It stops polling for new
+        //    work and drains whatever is already queued (bounded by
+        //    `retry_worker::DEFAULT_DRAIN_TIMEOUT`) before exiting, so a
+        //    cascade enqueued moments before shutdown is written now rather
+        //    than deferred to the next session. Step 4 awaits that drain.
         let _ = self.shutdown_signal.send(true);
 
         // 2. Abort the signal handler (it's blocked on Ctrl-C waiting).

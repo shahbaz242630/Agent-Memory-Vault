@@ -68,7 +68,7 @@ async fn content_ceiling_stores_intact_or_rejects_cleanly() {
         rerank_tokenizer_path: None,
     };
     let app = Application::new(&config).await.expect("app");
-    let _shutdown = app.start();
+    let _shutdown = app.spawn_retry_worker();
     let adapter = app.adapter();
     let boundary = Boundary::new("testeval").expect("boundary");
 

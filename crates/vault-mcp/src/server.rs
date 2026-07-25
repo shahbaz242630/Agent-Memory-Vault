@@ -1193,7 +1193,7 @@ pub(crate) fn vault_error_to_mcp(err: VaultError) -> McpError {
         | VaultError::Io(_)
         | VaultError::Serde(_)
         // T0.1.10 Phase 2: WorkerSpawnFailed / McpBindFailed are startup
-        // errors that surface during Application::start before any MCP
+        // errors that surface during Application::spawn_retry_worker before any MCP
         // tool dispatch. They should never reach this function in
         // practice — startup failure aborts the process before MCP
         // accepts requests. Mapped to internal_error defensively to

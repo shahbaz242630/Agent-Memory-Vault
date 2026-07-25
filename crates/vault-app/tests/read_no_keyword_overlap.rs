@@ -102,7 +102,7 @@ async fn no_keyword_overlap_read_surfaces_fact_and_still_abstains_on_no_signal()
     let app = Application::new(&config)
         .await
         .expect("Application::new must compose the read stack (BGE + reranker)");
-    let _shutdown = app.start(); // spawn the cascading retry worker
+    let _shutdown = app.spawn_retry_worker(); // spawn the cascading retry worker
     let adapter = app.adapter();
 
     let boundary = Boundary::new("evalfun").expect("valid boundary");
@@ -203,7 +203,7 @@ async fn cello_surfaces_amid_distractors_and_still_abstains_on_no_signal() {
     let app = Application::new(&config)
         .await
         .expect("Application::new must compose the read stack (BGE + reranker)");
-    let _shutdown = app.start();
+    let _shutdown = app.spawn_retry_worker();
     let adapter = app.adapter();
 
     let boundary = Boundary::new("evalfun").expect("valid boundary");
@@ -331,7 +331,7 @@ async fn synonym_gap_reads_surface_recall_first_and_still_abstain_on_no_signal()
     let app = Application::new(&config)
         .await
         .expect("Application::new must compose the read stack (BGE + reranker)");
-    let _shutdown = app.start();
+    let _shutdown = app.spawn_retry_worker();
     let adapter = app.adapter();
     let boundary = Boundary::new("evalsyn").expect("valid boundary");
 

@@ -924,7 +924,7 @@ async fn dispatch_daemon(
     // Start the cascading retry worker (drains SQLite → vector store). The
     // returned sender is held for the daemon's lifetime; dropping it on
     // shutdown asks the worker to exit.
-    let _worker_shutdown = app.start();
+    let _worker_shutdown = app.spawn_retry_worker();
 
     // Wrap the REAL adapter in the auth-gating multi-agent handler.
     let adapter: Arc<dyn vault_mcp::Adapter> = app.adapter().clone();

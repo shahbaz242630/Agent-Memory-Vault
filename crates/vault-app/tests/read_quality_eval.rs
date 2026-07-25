@@ -250,7 +250,7 @@ async fn read_quality_eval_baseline() {
     let app = Application::new(&config)
         .await
         .expect("Application::new must compose the read stack");
-    let _shutdown = app.start(); // spawn the cascading retry worker
+    let _shutdown = app.spawn_retry_worker(); // spawn the cascading retry worker
     let adapter = app.adapter();
 
     // Separate BGE handle to read out the raw top-1 cosine the gate keys on

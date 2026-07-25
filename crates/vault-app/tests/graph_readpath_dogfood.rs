@@ -260,7 +260,7 @@ async fn graph_readpath_dogfood() {
         let app = Application::new(&app)
             .await
             .expect("Application::new (seed + consolidate)");
-        let _shutdown = app.start();
+        let _shutdown = app.spawn_retry_worker();
         let adapter = app.adapter();
 
         for content in &facts {
