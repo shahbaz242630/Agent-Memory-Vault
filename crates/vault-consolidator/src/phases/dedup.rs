@@ -29,9 +29,58 @@
 //! vs the next class's ceiling 0.883), so `NEAR_IDENTICAL_COS = 0.93` has a
 //! wide margin. Containment separates near-identical (floor 0.889) from
 //! complementary (ceiling 0.556), so `NEAR_IDENTICAL_LEX = 0.80` sits in the
-//! gap. Contradictory pairs can share high containment but score < 0.92
-//! cosine, so they never cluster at the 0.92 gate AND are caught separately by
-//! the topic-level A5 pass — the cosine axis keeps them out of dedup.
+//! gap.
+//!
+//! ## ⚠️ The cosine axis does NOT keep contradictions out — third axis added
+//!
+//! This module previously claimed that *"contradictory pairs can share high
+//! containment but score < 0.92 cosine, so they never cluster at the 0.92 gate
+//! AND are caught separately by the topic-level A5 pass — the cosine axis keeps
+//! them out of dedup."* **That is false, and was falsified by measurement on
+//! 2026-07-26.**
+//!
+//! Both axes above are blind to word ORDER by construction: bge-small scores
+//! `"The user prefers tea over coffee."` against `"The user prefers coffee over
+//! tea."` at **0.9979** — higher than any true paraphrase measured — and
+//! [`token_containment`] compares token *sets*, which cannot represent order at
+//! all. Two order-blind checks cannot catch a reordering. Re-measured over 8
+//! contradictory pairs, the class spans **0.7199 – 0.9979**; four breach the
+//! documented 0.883 ceiling. The 2026-05-31 calibration only ever sampled
+//! *different-value* contradictions (Vega/Atlas — 0.7199), never
+//! *reversed-argument* ones.
+//!
+//! **Confirmed live**, clean 4-memory vault, 2026-07-26: the pair cleared both
+//! gates, was collapsed by plain code, the older fact was superseded, and the
+//! run reported `contradictions queued: 0` with an empty `## Merges` section —
+//! a fact left the vault and the user-facing summary showed nothing.
+//!
+//! **The defect is not that a fact was retired — it is that the pair was
+//! treated as a DUPLICATE, so contradiction detection never ran on it at all.**
+//! Nothing was recorded as a contradiction, and dedup does not render into
+//! `## Merges` either, so the collapse appeared nowhere a user would look.
+//! BRD §5.6 line 985 requires contradictions reach the review path — *"For
+//! contradictions, write to `ConflictReview` queue, do not auto-resolve"* — and
+//! V0.2 refines that per `Memory Vault Tests.md` K6: *"clear-winner
+//! contradictions auto-`invalidate()`; ambiguous ones queue to
+//! `conflicts_for_user_review`, not silently picked"*. Auto-resolving a clear
+//! winner is therefore correct and intended; **reaching that path at all is
+//! what this pair never did.**
+//!
+//! So the gate takes a **third axis**: [`is_pure_reordering`] — same word
+//! multiset in a different order → decline. Declining costs no legitimate
+//! merge: the cluster falls through to the Phase-2 LLM path, which per BRD §5.6
+//! line 983 decides *"merge into one memory" / "keep separate" / "contradiction
+//! — flag for user"*. We trade one model call for never blind-collapsing a
+//! reversal.
+//!
+//! **Re-verified live on the same 4-memory vault after the fix, 2026-07-26:**
+//! `clusters deduped: 0` / `memories deduped: 0` (the blind collapse is gone),
+//! this module's decline logged, and the pair reached the contradiction path —
+//! `contradictions_auto_resolved=1`, rendered in the run summary as
+//! `**Auto-resolved (newer fact won):** 1` plus a per-boundary detail line. The
+//! newer fact still wins, which is the intended clear-winner outcome; the
+//! difference is that it is now a recorded contradiction rather than an
+//! invisible deduplication.
 
 use std::collections::HashSet;
 
@@ -66,13 +115,51 @@ pub(crate) struct DedupPlan {
     pub max_confidence: f32,
 }
 
-/// Lowercased alphanumeric word tokens of `s`. Splits on any non-alphanumeric
-/// char (Unicode-aware via [`char::is_alphanumeric`]); empty tokens dropped.
-fn tokens(s: &str) -> HashSet<String> {
+/// Lowercased alphanumeric word tokens of `s` **in order**. Splits on any
+/// non-alphanumeric char (Unicode-aware via [`char::is_alphanumeric`]); empty
+/// tokens dropped. The single tokenisation definition in this module — both
+/// [`tokens`] and [`is_pure_reordering`] derive from it, so the set-based and
+/// order-based axes can never drift apart on what counts as a word.
+fn token_sequence(s: &str) -> Vec<String> {
     s.split(|c: char| !c.is_alphanumeric())
         .filter(|t| !t.is_empty())
         .map(str::to_lowercase)
         .collect()
+}
+
+/// Lowercased alphanumeric word tokens of `s`, order discarded.
+fn tokens(s: &str) -> HashSet<String> {
+    token_sequence(s).into_iter().collect()
+}
+
+/// `true` when `a` and `b` contain **exactly the same words** (same multiset,
+/// so repeats count) arranged in a **different order**.
+///
+/// This is the order-sensitive axis the cosine and containment gates cannot
+/// provide — see the module header. It is deliberately narrow: it fires only on
+/// a pure permutation, which is precisely the reversed-argument shape
+/// (`"prefers tea over coffee"` / `"prefers coffee over tea"`) that scored
+/// 0.9979 cosine and 1.00 containment and was collapsed blind.
+///
+/// Identical text returns `false` — that is a genuine duplicate, not a
+/// reordering, and must remain eligible for collapse.
+///
+/// **False positives are cheap by design.** A same-words-different-order pair
+/// that really IS a paraphrase (`"Mondays and Thursdays"` /
+/// `"Thursdays and Mondays"`) is not lost — it merely stops qualifying for the
+/// *deterministic* collapse and is handed to the Phase-2 judgement path, which
+/// can still merge it. The asymmetry is intentional: an unnecessary model call
+/// costs seconds, a blind-collapsed contradiction costs a fact.
+fn is_pure_reordering(a: &str, b: &str) -> bool {
+    let (seq_a, seq_b) = (token_sequence(a), token_sequence(b));
+    // Same words in the SAME order is a duplicate, not a reordering.
+    if seq_a == seq_b {
+        return false;
+    }
+    let (mut sorted_a, mut sorted_b) = (seq_a, seq_b);
+    sorted_a.sort();
+    sorted_b.sort();
+    sorted_a == sorted_b
 }
 
 /// Lexical containment = `|A ∩ B| / min(|A|, |B|)` over word-token sets.
@@ -130,6 +217,20 @@ pub(crate) fn plan_dedup(members: &[Memory], embeddings: &[Vec<f32>]) -> Option<
             }
             let lex = token_containment(&members[i].content, &members[j].content);
             if lex < NEAR_IDENTICAL_LEX {
+                return None;
+            }
+            // Third axis. Checked LAST on purpose: reaching here means the pair
+            // already cleared both similarity gates, so this log line marks a
+            // collapse that WOULD have happened silently. Ids only — never
+            // memory content in logs.
+            if is_pure_reordering(&members[i].content, &members[j].content) {
+                tracing::info!(
+                    left = ?members[i].id,
+                    right = ?members[j].id,
+                    "declining deterministic dedup: identical words in a different order — \
+                     routing to the merge/contradiction path so the pair is judged rather than \
+                     collapsed as a duplicate"
+                );
                 return None;
             }
         }
@@ -387,6 +488,76 @@ mod tests {
         let plan = plan_dedup(&[m0, m1], &e).expect("eligible");
         assert_eq!(plan.summed_access_count, 12);
         assert!((plan.max_confidence - 0.95).abs() < 1e-6);
+    }
+
+    // ── is_pure_reordering (the order axis) ────────────────────────────
+    #[test]
+    fn reordering_detects_reversed_arguments() {
+        // The live-confirmed case: cosine 0.9979, containment 1.00.
+        assert!(is_pure_reordering(
+            "The user prefers tea over coffee.",
+            "The user prefers coffee over tea."
+        ));
+    }
+
+    #[test]
+    fn reordering_is_false_for_identical_text() {
+        // A genuine duplicate must stay eligible for collapse.
+        assert!(!is_pure_reordering(
+            "the user drinks tea",
+            "the user drinks tea"
+        ));
+    }
+
+    #[test]
+    fn reordering_is_false_when_the_words_differ() {
+        // Battery pair 1 — a real near-duplicate the live run correctly
+        // deduped. "editor" vs "editors" is a different multiset.
+        assert!(!is_pure_reordering(
+            "The user prefers dark mode in their code editor.",
+            "The user prefers dark mode in their code editors."
+        ));
+    }
+
+    #[test]
+    fn reordering_ignores_case_and_punctuation() {
+        assert!(is_pure_reordering("Tea over coffee!", "coffee over tea"));
+    }
+
+    #[test]
+    fn reordering_compares_multisets_not_sets() {
+        // Same SET {tea, coffee} but different counts → not a permutation.
+        // A set-based check would wrongly call this a reordering.
+        assert!(!is_pure_reordering("tea tea coffee", "tea coffee coffee"));
+    }
+
+    #[test]
+    fn plan_dedup_blocks_reversed_argument_contradiction() {
+        // Regression pin for the live 2026-07-26 finding: this pair cleared
+        // BOTH similarity gates and was collapsed as a DUPLICATE, so
+        // contradiction detection never ran and nothing was recorded. After
+        // the fix the same vault reports `contradictions_auto_resolved=1`.
+        let m0 = mem("The user prefers tea over coffee.");
+        let m1 = mem("The user prefers coffee over tea.");
+        // Cosine 1.0 — comfortably above the gate, as measured in reality.
+        let e = vec![unit(1.0, 0.0), unit(1.0, 0.0)];
+        assert!(
+            plan_dedup(&[m0, m1], &e).is_none(),
+            "a reversed-argument contradiction must never be blind-collapsed"
+        );
+    }
+
+    #[test]
+    fn plan_dedup_still_collapses_a_genuine_near_duplicate() {
+        // Over-fire guard for the new axis: battery pair 1, which the live
+        // 2026-07-25 run correctly deduped, must still be eligible.
+        let m0 = mem("The user prefers dark mode in their code editor.");
+        let m1 = mem("The user prefers dark mode in their code editors.");
+        let e = vec![unit(1.0, 0.01), unit(1.0, 0.0)];
+        assert!(
+            plan_dedup(&[m0, m1], &e).is_some(),
+            "the order axis must not block genuine near-duplicates"
+        );
     }
 
     #[test]

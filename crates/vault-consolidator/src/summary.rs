@@ -88,12 +88,36 @@ fn format_duration_human(d: Duration) -> String {
 fn write_merges_section(out: &mut String, per_boundary: &BTreeMap<Boundary, BoundarySummary>) {
     writeln!(out, "## Merges").expect("writing to String never fails");
     writeln!(out).expect("writing to String never fails");
+
+    // Aggregate deterministic-dedup collapses (ADR-063) so a superseded fact is
+    // never invisible — exactly the reasoning behind the Contradictions
+    // section's auto-resolved line. Before this, dedup rendered NOWHERE in the
+    // summary: a run that collapsed facts printed an empty "## Merges" and
+    // "Auto-resolved: 0", so the document said "nothing happened" while a fact
+    // had left the vault. Found 2026-07-26 while live-testing the reordering
+    // guard in `phases::dedup`. A collapse you cannot see is one you cannot
+    // decide to roll back.
+    let deduped_memories: usize = per_boundary.values().map(|b| b.deduped_memories).sum();
+    writeln!(out, "**Collapsed as duplicates:** {deduped_memories}")
+        .expect("writing to String never fails");
+    writeln!(out).expect("writing to String never fails");
+
     for (boundary, summary) in per_boundary {
-        if summary.applied_merges.is_empty() {
+        if summary.applied_merges.is_empty() && summary.deduped_memories == 0 {
             continue;
         }
         writeln!(out, "### {}", boundary.as_str()).expect("writing to String never fails");
         writeln!(out).expect("writing to String never fails");
+        if summary.deduped_memories > 0 {
+            writeln!(
+                out,
+                "- Collapsed as duplicates: {} fact(s) across {} cluster(s) \
+                 (near-identical wording; the newest copy was kept).",
+                summary.deduped_memories, summary.deduped_clusters
+            )
+            .expect("writing to String never fails");
+            writeln!(out).expect("writing to String never fails");
+        }
         for amwc in &summary.applied_merges {
             write_merge_entry(out, amwc);
         }
@@ -517,6 +541,57 @@ mod tests {
         assert!(
             md.contains("**Auto-resolved (newer fact won):** 0"),
             "empty run must report 0 auto-resolved retirements:\n{md}"
+        );
+    }
+
+    /// The dedup-visibility gap, found 2026-07-26 while live-testing the
+    /// `phases::dedup` reordering guard: a run that collapsed facts by
+    /// deterministic dedup rendered NOTHING in the summary — an empty
+    /// `## Merges` and `Auto-resolved: 0` — so the document read "nothing
+    /// happened" while a fact had left the vault. Both the aggregate line and
+    /// the per-boundary detail must appear even when the merge list is empty,
+    /// which is the normal shape for a dedup-only run.
+    #[test]
+    fn merges_section_surfaces_deduped_collapses() {
+        let summary = BoundarySummary {
+            deduped_memories: 2,
+            deduped_clusters: 1,
+            ..Default::default()
+        };
+        let mut per_boundary = BTreeMap::new();
+        per_boundary.insert(boundary("personal"), summary);
+        let state = RunState {
+            started_at: fixed_started_at(),
+            duration: Duration::from_secs(30),
+            memories_processed: 3,
+            memories_decayed: 0,
+            memories_archived: 0,
+            per_boundary,
+        };
+
+        let md = generate_summary_markdown(&state, "test-cp-dedup");
+        assert!(
+            md.contains("**Collapsed as duplicates:** 2"),
+            "aggregate collapse count missing from the Merges section:\n{md}"
+        );
+        assert!(
+            md.contains("### personal"),
+            "per-boundary sub-header missing despite a collapse — an empty merge \
+             list must not hide it:\n{md}"
+        );
+        assert!(
+            md.contains("2 fact(s) across 1 cluster(s)"),
+            "per-boundary collapse detail missing:\n{md}"
+        );
+    }
+
+    /// An empty run reports zero collapses (no false positives).
+    #[test]
+    fn merges_section_reports_zero_collapsed_for_empty_run() {
+        let md = generate_summary_markdown(&empty_run_state(), "test-cp-dedup-empty");
+        assert!(
+            md.contains("**Collapsed as duplicates:** 0"),
+            "empty run must report 0 collapses:\n{md}"
         );
     }
 
