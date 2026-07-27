@@ -1961,8 +1961,12 @@ async fn probe_contradiction_pair_distribution() {
     // The dedup gate's lexical floor (`phases::dedup::NEAR_IDENTICAL_LEX`).
     const DEDUP_LEX_FLOOR: f32 = 0.80;
     // The merge/dedup clustering gate (cluster.rs): only pairs >= this even
-    // reach merge/dedup; below it they are contradiction-only.
-    const MERGE_GATE_COS: f32 = 0.92;
+    // reach merge/dedup; below it they are contradiction-only. Read from the
+    // shipped config rather than hardcoded so this diagnostic always describes
+    // the gate the product actually runs (0.84 since ADR-097 — a hardcoded
+    // 0.92 here would have kept printing a band that no longer exists).
+    let merge_gate_cos =
+        vault_consolidator::ConsolidatorConfig::default().merge_similarity_threshold;
 
     // Collect every candidate pair across all boundaries with cosine +
     // containment + both texts (the pair set is already 0.70-floored +
@@ -2044,25 +2048,26 @@ async fn probe_contradiction_pair_distribution() {
         println!("   floor {x:.2}: {surviving:>6} pairs ({pct:>5.1}%)   {verdict}");
     }
 
-    // Near-dup tail: pairs >= the 0.92 merge gate that nonetheless reached
+    // Near-dup tail: pairs >= the merge gate that nonetheless reached
     // Phase 2b — these signal merge/dedup under-collapsing (Finding B), the
     // OTHER lever for shrinking the pair count.
     let near_dups = pair_cosines
         .iter()
-        .filter(|&&c| c >= MERGE_GATE_COS)
+        .filter(|&&c| c >= merge_gate_cos)
         .count();
     println!(
-        "\nnear-duplicate pairs (>= {MERGE_GATE_COS} merge gate, yet still contradiction-judged): {near_dups} ({:.1}%)",
+        "\nnear-duplicate pairs (>= {merge_gate_cos} merge gate, yet still contradiction-judged): {near_dups} ({:.1}%)",
         near_dups as f32 / total_pairs as f32 * 100.0
     );
     println!("  ^ if dedup/merge collapsed these, they would never reach the slow judge.");
 
-    // ── WHY aren't the >= 0.92 pairs collapsing? Diagnose the dedup gate ──
-    // The dedup gate requires cosine >= 0.93 AND containment >= 0.80. For pairs
-    // already >= 0.92 cosine, the LEXICAL axis is the usual blocker. Split them.
+    // ── WHY aren't the merge-eligible pairs collapsing? Diagnose dedup ──
+    // The dedup gate requires cosine >= 0.93 AND containment >= 0.80 AND
+    // not-a-pure-reordering (ADR-096). For pairs already above the clustering
+    // gate, the LEXICAL axis is the usual blocker. Split them.
     let merge_eligible: Vec<&Pair> = pairs_full
         .iter()
-        .filter(|p| p.cos >= MERGE_GATE_COS)
+        .filter(|p| p.cos >= merge_gate_cos)
         .collect();
     let lex_pass = merge_eligible
         .iter()
@@ -2070,7 +2075,7 @@ async fn probe_contradiction_pair_distribution() {
         .count();
     let lex_fail = merge_eligible.len() - lex_pass;
     println!(
-        "\n-- of the {} pairs >= {MERGE_GATE_COS} cosine (merge-eligible) --",
+        "\n-- of the {} pairs >= {merge_gate_cos} cosine (merge-eligible) --",
         merge_eligible.len()
     );
     println!(
@@ -2080,7 +2085,7 @@ async fn probe_contradiction_pair_distribution() {
     // Eyeball sample: are these genuinely duplicates that SHOULD merge, or
     // distinct facts? Print the lowest-containment merge-eligible pairs (the
     // ones the lexical gate is rejecting) + a few high-cosine examples.
-    println!("\n-- sample merge-eligible pairs the LEXICAL gate rejects (cos>={MERGE_GATE_COS}, lex<{DEDUP_LEX_FLOOR}) --");
+    println!("\n-- sample merge-eligible pairs the LEXICAL gate rejects (cos>={merge_gate_cos}, lex<{DEDUP_LEX_FLOOR}) --");
     let mut lex_rejects: Vec<&&Pair> = merge_eligible
         .iter()
         .filter(|p| p.lex < DEDUP_LEX_FLOOR)
@@ -2093,12 +2098,18 @@ async fn probe_contradiction_pair_distribution() {
         );
     }
 
-    // Also sample the 0.85–0.92 band (BELOW the merge gate but high) — if these
-    // are ALSO duplicates, the 0.92 clustering gate itself is too high.
-    println!("\n-- sample pairs in the 0.85-0.92 band (below merge gate; are these dups too?) --");
+    // Also sample the 0.85-to-gate band (BELOW the merge gate but high) — if
+    // these are ALSO duplicates, the clustering gate itself is too high.
+    // ADR-097 note: this hypothesis was tested and CONFIRMED — the gate moved
+    // 0.92 → 0.84 on the strength of it. The band is narrower now; a still-dup-
+    // heavy sample here is the signal for the next move (0.84 is the charted
+    // next step, at the cost of doubled contradiction exposure).
+    println!(
+        "\n-- sample pairs in the 0.85-to-gate band (below merge gate; are these dups too?) --"
+    );
     let mut mid: Vec<&Pair> = pairs_full
         .iter()
-        .filter(|p| p.cos >= 0.85 && p.cos < MERGE_GATE_COS)
+        .filter(|p| p.cos >= 0.85 && p.cos < merge_gate_cos)
         .collect();
     mid.sort_by(|x, y| y.cos.total_cmp(&x.cos));
     for p in mid.iter().take(12) {

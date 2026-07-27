@@ -544,8 +544,9 @@ impl Application {
         //    pay model-load cost per run, then construct a
         //    `vault_consolidator::Consolidator` with the shared storage
         //    + embedder + a default `ConsolidatorConfig` (BRD §5.6
-        //    defaults: 3 AM, 0.92 similarity, 180-day decay, 365-day
-        //    archive, 1000 memories/run).
+        //    defaults: 3 AM, 180-day decay, 365-day archive, 1000
+        //    memories/run; similarity 0.84 per ADR-097, diverging from
+        //    the BRD's 0.92 on measured evidence).
         //
         //    When `None`, the consolidator is unwired and
         //    `run_consolidation_with_safety` surfaces `VaultError::Config`

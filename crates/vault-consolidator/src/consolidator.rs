@@ -124,7 +124,67 @@ pub struct ConsolidatorConfig {
     /// Time of day to schedule the nightly run. T0.2.6 wires the scheduler.
     pub run_at: NaiveTime,
     /// Cosine-similarity threshold above which Phase 1 forms cluster edges.
-    /// BRD §5.6 line 904 default: 0.92.
+    ///
+    /// **BRD §5.6 line 904 specifies `0.92`. We ship `0.84` — a deliberate,
+    /// measured divergence (ADR-097).** At 0.92 the gate left 5 of 12
+    /// same-meaning pairs permanently unclustered, so no consolidation phase
+    /// could ever reach them and a user's vault kept both wordings forever.
+    ///
+    /// Measured on the 100-entry / 20-topic acceptance fixture behind
+    /// `tests/acceptance.rs` (ADR-045 §d floors: precision ≥ 0.95, recall
+    /// ≥ 0.90):
+    ///
+    /// | gate | precision | recall |
+    /// |------|-----------|--------|
+    /// | 0.92 | 1.0000    | 0.9300 |
+    /// | 0.89 | 1.0000    | 0.9650 |
+    /// | 0.84 | 1.0000    | 1.0000 |
+    ///
+    /// Precision is unchanged at a perfect 1.0000 (it holds at 1.0000 all the
+    /// way down to 0.80 on that fixture); the move buys recall only, and at
+    /// 0.84 recall is perfect too.
+    ///
+    /// **0.82 is the floor, not 0.84's neighbour.** At 0.82 the `chained`
+    /// count doubles — clusters start spanning more than one case via
+    /// transitive closure, i.e. unrelated facts gluing together. 0.84 is the
+    /// last value before that begins.
+    ///
+    /// **What the lower gate admits, and why it is safe.** Knowledge-update
+    /// contradictions are interleaved with paraphrases in cosine space —
+    /// measured paraphrases span 0.8237–0.9936 and contradictions 0.7199–0.9979,
+    /// so *no* threshold separates the classes. Lowering the gate therefore
+    /// pulls more contradictions into the Phase-2 merge path. That is not a new
+    /// mechanism (at 0.92 a reversed-argument pair already clustered) and it is
+    /// not the dangerous path:
+    ///
+    /// - Deterministic dedup — the only route by which a fact leaves the vault
+    ///   with **no** model judgement and no record — needs cosine ≥ 0.93 AND
+    ///   token-containment ≥ 0.80 AND (ADR-096) not-a-pure-reordering. No
+    ///   measured contradictory pair clears it at any gate value.
+    /// - [`decide_merge`](crate::decide_merge) is contradiction-aware: it can
+    ///   return `KeepSeparate` or `Contradiction` as well as `Merge`, and
+    ///   anything left active is re-examined by the Phase-2b nearest-neighbour
+    ///   pass regardless of whether it clustered.
+    ///
+    /// **The residual risk — a model that answers `Merge` on a genuine
+    /// contradiction — was the one thing no sweep could model, so it was RUN,
+    /// twice, on real Phi-4 before shipping.** Fresh vaults, labelled fixtures,
+    /// vectors verified present first (a memory with no vector is invisible to
+    /// clustering and would have voided the test):
+    ///
+    /// | gate | clusters | duplicate pairs merged | contradictions judged | **wrongly merged** |
+    /// |------|----------|------------------------|-----------------------|--------------------|
+    /// | 0.89 | 6        | 3                      | 3                     | **0**              |
+    /// | 0.84 | 10       | 4                      | 6                     | **0**              |
+    ///
+    /// Both runs: zero blind dedup collapses, zero skipped clusters, controls
+    /// untouched, every contradiction resolved by recency with the stale side
+    /// retired and the current one kept. Handed six contradictions at 0.84 —
+    /// including `"standup is at 9am"` vs `"standup is at 10:30am"` and
+    /// `MacBook Pro` vs `ThinkPad` — Phi-4 declined to merge every one.
+    ///
+    /// 0.84 was initially deferred *because* this behaviour was assumed rather
+    /// than observed. Observing it is what promoted the value.
     pub merge_similarity_threshold: f32,
     /// Days of inactivity before a memory's confidence multiplies by 0.9.
     /// BRD §5.6 line 905 default: 180. Phase 4 (T0.2.4) consumes.
@@ -139,11 +199,13 @@ pub struct ConsolidatorConfig {
 }
 
 impl Default for ConsolidatorConfig {
-    /// Defaults per BRD §5.6 lines 903-907 verbatim.
+    /// Defaults per BRD §5.6 lines 903-907 verbatim, **except**
+    /// `merge_similarity_threshold` — see the field docs for the measured
+    /// 0.92 → 0.84 divergence (ADR-097).
     fn default() -> Self {
         Self {
             run_at: NaiveTime::from_hms_opt(3, 0, 0).expect("3:00 AM is a valid NaiveTime"),
-            merge_similarity_threshold: 0.92,
+            merge_similarity_threshold: 0.84,
             decay_after_days: 180,
             archive_after_days: 365,
             max_memories_per_run: 1000,
@@ -483,9 +545,20 @@ impl Consolidator {
 
         // ── Phase 2b: nearest-neighbor contradiction detection (T0.3.x A5, ADR-065) ──
         //
-        // Decoupled from the 0.92 merge gate (which never clusters a
-        // knowledge-update pair — it sits below 0.92) AND from K-means topic
-        // grouping. ADR-060's premise — that a topic co-locates the
+        // Decoupled from the merge gate AND from K-means topic grouping.
+        //
+        // ADR-097 note: this pass was written when the gate was 0.92 and the
+        // comment here claimed a knowledge-update pair "sits below 0.92" and so
+        // never clusters. That was only ever true of *some* such pairs —
+        // measured, contradictions span cosine 0.7199–0.9979 — and at the
+        // shipped 0.84 gate the higher band DOES cluster. This pass is
+        // therefore not merely a fallback for un-clustered pairs: it is the
+        // catch-all that re-examines everything still active after Phase 2,
+        // including pairs the merge path saw and declined to resolve. The
+        // majority of contradictions still sit below the gate and reach
+        // detection ONLY here.
+        //
+        // ADR-060's premise — that a topic co-locates the
         // conflicting pair — was proven FALSE in the §7 dogfood (2026-06-01):
         // K-means split the Tesla→Rivian pair across groups, so it was never
         // judged and A5 silently failed. Contradiction detection is a
@@ -1619,7 +1692,14 @@ mod tests {
     fn consolidator_config_default_matches_brd_spec() {
         let c = ConsolidatorConfig::default();
         assert_eq!(c.run_at, NaiveTime::from_hms_opt(3, 0, 0).unwrap());
-        assert_eq!(c.merge_similarity_threshold, 0.92);
+        // DELIBERATE BRD DIVERGENCE (ADR-097): §5.6 line 904 specifies 0.92;
+        // we ship 0.84 on measured evidence + two live Phi-4 runs (acceptance-fixture precision
+        // unchanged at 1.0000, recall 0.9300 → 0.9650). Pinned so the
+        // divergence stays a decision rather than drifting silently.
+        assert_eq!(
+            c.merge_similarity_threshold, 0.84,
+            "shipped clustering gate must be the ADR-097 value, not the BRD's 0.92"
+        );
         assert_eq!(c.decay_after_days, 180);
         assert_eq!(c.archive_after_days, 365);
         assert_eq!(c.max_memories_per_run, 1000);

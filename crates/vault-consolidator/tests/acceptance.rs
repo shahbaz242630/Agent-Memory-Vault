@@ -28,8 +28,9 @@
 //! 4. Build a sealed `StorageBackend` over a tempdir; write all 100 memories
 //!    and embeddings through the cascading write path; drain the retry queue
 //!    so LanceDB upserts complete before clustering.
-//! 5. Call `find_candidate_clusters` at the default 0.92 threshold,
-//!    `since = None` (full-scan).
+//! 5. Call `find_candidate_clusters` at the SHIPPED
+//!    `ConsolidatorConfig::default().merge_similarity_threshold` (0.84 since
+//!    ADR-097; read live, never hardcoded), `since = None` (full-scan).
 //! 6. Compute precision + recall against `topic_id` ground truth.
 //! 7. **Gate B** (BRD §6.2 / ADR-045 §d) — assert `precision ≥ 0.95` AND
 //!    `recall ≥ 0.90`.
@@ -49,7 +50,7 @@ use std::sync::Arc;
 
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
-use vault_consolidator::find_candidate_clusters;
+use vault_consolidator::{find_candidate_clusters, ConsolidatorConfig};
 use vault_core::{Boundary, Memory, MemoryId, MemoryType, NewMemory};
 use vault_embedding::{BgeSmallProvider, EmbeddingProvider, EMBEDDING_DIM};
 use vault_storage::{RetryWorker, SqlCipherKey, StepResult, StorageBackend};
@@ -59,9 +60,17 @@ use vault_storage::{RetryWorker, SqlCipherKey, StepResult, StorageBackend};
 /// `vault-retrieval/tests/common/mod.rs:26`.
 const TEST_AT_REST_KEY: [u8; 32] = [0xab; 32];
 
-/// Default `merge_similarity_threshold` from `ConsolidatorConfig`
-/// (BRD §5.6 line 904). Locked here so the test traces back to spec.
-const ACCEPTANCE_THRESHOLD: f32 = 0.92;
+/// The **shipped** `merge_similarity_threshold`, read from
+/// `ConsolidatorConfig::default()` rather than hardcoded.
+///
+/// This was a `0.92` literal until ADR-097 lowered the shipped gate to 0.84.
+/// A hardcoded copy would have left the BRD §6.2 ship-gate quietly measuring a
+/// threshold the product no longer uses — passing while saying nothing about
+/// what users actually get. Deriving it means this test always grades shipped
+/// behaviour, and any future gate change is graded here automatically.
+fn acceptance_threshold() -> f32 {
+    ConsolidatorConfig::default().merge_similarity_threshold
+}
 
 /// Precision floor per ADR-045 §d.
 const PRECISION_FLOOR: f64 = 0.95;
@@ -344,15 +353,14 @@ async fn clustering_meets_brd_acceptance_floor() {
     );
 
     // ── Step 6: run clustering ──────────────────────────────────────────
-    let clusters = find_candidate_clusters(
-        &storage,
-        embedder.as_ref(),
-        &boundary,
-        ACCEPTANCE_THRESHOLD,
-        None,
-    )
-    .await
-    .expect("find_candidate_clusters");
+    let threshold = acceptance_threshold();
+    tracing::info!(
+        threshold,
+        "clustering at the SHIPPED ConsolidatorConfig gate (ADR-097)"
+    );
+    let clusters = find_candidate_clusters(&storage, embedder.as_ref(), &boundary, threshold, None)
+        .await
+        .expect("find_candidate_clusters");
 
     tracing::info!(
         cluster_count = clusters.len(),
@@ -377,12 +385,12 @@ async fn clustering_meets_brd_acceptance_floor() {
         precision >= PRECISION_FLOOR,
         "Gate B FAILED: precision {precision:.4} below ADR-045 §d floor of {PRECISION_FLOOR}. \
          Clustering algorithm is grouping cross-topic memories together — false-positive edges \
-         crossed the {ACCEPTANCE_THRESHOLD} cosine-similarity threshold."
+         crossed the {threshold} cosine-similarity threshold."
     );
     assert!(
         recall >= RECALL_FLOOR,
         "Gate B FAILED: recall {recall:.4} below ADR-045 §d floor of {RECALL_FLOOR}. \
          Clustering algorithm is splitting same-topic memories across clusters — true-positive \
-         edges fell below the {ACCEPTANCE_THRESHOLD} cosine-similarity threshold."
+         edges fell below the {threshold} cosine-similarity threshold."
     );
 }

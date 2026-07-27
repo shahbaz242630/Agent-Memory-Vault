@@ -7,7 +7,8 @@
 //! Phi-4's token budget and skipped forever.
 //!
 //! `#![cfg(not(target_os = "macos"))]` per ADR-033 — real BGE embeddings are
-//! exercised so the facts genuinely cluster (cosine ≥ 0.92). Linux + Windows
+//! exercised so the facts genuinely cluster (cosine ≥ the shipped merge gate,
+//! 0.84 since ADR-097; these fixtures sit far above either value). Linux + Windows
 //! CI covers it. (The skip/resilience path is covered platform-independently
 //! by `merge_resilience.rs` via a constant-vector mock embedder.)
 

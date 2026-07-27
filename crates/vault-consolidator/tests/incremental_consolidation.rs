@@ -22,7 +22,12 @@ use vault_embedding::{EmbeddingProvider, EMBEDDING_DIM};
 use vault_storage::{RetryWorker, SqlCipherKey, StepResult, StorageBackend};
 
 const TEST_AT_REST_KEY: [u8; 32] = [0xab; 32];
-const THRESHOLD: f32 = 0.92;
+/// Clustering gate for this file's runs. `KeyedEmbedder` below emits unit basis
+/// vectors, so every pair is cosine 1.0 (same tag) or 0.0 (different tag) and
+/// the exact value is immaterial — it is pinned to the shipped default anyway
+/// (0.84 since ADR-097) so a reader never has to wonder whether this file is
+/// deliberately testing an off-spec gate.
+const THRESHOLD: f32 = 0.84;
 
 /// Deterministic embedder: the leading `kN` token of the content selects a unit
 /// basis vector (a single 1.0 at index `N % EMBEDDING_DIM`). Same tag → identical

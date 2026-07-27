@@ -369,7 +369,9 @@ async fn rollback_restores_pre_consolidation_state_exactly() {
     let (storage, _dir) = open_sealed_storage_for_test("rollback-exact-passphrase").await;
 
     // A near-identical pair (collapses via dedup) + an unrelated singleton.
-    // Same paraphrases the summary-sections test proves cluster at 0.92.
+    // Same paraphrases the summary-sections test proves cluster at the
+    // shipped merge gate (0.84 since ADR-097; this pair sits well above both
+    // it and the pre-ADR-097 0.92).
     let work = Boundary::new("work").expect("valid boundary");
     let memories = vec![
         make_memory_with_content("Daily standup moved to 10am from 9am", &work),

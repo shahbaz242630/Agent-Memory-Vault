@@ -73,6 +73,19 @@
 //! — flag for user"*. We trade one model call for never blind-collapsing a
 //! reversal.
 //!
+//! ## ADR-097 — the clustering gate moved; these axes did NOT
+//!
+//! The quoted claim above references "the 0.92 gate" because that is what
+//! Phase-1 shipped at the time. ADR-097 lowered it to **0.84**, which sends
+//! more pairs — including more contradictions — into this function. The dedup
+//! axes are deliberately unchanged, and re-measurement confirms they hold: with
+//! all three axes applied, **no** contradictory or complementary pair in the
+//! labelled corpus clears `NEAR_IDENTICAL_COS` + `NEAR_IDENTICAL_LEX` at any
+//! gate value from 0.96 down to 0.80. This gate's job is to be the narrow,
+//! high-confidence path that skips the model; a wider clustering gate simply
+//! hands it more candidates to decline. Re-run the danger scan in
+//! `vault-embedding`'s `paraphrase_cluster_gate` example after any change here.
+//!
 //! **Re-verified live on the same 4-memory vault after the fix, 2026-07-26:**
 //! `clusters deduped: 0` / `memories deduped: 0` (the blind collapse is gone),
 //! this module's decline logged, and the pair reached the contradiction path —

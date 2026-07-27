@@ -11,8 +11,10 @@
 //! ## Threshold semantics — locked
 //!
 //! `merge_similarity_threshold` is **cosine similarity** (not cosine distance).
-//! The default value 0.92 (BRD §5.6 line 904 `ConsolidatorConfig`) means
-//! "keep neighbour edges where cos(query, candidate) ≥ 0.92."
+//! The shipped default is **0.84** (ADR-097; BRD §5.6 line 904 specifies 0.92 —
+//! see `ConsolidatorConfig::merge_similarity_threshold` for the measured
+//! rationale) and means "keep neighbour edges where
+//! cos(query, candidate) ≥ threshold."
 //!
 //! `LanceVectorStore::search` returns **distance** under `DistanceType::Cosine`
 //! (smaller = closer; identical = 0). For L2-normalised bge-small-en-v1.5
@@ -41,8 +43,8 @@
 //! defaults produce bit-reproducible output for the same input). The
 //! re-embed vs. stored-embed similarity is bounded by IEEE-754 rounding
 //! noise at ~sub-1e-6 per coordinate; cosine similarity is invariant under
-//! such noise (well within the 1e-3 worst-case headroom against a 0.92
-//! threshold). See ADR-045 §c.
+//! such noise (well within the 1e-3 worst-case headroom against the
+//! threshold, at 0.92 or the shipped 0.84). See ADR-045 §c.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -139,8 +141,9 @@ impl Cluster {
 /// - `boundary`: scopes the run to a single boundary (BRD §11.4.3 — every
 ///   memory belongs to exactly one boundary; the consolidator processes one
 ///   boundary at a time per BRD §5.6 line 971 "one summary per boundary").
-/// - `threshold`: cosine similarity threshold ∈ [0.0, 1.0]. Recommended
-///   default from `ConsolidatorConfig`: 0.92.
+/// - `threshold`: cosine similarity threshold ∈ [0.0, 1.0]. Pass
+///   `ConsolidatorConfig::default().merge_similarity_threshold` (0.84 since
+///   ADR-097) rather than a literal, so callers track the shipped gate.
 /// - `since`: incremental watermark (ADR-082). `None` = full sweep over the
 ///   whole active boundary (cold start / periodic deep-clean). `Some(ts)` =
 ///   seed only on facts created at/after `ts` (the last successful run's start

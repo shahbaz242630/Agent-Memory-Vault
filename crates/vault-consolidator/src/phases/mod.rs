@@ -22,8 +22,9 @@
 //! [`candidates`] generates nearest-neighbor candidate pairs (ADR-065,
 //! replacing the K-means topic grouping that did NOT co-locate the
 //! conflicting pair) and [`contradiction`] judges each pair with Phi-4 +
-//! recency, so knowledge-update contradictions (which sit below the 0.92
-//! merge gate) get detected.
+//! recency, so knowledge-update contradictions get detected — including the
+//! majority that sit below the merge gate and are reachable by no other route
+//! (ADR-097).
 
 pub mod archive;
 pub mod candidates;

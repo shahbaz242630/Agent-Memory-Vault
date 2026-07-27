@@ -1,15 +1,24 @@
 //! Pairwise contradiction detection (T0.3.x A5 — the V0.2 ship-gate).
 //!
-//! ## Why this exists — decoupling detection from the 0.92 merge gate
+//! ## Why this exists — decoupling detection from the merge gate
 //!
-//! Phase-1 clustering (`phases/cluster.rs`) only forms edges at cosine
-//! **≥ 0.92** — tuned to catch near-duplicates for *merging*. A
-//! knowledge-update contradiction ("the user works at Vega" → later "the
-//! user works at Atlas, having left Vega") is semantically *related* but its
-//! pairwise cosine sits **below** 0.92, so the pair never clusters and
-//! `decide_merge` never sees it. Result (confirmed live in Claude Desktop,
-//! 2026-05-29): contradictions are never detected and reads return both the
-//! stale and current facts.
+//! Phase-1 clustering (`phases/cluster.rs`) only forms edges at or above
+//! `merge_similarity_threshold` — a gate tuned to catch near-duplicates for
+//! *merging*. A knowledge-update contradiction ("the user works at Vega" →
+//! later "the user works at Atlas, having left Vega") is semantically
+//! *related* but its pairwise cosine typically sits **below** that gate, so the
+//! pair never clusters and `decide_merge` never sees it. Result (confirmed live
+//! in Claude Desktop, 2026-05-29): contradictions are never detected and reads
+//! return both the stale and current facts.
+//!
+//! **ADR-097 refinement.** Contradictions are not cleanly below the gate as a
+//! class — measured, they span cosine **0.7199–0.9979**, interleaved with
+//! paraphrases (0.8237–0.9936). At the shipped 0.84 gate the top of that range
+//! DOES cluster and reaches `decide_merge` first. This module is therefore not
+//! a fallback for "the pairs clustering misses" — it is the **catch-all** that
+//! re-judges everything still active after Phase 2, whether or not it
+//! clustered. The bulk of the contradiction mass still sits below the gate and
+//! is reachable ONLY here.
 //!
 //! ## Candidate generation — nearest neighbors, not K-means (ADR-065)
 //!
@@ -21,8 +30,8 @@
 //! fact, take its top-K nearest cosine neighbors above a floor and union them
 //! into an unordered candidate-pair set (the conflicting pair is each other's
 //! *nearest* neighbor, so it is always included). Those pairs feed
-//! [`judge_candidate_pairs`] below. The 0.92 gate is untouched; it still
-//! governs *merging*. This module governs *contradiction* judging.
+//! [`judge_candidate_pairs`] below. The merge gate governs *merging*; this
+//! module governs *contradiction* judging, independently of it.
 //!
 //! ## Pairwise judging — the precision fix (ADR-062, 2026-05-30)
 //!
