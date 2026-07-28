@@ -64,11 +64,16 @@ pub(crate) fn get_or_init_backend() -> VaultLlmResult<Arc<LlamaBackend>> {
 /// responsible for resolving the cross-platform `model_dir` — we don't pull in
 /// `directories`/`dirs` here to keep dep surface lean. Typical usage on V0.2:
 ///
-/// ```ignore
+/// ```text
 /// let model_dir = tauri_app.path().app_data_dir()?.join("models");
 /// let config = Phi4MiniConfig::v0_2_default(model_dir);
 /// let provider = Phi4MiniProvider::new(config).await?;
 /// ```
+// The fence above is tagged `text`, not `ignore`, deliberately: the weekly
+// real-model smoke job runs `cargo test -p vault-llm -- --ignored`, and that
+// flag forces every `ignore`-tagged fence to COMPILE. This snippet is
+// illustrative pseudo-code (`tauri_app` is not a binding here), so it cannot.
+// Pinned by `tests/doc_fences.rs`. See ADR-098.
 #[derive(Debug, Clone)]
 pub struct Phi4MiniConfig {
     /// Directory under which the GGUF lives. Created if absent.
