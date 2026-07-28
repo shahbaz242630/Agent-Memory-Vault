@@ -12,6 +12,15 @@ on:
   # to avoid burning CI on a duplicate run.
   schedule:
     - cron: '0 12 * * MON'  # Monday 12:00 UTC
+  # ADR-098 (2026-07-28): manual trigger for `real-model-smoke`. Before this,
+  # that job could ONLY be fired by the weekly cron — the `run-llm-smoke` label
+  # its condition keys on had never been created in this repo, so the documented
+  # "trigger it on a PR" escape hatch silently matched nothing. That is a large
+  # part of why the job sat red for six consecutive weeks unnoticed: the only
+  # signal fired once a week and there was no way to ask it a question. A
+  # `workflow_dispatch` cannot fire on its own, so this widens nothing
+  # automatic; it just makes the alarm testable on demand.
+  workflow_dispatch:
 
 # Windows runner choice: T0.2.3 close commit 9 fix-forward (2026-05-17). The
 # clippy + build-and-test matrices + the real-model-smoke job use `windows-2025`
@@ -657,8 +666,8 @@ jobs:
     # Single-OS (windows-2025) for V0.2 per concern #6 lock — Mac Metal
     # autodetect deferred until first M1/M2 beta user joins; ubuntu-latest
     # smoke deferred until Linux beta user joins.
-    name: real-model smoke (weekly cron + `run-llm-smoke` label)
-    if: github.event_name == 'schedule' || contains(github.event.pull_request.labels.*.name, 'run-llm-smoke')
+    name: real-model smoke (weekly cron + `run-llm-smoke` label + manual)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'run-llm-smoke')
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@v6
