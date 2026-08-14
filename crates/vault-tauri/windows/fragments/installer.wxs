@@ -114,5 +114,73 @@
       </Component>
     </DirectoryRef>
 
+    <!--
+      ========================================================================
+      ADR-SEC-005 close (2026-07-28) — uninstall removes the registered
+      maintenance task.
+
+      THE GAP THIS CLOSES, observed live rather than reasoned about: on the
+      founder's machine `\com.memoryvault.maintenance` was still registered
+      from a session-27 test, still `Ready`, still firing DAILY, pointing at a
+      `target\debug\vault-cli.exe` inside the repo, and returning Last Result 1
+      every morning. Turning the feature on once leaves an OS-level task that
+      outlives whatever created it. For a product whose promise is "you own
+      your data and nothing is left behind", leaving a scheduled job on a
+      machine after uninstall is squarely the wrong behaviour.
+
+      WHY schtasks.exe AND NOT OUR OWN vault-cli: during an uninstall our
+      binary is the thing being deleted. Driving removal through it would mean
+      sequencing before RemoveFiles, and it could be file-locked, missing, or
+      crash — and a crash here fails the USER'S UNINSTALL. schtasks.exe ships
+      with Windows, is always present, and is unaffected by our own removal.
+      (vault-scheduler's tested `unregister` still owns removal at RUN time;
+      this is purely the teardown path, where that crate is unavailable.)
+
+      WHY `NOT UPGRADINGPRODUCTCODE` — the non-obvious one. `REMOVE="ALL"` is
+      ALSO true while a major upgrade removes the OLD product. Conditioned on
+      REMOVE alone, every app update would silently switch off the user's
+      automatic maintenance and never say so. UPGRADINGPRODUCTCODE is set only
+      in that removal-during-upgrade pass, so excluding it keeps the schedule
+      across upgrades and clears it only on a real uninstall.
+
+      Return="ignore": `schtasks /Delete` exits non-zero when the task is
+      absent (never scheduled, or already removed). That must NEVER fail an
+      uninstall — matching the idempotent posture `Scheduler::unregister`
+      already has in Rust.
+
+      Execute="immediate" (not deferred): the task is per-user, created by the
+      interactive user with LogonType=InteractiveToken (verified session 27),
+      so removal belongs in that same user's context. Immediate execution also
+      resolves [SystemFolder] normally, which a deferred action cannot.
+      KNOWN LIMIT, accepted: if user A installs and user B uninstalls, A's task
+      survives. Deferred-as-SYSTEM would cover that but cannot resolve
+      properties and would delete another user's task from an unelevated UI
+      flow. Single-owner desktop vault — not worth the complexity today.
+
+      The task id is DUPLICATED from `MAINTENANCE_TASK_ID` in
+      `src/commands/maintenance.rs`. That cross-language duplication is pinned
+      by `tests/installer_contract.rs`, the same guard pattern
+      `frontend_contract.rs` uses for the JS↔Rust boundary.
+
+      ⚠️ MUST stay in THIS <Fragment>. A WiX fragment is pulled in only when
+      something references it; tauri.conf.json's componentRefs reference the
+      three components above. A CustomAction placed in a separate fragment
+      would be silently dropped from the MSI with no error.
+
+      Scope: Windows only. macOS/Linux ship no installer yet, so there is no
+      uninstall hook to attach to. Their teardown lands with their packaging.
+      ========================================================================
+    -->
+    <CustomAction
+      Id="RemoveMaintenanceTask"
+      Directory="INSTALLDIR"
+      ExeCommand="&quot;[SystemFolder]schtasks.exe&quot; /Delete /TN &quot;com.memoryvault.maintenance&quot; /F"
+      Execute="immediate"
+      Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="RemoveMaintenanceTask" Before="RemoveFiles">REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE</Custom>
+    </InstallExecuteSequence>
+
   </Fragment>
 </Wix>
