@@ -125,6 +125,7 @@ fn main() {
             vault_tauri::commands::maintenance::get_maintenance_schedule,
             vault_tauri::commands::maintenance::set_maintenance_schedule,
             vault_tauri::commands::maintenance::run_maintenance_now,
+            vault_tauri::commands::erasure::erase_everything,
         ])
         .setup(|app| {
             // 1. Resolve libonnxruntime dylib path per ADR-019.

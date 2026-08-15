@@ -566,6 +566,127 @@ fn rollback_keychain_entry(namespace: &str, vault_id: &str) {
     }
 }
 
+/// Destroy the master_key in the OS keychain — **cryptographic erasure**
+/// (ADR-SEC-008).
+///
+/// This is the operative half of "delete everything". Every at-rest key in
+/// the vault is derived from this one 32-byte secret (`at_rest_key` and
+/// `sqlcipher_passphrase`, both BLAKE3 subkeys — see the module docs), so
+/// destroying it renders `vault.db`, the Lance vector store, the sealed
+/// graph, and the sealed REPORTs permanently undecryptable **whether or not
+/// those files are ever removed from disk**.
+///
+/// This is the mechanism BRD §11.5.4 already specifies: *"Account deletion:
+/// master key is destroyed, making all encrypted data permanently
+/// unrecoverable."* NIST SP 800-88 classes cryptographic erase as
+/// **Purge**-level sanitization, and unlike file deletion it is not defeated
+/// by filesystem journaling, SSD wear-levelling, block remapping, or a
+/// backup of the data directory taken earlier.
+///
+/// # Ordering contract — destroy the KEY BEFORE the FILES
+///
+/// Callers MUST call this first and delete the data directory second. The
+/// two orders fail very differently:
+///
+/// - key-then-files, interrupted → files remain but are **cryptographically
+///   dead**. The user's data is gone, which is what they asked for.
+/// - files-then-key, interrupted → the key survives in Credential Manager
+///   and any copy of the data directory (a backup, a synced folder, a
+///   forensic image) is **still decryptable**. The erasure silently did not
+///   happen.
+///
+/// Only the first order is safe under partial failure, so it is the
+/// contract rather than an implementation detail.
+///
+/// # Returns
+///
+/// `Ok(true)` if an entry existed and was deleted, `Ok(false)` if there was
+/// nothing to delete. Idempotent: erasing an already-erased vault is a
+/// successful no-op, not an error, so a retry after a partial failure is
+/// always safe.
+///
+/// # Errors
+///
+/// [`VaultError::KeychainProvenance`] if the keychain store cannot be
+/// opened or the delete fails for a reason other than "not found". **A
+/// caller MUST NOT report the wipe as successful when this errors** — the
+/// data is still readable.
+#[cfg(windows)]
+pub fn destroy_master_key(namespace: &str, vault_id: &str) -> VaultResult<bool> {
+    use windows_native_keyring_store::Store;
+
+    keyring_core::set_default_store(
+        Store::new()
+            .map_err(|e| VaultError::KeychainProvenance(format!("Store::new failed: {e}")))?,
+    );
+
+    let result = destroy_master_key_inner(namespace, vault_id);
+
+    keyring_core::unset_default_store();
+
+    result
+}
+
+/// Non-Windows stub, mirroring [`read_or_init_master_key`]. Erasure must
+/// FAIL LOUDLY rather than silently no-op on an unsupported platform: a
+/// caller that treated `Ok(false)` as "nothing to erase" would tell the
+/// user their vault was destroyed when it was not.
+#[cfg(not(windows))]
+pub fn destroy_master_key(_namespace: &str, _vault_id: &str) -> VaultResult<bool> {
+    Err(VaultError::KeychainProvenance(format!(
+        "Cryptographic erasure is Windows-only at V0.2 Phase 1 (current platform: {}). \
+         Erasure MUST NOT be reported as successful on an unsupported platform.",
+        std::env::consts::OS
+    )))
+}
+
+#[cfg(windows)]
+fn destroy_master_key_inner(namespace: &str, vault_id: &str) -> VaultResult<bool> {
+    use keyring_core::Entry;
+
+    let entry = Entry::new(namespace, vault_id).map_err(|e| {
+        VaultError::KeychainProvenance(format!("Entry::new failed during erasure: {e}"))
+    })?;
+
+    // `keyring-core` does not expose a stable NotFound kind (see the
+    // read path's note at `read_or_init_inner`), so "already absent" is
+    // distinguished by probing first. A racing second erase therefore
+    // reports `Ok(false)` rather than an error — correct for an operation
+    // whose postcondition is "the key does not exist".
+    match entry.get_secret() {
+        Err(_) => {
+            info!(
+                namespace,
+                vault_id, "cryptographic erasure: no keychain entry present (already erased)"
+            );
+            Ok(false)
+        }
+        Ok(_) => {
+            entry.delete_credential().map_err(|e| {
+                VaultError::KeychainProvenance(format!("delete_credential failed: {e}"))
+            })?;
+            // Verify rather than assume. This is the single step that makes
+            // the data unrecoverable; a delete that silently did nothing
+            // would leave us telling the user their vault was erased when
+            // every byte is still decryptable.
+            if entry.get_secret().is_ok() {
+                return Err(VaultError::KeychainProvenance(
+                    "delete_credential reported success but the master_key is still \
+                     readable; cryptographic erasure did NOT occur"
+                        .to_string(),
+                ));
+            }
+            warn!(
+                namespace,
+                vault_id,
+                "CRYPTOGRAPHIC ERASURE COMPLETE: master_key destroyed; all vault \
+                 data is now permanently unrecoverable (ADR-SEC-008)"
+            );
+            Ok(true)
+        }
+    }
+}
+
 /// Derive the SqlCipher passphrase from the master_key per ADR-040
 /// amendment option β: BLAKE3 derive_key with the locked
 /// [`SQLCIPHER_KDF_CONTEXT`] domain-separator, hex-encoded to a 64-character

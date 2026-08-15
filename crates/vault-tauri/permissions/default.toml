@@ -114,3 +114,8 @@ commands.allow = ["set_maintenance_schedule"]
 identifier = "allow-run-maintenance-now"
 description = "Allow invoking the run_maintenance_now command (run one consolidation immediately by spawning the bundled vault-cli; skips cleanly if the vault is in use)."
 commands.allow = ["run_maintenance_now"]
+
+[[permission]]
+identifier = "allow-erase-everything"
+description = "Allow invoking the erase_everything command (permanently destroy every memory in this vault by destroying its encryption key in the operating system credential store, then removing the vault's data files). Irreversible."
+commands.allow = ["erase_everything"]

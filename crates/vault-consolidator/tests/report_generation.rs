@@ -234,23 +234,38 @@ async fn generated_report_round_trips_to_disk_at_expected_path() {
 
     // Write to a separate temp vault_root (the writer creates reports/ lazily).
     let vault_root = tempfile::tempdir().expect("vault_root tempdir");
-    let path = write_report_atomic(&report, vault_root.path()).expect("write_report_atomic");
+    // ADR-SEC-007: the REPORT is written SEALED. The at-rest key is supplied
+    // by vault-app in production (AppConfig::at_rest_key).
+    const TEST_KEY: [u8; 32] = [0x5a; 32];
+    let path =
+        write_report_atomic(&report, vault_root.path(), &TEST_KEY).expect("write_report_atomic");
 
     assert_eq!(
         path,
         vault_root
             .path()
             .join("reports")
-            .join("personal.report.json"),
+            .join("personal.report.sealed"),
         "REPORT must land at the path FilesystemReportLoader reads from"
     );
     assert!(path.exists(), "REPORT file must exist after write");
 
+    let sealed = std::fs::read(&path).expect("read sealed REPORT file");
+    assert!(
+        !String::from_utf8_lossy(&sealed).contains("facts_by_topic"),
+        "SECURITY (ADR-SEC-007): the REPORT must not be readable on disk"
+    );
+
+    let plaintext = vault_storage::unseal_vault_blob(
+        &sealed,
+        &TEST_KEY,
+        &vault_storage::sealed_report_relative_path(&report.boundary),
+    )
+    .expect("sealed REPORT must unseal");
     let restored: Report =
-        serde_json::from_str(&std::fs::read_to_string(&path).expect("read REPORT file"))
-            .expect("REPORT JSON must deserialize back into Report");
+        serde_json::from_slice(&plaintext).expect("REPORT JSON must deserialize back into Report");
     assert_eq!(
         restored, report,
-        "REPORT must round-trip through atomic-write + JSON parse unchanged"
+        "REPORT must round-trip through atomic-write + seal + unseal unchanged"
     );
 }

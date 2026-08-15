@@ -22,6 +22,7 @@
     "allow-ensure-maintenance-engine",
     "allow-get-maintenance-schedule",
     "allow-set-maintenance-schedule",
-    "allow-run-maintenance-now"
+    "allow-run-maintenance-now",
+    "allow-erase-everything"
   ]
 }

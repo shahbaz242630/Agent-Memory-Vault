@@ -29,6 +29,7 @@ pub mod metadata_store;
 pub(crate) mod migrations;
 pub(crate) mod migrations_graph;
 pub mod pending_sync;
+pub mod report_layout;
 pub mod retry_queue;
 pub mod retry_worker;
 pub mod sealed_object_store;
@@ -57,6 +58,10 @@ pub use metadata_store::{
     rekey_in_place, verify_sqlcipher_passphrase, MemoryFilter, MetadataStore,
 };
 pub use pending_sync::{PendingSync, PendingSyncEntry};
+pub use report_layout::{
+    sealed_report_filename, sealed_report_relative_path, REPORTS_DIRNAME,
+    REPORT_LEGACY_PLAINTEXT_SUFFIX, REPORT_SEALED_SUFFIX,
+};
 pub use retry_queue::{
     base_backoff_secs, compute_next_attempt, is_permanent, CascadeOperation, DeadLetterReason,
     FailureOutcome, FixedJitter, JitterSource, NewRetry, RetryEntry, RetryQueue, SeededJitter,
@@ -64,6 +69,7 @@ pub use retry_queue::{
 };
 pub use retry_worker::{RetryWorker, StepResult, DEFAULT_POLL_INTERVAL};
 pub use sealed_object_store::{
-    make_vault_sealed_uri, SealedFileStoreProvider, VAULT_SEALED_SCHEME,
+    make_vault_sealed_uri, seal_vault_blob, unseal_vault_blob, SealedFileStoreProvider,
+    VAULT_SEALED_SCHEME,
 };
 pub use vector_store::{LanceVectorStore, VectorStore};

@@ -221,6 +221,66 @@ pub(crate) fn unseal_file_bytes(
 }
 
 // ============================================================
+//   Public whole-artifact sealing (ADR-SEC-007)
+// ============================================================
+
+/// Seal an arbitrary vault artifact into the SAME at-rest envelope the
+/// vector store and the graph snapshot use.
+///
+/// Added at ADR-SEC-007 for the consolidator REPORT, which was writing
+/// **plaintext JSON containing verbatim memory text** to
+/// `<vault_root>/reports/<boundary>.report.json` — a direct violation of
+/// BRD §11.5.1 ("All data on disk is encrypted. No exceptions.").
+///
+/// # Why a wrapper rather than a new sealing routine
+///
+/// SP-5 ("No Cryptographic DIY"). This delegates verbatim to
+/// [`seal_file_bytes`] + [`compute_aad`], so the REPORT gets the identical
+/// XChaCha20-Poly1305 envelope, the identical framing, and the identical
+/// `"vault-at-rest-v1"` domain separator as every other sealed artifact.
+/// There is no second crypto path to review or get wrong.
+///
+/// # Why `relative_path` is the AAD input, and what it buys
+///
+/// AAD is `BLAKE3("vault-at-rest-v1" || relative_path)` — the artifact's
+/// position within the vault. For REPORTs the caller passes
+/// `reports/<boundary>.report.sealed`, which means **the boundary name is
+/// inside the AAD**. That satisfies BRD §11.3.2 ("AAD includes memory ID
+/// and boundary — binds ciphertext to context, prevents swap attacks")
+/// for free: renaming `work.report.sealed` over `personal.report.sealed`
+/// changes the AAD, so the AEAD authentication fails and the read fails
+/// closed rather than serving one boundary's facts under another's name.
+///
+/// Pass a path RELATIVE to the vault root, with `/` separators, so the
+/// binding is invariant to where the vault directory itself lives (same
+/// rationale as ADR-008 amendment v2 — see [`compute_aad`]).
+#[must_use]
+pub fn seal_vault_blob(plaintext: &[u8], key: &[u8; 32], relative_path: &str) -> Vec<u8> {
+    seal_file_bytes(plaintext, key, &compute_aad(relative_path))
+}
+
+/// Unseal an artifact sealed by [`seal_vault_blob`].
+///
+/// # Errors
+///
+/// Returns `Err` on framing mismatch, unknown version byte, or AEAD
+/// authentication failure — which covers a wrong key, tampered bytes, AND
+/// a `relative_path` that does not match the one used at seal time (the
+/// cross-boundary swap case above).
+///
+/// Callers MUST treat any `Err` as fail-closed (SP-4): surface the
+/// artifact as missing or error out, never fall back to reading the
+/// bytes as plaintext. The error string is bounded and intended for logs,
+/// not end-user display (SP-4 forbids leaking internals to users).
+pub fn unseal_vault_blob(
+    sealed: &[u8],
+    key: &[u8; 32],
+    relative_path: &str,
+) -> Result<Vec<u8>, String> {
+    unseal_file_bytes(sealed, key, &compute_aad(relative_path))
+}
+
+// ============================================================
 //   URL helpers — vault-sealed:/// scheme construction
 // ============================================================
 

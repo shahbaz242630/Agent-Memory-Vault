@@ -79,6 +79,11 @@ chrono.workspace = true
 # serde_json moved to dev-deps was reversed at T0.2.3 close (line 51) for
 # read_pipeline.rs JSON parsing.
 
+# zeroize — added at ADR-SEC-007. `FilesystemReportLoader` now holds the
+# at-rest key (K3) to unseal the REPORT artifact, and BRD §11.5.3 requires
+# all key material to be wiped on drop. Same workspace pin as vault-app.
+zeroize.workspace = true
+
 [dev-dependencies]
 # vault-storage as a dev-dep (no special features). Sub-task (d) of
 # T0.2.0 Phase 3 (2026-05-12) migrated vault-retrieval's test surfaces

@@ -54,5 +54,9 @@ pub use consolidator::{
 };
 pub use phases::cluster::{find_candidate_clusters, Cluster};
 pub use phases::merge::{apply_merge, decide_merge, AppliedMerge, MergeOutcome};
-pub use report::{generate_report, write_report_atomic, Report, ReportFact};
+pub use report::{
+    generate_report, migrate_plaintext_reports, sealed_report_relative_path, write_report_atomic,
+    PlaintextReportMigration, Report, ReportFact, REPORTS_DIRNAME, REPORT_LEGACY_PLAINTEXT_SUFFIX,
+    REPORT_SEALED_SUFFIX,
+};
 pub use topics::{discover_topics, Topic, TopicMap};

@@ -561,6 +561,48 @@ textarea.mv-input { resize: none; }
   margin: 26px 0 40px;
 }
 
+/* your-memories / delete-everything (ADR-SEC-008).
+   Visually quiet until the user opts in: the destructive control should be
+   findable, not prominent. Nothing here is red-by-default — the alarm
+   appears only once the confirm step is revealed. */
+.data-section { margin: 34px 0 8px; }
+.data-title { font: 500 13px var(--sans); color: var(--ink); margin-bottom: 10px; }
+.data-note {
+  font: 400 13px/1.6 var(--sans); color: var(--faint-2);
+  margin: 0 0 10px; max-width: 60ch;
+}
+.data-path {
+  font: 400 12px var(--mono); color: var(--faint-2);
+  user-select: text; word-break: break-all;
+  margin: 0 0 14px;
+}
+.data-warn {
+  font: 400 13px/1.6 var(--sans); color: var(--ink);
+  margin: 0 0 14px; max-width: 60ch;
+}
+.danger-button {
+  font: 500 13px var(--sans); color: var(--ink);
+  background: transparent; border: 1px solid var(--line);
+  border-radius: 6px; padding: 8px 14px; cursor: pointer;
+}
+.danger-button:hover:not(:disabled) { border-color: var(--ink); }
+.danger-button:disabled { opacity: 0.45; cursor: default; }
+.erase-confirm {
+  margin-top: 18px; padding: 18px;
+  border: 1px solid var(--line); border-radius: 8px;
+}
+.erase-label { display: block; font: 400 13px var(--sans); color: var(--faint-2); margin-bottom: 8px; }
+.erase-input {
+  font: 400 13px var(--mono); color: var(--ink);
+  background: transparent; border: 1px solid var(--line);
+  border-radius: 6px; padding: 8px 10px; width: 180px;
+}
+.erase-actions { display: flex; align-items: center; gap: 18px; margin-top: 16px; }
+.erase-status {
+  font: 400 13px/1.6 var(--sans); color: var(--faint-2);
+  margin: 14px 0 0; max-width: 60ch;
+}
+
 /* footer */
 .statusbar {
   display: flex; align-items: center; justify-content: center; gap: 8px;

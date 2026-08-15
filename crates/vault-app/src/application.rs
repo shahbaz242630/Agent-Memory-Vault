@@ -44,7 +44,8 @@ use std::time::Duration;
 
 use uuid::Uuid;
 use vault_consolidator::{
-    write_report_atomic, ConsolidationReport, Consolidator, ConsolidatorConfig,
+    migrate_plaintext_reports, write_report_atomic, ConsolidationReport, Consolidator,
+    ConsolidatorConfig,
 };
 use vault_core::{Boundary, VaultError, VaultResult};
 use vault_embedding::{
@@ -57,6 +58,7 @@ use vault_retrieval::{
     RerankedRetriever, Retriever, SemanticRetriever, StructuredReadPipeline,
 };
 use vault_storage::{MemoryFilter, MetadataStore, RetryWorker, StorageBackend};
+use zeroize::Zeroizing;
 
 use crate::consolidator_lock::ConsolidatorLock;
 use crate::process_exit::{LiveProcessExit, ProcessExit};
@@ -162,6 +164,15 @@ pub struct Application {
     /// the safety wrapper doesn't require `AppConfig` to be threaded
     /// through the lifecycle.
     vault_root: PathBuf,
+    /// At-rest key (K3), captured for the same reason as `vault_root`: the
+    /// consolidation safety wrapper needs it to SEAL each per-boundary
+    /// REPORT (ADR-SEC-007) and must not require `AppConfig` to be threaded
+    /// through the lifecycle.
+    ///
+    /// `Zeroizing` so it is wiped on drop (BRD §11.5.3). `Application` has
+    /// no `Debug` derive, so there is no redaction impl to maintain here —
+    /// if one is ever added, this field MUST be redacted.
+    at_rest_key: Zeroizing<[u8; 32]>,
     /// Concrete handle to the lazy reranker (ADR-070, 2026-06-05), kept so the
     /// serve path can warm the ~1.2 GB model in the background AFTER the MCP
     /// handshake binds. `None` when no reranker model is configured (the cosine
@@ -468,7 +479,9 @@ impl Application {
         //
         //    - loads the per-boundary REPORT artifact via
         //      [`FilesystemReportLoader`] from
-        //      `<vault_root>/reports/<boundary>.report.json`,
+        //      `<vault_root>/reports/<boundary>.report.sealed`
+        //      (SEALED since ADR-SEC-007 — the loader holds the at-rest
+        //      key and unseals in memory),
         //    - enriches each retrieved candidate with its
         //      consolidator-discovered topic label, and
         //    - emits the six ADR-054 Contract 2 health-warnings
@@ -481,7 +494,45 @@ impl Application {
         //    (no Option) — no model loading, no fallible setup. The
         //    `AppConfig.qwen_model_path` field is now dead (kept with
         //    #[allow(dead_code)] until Commit 8 removes it).
-        let report_loader = Arc::new(FilesystemReportLoader::new(vault_root.clone()));
+        // ADR-SEC-007 one-shot migration. Every vault that ran a
+        // consolidation before this build has
+        // `reports/<boundary>.report.json` sitting on disk in the CLEAR,
+        // containing verbatim memory text. Shipping the sealed writer alone
+        // would never touch those files — the new writer uses a different
+        // filename, so the plaintext would simply persist forever.
+        //
+        // Runs before the loader is built, on every startup, and is
+        // idempotent (a vault with no legacy REPORTs is an all-zero no-op).
+        // Deliberately NOT gated on a version marker: a marker that got out
+        // of step would silently skip the sweep, and the sweep is cheap.
+        //
+        // A failure here is logged, not fatal — it must never prevent the
+        // app from starting — but `failed_to_remove > 0` is an ERROR
+        // because it means plaintext memory text is still readable.
+        match migrate_plaintext_reports(&vault_root, &config.at_rest_key) {
+            Ok(m) if m.found > 0 => tracing::warn!(
+                target: "vault_app::report_migration",
+                found = m.found,
+                sealed = m.sealed,
+                discarded = m.discarded,
+                failed_to_remove = m.failed_to_remove,
+                "ADR-SEC-007: legacy PLAINTEXT REPORT artifacts found and removed"
+            ),
+            Ok(_) => tracing::debug!(
+                target: "vault_app::report_migration",
+                "no legacy plaintext REPORT artifacts present"
+            ),
+            Err(e) => tracing::error!(
+                target: "vault_app::report_migration",
+                error = %e,
+                "ADR-SEC-007 plaintext REPORT sweep failed; plaintext may remain on disk"
+            ),
+        }
+
+        let report_loader = Arc::new(FilesystemReportLoader::new(
+            vault_root.clone(),
+            &config.at_rest_key,
+        ));
         // Relevance gate. Production (ADR-057 amendment, 2026-05-29): the
         // cross-encoder reranker (Qwen3-Reranker-0.6B) is the relevance gate —
         // it separates topically-adjacent-but-wrong facts that the cosine floor
@@ -620,6 +671,7 @@ impl Application {
             storage,
             consolidator,
             vault_root,
+            at_rest_key: config.at_rest_key.clone(),
             reranker_warmup,
         })
     }
@@ -841,6 +893,10 @@ impl Application {
         let consolidator_handle = self.consolidator.as_ref().map(|consolidator| {
             let consolidator = consolidator.clone();
             let vault_root = self.vault_root.clone();
+            // ADR-SEC-007: the scheduled run seals its REPORTs like any
+            // other, so the task owns a zeroizing clone of the at-rest key
+            // alongside the vault root.
+            let at_rest_key = self.at_rest_key.clone();
             // The configured-time default lives in `ConsolidatorConfig`
             // (BRD §5.6 default 03:00); a caller-supplied override
             // (`vault-cli mcp --run-at HH:MM`) takes precedence — primarily
@@ -857,6 +913,7 @@ impl Application {
             tokio::spawn(run_consolidator_schedule(
                 consolidator,
                 vault_root,
+                at_rest_key,
                 run_at,
                 cancel,
             ))
@@ -911,7 +968,7 @@ impl Application {
                 )
             })?
             .clone();
-        run_consolidation_under_safety(consolidator, &self.vault_root).await
+        run_consolidation_under_safety(consolidator, &self.vault_root, &self.at_rest_key).await
     }
 }
 
@@ -928,6 +985,7 @@ impl Application {
 async fn run_consolidation_under_safety(
     consolidator: Arc<Consolidator>,
     vault_root: &std::path::Path,
+    at_rest_key: &[u8; 32],
 ) -> VaultResult<ConsolidationReport> {
     let run_id = Uuid::new_v4();
     tracing::info!(
@@ -1001,7 +1059,7 @@ async fn run_consolidation_under_safety(
     // the correct degraded signal). The merge work already committed to
     // storage above is durable regardless.
     for report_artifact in &reports {
-        match write_report_atomic(report_artifact, vault_root) {
+        match write_report_atomic(report_artifact, vault_root, at_rest_key) {
             Ok(path) => tracing::info!(
                 target: "vault_app::consolidator",
                 run_id = %run_id,
@@ -1064,6 +1122,7 @@ async fn run_consolidation_under_safety(
 async fn run_consolidator_schedule(
     consolidator: Arc<Consolidator>,
     vault_root: PathBuf,
+    at_rest_key: Zeroizing<[u8; 32]>,
     run_at: chrono::NaiveTime,
     mut cancel: tokio::sync::watch::Receiver<bool>,
 ) {
@@ -1081,7 +1140,11 @@ async fn run_consolidator_schedule(
         );
         tokio::select! {
             _ = tokio::time::sleep(wait) => {
-                match run_consolidation_under_safety(consolidator.clone(), &vault_root).await {
+                match run_consolidation_under_safety(
+                    consolidator.clone(),
+                    &vault_root,
+                    &at_rest_key,
+                ).await {
                     Ok(report) => tracing::info!(
                         target: "vault_app::consolidator",
                         memories_processed = report.memories_processed,

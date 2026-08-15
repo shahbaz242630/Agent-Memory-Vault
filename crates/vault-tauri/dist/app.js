@@ -996,6 +996,80 @@ async function renderSettings() {
       <span class="lbl">${esc(r.label)}</span>
       <span class="val${r.good ? " good" : ""}">${esc(r.value)}</span>
     </div>`).join("");
+
+  // ADR-SEC-008: show the user where their memories actually live, so
+  // "uninstalling does not remove them" is a checkable statement.
+  // textContent, not markup — this is a filesystem path from the backend.
+  $("data-location").textContent = info.data_dir || "";
+}
+
+// -- delete everything (ADR-SEC-008) --
+
+const ERASE_PHRASE = "DELETE";
+
+function resetEraseConfirm() {
+  $("erase-confirm").classList.add("hidden");
+  $("erase-reveal").classList.remove("hidden");
+  $("erase-phrase").value = "";
+  $("erase-confirm-btn").disabled = true;
+  $("erase-status").textContent = "";
+}
+
+function revealEraseConfirm() {
+  $("erase-reveal").classList.add("hidden");
+  $("erase-confirm").classList.remove("hidden");
+  $("erase-phrase").value = "";
+  $("erase-confirm-btn").disabled = true;
+  $("erase-phrase").focus();
+}
+
+// The button unlocks only on an exact match. This is the one action in the
+// app that cannot be undone — not even from a copy of the data folder —
+// so passing the gate should require intent, not a reflex click. A yes/no
+// dialog is too easy to click through for a consequence this size.
+function onErasePhraseInput() {
+  $("erase-confirm-btn").disabled = $("erase-phrase").value !== ERASE_PHRASE;
+}
+
+async function eraseEverything() {
+  if ($("erase-phrase").value !== ERASE_PHRASE) return;
+
+  $("erase-confirm-btn").disabled = true;
+  $("erase-cancel").disabled = true;
+  $("erase-status").textContent = "Deleting your memories…";
+
+  let result;
+  try {
+    result = await invoke("erase_everything");
+  } catch (err) {
+    // Honest failure. The vault is STILL READABLE when this path runs, and
+    // saying anything softer than that would be a lie about the one
+    // property the user was trying to obtain.
+    $("erase-status").textContent =
+      "Your memories were NOT deleted, and they are still readable. Nothing was changed. Please try again, or restart Memory Vault and retry.";
+    $("erase-cancel").disabled = false;
+    $("erase-confirm-btn").disabled = false;
+    return;
+  }
+
+  // Report what actually happened. Leftover files are a disk-space fact,
+  // not a confidentiality one — once the key is destroyed the remaining
+  // bytes cannot be read by anyone.
+  const leftover = Number(result && result.undeletable_count) || 0;
+  $("erase-status").textContent = leftover > 0
+    ? "Your memories are permanently deleted and can no longer be read. A few files could not be removed from disk, but they are now unreadable. Memory Vault will close."
+    : "Your memories are permanently deleted. Memory Vault will close.";
+
+  // The app is now running against a vault that no longer exists; staying
+  // open would show stale, already-unreadable state. Close rather than
+  // pretend.
+  setTimeout(() => {
+    try {
+      if (window.__TAURI__ && window.__TAURI__.window) {
+        window.__TAURI__.window.getCurrentWindow().close();
+      }
+    } catch (_) { /* best-effort; the message above already stands */ }
+  }, 2500);
 }
 
 // -- maintenance tab --
@@ -1329,6 +1403,12 @@ function init() {
 
   // home — settings
   $("replay-welcome").addEventListener("click", replayWelcome);
+
+  // home — settings — delete everything (ADR-SEC-008)
+  $("erase-reveal").addEventListener("click", revealEraseConfirm);
+  $("erase-cancel").addEventListener("click", resetEraseConfirm);
+  $("erase-phrase").addEventListener("input", onErasePhraseInput);
+  $("erase-confirm-btn").addEventListener("click", eraseEverything);
 
   // First-run acquisition. Started for EVERY launch, not just onboarding
   // ones: a returning user whose files were never fetched (or were removed)

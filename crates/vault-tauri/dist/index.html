@@ -237,6 +237,53 @@
         <div id="tab-settings" class="tab-pane tab-body settings-body hidden">
           <div class="headline">Settings.</div>
           <div id="settings-rows" class="tab-rows"></div>
+
+          <!-- Your data (ADR-SEC-008). The honest-UI rule (ADR-086) applies
+               with force here: uninstalling does NOT remove memories, and a
+               user who is never told that will assume it does. Saying so
+               plainly costs nothing and turns a silent surprise into an
+               informed choice. -->
+          <div class="data-section">
+            <div class="data-title">Your memories</div>
+            <p class="data-note">
+              Everything you keep is stored on this device and encrypted. It stays
+              on this device even if you uninstall Memory Vault &mdash; uninstalling
+              removes the app, not your memories. You can always find them here:
+            </p>
+            <p id="data-location" class="data-path"></p>
+            <p class="data-note">
+              To remove them for good, use the button below. This is the only
+              action that erases your memories.
+            </p>
+
+            <button id="erase-reveal" class="danger-button">Delete everything</button>
+
+            <!-- Type-to-confirm rather than a yes/no dialog. This action is
+                 permanent and cannot be undone from a backup either (the
+                 encryption key is destroyed), so it deserves a gate a
+                 mis-click cannot pass. -->
+            <div id="erase-confirm" class="erase-confirm hidden">
+              <p class="data-warn">
+                This permanently deletes every memory in your vault. It cannot be
+                undone, and it cannot be recovered from a copy of your data folder
+                &mdash; the encryption key is destroyed, so what remains on disk
+                becomes unreadable to everyone, including us.
+              </p>
+              <label class="erase-label" for="erase-phrase">
+                Type <strong>DELETE</strong> to confirm:
+              </label>
+              <input id="erase-phrase" class="erase-input" type="text"
+                     autocomplete="off" spellcheck="false" />
+              <div class="erase-actions">
+                <button id="erase-cancel" class="link-underline">Cancel</button>
+                <button id="erase-confirm-btn" class="danger-button" disabled>
+                  Permanently delete everything
+                </button>
+              </div>
+              <p id="erase-status" class="erase-status"></p>
+            </div>
+          </div>
+
           <div class="settings-actions">
             <button id="replay-welcome" class="link-underline">Replay welcome</button>
           </div>

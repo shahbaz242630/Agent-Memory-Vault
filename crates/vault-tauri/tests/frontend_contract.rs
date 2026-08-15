@@ -43,7 +43,11 @@ const COMMAND_SOURCES: &[(&str, &str)] = &[
         "maintenance.rs",
         include_str!("../src/commands/maintenance.rs"),
     ),
+    ("erasure.rs", include_str!("../src/commands/erasure.rs")),
 ];
+
+/// The markup, for guards that pin UI structure rather than wiring.
+const INDEX_HTML: &str = include_str!("../dist/index.html");
 
 const MAIN_RS: &str = include_str!("../src/main.rs");
 const PERMISSIONS_TOML: &str = include_str!("../permissions/default.toml");
@@ -196,6 +200,71 @@ fn frontend_confirm_helper_is_present_and_used_by_destructive_actions() {
         uses >= 2,
         "expected both destructive actions (forget, revoke) to await \
          confirmAction(); found {uses} call site(s)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Guard 1b — the irreversible action keeps its type-to-confirm gate
+// (ADR-SEC-008)
+// ---------------------------------------------------------------------------
+
+/// `erase_everything` destroys the master key. It cannot be undone, and it
+/// cannot be recovered from a copy of the data folder. A yes/no dialog is
+/// too easy to click through for that, so the UI requires the user to type
+/// a phrase.
+///
+/// This guard exists because the gate is pure convention: nothing in the
+/// Rust command enforces it, so a UI refactor could quietly reduce the most
+/// destructive action in the product to a single click and every other test
+/// would still pass.
+#[test]
+fn erase_everything_is_gated_behind_a_typed_confirmation() {
+    assert!(
+        APP_JS.contains("ERASE_PHRASE"),
+        "ADR-SEC-008: the typed-confirmation constant is gone from dist/app.js. \
+         erase_everything permanently destroys the vault key and MUST NOT be \
+         reachable from a single click."
+    );
+    assert!(
+        INDEX_HTML.contains("id=\"erase-phrase\""),
+        "ADR-SEC-008: the type-to-confirm input is missing from index.html"
+    );
+
+    // The invoke must be downstream of the phrase check, not merely present
+    // somewhere in the file.
+    let guard = APP_JS
+        .find("if ($(\"erase-phrase\").value !== ERASE_PHRASE) return;")
+        .expect(
+            "ADR-SEC-008: eraseEverything() no longer early-returns on a phrase \
+             mismatch, so the typed confirmation is decorative",
+        );
+    let call = APP_JS
+        .find("invoke(\"erase_everything\")")
+        .expect("dist/app.js must invoke erase_everything");
+    assert!(
+        guard < call,
+        "ADR-SEC-008: the phrase check must run BEFORE invoke(\"erase_everything\"); \
+         found the guard at {guard} and the call at {call}"
+    );
+}
+
+/// The user must be told that uninstalling leaves their memories on disk.
+/// Silence here is the actual product problem ADR-SEC-008 set out to fix —
+/// a user who uninstalls a privacy product reasonably assumes it took its
+/// data with it.
+#[test]
+fn settings_discloses_that_uninstalling_keeps_memories() {
+    let html = INDEX_HTML.to_lowercase();
+    assert!(
+        html.contains("uninstall"),
+        "ADR-SEC-008: the Settings tab no longer tells the user what happens to \
+         their memories when they uninstall. Keeping data on uninstall is the \
+         right default; keeping it SILENTLY is not."
+    );
+    assert!(
+        INDEX_HTML.contains("id=\"data-location\""),
+        "ADR-SEC-008: the vault location is no longer shown, so the disclosure \
+         is not checkable by the user"
     );
 }
 
