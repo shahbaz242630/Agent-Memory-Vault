@@ -33,6 +33,7 @@
 #![forbid(unsafe_code)]
 
 pub mod commands;
+pub mod logging;
 pub mod model_fetch;
 
 use std::path::PathBuf;

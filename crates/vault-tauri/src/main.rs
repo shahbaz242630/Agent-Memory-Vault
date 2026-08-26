@@ -98,7 +98,12 @@ const EXIT_CONFIG_ERROR: i32 = 2;
 const EXIT_STARTUP_FAILURE: i32 = 1;
 
 fn main() {
-    tracing_subscriber::fmt::init();
+    // Logging is initialised inside `.setup()` rather than here: the log
+    // directory comes from `app.path().app_log_dir()`, which does not exist
+    // until Tauri has built the app handle. `tracing_subscriber::fmt::init()`
+    // used to run at this point and wrote to STDOUT -- which a GUI process
+    // launched from Explorer does not have, so every event this application
+    // emitted went nowhere (ADR-SEC-014).
 
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -128,6 +133,29 @@ fn main() {
             vault_tauri::commands::erasure::erase_everything,
         ])
         .setup(|app| {
+            // 0. File logging FIRST, so every later step in this closure --
+            //    including the fatal-dialog paths below -- is recorded. A
+            //    startup failure is exactly the case a beta tester cannot
+            //    describe and we cannot reproduce (ADR-SEC-014).
+            //
+            //    Non-fatal by design: an app that refuses to start because it
+            //    could not open a log file has turned a diagnostic aid into an
+            //    outage. On failure we carry on with no log rather than block
+            //    the user from their own memories.
+            match app.path().app_log_dir() {
+                Ok(dir) => match vault_tauri::logging::init(&dir) {
+                    Ok(path) => {
+                        tracing::info!(
+                            target: "vault_tauri::startup",
+                            log_file = %path.display(),
+                            "file logging started"
+                        );
+                    }
+                    Err(e) => eprintln!("memory-vault: could not start file logging: {e}"),
+                },
+                Err(e) => eprintln!("memory-vault: could not locate a log directory: {e}"),
+            }
+
             // 1. Resolve libonnxruntime dylib path per ADR-019.
             let ort_lib_path = match resolve_ort_lib_path(app.handle()) {
                 Ok(p) => p,

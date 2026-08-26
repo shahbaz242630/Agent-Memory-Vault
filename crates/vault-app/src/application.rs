@@ -40,7 +40,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 use vault_consolidator::{
@@ -57,7 +57,7 @@ use vault_retrieval::{
     FilesystemReportLoader, GraphRetriever, HybridRetriever, KeywordIndex, KeywordRetriever,
     RerankedRetriever, Retriever, SemanticRetriever, StructuredReadPipeline,
 };
-use vault_storage::{MemoryFilter, MetadataStore, RetryWorker, StorageBackend};
+use vault_storage::{MemoryFilter, MetadataStore, RetryWorker, StepResult, StorageBackend};
 use zeroize::Zeroizing;
 
 use crate::consolidator_lock::ConsolidatorLock;
@@ -73,6 +73,32 @@ use crate::{AppConfig, VaultAdapter};
 /// transaction wrappers; atomic REPORT artifact writes (`.tmp + rename` at
 /// Commit 4) preserve the previous artifact intact under cancellation.
 pub(crate) const CONSOLIDATOR_HARD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Wall-clock budget for the startup cascade drain (ADR-SEC-013).
+///
+/// Five seconds is chosen against what it is competing with, not against how
+/// long a drain "should" take: the desktop app already spends far longer than
+/// this loading its ranking model, and the founder's standing decision is that
+/// the window opens immediately rather than blocking on background work. A
+/// typical backlog is one or two entries and finishes in milliseconds; a
+/// pathological one is capped here and simply continues on the background
+/// worker, exactly as it did before this drain existed.
+pub(crate) const STARTUP_DRAIN_BUDGET: Duration = Duration::from_secs(5);
+
+/// What a startup drain actually managed to do. Reported honestly so the log
+/// line cannot imply more than happened.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StartupDrain {
+    /// Entries the drain took off the queue and tried to run.
+    pub attempted: usize,
+    /// Of those, how many completed their vector-store half.
+    pub succeeded: usize,
+    /// `true` when the queue reported Idle before the budget expired, i.e.
+    /// nothing was left behind. `false` means the budget capped the drain and
+    /// the background worker still has work — reported rather than inferred so
+    /// the log line cannot overclaim.
+    pub fully_drained: bool,
+}
 
 /// Wrap an inner consolidation future in a hard timeout. If the inner
 /// future completes before `timeout_dur`, returns its [`VaultResult`]
@@ -529,6 +555,39 @@ impl Application {
             ),
         }
 
+        // ADR-SEC-013 — drain cascades left over from a previous session.
+        //
+        // `write_memory` / `delete_memory` commit metadata + an audit row
+        // transactionally and ENQUEUE the vector-store half as a cascade; a
+        // background `RetryWorker` performs it. The background worker is
+        // fire-and-forget, and in the desktop app its `JoinHandle` is dropped
+        // (tech-debt, HANDOFF), so anything still queued when the window closes
+        // is deferred to the next launch. Nothing was making that next launch
+        // actually happen.
+        //
+        // Observed live 2026-08-26: a memory deleted in the desktop app left
+        // its row gone from SQLCipher but its VECTOR still in Lance 30 minutes
+        // later, and closing the app did not clear it. Retrieval is
+        // orphan-safe, so the deleted memory was never returned — but the
+        // embedding of deleted content lingered on disk, which for a product
+        // whose promise is "delete means delete" is the wrong kind of
+        // almost-right.
+        //
+        // Deliberately BOUNDED and non-fatal: a large or permanently-failing
+        // backlog must never stop the app from starting. Whatever does not
+        // drain here stays queued for the background worker exactly as before,
+        // so this can only improve on the previous behaviour.
+        let drained = Self::drain_startup_cascades(&storage, STARTUP_DRAIN_BUDGET).await;
+        if drained.attempted > 0 {
+            tracing::info!(
+                target: "vault_app::startup_drain",
+                attempted = drained.attempted,
+                succeeded = drained.succeeded,
+                fully_drained = drained.fully_drained,
+                "drained cascades queued by a previous session"
+            );
+        }
+
         let report_loader = Arc::new(FilesystemReportLoader::new(
             vault_root.clone(),
             &config.at_rest_key,
@@ -793,6 +852,57 @@ impl Application {
         let worker = RetryWorker::new(self.storage.clone());
         tokio::spawn(worker.run(rx));
         tx
+    }
+
+    /// Work the cascade queue until it is empty or `budget` expires
+    /// (ADR-SEC-013).
+    ///
+    /// Called during [`Self::new`] so it cannot be forgotten by a caller — the
+    /// desktop app and the CLI both get it for free. That placement is
+    /// deliberate: the equivalent "each host remembers to do it" arrangement is
+    /// how the desktop app ended up with no reranker warm-up for months
+    /// (ADR-090), and how a queued delete could sit unprocessed across a whole
+    /// app session.
+    ///
+    /// Never returns an error. A drain is opportunistic cleanup of work that
+    /// is already durably queued; failing to complete it must not prevent the
+    /// vault from opening, and anything left behind is retried by the
+    /// background worker on its normal backoff schedule.
+    async fn drain_startup_cascades(storage: &StorageBackend, budget: Duration) -> StartupDrain {
+        let mut out = StartupDrain::default();
+        let deadline = Instant::now() + budget;
+        let mut worker = RetryWorker::new(storage.clone());
+
+        while Instant::now() < deadline {
+            match worker.step().await {
+                Ok(StepResult::Idle) => {
+                    out.fully_drained = true;
+                    break;
+                }
+                Ok(StepResult::SucceededEntry { .. }) => {
+                    out.attempted += 1;
+                    out.succeeded += 1;
+                }
+                // Rescheduled / DeadLettered are both "handled": the entry was
+                // taken off the due-list and its next state recorded. Counting
+                // them as attempted-but-not-succeeded keeps the log honest
+                // instead of looping on an entry that will not progress.
+                Ok(_) => {
+                    out.attempted += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "vault_app::startup_drain",
+                        error = %e,
+                        "startup cascade drain stopped early; queued work stays \
+                         for the background worker"
+                    );
+                    break;
+                }
+            }
+        }
+
+        out
     }
 
     /// **Production lifecycle entry point.** Spawn the cascading retry
