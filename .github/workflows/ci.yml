@@ -5,6 +5,16 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # `labeled` is load-bearing, not decorative. `real-model-smoke`'s condition
+    # (line ~724) reads `github.event.pull_request.labels`, and a workflow run's
+    # event payload is frozen when the run starts. Without `labeled` in this
+    # list the default types are [opened, synchronize, reopened], so a run
+    # triggered by `opened` sees ZERO labels -- and a label added afterwards can
+    # never re-evaluate the condition. That made ADR-098's documented escape
+    # hatch ("trigger it on a PR with the run-llm-smoke label") impossible to
+    # use in practice: you would have to label a pull request before creating
+    # it. Discovered 2026-08-26 doing exactly that on PR #43.
+    types: [opened, synchronize, reopened, labeled]
   # T0.2.1 ADR-044 / iteration 2 concern #1 lock: weekly cron triggers the
   # `real-model-smoke` job that runs `#[ignore]`'d real-model integration
   # tests against the actual 2.49 GB Phi-4-mini GGUF. The standard
