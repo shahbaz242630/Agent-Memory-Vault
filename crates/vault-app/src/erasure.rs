@@ -85,7 +85,16 @@ impl ErasureOutcome {
 /// directory wholesale, because the vault directory is chosen by the caller
 /// and a bug in that path must not turn into an unbounded recursive delete
 /// of, say, `%APPDATA%`.
-const VAULT_ENTRIES: &[&str] = &[
+///
+/// **Public because it is the vault's on-disk inventory, not just erasure's
+/// private business.** `tests/vault_at_rest_sweep.rs` asserts that a real
+/// assembled vault contains NOTHING outside this list — the check that
+/// ADR-SEC-007 did not have. That leak happened because a new artifact
+/// (`reports/*.json`) appeared on disk and no test was positioned to notice
+/// a new artifact at all. Keeping one list, read by both the eraser and the
+/// sweep, means a new artifact must be declared in exactly one place or two
+/// tests fail.
+pub const VAULT_ENTRIES: &[&str] = &[
     "vault.db",
     "vault.db-wal",
     "vault.db-shm",
