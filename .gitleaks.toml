@@ -1,0 +1,38 @@
+# Secret scanning configuration.
+#
+# Extends the default gitleaks ruleset rather than replacing it -- the defaults
+# already cover what matters most here: PEM private keys, cloud provider
+# tokens, and high-entropy generic secrets.
+#
+# WHY WE RUN A SCANNER AT ALL WHEN GITHUB ALREADY SCANS: GitHub's native
+# push protection on a free public repository matches KNOWN PROVIDER patterns
+# only (an AWS key, a Stripe token). The "non-provider patterns" setting that
+# would catch a raw private key or a custom signing secret is a paid GHAS
+# feature and is confirmed unavailable on this repository. For a project whose
+# single guarantee is that a server cannot read user vault contents, a leaked
+# private key is the worst-case event, so that gap is closed here instead.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Paths that generate noise without carrying secrets"
+
+paths = [
+  # Dependency lockfile: thousands of checksums, no secrets. Its hashes are
+  # exactly the shape of a high-entropy false positive.
+  '''Cargo\.lock$''',
+]
+
+# NOTE ON TEST KEY MATERIAL: this codebase hardcodes 32-byte master keys in
+# tests (`b"acceptance-a-master-key-32-bytes"`, `b"phase-0d-correct-master-
+# 32-bytes"` and similar). There is deliberately NO allowlist entry for them.
+# They are readable English by construction, so their Shannon entropy is far
+# below any generic-secret rule's threshold and no rule fires on them. Adding
+# an allowlist pattern broad enough to cover them would also cover a REAL key
+# that happened to sit on the same line -- the allowlist would then be a
+# permanent hole guarding against a false positive that does not occur.
+#
+# If a future test needs genuinely random key material, generate it at runtime
+# (`rand::random()`), never paste a literal. Nothing to allowlist means nothing
+# to keep true.
