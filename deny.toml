@@ -18,9 +18,70 @@ all-features = false
 [advisories]
 version = 2
 # RustSec advisory database. Anything unignored that matches is an error.
-# Add an entry here ONLY with a dated comment explaining why it cannot be
-# fixed and when it will be revisited -- never to silence a red build.
-ignore = []
+#
+# TRIAGED 2026-08-26, the first time this check ever ran on this repository.
+# It found 24 advisories. Three were fixable and ARE fixed in this same commit
+# (anyhow -> 1.0.103, crossbeam-epoch -> 0.9.20, h2 -> 0.4.16). The 21 below
+# cannot be fixed by us today; each says why, and what would change that.
+#
+# THIS LIST IS DEBT, NOT ABSOLUTION. The check stays BLOCKING, so any NEW
+# advisory fails the build from now on. Revisit whenever `lance` or `tauri` is
+# upgraded -- both chains below move only when they do.
+ignore = [
+    # -- gtk-rs GTK3 bindings, unmaintained upstream ------------------------
+    # Reach us through tauri -> wry on LINUX ONLY. We ship Windows (ADR-091),
+    # so none of this is in the binary any user runs. RustSec reports "no safe
+    # upgrade is available" for all ten: GTK3 bindings are done, and the
+    # ecosystem's answer is GTK4, which Tauri v2 does not use.
+    # Resolved when Tauri moves off gtk-rs, or when we ship a Linux build and
+    # must re-evaluate properly.
+    "RUSTSEC-2024-0411", # gdkwayland-sys
+    "RUSTSEC-2024-0412", # gdk
+    "RUSTSEC-2024-0413", # atk
+    "RUSTSEC-2024-0414", # gdkx11-sys
+    "RUSTSEC-2024-0415", # gtk
+    "RUSTSEC-2024-0416", # atk-sys
+    "RUSTSEC-2024-0417", # gdkx11
+    "RUSTSEC-2024-0418", # gdk-sys
+    "RUSTSEC-2024-0419", # gtk3-macros
+    "RUSTSEC-2024-0420", # gtk-sys
+
+    # -- cloud object-store signing path ------------------------------------
+    # All three arrive via the SAME chain:
+    #   reqsign -> opendal -> lance-io -> lance -> lancedb -> vault-storage
+    # `reqsign` signs cloud storage requests (AWS SigV4 / Azure / GCS) and
+    # `opendal` abstracts cloud object stores. Memory Vault runs LanceDB
+    # against the LOCAL FILESYSTEM: we sign no cloud requests and parse no
+    # cloud XML responses, so this code is linked but never executed.
+    #
+    # Stated precisely: this is a REACHABILITY argument, not a guarantee. The
+    # code is present in the binary. Both classes need the code to actually run
+    # against attacker-influenced input, which requires a cloud backend we do
+    # not configure. If a cloud backend is ever added -- Managed mode is the
+    # obvious candidate -- these MUST be re-triaged before that ships.
+    #
+    # `cargo update` cannot fix quick-xml: reqsign requires ^0.37 and the fix
+    # landed in 0.41, so the whole lance chain has to move first.
+    "RUSTSEC-2023-0071", # rsa -- Marvin timing sidechannel. NO fixed version
+                         #        exists upstream; the crate has no answer yet.
+    "RUSTSEC-2026-0194", # quick-xml -- quadratic run time on duplicate attrs
+    "RUSTSEC-2026-0195", # quick-xml -- unbounded namespace alloc (DoS)
+
+    # -- unmaintained build-time and data crates ----------------------------
+    # No fixed version published for any of these. They are transitive, and
+    # none is reachable from a request path: proc-macro-error and paste run at
+    # COMPILE time only, and the unic-* crates are static Unicode tables.
+    # Resolved when the crates that depend on them move to maintained
+    # replacements; nothing we can force.
+    "RUSTSEC-2024-0370", # proc-macro-error (build-time)
+    "RUSTSEC-2024-0436", # paste (build-time)
+    "RUSTSEC-2025-0075", # unic-char-range
+    "RUSTSEC-2025-0080", # unic-common
+    "RUSTSEC-2025-0081", # unic-char-property
+    "RUSTSEC-2025-0098", # unic-ucd-version
+    "RUSTSEC-2025-0100", # unic-ucd-ident
+    "RUSTSEC-2025-0134", # rustls-pemfile
+]
 
 [licenses]
 version = 2
@@ -43,8 +104,22 @@ allow = [
     "Unicode-3.0",
     "OpenSSL",
     "Unlicense",
+    # Added 2026-08-26 after the first real run against the ~700-crate tree.
+    # Both are permissive and carry no copyleft obligation on a distributed
+    # binary; they were absent only because the initial list was written from
+    # the common set rather than from what we actually depend on.
+    "0BSD",              # BSD Zero Clause -- public-domain equivalent
+    "CDLA-Permissive-2.0", # Community Data License Agreement, permissive
 ]
 confidence-threshold = 0.8
+
+# Our OWN crates declare `license = "Proprietary"`, which is not a valid SPDX
+# expression, so without this every workspace member is reported "unlicensed"
+# and the check fails on 13 false positives. `publish = false` in
+# [workspace.package] is what marks them private; this tells cargo-deny to skip
+# them. Third-party licences are unaffected -- that is the whole point of the
+# check and it stays strict.
+private = { ignore = true }
 
 [bans]
 # A duplicated crate version is usually harmless transitive drift, not a

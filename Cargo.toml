@@ -20,6 +20,11 @@ members = [
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.81"
+# Never published to crates.io. Declared so cargo-deny can tell these
+# apart from third-party crates: without it every workspace member is
+# reported "unlicensed" (Proprietary is not a valid SPDX expression) and
+# every `path = "../"` dependency is reported as a wildcard.
+publish = false
 license = "Proprietary"
 authors = ["Shahbaz Malik"]
 repository = "https://github.com/shahbaz242630/Agent-Memory-Vault"
@@ -46,7 +51,9 @@ futures = "=0.3.32"
 
 # Error handling (BRD §4.1)
 thiserror = "=2.0.18"
-anyhow = "=1.0.102"
+# 1.0.103 fixes RUSTSEC-2026-0190 (unsoundness in Error::downcast_mut).
+# Bumped 2026-08-26 by the first cargo-deny run; patch-level, no API change.
+anyhow = "=1.0.103"
 
 # Serialization (BRD §4.1)
 serde = { version = "=1.0.228", features = ["derive"] }
