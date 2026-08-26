@@ -45,6 +45,7 @@
 //! and continues — one bad fact never aborts the run, and the fact is retried
 //! next cycle (its fingerprint was never written).
 
+use crate::prompt_guard::{delimit_memory_content, guarded_system_prompt};
 use serde_json::{json, Value};
 use tracing::warn;
 use vault_core::{Memory, VaultError, VaultResult};
@@ -86,6 +87,10 @@ const ENRICHMENT_SEED: u32 = 0x0A11_A5E5;
 /// verbatim from the alias-only call so search recall does not regress, and the
 /// entity-type guidance keeps products / vehicles / instruments as `concept`.
 fn enrichment_prompt(content: &str) -> String {
+    // BRD §11.7.3: memory content is wrapped in clear delimiters. It is
+    // interpolated LAST here, the position an injected instruction most
+    // wants, so the boundary has to be explicit.
+    let delimited = delimit_memory_content(content);
     format!(
         "A memory about the user is below. Return strict JSON with exactly three fields.\n\
          1. \"aliases\": 5 to 8 SINGLE-WORD search keywords a person might type to find \
@@ -111,7 +116,7 @@ fn enrichment_prompt(content: &str) -> String {
          sibling_of, owns, drives, learning, allergic_to). Capture the user's most \
          important link (e.g. the user to their employer); ALWAYS capture the user's \
          relationship to any family member named (parent_of, sibling_of, married_to).\n\n\
-         Memory: {content}"
+         Memory:\n{delimited}"
     )
 }
 
@@ -256,7 +261,7 @@ async fn generate_enrichment(content: &str, llm: &dyn LlmProvider) -> VaultResul
         temperature: 0.0,
         top_p: 1.0,
         seed: Some(ENRICHMENT_SEED),
-        system_prompt: Some(ENRICHMENT_SYSTEM_PROMPT.to_string()),
+        system_prompt: Some(guarded_system_prompt(ENRICHMENT_SYSTEM_PROMPT)),
     };
     let raw = llm
         .complete_json(&enrichment_prompt(content), ENRICHMENT_SCHEMA, &params)
@@ -704,7 +709,11 @@ mod tests {
             temperature: 0.0,
             top_p: 1.0,
             seed: Some(ENRICHMENT_SEED),
-            system_prompt: Some(COMBINED_SYSTEM_PROMPT.to_string()),
+            // Guarded like production: this probe exists to observe what the
+            // REAL model does on the REAL prompt, so it has to carry the same
+            // §11.7.3 preamble the shipped path carries. It also keeps
+            // `prompt_guard_coverage` free of exceptions.
+            system_prompt: Some(guarded_system_prompt(COMBINED_SYSTEM_PROMPT)),
         };
 
         println!("\n============ REAL Phi-4 combined extraction ============");

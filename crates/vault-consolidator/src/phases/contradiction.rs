@@ -88,6 +88,7 @@ use std::cmp::Ordering;
 use serde::{Deserialize, Serialize};
 use tracing::{instrument, warn};
 
+use crate::prompt_guard::guarded_system_prompt;
 use vault_core::{Memory, MemoryId, VaultError, VaultResult};
 use vault_llm::{CompletionParams, LlmProvider};
 
@@ -304,7 +305,7 @@ pub async fn detect_pair_contradiction(
         temperature: 0.0,
         top_p: 1.0,
         seed: Some(JUDGE_SEED),
-        system_prompt: Some(CONTRADICTION_PAIR_SYSTEM_PROMPT.to_string()),
+        system_prompt: Some(guarded_system_prompt(CONTRADICTION_PAIR_SYSTEM_PROMPT)),
     };
 
     let raw = llm
@@ -556,7 +557,7 @@ pub async fn detect_contradiction_nary(
         temperature: 0.0,
         top_p: 1.0,
         seed: Some(JUDGE_SEED),
-        system_prompt: Some(CONTRADICTION_SYSTEM_PROMPT.to_string()),
+        system_prompt: Some(guarded_system_prompt(CONTRADICTION_SYSTEM_PROMPT)),
     };
 
     let raw = llm

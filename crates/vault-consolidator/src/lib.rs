@@ -44,6 +44,7 @@
 pub(crate) mod checkpoint;
 pub mod consolidator;
 pub mod phases;
+mod prompt_guard;
 pub mod report;
 pub mod scheduler;
 mod summary;

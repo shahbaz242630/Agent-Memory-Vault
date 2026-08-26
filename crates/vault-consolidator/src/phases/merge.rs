@@ -23,6 +23,7 @@
 //! [`LlmProvider`]: vault_llm::LlmProvider
 //! [`CompletionParams::system_prompt`]: vault_llm::CompletionParams
 
+use crate::prompt_guard::guarded_system_prompt;
 use serde::{Deserialize, Serialize};
 use tracing::{instrument, warn};
 use vault_core::{MemoryId, VaultError, VaultResult};
@@ -213,7 +214,7 @@ pub async fn decide_merge(
     // orchestrator skipping the cluster (ADR-062 iter 2 — merge is now
     // log-and-continue, not run-aborting), so this never crashes the run.
     let params = CompletionParams {
-        system_prompt: Some(MERGE_DECISION_SYSTEM_PROMPT.to_string()),
+        system_prompt: Some(guarded_system_prompt(MERGE_DECISION_SYSTEM_PROMPT)),
         max_tokens: MERGE_MAX_TOKENS,
         ..CompletionParams::default()
     };
