@@ -82,6 +82,7 @@ use std::collections::{BTreeSet, HashMap};
 use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
+use crate::prompt_guard::{delimit_memory_content, guarded_system_prompt};
 use vault_core::{Boundary, Memory, MemoryId, VaultError, VaultResult};
 use vault_embedding::EmbeddingProvider;
 use vault_llm::{CompletionParams, LlmProvider};
@@ -349,12 +350,17 @@ async fn label_one_cluster(
         .take(TOPIC_LABEL_SAMPLE_SIZE)
         .collect();
 
-    let memories_block = samples
-        .iter()
-        .enumerate()
-        .map(|(i, c)| format!("{}. {}", i + 1, c))
-        .collect::<Vec<_>>()
-        .join("\n");
+    // BRD §11.7.3: the sampled memory text is untrusted and goes straight into
+    // the prompt, so the whole block is delimited. Wrapping the block once
+    // rather than each numbered line keeps the tuned numbering format intact.
+    let memories_block = delimit_memory_content(
+        &samples
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{}. {}", i + 1, c))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
 
     let prompt = format!(
         "You name clusters of related memories. Below are short memories that \
@@ -371,9 +377,9 @@ async fn label_one_cluster(
         temperature: 0.0,
         top_p: 1.0,
         seed: Some(0xC07C_C07C), // arbitrary stable seed for label determinism
-        system_prompt: Some(
-            "You name clusters of related memories with short snake_case labels.".to_string(),
-        ),
+        system_prompt: Some(guarded_system_prompt(
+            "You name clusters of related memories with short snake_case labels.",
+        )),
     };
 
     let response = llm
