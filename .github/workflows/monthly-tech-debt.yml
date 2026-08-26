@@ -19,7 +19,13 @@ on:
   schedule:
     # Cron: 0 9 1-7 * 1 = 09:00 UTC on day-of-month 1-7 IF day-of-week is Monday.
     # The intersection (1-7 AND Monday) = first Monday of every month.
-    # GitHub Actions cron runs in UTC; 09:00 UTC = 09:00 GMT / 10:00 BST.
+    # GitHub Actions cron ALWAYS runs in UTC, and deliberately no local
+    # equivalent is given here. The previous note read "09:00 UTC = 09:00 GMT /
+    # 10:00 BST", which assumed a UK reader and was wrong twice over: it is
+    # wrong for half the year even in the UK, and the founder's machine is on
+    # UTC+4 (verified 2026-08-26). A hardcoded local time in a comment rots the
+    # moment anyone travels or the clocks change. Convert from UTC when you
+    # need a local time; do not record one here.
     - cron: '0 9 1-7 * 1'
   # Manual trigger via Actions UI — useful for testing the workflow on
   # demand without waiting for the next scheduled run. Removable if pure
