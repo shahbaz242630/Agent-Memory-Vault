@@ -287,6 +287,67 @@ fn build_spec(
     })
 }
 
+/// Re-register the maintenance task so an already-registered one points at the
+/// current runner (ADR-SEC-015 amendment 1).
+///
+/// # The upgrade hole this closes
+///
+/// The task is registered in exactly one place — [`set_maintenance_schedule`],
+/// which only runs when the user changes their schedule. Nothing re-registers
+/// it on startup.
+///
+/// So an installer that replaces the files on disk does **not** change what
+/// Windows has recorded. A user who had automatic maintenance on before
+/// ADR-SEC-015 keeps a task pointing at `vault-cli.exe`, and keeps getting a
+/// console window at login, forever — the fix would reach only brand-new
+/// installs and anyone who happened to toggle their schedule off and on.
+///
+/// That is not a hypothetical: it is the founder's own machine, and it would
+/// have been every beta tester who upgraded.
+///
+/// # Why unconditional re-registration rather than comparing first
+///
+/// Registration is idempotent (`schtasks /Create /F` replaces), and the
+/// alternative needs the backend to report a registered task's program so we
+/// can diff it — more surface, for a check that would end in the same call.
+///
+/// It also heals drift this comparison would not have thought to look for: the
+/// stale task found in session 27 pointed into `target\debug`, inside a build
+/// tree that gets wiped routinely.
+///
+/// The persisted config is the source of truth for the schedule, so rebuilding
+/// the task from it is the correct resolution of any disagreement.
+///
+/// # Never fatal
+///
+/// Returns nothing and logs on failure. A task we could not refresh is a
+/// console window at worst; an app that will not start because of one is an
+/// outage.
+pub fn heal_registered_task(ctx: &MaintenanceContext) {
+    let config = load_config(&ctx.config_path);
+    if !config.enabled {
+        // Maintenance is off. Registering a task the user turned off would be
+        // the app overriding an explicit choice.
+        return;
+    }
+
+    let spec = match build_spec(ctx, &config) {
+        Ok(spec) => spec,
+        Err(_) => {
+            tracing::warn!("could not rebuild the maintenance schedule; leaving the task as it is");
+            return;
+        }
+    };
+
+    match platform_scheduler().and_then(|s| s.register(&spec)) {
+        Ok(()) => tracing::info!(
+            program = %spec.program.display(),
+            "maintenance task refreshed to the current runner"
+        ),
+        Err(e) => tracing::warn!(error = %e, "could not refresh the maintenance task"),
+    }
+}
+
 /// Read back the summary the run just recorded, for the UI to display.
 ///
 /// Reading the file rather than the child's stdout means the UI and the
@@ -715,6 +776,85 @@ mod tests {
             args.iter().any(|a| a == "run"),
             "the consolidation subcommand must still be forwarded"
         );
+    }
+
+    /// ADR-SEC-015 amendment 1: maintenance OFF means we touch nothing.
+    ///
+    /// Registering a task for a user who turned maintenance off would be the
+    /// app overriding an explicit choice — a worse bug than the one the heal
+    /// exists to fix.
+    #[test]
+    fn healing_does_nothing_when_maintenance_is_disabled() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let mut ctx = ctx();
+        ctx.config_path = tmp.path().join("maintenance.json");
+
+        let disabled = MaintenanceConfig {
+            enabled: false,
+            ..MaintenanceConfig::default()
+        };
+        maintenance_state::save(&ctx.config_path, &disabled).expect("save");
+
+        // No OS call is made, so this is safe to run anywhere including CI.
+        heal_registered_task(&ctx);
+
+        // The config is left exactly as the user set it.
+        assert_eq!(load_config(&ctx.config_path), disabled);
+    }
+
+    /// The heal must rebuild the task from the user's persisted schedule, not
+    /// from defaults — otherwise refreshing the program path would silently
+    /// move a 22:30 weekly run to 03:00 daily.
+    ///
+    /// ⚠️ Exercises `build_spec`, **not** `heal_registered_task`, on purpose.
+    /// The heal's next step is a real `schtasks /Create`: calling it with an
+    /// enabled, valid config would register an actual scheduled task on the
+    /// developer's machine and on every CI runner. Do not "improve" this test
+    /// by calling the outer function.
+    #[test]
+    fn healing_rebuilds_the_spec_from_the_persisted_schedule() {
+        let ctx = ctx();
+        let config = MaintenanceConfig {
+            enabled: true,
+            frequency: "weekly".into(),
+            weekday: 3,
+            hour: 22,
+            minute: 30,
+            last_run: None,
+        };
+
+        let spec = build_spec(&ctx, &config).expect("spec should build");
+        assert_eq!(spec.program, ctx.vault_maintenance, "the windowless runner");
+        assert_eq!(
+            spec.time_of_day,
+            chrono::NaiveTime::from_hms_opt(22, 30, 0).expect("valid time")
+        );
+        assert_eq!(
+            spec.frequency,
+            Frequency::Weekly {
+                day: chrono::Weekday::Wed
+            }
+        );
+    }
+
+    /// A corrupt or unbuildable config must not panic startup.
+    #[test]
+    fn healing_survives_a_config_it_cannot_turn_into_a_schedule() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let mut ctx = ctx();
+        ctx.config_path = tmp.path().join("maintenance.json");
+
+        // `enabled` with an hour no clock has. `build_spec` rejects it; the
+        // heal must log and move on rather than unwrapping.
+        let impossible = MaintenanceConfig {
+            enabled: true,
+            hour: 99,
+            ..MaintenanceConfig::default()
+        };
+        maintenance_state::save(&ctx.config_path, &impossible).expect("save");
+
+        heal_registered_task(&ctx);
+        // Reaching here without a panic is the assertion.
     }
 
     /// The status file is named once, by the app. The runner appends

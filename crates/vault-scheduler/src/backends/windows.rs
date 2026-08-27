@@ -166,12 +166,46 @@ pub(crate) use imp::WindowsScheduler;
 #[cfg(windows)]
 mod imp {
     use std::io::Write;
+    // `creation_flags` lives on this extension trait; it is the only way to
+    // pass CREATE_NO_WINDOW without an external bindings crate.
+    use std::os::windows::process::CommandExt;
     use std::process::Command;
 
     use super::build_task_xml;
     use crate::error::{SchedulerError, SchedulerResult};
     use crate::spec::{ScheduleSpec, ScheduleStatus, TaskId};
     use crate::Scheduler;
+
+    /// `CREATE_NO_WINDOW` — run a console child with no console window.
+    ///
+    /// From the Win32 process-creation flags. Declared here rather than pulled
+    /// from a binding crate: it is one stable constant, and the alternative is
+    /// a new dependency for a single `u32`.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    /// Build a `schtasks.exe` command that shows no console window
+    /// (ADR-SEC-015 amendment 1).
+    ///
+    /// # Why every call site must go through this
+    ///
+    /// `schtasks.exe` is a console program. The desktop app is linked for the
+    /// Windows subsystem and therefore has no console of its own, so Windows
+    /// creates a **new console window** for any console child it spawns.
+    ///
+    /// That made a black window flash on the user's screen every time the
+    /// Maintenance tab was opened (`get_maintenance_schedule` calls
+    /// [`Scheduler::status`], which queries `schtasks`) and every time the
+    /// schedule was changed. Same defect as the scheduled run itself, in the
+    /// crate whose whole job is talking to the OS scheduler.
+    ///
+    /// Found while adding the startup re-registration in ADR-SEC-015
+    /// amendment 1 — which would otherwise have flashed a console on **every**
+    /// app launch, turning an occasional annoyance into a permanent one.
+    fn schtasks_command() -> Command {
+        let mut command = Command::new("schtasks");
+        command.creation_flags(CREATE_NO_WINDOW);
+        command
+    }
 
     /// Task Scheduler backend driving `schtasks.exe`.
     pub(crate) struct WindowsScheduler;
@@ -214,7 +248,7 @@ mod imp {
         fn status(&self, task_id: &TaskId) -> SchedulerResult<ScheduleStatus> {
             // `schtasks /Query` exits non-zero when the task does not exist; we
             // read that as "not registered" rather than a backend failure.
-            match Command::new("schtasks")
+            match schtasks_command()
                 .args(["/Query", "/TN", task_id.as_str()])
                 .output()
             {
@@ -234,7 +268,7 @@ mod imp {
     /// Run `schtasks.exe` with `args`, returning its stdout on success or a
     /// [`SchedulerError::BackendFailed`] carrying stderr on a non-zero exit.
     fn run_schtasks(args: &[&str]) -> SchedulerResult<String> {
-        let output = Command::new("schtasks")
+        let output = schtasks_command()
             .args(args)
             .output()
             .map_err(SchedulerError::Io)?;
@@ -275,6 +309,22 @@ mod imp {
         let mut file = std::fs::File::create(&path).map_err(SchedulerError::Io)?;
         file.write_all(&bytes).map_err(SchedulerError::Io)?;
         Ok(path)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::CREATE_NO_WINDOW;
+
+        /// Pin the magic number itself, by reading the constant rather than
+        /// scanning for its text.
+        ///
+        /// A wrong value compiles, runs, and silently restores the console
+        /// window this whole change exists to remove — there is no failure
+        /// anyone would notice except a user seeing a black rectangle.
+        #[test]
+        fn the_no_window_flag_is_the_documented_win32_constant() {
+            assert_eq!(CREATE_NO_WINDOW, 0x0800_0000);
+        }
     }
 }
 
@@ -369,5 +419,92 @@ mod tests {
         // Trailing backslashes before the closing quote are doubled so they do
         // not escape it.
         assert_eq!(windows_quote_arg(r"a b\"), r#""a b\\""#);
+    }
+
+    /// ADR-SEC-015 amendment 1: no `schtasks` call may spawn a visible console.
+    ///
+    /// A source scan rather than a behavioural test, because the defect is
+    /// invisible to any assertion we can make about a `Command` — the window
+    /// appears at spawn time, on a real desktop, and nothing observable comes
+    /// back. The only reliable guard is that every call site routes through
+    /// the one builder that sets the flag.
+    ///
+    /// This is the same shape as `prompt_guard_coverage.rs`: scan our own
+    /// source and fail the build if the pattern is bypassed.
+    /// Drop `//` comments so prose about the pattern is not mistaken for the
+    /// pattern.
+    ///
+    /// The first version of the guard below failed against its own explanatory
+    /// comment — exactly what `prompt_guard_coverage.rs` hit in session 32,
+    /// where a comment quoting the guarded construct tripped the guard. The
+    /// lesson recorded there was to make the matcher comment-aware rather than
+    /// excuse the file, because excusing it is how a guard quietly stops
+    /// guarding.
+    ///
+    /// Deliberately naive: it also truncates at a `//` inside a string literal
+    /// (this file has one, in the XML namespace URL). That is harmless here —
+    /// the discarded remainder never contains the scanned construct — and the
+    /// alternative is a Rust lexer in a test.
+    fn strip_line_comments(src: &str) -> String {
+        src.lines()
+            .map(|line| match line.find("//") {
+                Some(i) => &line[..i],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The body of `schtasks_command`, so an assertion about the builder cannot
+    /// be satisfied by this test file's own text.
+    fn builder_body(code: &str) -> &str {
+        let start = code
+            .find("fn schtasks_command()")
+            .expect("the builder must exist");
+        let rest = &code[start..];
+        let end = rest.find("\n    }").expect("the builder must close");
+        &rest[..end]
+    }
+
+    #[test]
+    fn every_schtasks_invocation_suppresses_its_console_window() {
+        let code = strip_line_comments(include_str!("windows.rs"));
+
+        let direct = code.matches("Command::new(\"schtasks\")").count();
+        assert_eq!(
+            direct, 1,
+            "expected exactly ONE schtasks command construction (the one inside \
+             `schtasks_command()`), found {direct}.\n\
+             More than one: a call site bypassed the builder, inherits no \
+             creation flags, and Windows gives that child a console window -- \
+             the defect ADR-SEC-015 exists to remove, reappearing in the crate \
+             that talks to the scheduler.\n\
+             Zero: the scanned construct no longer matches the code, so this \
+             guard has gone vacuous and must be re-pointed at whatever \
+             replaced it."
+        );
+
+        // Scoped to the builder's own body. Asserting against the whole file
+        // would be satisfied by the string literal on this very line.
+        assert!(
+            builder_body(&code).contains("creation_flags(CREATE_NO_WINDOW)"),
+            "`schtasks_command()` no longer sets CREATE_NO_WINDOW, so every \
+             schtasks call is back to showing a console window"
+        );
+    }
+
+    #[test]
+    fn the_comment_stripper_does_not_confuse_prose_for_code() {
+        // Guards the guard. If stripping broke, the count assertion above
+        // would start failing against explanatory comments -- and the tempting
+        // fix would be to delete the comments rather than fix the matcher.
+        let sample = "let a = Command::new(\"schtasks\");\n// see Command::new(\"schtasks\")\n";
+        assert_eq!(
+            strip_line_comments(sample)
+                .matches("Command::new(\"schtasks\")")
+                .count(),
+            1,
+            "the commented mention must not be counted"
+        );
     }
 }
