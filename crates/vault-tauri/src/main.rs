@@ -475,6 +475,18 @@ fn main() {
             app.manage(vault_tauri::commands::logs::LogContext {
                 log_dir: log_dir.clone(),
             });
+            // ADR-SEC-015 amendment 1: an already-registered task still points
+            // at whatever the build that registered it chose. Replacing the
+            // files on disk does not change what Windows recorded, so an
+            // upgrading user would keep the console window indefinitely. Refresh
+            // it here, before the context is moved into managed state.
+            //
+            // Synchronous on the setup thread by choice: it is one `schtasks`
+            // call, it runs before the window is shown, and doing it here means
+            // it cannot race a user who opens the Maintenance tab. Never fatal —
+            // a task we could not refresh is a console window at worst.
+            vault_tauri::commands::maintenance::heal_registered_task(&maintenance_ctx);
+
             app.manage(maintenance_ctx);
             app.manage(vault_tauri::commands::maintenance::MaintenanceEngineFetch::new(models_dir));
 
