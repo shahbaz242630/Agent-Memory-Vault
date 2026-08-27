@@ -115,6 +115,13 @@ identifier = "allow-run-maintenance-now"
 description = "Allow invoking the run_maintenance_now command (run one consolidation immediately by spawning the bundled vault-cli; skips cleanly if the vault is in use)."
 commands.allow = ["run_maintenance_now"]
 
+# Diagnostic-log export (ADR-SEC-017).
+
+[[permission]]
+identifier = "allow-export-logs"
+description = "Allow invoking the export_logs command (save a copy of the application's own activity record to a location the user chooses, so it can be sent for support). Reads only the app's diagnostic log, which carries no memory content by construction; the audit log is not included."
+commands.allow = ["export_logs"]
+
 [[permission]]
 identifier = "allow-erase-everything"
 description = "Allow invoking the erase_everything command (permanently destroy every memory in this vault by destroying its encryption key in the operating system credential store, then removing the vault's data files). Irreversible."

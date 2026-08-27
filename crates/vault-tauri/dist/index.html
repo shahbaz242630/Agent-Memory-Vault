@@ -284,6 +284,28 @@
             </div>
           </div>
 
+          <!-- Diagnostic log export (ADR-SEC-017). The log already exists but
+               lands in a hidden system folder no ordinary user will find, so
+               "it broke" still tells us nothing. This is the last few feet:
+               one button, one file, somewhere it can be attached from.
+               ADR-086: describes what the file contains and what it does not,
+               without naming a single piece of the stack. -->
+          <div class="data-section">
+            <div class="data-title">If something goes wrong</div>
+            <p class="data-note">
+              Memory Vault keeps a private activity record on this device &mdash;
+              what it did and when, and any errors it ran into. It records
+              <strong>none of your memories</strong>, and it is never sent
+              anywhere on its own.
+            </p>
+            <p class="data-note">
+              If you hit a problem, save a copy and send it to us. It helps us
+              find the fault without ever seeing what you keep.
+            </p>
+            <button id="export-logs" class="link-underline">Save activity record&hellip;</button>
+            <p id="export-logs-status" class="data-note"></p>
+          </div>
+
           <div class="settings-actions">
             <button id="replay-welcome" class="link-underline">Replay welcome</button>
           </div>

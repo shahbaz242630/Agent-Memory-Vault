@@ -22,6 +22,20 @@ tokio = { workspace = true }
 # tracing — structured logs at the application boundary.
 tracing.workspace = true
 
+# tracing-subscriber — backs `logging::init`, the shared on-disk application
+# log (ADR-SEC-014, moved here by ADR-SEC-015 so the desktop app and the
+# windowless maintenance path write one file through one implementation).
+# Already compiled for this workspace via vault-tauri and vault-cli; declaring
+# it here adds no new crate to the tree.
+tracing-subscriber = { workspace = true }
+
+# serde + serde_json — `maintenance_state` reads and writes `maintenance.json`,
+# the schedule + last-run file shared by the desktop app and whichever process
+# actually ran maintenance (ADR-SEC-016). Both were already dev-dependencies of
+# this crate; the production declaration makes the shared type buildable.
+serde = { workspace = true }
+serde_json = { workspace = true }
+
 # Domain types: Memory, MemoryId, NewMemory, Boundary, VaultError.
 vault-core = { path = "../vault-core" }
 
@@ -131,7 +145,6 @@ test-helpers = []
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 tempfile.workspace = true
-serde_json = { workspace = true }
 
 # Multi-agent daemon SPIKE Stage B (next-arc, 2026-06-23) — DEV-ONLY.
 # `tests/concurrent_multiagent_stage_b.rs` proves the REAL three-store stack

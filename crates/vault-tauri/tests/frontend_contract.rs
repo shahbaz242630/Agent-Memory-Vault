@@ -44,6 +44,7 @@ const COMMAND_SOURCES: &[(&str, &str)] = &[
         include_str!("../src/commands/maintenance.rs"),
     ),
     ("erasure.rs", include_str!("../src/commands/erasure.rs")),
+    ("logs.rs", include_str!("../src/commands/logs.rs")),
 ];
 
 /// The markup, for guards that pin UI structure rather than wiring.
@@ -266,6 +267,56 @@ fn settings_discloses_that_uninstalling_keeps_memories() {
         "ADR-SEC-008: the vault location is no longer shown, so the disclosure \
          is not checkable by the user"
     );
+}
+
+#[test]
+fn settings_offers_a_way_to_send_us_the_activity_record() {
+    // ADR-SEC-017. Without a visible affordance the log exists but sits in a
+    // hidden system folder, and "it broke" from a beta tester yields nothing —
+    // which is the state ADR-SEC-014 was written to end.
+    assert!(
+        INDEX_HTML.contains("id=\"export-logs\""),
+        "ADR-SEC-017: the Settings tab no longer offers a log export. The log \
+         then only exists somewhere a non-technical tester cannot reach."
+    );
+    assert!(
+        APP_JS.contains("invoke(\"export_logs\""),
+        "the export button must actually call the command"
+    );
+}
+
+#[test]
+fn the_export_copy_promises_that_memories_are_not_included() {
+    // The user is about to email this file to strangers. If the UI does not
+    // say plainly that their memories are not in it, the honest answer for a
+    // cautious person is "don't send it" -- and we lose the diagnostic.
+    let html = INDEX_HTML.to_lowercase();
+    let claim = html
+        .find("none of your memories")
+        .expect("ADR-SEC-017: the export section must state that memories are not included");
+    let button = html
+        .find("id=\"export-logs\"")
+        .expect("export button must exist");
+    assert!(
+        claim < button,
+        "the promise must be made BEFORE the button, not after it"
+    );
+}
+
+#[test]
+fn the_export_never_names_the_stack() {
+    // ADR-086 white-label: user-visible copy describes capability and trust,
+    // never the implementation.
+    let html = INDEX_HTML.to_lowercase();
+    // Deliberately NOT "rust": the white-label guidance asks for trust
+    // language, and "trust" contains it. A guard that fires on the wording we
+    // want people to use gets deleted rather than obeyed.
+    for banned in ["tracing", "log file", "stdout", "subscriber", "tauri"] {
+        assert!(
+            !html.contains(banned),
+            "the Settings copy names an implementation detail: {banned:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

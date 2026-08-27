@@ -13,6 +13,14 @@ repository.workspace = true
 name = "vault-cli"
 path = "src/main.rs"
 
+# The windowless maintenance runner (ADR-SEC-015). Linked for the Windows
+# subsystem so a scheduled nightly run never shows a console window. Declared
+# explicitly rather than relying on `src/bin` auto-discovery so the pair is
+# visible in one place.
+[[bin]]
+name = "vault-maintenance"
+path = "src/bin/vault-maintenance.rs"
+
 [dependencies]
 vault-core = { path = "../vault-core" }
 vault-storage = { path = "../vault-storage" }

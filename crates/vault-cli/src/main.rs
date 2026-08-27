@@ -52,6 +52,8 @@ use tokio::net::TcpListener;
 use uuid::Uuid;
 use vault_mcp::DaemonServer;
 
+use vault_app::maintenance_state::{self, RunOutcome, RunSummary};
+
 use vault_app::keychain::{
     derive_at_rest_key, derive_sqlcipher_passphrase, read_or_init_master_key, PRODUCTION_NAMESPACE,
     VAULT_ID,
@@ -247,7 +249,21 @@ enum ConsolidateAction {
     /// (cross-process lockfile at `<vault_root>/.consolidator.lock`). Hard
     /// timeout 30 min — past this, the run is cancelled and the previous
     /// nightly summary remains the latest artifact on disk.
-    Run,
+    Run {
+        /// Record the run's outcome into this `maintenance.json` so the
+        /// desktop app can show it (ADR-SEC-016).
+        ///
+        /// Only the run's **counters** are recorded — never the summary
+        /// markdown or a contradiction's reasoning, both of which are derived
+        /// from memory content and would land in a plaintext file. See
+        /// `vault_app::maintenance_state`.
+        ///
+        /// Written by this process because this is the process holding the
+        /// `ConsolidationReport`. A run that never gets this far (a held lock,
+        /// a crash) is recorded by whoever spawned us.
+        #[arg(long, value_name = "PATH")]
+        record_status: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -351,6 +367,25 @@ async fn main() -> ExitCode {
 
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
+
+    // ADR-SEC-015: when we are the child of the windowless maintenance
+    // launcher, there is no console and therefore no stderr for logs to reach.
+    // `VAULT_LOG_DIR` redirects them into the shared application log file
+    // instead, so an overnight failure leaves evidence. Falls through to the
+    // stderr subscriber below if the directory cannot be opened -- a log we
+    // could not create must never stop a maintenance run.
+    if let Some(dir) = std::env::var_os(vault_app::logging::LOG_DIR_ENV) {
+        match vault_app::logging::init(Path::new(&dir)) {
+            Ok(path) => {
+                tracing::info!(log_file = %path.display(), "file logging started");
+                return;
+            }
+            Err(e) => {
+                eprintln!("memory-vault: could not start file logging: {e}");
+            }
+        }
+    }
+
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("warn,vault_cli=info,vault_mcp=info"));
     // Write to STDERR, not STDOUT. The `mcp serve` subcommand reserves
@@ -763,7 +798,9 @@ async fn dispatch_consolidate(
     )
     .await?;
     match action {
-        ConsolidateAction::Run => run_one_consolidation(&app).await,
+        ConsolidateAction::Run { record_status } => {
+            run_one_consolidation(&app, record_status.as_deref()).await
+        }
     }
 }
 
@@ -1049,14 +1086,45 @@ async fn build_application(
     })
 }
 
-async fn run_one_consolidation(app: &Application) -> Result<()> {
+async fn run_one_consolidation(app: &Application, record_status: Option<&Path>) -> Result<()> {
     println!("starting consolidation run...");
     let report = app
         .run_consolidation_with_safety()
         .await
         .context("consolidation run failed")?;
     print_consolidation_report(&report);
+
+    if let Some(status_path) = record_status {
+        let outcome = RunOutcome::Completed(run_summary_of(&report));
+        // Best-effort: a status file we could not write is a stale badge in
+        // the UI, not a reason to fail a consolidation that already succeeded
+        // and already committed its work.
+        if let Err(e) =
+            maintenance_state::record_run(status_path, &outcome, chrono::Utc::now().to_rfc3339())
+        {
+            tracing::warn!(error = %e, "could not record the maintenance outcome");
+        }
+    }
     Ok(())
+}
+
+/// Project a [`ConsolidationReport`] onto the counters that are safe to write
+/// to `maintenance.json`.
+///
+/// This is the privacy boundary for ADR-SEC-016: the report also carries
+/// `summary_markdown` and per-conflict `reasoning`, both derived from memory
+/// content, and neither crosses into the plaintext status file. The mapping is
+/// explicit field-by-field rather than a serde passthrough so that adding a
+/// text field to `ConsolidationReport` cannot silently start leaking it.
+fn run_summary_of(r: &ConsolidationReport) -> RunSummary {
+    RunSummary {
+        memories_processed: r.memories_processed as u64,
+        memories_merged: r.memories_merged as u64,
+        memories_deduped: r.memories_deduped as u64,
+        memories_archived: r.memories_archived as u64,
+        contradictions_resolved: r.contradictions_resolved as u64,
+        duration_secs: r.duration.as_secs(),
+    }
 }
 
 fn print_consolidation_report(r: &ConsolidationReport) {
@@ -1611,12 +1679,90 @@ mod tests {
                 assert_eq!(ort_lib, PathBuf::from("/tmp/libonnxruntime.so"));
                 assert_eq!(phi4_model, PathBuf::from("/tmp/phi-4-mini.gguf"));
                 assert!(
-                    matches!(action, ConsolidateAction::Run),
+                    matches!(
+                        action,
+                        ConsolidateAction::Run {
+                            record_status: None
+                        }
+                    ),
                     "expected ConsolidateAction::Run; got {action:?}"
                 );
             }
             other => panic!("expected Command::Consolidate, got: {other:?}"),
         }
+    }
+
+    /// ADR-SEC-016: the scheduled path passes `--record-status` so the run
+    /// that does the work is the one that reports it. A parse regression here
+    /// would silently return the Maintenance tab to showing a stale outcome
+    /// forever, which is the exact bug the flag exists to fix.
+    #[test]
+    fn cli_parses_consolidate_run_with_a_status_file() {
+        let cli = Cli::try_parse_from([
+            "vault-cli",
+            "--vault-db",
+            "/tmp/vault.db",
+            "--vector-dir",
+            "/tmp/lance",
+            "--graph-db",
+            "/tmp/graph.duckdb",
+            "consolidate",
+            "--bge-model",
+            "/tmp/bge.onnx",
+            "--bge-tokenizer",
+            "/tmp/tokenizer.json",
+            "--ort-lib",
+            "/tmp/libonnxruntime.so",
+            "--phi4-model",
+            "/tmp/phi-4-mini.gguf",
+            "run",
+            "--record-status",
+            "/tmp/maintenance.json",
+        ])
+        .expect("consolidate-run with --record-status should parse");
+        match cli.command {
+            Command::Consolidate { action, .. } => match action {
+                ConsolidateAction::Run { record_status } => {
+                    assert_eq!(record_status, Some(PathBuf::from("/tmp/maintenance.json")));
+                }
+            },
+            other => panic!("expected Command::Consolidate, got: {other:?}"),
+        }
+    }
+
+    /// The projection that keeps memory-derived text out of a plaintext file.
+    #[test]
+    fn the_recorded_summary_carries_counters_not_report_prose() {
+        let report = ConsolidationReport {
+            memories_processed: 41,
+            memories_merged: 3,
+            contradictions_resolved: 4,
+            contradictions_auto_resolved: 0,
+            memories_archived: 1,
+            memories_decayed: 0,
+            clusters_deduped: 0,
+            memories_deduped: 2,
+            clusters_skipped: 0,
+            duration: std::time::Duration::from_secs(82),
+            conflicts_for_user_review: Vec::new(),
+            checkpoint_id: None,
+            summary_markdown: "the user moved to Porto and stopped cycling".into(),
+        };
+
+        let summary = run_summary_of(&report);
+        assert_eq!(summary.memories_processed, 41);
+        assert_eq!(summary.memories_merged, 3);
+        assert_eq!(summary.memories_deduped, 2);
+        assert_eq!(summary.memories_archived, 1);
+        assert_eq!(summary.contradictions_resolved, 4);
+        assert_eq!(summary.duration_secs, 82);
+
+        // The report's prose must not survive the projection.
+        let line = summary.to_line();
+        assert!(
+            !line.contains("Porto") && !line.contains("cycling"),
+            "memory-derived text reached the plaintext status line: {line}"
+        );
     }
 
     #[test]

@@ -1072,6 +1072,56 @@ async function eraseEverything() {
   }, 2500);
 }
 
+// -- diagnostic log export (ADR-SEC-017) --
+
+// The save dialog. Guarded like the other bridges so the UI still renders in a
+// plain browser for design review.
+const saveDialog = window.__TAURI__ && window.__TAURI__.dialog
+  ? window.__TAURI__.dialog.save
+  : async () => null;
+
+// A default filename the user can recognise in their Downloads folder a week
+// later. Dated, because the second thing we ask is always "when was this?".
+function logExportFilename() {
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  return `memory-vault-log-${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}.txt`;
+}
+
+async function exportLogs() {
+  const status = $("export-logs-status");
+  status.textContent = "";
+
+  let destination;
+  try {
+    destination = await saveDialog({
+      defaultPath: logExportFilename(),
+      filters: [{ name: "Text file", extensions: ["txt"] }],
+    });
+  } catch (_) {
+    status.textContent = "Could not open the save window. Please try again.";
+    return;
+  }
+  // Cancelled. Not an error, and saying nothing is the right response.
+  if (!destination) return;
+
+  $("export-logs").disabled = true;
+  status.textContent = "Saving…";
+  try {
+    const bytes = await invoke("export_logs", { destination });
+    const kb = Math.max(1, Math.round(Number(bytes) / 1024));
+    status.textContent = `Saved (${kb} KB). You can attach this file to an email.`;
+  } catch (err) {
+    // Distinguish "nothing to send" from "we could not write it" — they lead
+    // the user to completely different next steps.
+    status.textContent = String(err) === "log_export_empty"
+      ? "There is nothing recorded yet, so there is nothing to save."
+      : "Could not save the file. Please pick a different folder and try again.";
+  } finally {
+    $("export-logs").disabled = false;
+  }
+}
+
 // -- maintenance tab --
 
 const WEEKDAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
@@ -1403,6 +1453,7 @@ function init() {
 
   // home — settings
   $("replay-welcome").addEventListener("click", replayWelcome);
+  $("export-logs").addEventListener("click", exportLogs);
 
   // home — settings — delete everything (ADR-SEC-008)
   $("erase-reveal").addEventListener("click", revealEraseConfirm);

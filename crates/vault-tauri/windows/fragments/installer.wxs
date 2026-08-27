@@ -112,6 +112,32 @@
           Source="C:\Projects\GitHub\Memory Vault\target\release\vault-cli.exe"
           KeyPath="yes" />
       </Component>
+
+      <!--
+        ADR-SEC-015 — the windowless maintenance runner.
+
+        MUST ship beside vault-cli.exe. The runner resolves its child as its
+        own SIBLING (`current_exe().parent()`), so installing one without the
+        other gives a scheduled task that starts, finds nothing to run, and
+        records a failed maintenance run every night.
+
+        This is the binary the registered OS task points at. `vault-cli.exe` is
+        a console program, so scheduling it directly opened a black terminal on
+        the user's desktop at login — observed on the founder's machine
+        2026-08-27. This one is linked for the Windows subsystem and spawns
+        vault-cli with CREATE_NO_WINDOW, so nothing is ever displayed.
+
+        Same @Id-by-hand reasoning as VaultCliBinary above: the hyphen in
+        "vault-maintenance" is an illegal WiX identifier, so we name the
+        component ourselves and the natural filename ships unchanged.
+      -->
+      <Component Id="VaultMaintenanceBinary" Guid="5F1B3D7C-8A2E-4C6B-9D4F-1E3A5C7B9D2F">
+        <File
+          Id="VaultMaintenanceExe"
+          Name="vault-maintenance.exe"
+          Source="C:\Projects\GitHub\Memory Vault\target\release\vault-maintenance.exe"
+          KeyPath="yes" />
+      </Component>
     </DirectoryRef>
 
     <!--

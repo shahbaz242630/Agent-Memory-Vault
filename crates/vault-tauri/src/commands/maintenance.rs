@@ -8,18 +8,35 @@
 //!   does NOT gate onboarding: recall never needs Phi-4, only maintenance does.
 //! - [`get_maintenance_schedule`] / [`set_maintenance_schedule`] — read and
 //!   change the schedule. `set` registers (or removes) a per-user OS task via
-//!   `vault-scheduler` that runs the bundled `vault-cli consolidate run`
-//!   (ADR-093), and persists the user's choice.
+//!   `vault-scheduler` that runs the bundled `vault-maintenance` runner
+//!   (ADR-093, ADR-SEC-015), and persists the user's choice.
 //! - [`run_maintenance_now`] — run a consolidation immediately by spawning the
-//!   same bundled `vault-cli` as a subprocess (one code path with the schedule).
+//!   same bundled runner (one code path with the schedule).
 //!
 //! ## Why the desktop app never loads Phi-4 (ADR-093)
 //!
-//! Both the scheduled run and "Run now" launch `vault-cli` in its own
+//! Both the scheduled run and "Run now" launch the consolidation in its own
 //! short-lived process. The desktop app therefore never loads the 2.5 GB model
 //! into its own address space, and there is exactly one consolidation code
-//! path. The scheduled/subprocess command is pointed at the desktop app's exact
-//! vault paths so it operates on the same vault.
+//! path. The subprocess is pointed at the desktop app's exact vault paths so it
+//! operates on the same vault.
+//!
+//! ## Why the runner and not `vault-cli` directly (ADR-SEC-015)
+//!
+//! `vault-cli` is a console program, so Windows gives it a console window. A
+//! task registered under `InteractiveToken` therefore opened a black terminal
+//! on the user's desktop — which is exactly what happened to the founder at
+//! login on 2026-08-27. `vault-maintenance` is linked for the Windows subsystem
+//! and spawns `vault-cli` with `CREATE_NO_WINDOW`, so neither process shows a
+//! window. Both entry points here go through it.
+//!
+//! ## Who records the outcome (ADR-SEC-016)
+//!
+//! Whoever *ran* maintenance, not whoever started it. `vault-cli` writes its
+//! own counters once it has a report; the runner records a run that never got
+//! that far. This module reads `maintenance.json`, and no longer writes a
+//! `last_run` of its own — a scheduled run with the app closed must update the
+//! same status the tab shows.
 //!
 //! ## Single-writer safety
 //!
@@ -37,8 +54,9 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tauri::{Emitter, State};
+use vault_app::maintenance_state::{self, LastRun, MaintenanceConfig, RunOutcome};
 use vault_app::Application;
 use vault_mcp::ToolInvokeDetails;
 use vault_scheduler::{platform_scheduler, Frequency, ScheduleSpec, SchedulerError, TaskId};
@@ -74,6 +92,13 @@ pub const ERR_MAINTENANCE_FAILED: &str = "maintenance_run_failed";
 pub struct MaintenanceContext {
     /// Absolute path to the bundled `vault-cli` executable.
     pub vault_cli: PathBuf,
+    /// Absolute path to the bundled `vault-maintenance` executable — the
+    /// windowless runner both the schedule and "Run now" go through
+    /// (ADR-SEC-015).
+    pub vault_maintenance: PathBuf,
+    /// Directory the application log lives in, handed to the runner so a
+    /// background run's diagnostics reach the same file as the app's.
+    pub log_dir: PathBuf,
     /// The desktop app's SQLCipher metadata DB (`<data>/vault.db`).
     pub vault_db: PathBuf,
     /// The desktop app's LanceDB dir (`<data>/lance`).
@@ -92,11 +117,19 @@ pub struct MaintenanceContext {
     pub config_path: PathBuf,
 }
 
-/// Build the full `vault-cli` argument vector (after the program) for a
-/// consolidation run against the desktop app's own vault.
+/// Build the full `vault-maintenance` argument vector (after the program) for
+/// a consolidation run against the desktop app's own vault.
+///
+/// The runner's own two flags come first; everything after them is forwarded
+/// to `vault-cli` verbatim (ADR-SEC-015). The runner appends `--record-status`
+/// itself, so the status file is named exactly once, here.
 fn consolidate_args(ctx: &MaintenanceContext) -> Vec<String> {
     let s = |p: &Path| p.to_string_lossy().into_owned();
     vec![
+        "--status-file".into(),
+        s(&ctx.config_path),
+        "--log-dir".into(),
+        s(&ctx.log_dir),
         "--vault-db".into(),
         s(&ctx.vault_db),
         "--vector-dir".into(),
@@ -165,49 +198,6 @@ impl MaintenanceEngineProgress {
     }
 }
 
-/// The persisted schedule choice (`<data>/maintenance.json`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MaintenanceConfig {
-    /// Whether automatic maintenance is turned on.
-    pub enabled: bool,
-    /// `"daily"` or `"weekly"`.
-    pub frequency: String,
-    /// Day of week for a weekly schedule, 0 = Sunday .. 6 = Saturday.
-    pub weekday: u8,
-    /// Hour of day (0-23).
-    pub hour: u8,
-    /// Minute of hour (0-59).
-    pub minute: u8,
-    /// Outcome of the most recent run, if any.
-    #[serde(default)]
-    pub last_run: Option<LastRun>,
-}
-
-impl Default for MaintenanceConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            frequency: "daily".to_string(),
-            weekday: 0,
-            hour: 3,
-            minute: 0,
-            last_run: None,
-        }
-    }
-}
-
-/// The outcome of a maintenance run, shown in the tab.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LastRun {
-    /// RFC-3339 timestamp of completion.
-    pub finished_at: String,
-    /// Whether it succeeded.
-    pub ok: bool,
-    /// A short human-readable summary (the consolidation report, truncated) or
-    /// an error code.
-    pub summary: String,
-}
-
 /// What the Maintenance tab renders.
 #[derive(Debug, Clone, Serialize)]
 pub struct ScheduleView {
@@ -232,16 +222,16 @@ pub struct ScheduleView {
 /// Load the persisted config, falling back to the default when absent or
 /// unreadable (a corrupt file must not brick the tab).
 fn load_config(path: &Path) -> MaintenanceConfig {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    maintenance_state::load(path)
 }
 
-/// Persist the config as pretty JSON.
+/// Persist the config atomically, mapping any failure to the opaque code the
+/// IPC boundary allows (§11.7.2).
 fn save_config(path: &Path, config: &MaintenanceConfig) -> Result<(), String> {
-    let json = serde_json::to_string_pretty(config).map_err(|_| ERR_SCHEDULE_FAILED.to_string())?;
-    std::fs::write(path, json).map_err(|_| ERR_SCHEDULE_FAILED.to_string())
+    maintenance_state::save(path, config).map_err(|e| {
+        tracing::error!(error = %e, "could not persist the maintenance schedule");
+        ERR_SCHEDULE_FAILED.to_string()
+    })
 }
 
 /// Map a 0-6 index (Sunday-based) to a [`chrono::Weekday`].
@@ -285,7 +275,10 @@ fn build_spec(
         label: MAINTENANCE_LABEL.to_string(),
         frequency,
         time_of_day,
-        program: ctx.vault_cli.clone(),
+        // The windowless runner, never `vault-cli` directly (ADR-SEC-015).
+        // Pointing this at a console binary is what put an unexplained black
+        // terminal on the founder's screen at login on 2026-08-27.
+        program: ctx.vault_maintenance.clone(),
         args: consolidate_args(ctx),
         env: vec![(
             LANCE_MEM_POOL_ENV.0.to_string(),
@@ -294,15 +287,19 @@ fn build_spec(
     })
 }
 
-/// Truncate `s` to at most `max` characters, appending an ellipsis when cut.
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(max).collect();
-        out.push('…');
-        out
-    }
+/// Read back the summary the run just recorded, for the UI to display.
+///
+/// Reading the file rather than the child's stdout means the UI and the
+/// Maintenance tab always show the same line, and that line is the
+/// counters-only one built in `vault_app::maintenance_state` — never report
+/// prose. Falls back to the generic success wording if the file could not be
+/// read, because the run itself did succeed and saying otherwise would be a
+/// lie about the vault's state.
+fn recorded_summary(config_path: &Path) -> String {
+    load_config(config_path)
+        .last_run
+        .map(|r| r.summary)
+        .unwrap_or_else(|| "maintenance complete".to_string())
 }
 
 /// Download Phi-4 (the maintenance engine) if absent, reporting progress.
@@ -471,48 +468,51 @@ pub async fn run_maintenance_now(
     let start = Instant::now();
     let args = consolidate_args(&ctx);
 
-    let output = tokio::process::Command::new(&ctx.vault_cli)
+    // Through the windowless runner, exactly as the schedule does
+    // (ADR-SEC-015): one code path, and no console window flashes over the app
+    // when the user presses the button.
+    let output = tokio::process::Command::new(&ctx.vault_maintenance)
         .args(&args)
         .env(LANCE_MEM_POOL_ENV.0, LANCE_MEM_POOL_ENV.1)
         .output()
         .await;
 
+    // The run records its own outcome into `maintenance.json` (ADR-SEC-016) —
+    // this command no longer writes it. That keeps one writer for the status
+    // regardless of who started the run, and it is what stops the child's
+    // stdout (which carries `summary_markdown` and contradiction reasoning,
+    // both derived from memory content) reaching a plaintext file.
     let (result, result_count): (Result<String, String>, u32) = match output {
-        Ok(out) if out.status.success() => {
-            let summary = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            (Ok(summary), 1)
-        }
+        Ok(out) if out.status.success() => (Ok(recorded_summary(&ctx.config_path)), 1),
         Ok(out) => {
             let combined = format!(
                 "{}{}",
                 String::from_utf8_lossy(&out.stderr),
                 String::from_utf8_lossy(&out.stdout)
-            )
-            .to_lowercase();
-            if combined.contains("busy") || combined.contains("already in use") {
-                tracing::warn!("maintenance run skipped: vault in use by another writer");
-                (Err(ERR_MAINTENANCE_BUSY.to_string()), 0)
-            } else {
-                tracing::error!(status = %out.status, "maintenance run failed");
-                (Err(ERR_MAINTENANCE_FAILED.to_string()), 0)
+            );
+            match maintenance_state::classify_failure(&combined) {
+                RunOutcome::Busy => {
+                    tracing::warn!("maintenance run skipped: vault in use by another writer");
+                    (Err(ERR_MAINTENANCE_BUSY.to_string()), 0)
+                }
+                _ => {
+                    tracing::error!(status = %out.status, "maintenance run failed");
+                    (Err(ERR_MAINTENANCE_FAILED.to_string()), 0)
+                }
             }
         }
         Err(e) => {
-            tracing::error!(error = %e, "failed to spawn vault-cli for maintenance");
+            tracing::error!(error = %e, "failed to spawn the maintenance runner");
+            // The runner never started, so nothing recorded an outcome. Do it
+            // here or the tab keeps showing the previous run forever.
+            let _ = maintenance_state::record_run(
+                &ctx.config_path,
+                &RunOutcome::Failed,
+                chrono::Utc::now().to_rfc3339(),
+            );
             (Err(ERR_MAINTENANCE_FAILED.to_string()), 0)
         }
     };
-
-    let mut config = load_config(&ctx.config_path);
-    config.last_run = Some(LastRun {
-        finished_at: chrono::Utc::now().to_rfc3339(),
-        ok: result.is_ok(),
-        summary: match &result {
-            Ok(s) => truncate(s, 500),
-            Err(code) => code.clone(),
-        },
-    });
-    let _ = save_config(&ctx.config_path, &config);
 
     let duration_ms = start.elapsed().as_millis() as u64;
     let error_for_audit = result.as_ref().err().map(|_| {
@@ -545,6 +545,10 @@ mod tests {
     fn ctx() -> MaintenanceContext {
         MaintenanceContext {
             vault_cli: PathBuf::from(r"C:\Program Files\Memory Vault\vault-cli.exe"),
+            vault_maintenance: PathBuf::from(
+                r"C:\Program Files\Memory Vault\vault-maintenance.exe",
+            ),
+            log_dir: PathBuf::from(r"C:\logs"),
             vault_db: PathBuf::from(r"C:\data\vault.db"),
             vector_dir: PathBuf::from(r"C:\data\lance"),
             graph_db: PathBuf::from(r"C:\data\graph.duckdb"),
@@ -676,9 +680,52 @@ mod tests {
         }
     }
 
+    /// ADR-SEC-015: the schedule must point at the windowless runner. If this
+    /// ever goes back to `vault_cli`, every user gets an unexplained black
+    /// console window at login — the defect the founder hit on 2026-08-27.
     #[test]
-    fn truncate_keeps_short_and_cuts_long() {
-        assert_eq!(truncate("short", 10), "short");
-        assert_eq!(truncate("abcdef", 3), "abc…");
+    fn the_registered_task_runs_the_windowless_runner() {
+        let ctx = ctx();
+        let config = MaintenanceConfig {
+            enabled: true,
+            ..MaintenanceConfig::default()
+        };
+        let spec = build_spec(&ctx, &config).expect("spec should build");
+        assert_eq!(spec.program, ctx.vault_maintenance);
+        assert_ne!(
+            spec.program, ctx.vault_cli,
+            "scheduling the console binary is what shows a window"
+        );
+    }
+
+    /// The runner's own flags must lead, and the child's arguments follow
+    /// untouched — that ordering is what `trailing_var_arg` on the runner
+    /// depends on.
+    #[test]
+    fn the_runner_receives_its_own_flags_before_the_forwarded_arguments() {
+        let ctx = ctx();
+        let args = consolidate_args(&ctx);
+
+        assert_eq!(args[0], "--status-file");
+        assert_eq!(args[1], ctx.config_path.to_string_lossy());
+        assert_eq!(args[2], "--log-dir");
+        assert_eq!(args[3], ctx.log_dir.to_string_lossy());
+        assert_eq!(args[4], "--vault-db", "the child's arguments follow");
+        assert!(
+            args.iter().any(|a| a == "run"),
+            "the consolidation subcommand must still be forwarded"
+        );
+    }
+
+    /// The status file is named once, by the app. The runner appends
+    /// `--record-status` itself, so naming it here too would pass it twice.
+    #[test]
+    fn the_app_does_not_pass_record_status_itself() {
+        let ctx = ctx();
+        let args = consolidate_args(&ctx);
+        assert!(
+            !args.iter().any(|a| a == "--record-status"),
+            "the runner owns this flag"
+        );
     }
 }

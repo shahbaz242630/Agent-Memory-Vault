@@ -131,6 +131,7 @@ fn main() {
             vault_tauri::commands::maintenance::set_maintenance_schedule,
             vault_tauri::commands::maintenance::run_maintenance_now,
             vault_tauri::commands::erasure::erase_everything,
+            vault_tauri::commands::logs::export_logs,
         ])
         .setup(|app| {
             // 0. File logging FIRST, so every later step in this closure --
@@ -142,19 +143,32 @@ fn main() {
             //    could not open a log file has turned a diagnostic aid into an
             //    outage. On failure we carry on with no log rather than block
             //    the user from their own memories.
-            match app.path().app_log_dir() {
-                Ok(dir) => match vault_tauri::logging::init(&dir) {
-                    Ok(path) => {
-                        tracing::info!(
-                            target: "vault_tauri::startup",
-                            log_file = %path.display(),
-                            "file logging started"
-                        );
+            //
+            //    The directory is kept: the maintenance runner is handed it so
+            //    a background run writes to the same file (ADR-SEC-015), and
+            //    `export_logs` reads it back (ADR-SEC-017).
+            let log_dir = match app.path().app_log_dir() {
+                Ok(dir) => {
+                    match vault_app::logging::init(&dir) {
+                        Ok(path) => {
+                            tracing::info!(
+                                target: "vault_tauri::startup",
+                                log_file = %path.display(),
+                                "file logging started"
+                            );
+                        }
+                        Err(e) => eprintln!("memory-vault: could not start file logging: {e}"),
                     }
-                    Err(e) => eprintln!("memory-vault: could not start file logging: {e}"),
-                },
-                Err(e) => eprintln!("memory-vault: could not locate a log directory: {e}"),
-            }
+                    dir
+                }
+                Err(e) => {
+                    eprintln!("memory-vault: could not locate a log directory: {e}");
+                    // Carry on with a path that simply holds no logs. Export
+                    // then reports "nothing to send", which is honest, rather
+                    // than the app refusing to start over a log directory.
+                    PathBuf::new()
+                }
+            };
 
             // 1. Resolve libonnxruntime dylib path per ADR-019.
             let ort_lib_path = match resolve_ort_lib_path(app.handle()) {
@@ -331,6 +345,11 @@ fn main() {
             let models_dir = data_dir.join("models");
             let maintenance_ctx = vault_tauri::commands::maintenance::MaintenanceContext {
                 vault_cli: resolve_vault_cli_path(),
+                // ADR-SEC-015: the windowless runner both entry points go
+                // through. Pointing the schedule at `vault-cli` is what showed
+                // a console window on the founder's desktop at login.
+                vault_maintenance: resolve_vault_maintenance_path(),
+                log_dir: log_dir.clone(),
                 vault_db: metadata_path.clone(),
                 vector_dir: vector_dir.clone(),
                 graph_db: graph_path.clone(),
@@ -453,6 +472,9 @@ fn main() {
             //    context for building the `vault-cli` invocation, plus the
             //    first-run Phi-4 download deduper (bound to the same models
             //    dir so what onboarding fetches is what a run later loads).
+            app.manage(vault_tauri::commands::logs::LogContext {
+                log_dir: log_dir.clone(),
+            });
             app.manage(maintenance_ctx);
             app.manage(vault_tauri::commands::maintenance::MaintenanceEngineFetch::new(models_dir));
 
@@ -555,17 +577,34 @@ fn resolve_reranker_paths(data_dir: &std::path::Path) -> (PathBuf, PathBuf) {
 /// during development. Falls back to the bare name (resolved via PATH, which the
 /// installer also puts the install dir on) if the current-exe lookup fails.
 fn resolve_vault_cli_path() -> PathBuf {
-    if let Some(p) = env_override_for("VAULT_CLI_PATH") {
+    resolve_sibling_binary("VAULT_CLI_PATH", "vault-cli")
+}
+
+/// Resolve the bundled `vault-maintenance` runner (ADR-SEC-015).
+///
+/// The windowless binary the OS task and "Run now" both invoke. Dev-mode
+/// override via `VAULT_MAINTENANCE_PATH`.
+fn resolve_vault_maintenance_path() -> PathBuf {
+    resolve_sibling_binary("VAULT_MAINTENANCE_PATH", "vault-maintenance")
+}
+
+/// Resolve a bundled executable that ships beside this one.
+///
+/// Honours an env override first (dev trees keep the binaries elsewhere), then
+/// falls back to a sibling of our own executable — which is where the
+/// installer puts them, and which cannot be redirected by the user's `PATH`.
+fn resolve_sibling_binary(env_var: &str, stem: &str) -> PathBuf {
+    if let Some(p) = env_override_for(env_var) {
         return p;
     }
     let exe_name = if cfg!(windows) {
-        "vault-cli.exe"
+        format!("{stem}.exe")
     } else {
-        "vault-cli"
+        stem.to_string()
     };
     std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join(exe_name)))
+        .and_then(|exe| exe.parent().map(|dir| dir.join(&exe_name)))
         .unwrap_or_else(|| PathBuf::from(exe_name))
 }
 
