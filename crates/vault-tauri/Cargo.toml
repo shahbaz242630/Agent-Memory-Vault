@@ -47,9 +47,13 @@ vault-llm = { path = "../vault-llm" }
 vault-scheduler = { path = "../vault-scheduler" }
 
 # Async runtime + tracing per workspace deps.
+#
+# `tracing-subscriber` is deliberately NOT declared here any more: subscriber
+# setup moved to `vault_app::logging` (ADR-SEC-015) so the desktop app and the
+# windowless maintenance runner write one log through one implementation. This
+# crate emits events and no longer configures where they go.
 tokio = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # Time-of-day / weekday for the maintenance schedule, and the last-run

@@ -30,6 +30,8 @@ mod config;
 mod consolidator_lock;
 pub mod erasure;
 pub mod keychain;
+pub mod logging;
+pub mod maintenance_state;
 mod normalization;
 pub mod process_exit;
 pub mod signal_source;

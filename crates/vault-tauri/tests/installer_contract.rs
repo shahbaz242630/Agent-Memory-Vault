@@ -219,6 +219,61 @@ fn every_component_ref_resolves_to_a_component_in_the_fragment() {
 }
 
 // ---------------------------------------------------------------------------
+// Guard 3b — the windowless maintenance runner ships (ADR-SEC-015).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_installer_ships_the_windowless_maintenance_runner() {
+    let markup = markup();
+
+    assert!(
+        markup.contains("Name=\"vault-maintenance.exe\""),
+        "installer.wxs no longer installs vault-maintenance.exe.\n\n\
+         The registered OS task points at that binary. Without it the nightly \
+         task starts, finds nothing, and records a failed maintenance run \
+         every morning."
+    );
+    assert!(
+        component_refs(TAURI_CONF)
+            .iter()
+            .any(|id| id == "VaultMaintenanceBinary"),
+        "tauri.conf.json stopped referencing VaultMaintenanceBinary, so the \
+         component is compiled out of the MSI with no error."
+    );
+}
+
+#[test]
+fn the_runner_and_its_child_install_into_the_same_directory() {
+    // The runner resolves `vault-cli` as its own SIBLING. Splitting them
+    // across directories compiles, installs, and fails only at 3am on a user's
+    // machine.
+    let markup = markup();
+    let cli = markup
+        .find("Name=\"vault-cli.exe\"")
+        .expect("vault-cli.exe must ship");
+    let runner = markup
+        .find("Name=\"vault-maintenance.exe\"")
+        .expect("vault-maintenance.exe must ship");
+    let install_dir = markup
+        .find("<DirectoryRef Id=\"INSTALLDIR\">")
+        .expect("INSTALLDIR ref must exist");
+    let after = markup[install_dir..]
+        .find("</DirectoryRef>")
+        .map(|i| i + install_dir)
+        .expect("the INSTALLDIR ref must close");
+
+    assert!(
+        cli > install_dir && cli < after,
+        "vault-cli.exe must install under INSTALLDIR"
+    );
+    assert!(
+        runner > install_dir && runner < after,
+        "vault-maintenance.exe must install under the SAME INSTALLDIR ref -- \
+         the runner looks for its child beside itself"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Guard 4 — the removal action shares the referenced components' fragment.
 // ---------------------------------------------------------------------------
 

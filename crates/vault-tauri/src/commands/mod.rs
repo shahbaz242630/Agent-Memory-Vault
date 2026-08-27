@@ -62,6 +62,7 @@ pub mod agent;
 pub mod boundary;
 pub mod engine;
 pub mod erasure;
+pub mod logs;
 pub mod maintenance;
 pub mod memory;
 pub mod settings;
@@ -72,6 +73,7 @@ pub use boundary::{
 };
 pub use engine::{ensure_recall_engine, RecallEngineFetch};
 pub use erasure::{erase_everything, erase_everything_inner};
+pub use logs::{export_logs, LogContext};
 pub use maintenance::{MaintenanceContext, MaintenanceEngineFetch};
 pub use memory::{
     add_memory, add_memory_inner, delete_memory, delete_memory_inner, list_recent_memories,

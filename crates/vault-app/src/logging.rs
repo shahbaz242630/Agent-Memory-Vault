@@ -1,4 +1,4 @@
-//! On-disk application log for the desktop app (ADR-SEC-014).
+//! On-disk application log (ADR-SEC-014; moved here by ADR-SEC-015).
 //!
 //! # Why this exists
 //!
@@ -6,6 +6,18 @@
 //! writes to **stdout**. A GUI process launched from Explorer or the Start menu
 //! has no console attached, so every `tracing` event this application has ever
 //! emitted went nowhere.
+//!
+//! # Why it lives in `vault-app` rather than the desktop app
+//!
+//! ADR-SEC-015 made the nightly maintenance run **windowless**, which removed
+//! the last place its output could have gone: a scheduled console process with
+//! no console has no stderr either. The run that operates on the vault
+//! unattended is precisely the one whose logs we cannot afford to lose, so the
+//! two binaries that need file logging — the desktop app and the maintenance
+//! path — now share one implementation in the crate they both depend on.
+//!
+//! Sharing it also keeps `tests/log_privacy.rs` meaningful: one writer, one set
+//! of rules, one place to check them.
 //!
 //! That was survivable while the only user was the founder, sitting at the
 //! machine, able to be asked questions directly. It stops being survivable at
@@ -69,7 +81,16 @@ pub const ROTATE_AT_BYTES: u64 = 5 * 1024 * 1024;
 /// the rotation budget in minutes.
 pub const DEFAULT_FILTER: &str = "warn,vault_app=info,vault_tauri=info,vault_storage=info,\
                                   vault_retrieval=info,vault_consolidator=info,vault_mcp=info,\
-                                  vault_scheduler=info";
+                                  vault_scheduler=info,vault_cli=info,vault_maintenance=info";
+
+/// Environment variable that redirects a console binary's logs into the shared
+/// application log file (ADR-SEC-015).
+///
+/// The windowless maintenance path sets this on the `vault-cli` child it
+/// spawns. Without it that child logs to stderr, which a process created with
+/// `CREATE_NO_WINDOW` has nowhere to show — the nightly run would be silent
+/// exactly when something went wrong overnight.
+pub const LOG_DIR_ENV: &str = "VAULT_LOG_DIR";
 
 /// A log file behind a mutex, usable as a `tracing` writer.
 ///
@@ -252,6 +273,20 @@ mod tests {
             assert!(
                 DEFAULT_FILTER.contains(&format!("{crate_name}=info")),
                 "{crate_name} must log at info"
+            );
+        }
+    }
+
+    #[test]
+    fn the_filter_covers_the_windowless_maintenance_path() {
+        // ADR-SEC-015: the scheduled run has no console, so this file is its
+        // only output. If these two are filtered out, a nightly failure leaves
+        // no trace anywhere -- which is the situation ADR-SEC-014 existed to
+        // end.
+        for crate_name in ["vault_cli", "vault_maintenance"] {
+            assert!(
+                DEFAULT_FILTER.contains(&format!("{crate_name}=info")),
+                "{crate_name} must log at info -- it is the unattended path"
             );
         }
     }

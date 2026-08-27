@@ -37,7 +37,7 @@
     "windows": {
       "wix": {
         "fragmentPaths": ["./windows/fragments/installer.wxs"],
-        "componentRefs": ["SetLanceMemPoolEnv", "VaultCliBinary", "AddInstallDirToPath"]
+        "componentRefs": ["SetLanceMemPoolEnv", "VaultCliBinary", "VaultMaintenanceBinary", "AddInstallDirToPath"]
       }
     }
   }
