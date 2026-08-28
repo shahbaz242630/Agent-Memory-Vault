@@ -36,24 +36,37 @@
 
 > ### ▶️ START HERE — session 34 opener (written at session-33 close, 2026-08-28)
 >
-> **In one line:** the product now has a name, a domain, an icon and a verified installer — **Zaaheen**, zaaheen.com — and the three defects the founder found by *switching his laptop on* are fixed, live-proven on hardware, and committed. **The domain blocker open since session 22 is CLOSED.** What has still never happened: this app running on a computer that is not the founder's.
+> **In one line:** the product now has a name, a domain, an icon and a verified installer — **Zaaheen**, zaaheen.com — and the three defects the founder found by *switching his laptop on* are fixed, live-proven on hardware, and committed. ⚠️ **All of it sits on PR #50, unmerged** — CI was still running at session close, so merging is step 1 below, not something already done. **The domain blocker open since session 22 is CLOSED.** What has still never happened: this app running on a computer that is not the founder's.
 >
 > ### 🎯 DO THIS FIRST (session 34)
 >
-> **1. 🔴 INSTALL IT ON A MACHINE THAT IS NOT THE FOUNDER'S.** Unchanged as the top item, and now genuinely unblocked: there is a verified installer at `C:\Projects\MemoryVault-artifacts\Zaaheen_0.2.0_beta-candidate.msi` (205.6 MB). Every install, gate run and live verification in this project's history has happened on one Windows box. A different Windows build, a missing VC++ redistributable, or antivirus quarantining an unsigned 205 MB installer have never been exercised once. **One clean machine or fresh VM before thirty strangers.** Not a code problem, and the highest-value thing left.
+> **1. 🟡 MERGE PR #50 FIRST — everything below assumes it landed.**
+>
+> Six commits, the whole of session 33: ADR-SEC-015/016/017 + Amendment 1, ADR-SEC-018 (the Zaaheen rename), the sage icon, the binary-name and duration fixes, the landing page, and this HANDOFF. Branch `fix/windowless-maintenance-and-log-export`, base `main`.
+>
+> ```
+> gh run list --branch fix/windowless-maintenance-and-log-export -L 3   # confirm green FIRST
+> gh pr merge 50 --rebase                                               # linear history is enforced
+> ```
+>
+> ⚠️ **It was NOT merged at session close because CI had not finished.** A `--force-with-lease` at 11:41 (removing a BOM that PowerShell had put in a commit subject) restarted the whole matrix, leaving `Analyse`, both Windows checks and all three `build + test` legs PENDING and `mergeStateStatus: BLOCKED`. Nothing was failing — it simply had not reported.
+>
+> **Do not merge on an unfinished matrix.** That rule exists because 22 commits once went in while CI was silently red (T0.1.6 → T0.1.9). Check, then merge.
+>
+> **2. 🔴 INSTALL IT ON A MACHINE THAT IS NOT THE FOUNDER'S.** The highest-value item once the merge is in, and now genuinely unblocked: there is a verified installer at `C:\Projects\MemoryVault-artifacts\Zaaheen_0.2.0_beta-candidate.msi` (205.6 MB). Every install, gate run and live verification in this project's history has happened on one Windows box. A different Windows build, a missing VC++ redistributable, or antivirus quarantining an unsigned 205 MB installer have never been exercised once. **One clean machine or fresh VM before thirty strangers.** Not a code problem, and the highest-value thing left.
 >
 > ⚠️ **Uninstall "Memory Vault" first if present.** Zaaheen has a different `UpgradeCode` (`{813E4161…}` vs `{2555FD66…}`) so it does **not** upgrade in place — installing both leaves two products in Add/Remove Programs. Correct for a renamed product, but it will surprise anyone not expecting it.
 >
-> **2. VERIFY THE THREE FIXES ON REAL HARDWARE.** All gate-covered; none has met the real thing on the *renamed* build:
+> **3. VERIFY THE THREE FIXES ON REAL HARDWARE.** All gate-covered; none has met the real thing on the *renamed* build:
 > - **No black terminal** at login, or when the Maintenance tab opens.
 > - **A fresh maintenance result** in the tab, with a realistic duration rather than `in 0s`. Cross-check `duration_secs` in `%LOCALAPPDATA%\com.zaaheen.app\logs\zaaheen.log`.
 > - **Settings → "Save activity record…"** produces a file a tester could attach.
 >
-> **3. GO LIVE — the path is staged and nothing is deployed.** `site/DEPLOY.md` holds the exact commands in order: create the Pages project → deploy (a `*.pages.dev` URL works with no DNS, so the page can be reviewed before the domain points at it) → attach `zaaheen.com` → attach `dl.zaaheen.com` to the R2 bucket → upload the MSI.
+> **4. GO LIVE — the path is staged and nothing is deployed.** `site/DEPLOY.md` holds the exact commands in order: create the Pages project → deploy (a `*.pages.dev` URL works with no DNS, so the page can be reviewed before the domain points at it) → attach `zaaheen.com` → attach `dl.zaaheen.com` to the R2 bucket → upload the MSI.
 >
 > ⚠️ **The notify form on the landing page HAS NO ENDPOINT.** It acknowledges in the browser and discards the address. **Wire it to a Worker (KV or D1) before anyone sees the page, or remove the form** — collecting an email and dropping it is worse than not asking.
 >
-> **4. FIVE DEPENDABOT PRs STILL OPEN** (#45–#49: `cmov`, `quinn-proto`, `serde_with`, `openssl`, `tar`). All CI-green. Triage as a batch.
+> **5. FIVE DEPENDABOT PRs STILL OPEN** (#45–#49: `cmov`, `quinn-proto`, `serde_with`, `openssl`, `tar`). All CI-green. Triage as a batch.
 >
 > ### ✅ WHAT SESSION 33 DID
 >
