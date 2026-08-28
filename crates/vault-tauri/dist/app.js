@@ -1,4 +1,4 @@
-// Memory Vault — V0.2 beta UI logic ("Quiet" direction).
+// Zaaheen — V0.2 beta UI logic ("Quiet" direction).
 // Vanilla JS, no framework, no eval, no remote resources (CSP: 'self').
 // All user/vault content rendered through esc() — BRD §11.12 vault-tauri
 // checklist (XSS prevention in webview).
@@ -337,7 +337,7 @@ function renderMaintEngineStatus() {
 // (stdio, 1:1) — cross-agent proven (Claude / Cursor / Codex).
 const SNIPPET_JSON = `{
   "mcpServers": {
-    "memory-vault": {
+    "zaaheen": {
       "command": "vault-cli",
       "args": ["mcp", "serve"]
     }
@@ -989,7 +989,7 @@ async function renderSettings() {
     info.audit_chain_verified
       ? { label: "Audit log", value: "recorded locally · history verified", good: true }
       : { label: "Audit log", value: "history could not be verified — the record may have been altered", good: false },
-    { label: "Version", value: `memory-vault ${info.version} · V0.2 beta` },
+    { label: "Version", value: `zaaheen ${info.version} · V0.2 beta` },
   ];
   $("settings-rows").innerHTML = rows.map((r) => `
     <div class="s-row">
@@ -1046,7 +1046,7 @@ async function eraseEverything() {
     // saying anything softer than that would be a lie about the one
     // property the user was trying to obtain.
     $("erase-status").textContent =
-      "Your memories were NOT deleted, and they are still readable. Nothing was changed. Please try again, or restart Memory Vault and retry.";
+      "Your memories were NOT deleted, and they are still readable. Nothing was changed. Please try again, or restart Zaaheen and retry.";
     $("erase-cancel").disabled = false;
     $("erase-confirm-btn").disabled = false;
     return;
@@ -1057,8 +1057,8 @@ async function eraseEverything() {
   // bytes cannot be read by anyone.
   const leftover = Number(result && result.undeletable_count) || 0;
   $("erase-status").textContent = leftover > 0
-    ? "Your memories are permanently deleted and can no longer be read. A few files could not be removed from disk, but they are now unreadable. Memory Vault will close."
-    : "Your memories are permanently deleted. Memory Vault will close.";
+    ? "Your memories are permanently deleted and can no longer be read. A few files could not be removed from disk, but they are now unreadable. Zaaheen will close."
+    : "Your memories are permanently deleted. Zaaheen will close.";
 
   // The app is now running against a vault that no longer exists; staying
   // open would show stale, already-unreadable state. Close rather than
@@ -1085,7 +1085,7 @@ const saveDialog = window.__TAURI__ && window.__TAURI__.dialog
 function logExportFilename() {
   const d = new Date();
   const pad = (n) => String(n).padStart(2, "0");
-  return `memory-vault-log-${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}.txt`;
+  return `zaaheen-log-${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}.txt`;
 }
 
 async function exportLogs() {

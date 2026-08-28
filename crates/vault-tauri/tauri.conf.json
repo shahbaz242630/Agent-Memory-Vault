@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Memory Vault",
+  "productName": "Zaaheen",
   "version": "0.2.0",
-  "identifier": "com.shahbaz242630.memory-vault",
+  "identifier": "com.zaaheen.app",
   "build": {
     "frontendDist": "dist"
   },
@@ -10,7 +10,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "Memory Vault",
+        "title": "Zaaheen",
         "width": 900,
         "height": 700,
         "minWidth": 900,
@@ -25,10 +25,11 @@
   "bundle": {
     "active": true,
     "targets": ["msi"],
+    "publisher": "Zaaheen",
     "category": "Productivity",
     "icon": ["icons/icon.ico", "icons/icon.png"],
-    "shortDescription": "A private, on-device memory vault for your AI agents.",
-    "longDescription": "Memory Vault is a personal, user-owned memory layer for AI assistants. Your memories stay on your own device and are encrypted at rest — any AI agent you connect reads from one private vault you control.",
+    "shortDescription": "A private, on-device memory for your AI assistants.",
+    "longDescription": "Zaaheen is a personal, user-owned memory layer for AI assistants. Your memories stay on your own device and are encrypted at rest — any AI agent you connect reads from one private vault you control.",
     "resources": {
       "../vault-embedding/test-fixtures/bge-small-en-v1.5/onnxruntime.dll": "libs/onnxruntime.dll",
       "../vault-embedding/test-fixtures/bge-small-en-v1.5/model.onnx": "models/model.onnx",

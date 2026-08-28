@@ -61,12 +61,12 @@ use std::sync::Mutex;
 use tracing_subscriber::fmt::MakeWriter;
 
 /// Log filename inside the log directory.
-pub const LOG_FILENAME: &str = "memory-vault.log";
+pub const LOG_FILENAME: &str = "zaaheen.log";
 
 /// Previous log, kept across one restart so a crash's final lines survive the
 /// next launch. One generation only — enough to diagnose "it broke, I
 /// reopened it", without unbounded growth on someone's disk.
-pub const LOG_FILENAME_PREVIOUS: &str = "memory-vault.log.1";
+pub const LOG_FILENAME_PREVIOUS: &str = "zaaheen.log.1";
 
 /// Rotate when the live log passes this size.
 ///
@@ -142,7 +142,7 @@ fn rotate_if_needed(live: &Path, previous: &Path) {
     // `rename` replaces an existing destination on both Windows and POSIX, so
     // the previous generation is dropped rather than accumulating.
     if let Err(e) = std::fs::rename(live, previous) {
-        eprintln!("memory-vault: log rotation failed ({e}); continuing on the existing file");
+        eprintln!("zaaheen: log rotation failed ({e}); continuing on the existing file");
     }
 }
 
@@ -180,7 +180,7 @@ pub fn init(log_dir: &Path) -> io::Result<PathBuf> {
     // Losing logging is bad; crashing on startup because logging was already
     // configured is worse.
     if let Err(e) = tracing::subscriber::set_global_default(subscriber) {
-        eprintln!("memory-vault: tracing already initialised ({e}); file logging not installed");
+        eprintln!("zaaheen: tracing already initialised ({e}); file logging not installed");
     }
 
     Ok(live)

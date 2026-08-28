@@ -149,7 +149,7 @@ async fn merge_acceptance_phase_1_to_3_end_to_end_against_100_fixture() {
          wiring time per phi4_mini_smoke.rs)",
     );
     let models_dir = std::path::PathBuf::from(appdata)
-        .join("com.shahbaz242630.memory-vault")
+        .join("com.zaaheen.app")
         .join("models");
     let phi4_config = vault_llm::Phi4MiniConfig::v0_2_default(models_dir);
     let llm = Arc::new(

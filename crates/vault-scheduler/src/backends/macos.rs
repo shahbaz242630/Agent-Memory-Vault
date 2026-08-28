@@ -213,13 +213,13 @@ mod tests {
 
     fn daily_spec_with_env() -> ScheduleSpec {
         ScheduleSpec {
-            task_id: TaskId::new("com.memoryvault.maintenance").unwrap(),
-            label: "Memory Vault automatic maintenance".into(),
+            task_id: TaskId::new("com.zaaheen.maintenance").unwrap(),
+            label: "Zaaheen automatic maintenance".into(),
             frequency: Frequency::Daily,
             time_of_day: NaiveTime::from_hms_opt(3, 5, 0).unwrap(),
             // A mac-style path with a space — launchd takes it as one array
             // element with no quoting.
-            program: PathBuf::from("/Applications/Memory Vault.app/Contents/MacOS/vault-cli"),
+            program: PathBuf::from("/Applications/Zaaheen.app/Contents/MacOS/zaaheen"),
             args: vec!["consolidate".into(), "run".into()],
             env: vec![("LANCE_MEM_POOL_SIZE".into(), "268435456".into())],
         }
@@ -229,10 +229,9 @@ mod tests {
     fn daily_plist_has_label_arguments_and_calendar_time() {
         let plist = build_launchd_plist(&daily_spec_with_env());
         assert!(plist.contains("<key>Label</key>"));
-        assert!(plist.contains("<string>com.memoryvault.maintenance</string>"));
+        assert!(plist.contains("<string>com.zaaheen.maintenance</string>"));
         // Program and each argument are distinct <string> elements.
-        assert!(plist
-            .contains("<string>/Applications/Memory Vault.app/Contents/MacOS/vault-cli</string>"));
+        assert!(plist.contains("<string>/Applications/Zaaheen.app/Contents/MacOS/zaaheen</string>"));
         assert!(plist.contains("<string>consolidate</string>"));
         assert!(plist.contains("<string>run</string>"));
         // 03:05.

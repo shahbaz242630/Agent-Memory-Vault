@@ -16,7 +16,7 @@
 //! - [`derive_at_rest_key`] — domain-separated BLAKE3 subkey, returned as
 //!   `Zeroizing<[u8; 32]>` for downstream consumption by
 //!   [`vault_storage::LanceVectorStore::open_with_at_rest_key`] (Phase 2/3).
-//! - [`PRODUCTION_NAMESPACE`] — `"com.memoryvault.v0.2"` reverse-DNS service
+//! - [`PRODUCTION_NAMESPACE`] — `"com.zaaheen.v0.2"` reverse-DNS service
 //!   string for production keychain entries.
 //!
 //! ## Platform support (Phase 1)
@@ -56,11 +56,11 @@ use zeroize::Zeroizing;
 /// Reverse-DNS namespace for production keychain entries — locked at ADR-040.
 ///
 /// Distinguishable from any other Memory Vault keychain entry; spike used
-/// `com.memoryvault.spike.v0.2` (different sub-namespace) so spike runs never
+/// `com.zaaheen.spike.v0.2` (different sub-namespace) so spike runs never
 /// collide with production. V1.0 multi-vault forward-compat preserved: same
 /// namespace will hold multiple per-vault entries differentiated by the
 /// account-string slot.
-pub const PRODUCTION_NAMESPACE: &str = "com.memoryvault.v0.2";
+pub const PRODUCTION_NAMESPACE: &str = "com.zaaheen.v0.2";
 
 /// V0.2 single-vault account string. Moved from vault-tauri main.rs at
 /// T0.2.0 Phase 3 sub-task (a) (2026-05-11) so vault-tauri + vault-cli
@@ -737,18 +737,14 @@ pub fn derive_at_rest_key(master_key: &[u8; 32]) -> Zeroizing<[u8; 32]> {
 pub mod test_helpers {
     /// Generate a unique-per-test namespace so concurrent + sequential test
     /// runs never collide on the same keychain entry. Prefixed with
-    /// `com.memoryvault.test.v0.2.` so a stale entry from a panicked test
+    /// `com.zaaheen.test.v0.2.` so a stale entry from a panicked test
     /// is still distinguishable from production / spike entries during
     /// manual Credential Manager cleanup.
     #[cfg(windows)]
     pub fn unique_test_namespace(test_name: &str) -> String {
         let mut nonce = [0u8; 8];
         getrandom::getrandom(&mut nonce).expect("getrandom for test namespace");
-        format!(
-            "com.memoryvault.test.v0.2.{}.{}",
-            test_name,
-            hex::encode(nonce)
-        )
+        format!("com.zaaheen.test.v0.2.{}.{}", test_name, hex::encode(nonce))
     }
 
     /// Best-effort cleanup helper. Used in test teardown so re-runs are

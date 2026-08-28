@@ -102,7 +102,7 @@ pub struct ScheduleSpec {
     pub frequency: Frequency,
     /// Local time-of-day to run at (minute precision is all any backend uses).
     pub time_of_day: NaiveTime,
-    /// The executable to run — the bundled `vault-cli` (ADR-093). An absolute
+    /// The executable to run — the bundled `zaaheen` CLI (ADR-093). An absolute
     /// path; may contain spaces (`C:\Program Files\...`).
     pub program: PathBuf,
     /// Arguments passed to `program`, one element per argv slot (not a shell
@@ -195,18 +195,18 @@ mod tests {
 
     fn realistic_spec() -> ScheduleSpec {
         ScheduleSpec {
-            task_id: TaskId::new("com.memoryvault.maintenance").unwrap(),
-            label: "Memory Vault automatic maintenance".into(),
+            task_id: TaskId::new("com.zaaheen.maintenance").unwrap(),
+            label: "Zaaheen automatic maintenance".into(),
             frequency: Frequency::Daily,
             time_of_day: NaiveTime::from_hms_opt(3, 0, 0).unwrap(),
             // A path with a space — the common Windows install location — must
             // pass validation; quoting is the backend's job.
-            program: PathBuf::from(r"C:\Program Files\Memory Vault\vault-cli.exe"),
+            program: PathBuf::from(r"C:\Program Files\Zaaheen\zaaheen.exe"),
             args: vec![
                 "consolidate".into(),
                 "run".into(),
                 "--phi4-model".into(),
-                r"C:\Users\sam\AppData\Roaming\Memory Vault\models\phi4.gguf".into(),
+                r"C:\Users\sam\AppData\Roaming\Zaaheen App\models\phi4.gguf".into(),
             ],
             env: vec![("LANCE_MEM_POOL_SIZE".into(), "268435456".into())],
         }
@@ -215,8 +215,8 @@ mod tests {
     #[test]
     fn task_id_accepts_the_canonical_identifier() {
         assert_eq!(
-            TaskId::new("com.memoryvault.maintenance").unwrap().as_str(),
-            "com.memoryvault.maintenance"
+            TaskId::new("com.zaaheen.maintenance").unwrap().as_str(),
+            "com.zaaheen.maintenance"
         );
         assert!(TaskId::new("vault-maintenance_v2").is_ok());
     }

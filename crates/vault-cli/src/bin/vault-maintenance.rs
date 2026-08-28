@@ -72,9 +72,9 @@ use vault_app::maintenance_state::{self, RunOutcome};
 
 /// Executable spawned to do the actual work, resolved as our own sibling.
 #[cfg(windows)]
-const VAULT_CLI_EXE: &str = "vault-cli.exe";
+const VAULT_CLI_EXE: &str = "zaaheen.exe";
 #[cfg(not(windows))]
-const VAULT_CLI_EXE: &str = "vault-cli";
+const VAULT_CLI_EXE: &str = "zaaheen";
 
 /// `CREATE_NO_WINDOW` — run a console child with no console window.
 ///
@@ -87,7 +87,7 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// Run a maintenance pass without showing a console window.
 #[derive(Parser, Debug)]
 #[command(
-    name = "vault-maintenance",
+    name = "zaaheen-maintenance",
     about = "Runs Memory Vault maintenance in the background, with no window.",
     long_about = None
 )]
@@ -117,7 +117,7 @@ fn main() -> ExitCode {
     // Logging first, so a failure in any later step is recorded somewhere. A
     // log we could not open is never a reason to skip maintenance.
     if let Err(e) = logging::init(&args.log_dir) {
-        eprintln!("memory-vault: could not start file logging: {e}");
+        eprintln!("zaaheen: could not start file logging: {e}");
     }
 
     let vault_cli = match args.vault_cli.clone() {
@@ -240,7 +240,7 @@ mod tests {
         // desktop app's vault. Dropping or reordering any of it would silently
         // consolidate the wrong vault, or none.
         let args = parse(&[
-            "vault-maintenance",
+            "zaaheen-maintenance",
             "--status-file",
             "/data/maintenance.json",
             "--log-dir",
@@ -263,7 +263,7 @@ mod tests {
         // `allow_hyphen_values` is what makes this work; without it clap
         // rejects the child's own flags as unknown arguments to us.
         let args = parse(&[
-            "vault-maintenance",
+            "zaaheen-maintenance",
             "--status-file",
             "/s.json",
             "--log-dir",
@@ -279,14 +279,14 @@ mod tests {
         // Both are how a run reports for duty. A launcher that can start
         // without them would run nightly and report nothing, which is the
         // state ADR-SEC-016 exists to end.
-        assert!(Args::try_parse_from(["vault-maintenance", "--log-dir", "/l"]).is_err());
-        assert!(Args::try_parse_from(["vault-maintenance", "--status-file", "/s.json"]).is_err());
+        assert!(Args::try_parse_from(["zaaheen-maintenance", "--log-dir", "/l"]).is_err());
+        assert!(Args::try_parse_from(["zaaheen-maintenance", "--status-file", "/s.json"]).is_err());
     }
 
     #[test]
     fn the_child_executable_defaults_to_our_own_sibling() {
         let args = parse(&[
-            "vault-maintenance",
+            "zaaheen-maintenance",
             "--status-file",
             "/s.json",
             "--log-dir",

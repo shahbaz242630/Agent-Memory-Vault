@@ -26,7 +26,7 @@
 //!   (i.e. 1.8-18 s per call upper bound).
 //!
 //! Per iteration 2 item 3 lock, downloads land at the **production cache
-//! location** (`%APPDATA%\com.shahbaz242630.memory-vault\models\`) so Phase 4
+//! location** (`%APPDATA%\com.zaaheen.app\models\`) so Phase 4
 //! dogfood + the air-gap fallback path share the same file + same hash.
 //!
 //! Run with:
@@ -91,7 +91,7 @@ async fn main() -> Result<()> {
 fn models_dir() -> PathBuf {
     let appdata = std::env::var("APPDATA").expect("APPDATA env var must be set on Windows");
     PathBuf::from(appdata)
-        .join("com.shahbaz242630.memory-vault")
+        .join("com.zaaheen.app")
         .join("models")
 }
 

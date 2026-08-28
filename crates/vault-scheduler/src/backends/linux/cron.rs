@@ -191,11 +191,11 @@ mod tests {
 
     fn spec() -> ScheduleSpec {
         ScheduleSpec {
-            task_id: TaskId::new("com.memoryvault.maintenance").unwrap(),
-            label: "Memory Vault automatic maintenance".into(),
+            task_id: TaskId::new("com.zaaheen.maintenance").unwrap(),
+            label: "Zaaheen automatic maintenance".into(),
             frequency: Frequency::Daily,
             time_of_day: NaiveTime::from_hms_opt(3, 0, 0).unwrap(),
-            program: PathBuf::from("/opt/Memory Vault/vault-cli"),
+            program: PathBuf::from("/opt/Zaaheen/zaaheen"),
             args: vec!["consolidate".into(), "run".into()],
             env: vec![("LANCE_MEM_POOL_SIZE".into(), "268435456".into())],
         }
@@ -216,12 +216,12 @@ mod tests {
     #[test]
     fn daily_block_has_markers_schedule_env_and_quoted_command() {
         let block = build_cron_block(&spec());
-        assert!(block.contains("# BEGIN vault-scheduler:com.memoryvault.maintenance"));
-        assert!(block.contains("# END vault-scheduler:com.memoryvault.maintenance"));
+        assert!(block.contains("# BEGIN vault-scheduler:com.zaaheen.maintenance"));
+        assert!(block.contains("# END vault-scheduler:com.zaaheen.maintenance"));
         assert!(block.contains("0 3 * * * "));
         assert!(block.contains("LANCE_MEM_POOL_SIZE='268435456' "));
         // Program path has a space, so it is single-quoted as one token.
-        assert!(block.contains("'/opt/Memory Vault/vault-cli' 'consolidate' 'run'"));
+        assert!(block.contains("'/opt/Zaaheen/zaaheen' 'consolidate' 'run'"));
     }
 
     #[test]
@@ -247,16 +247,16 @@ mod tests {
         let crontab = "\
 # a user's own job
 0 9 * * * /usr/bin/backup
-# BEGIN vault-scheduler:com.memoryvault.maintenance
-0 3 * * * '/opt/vault-cli' 'run'
-# END vault-scheduler:com.memoryvault.maintenance
+# BEGIN vault-scheduler:com.zaaheen.maintenance
+0 3 * * * '/opt/zaaheen' 'run'
+# END vault-scheduler:com.zaaheen.maintenance
 30 8 * * * /usr/bin/other
 ";
-        let stripped = strip_block(crontab, "com.memoryvault.maintenance");
+        let stripped = strip_block(crontab, "com.zaaheen.maintenance");
         assert!(stripped.contains("/usr/bin/backup"));
         assert!(stripped.contains("/usr/bin/other"));
         assert!(!stripped.contains("vault-scheduler"));
-        assert!(!stripped.contains("vault-cli"));
+        assert!(!stripped.contains("zaaheen"));
     }
 
     #[test]

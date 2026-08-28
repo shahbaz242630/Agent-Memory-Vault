@@ -157,12 +157,12 @@ fn main() {
                                 "file logging started"
                             );
                         }
-                        Err(e) => eprintln!("memory-vault: could not start file logging: {e}"),
+                        Err(e) => eprintln!("zaaheen: could not start file logging: {e}"),
                     }
                     dir
                 }
                 Err(e) => {
-                    eprintln!("memory-vault: could not locate a log directory: {e}");
+                    eprintln!("zaaheen: could not locate a log directory: {e}");
                     // Carry on with a path that simply holds no logs. Export
                     // then reports "nothing to send", which is honest, rather
                     // than the app refusing to start over a log directory.
@@ -176,7 +176,7 @@ fn main() {
                 Err(e) => {
                     show_fatal_dialog_and_exit(
                         app.handle(),
-                        "Memory Vault — Resource Resolution Failed",
+                        "Zaaheen — Resource Resolution Failed",
                         &format!(
                             "Could not locate libonnxruntime dylib.\n\n\
                              Details: {e}\n\n\
@@ -197,7 +197,7 @@ fn main() {
                 Ok(p) => p,
                 Err(e) => show_fatal_dialog_and_exit(
                     app.handle(),
-                    "Memory Vault — Model Resource Resolution Failed",
+                    "Zaaheen — Model Resource Resolution Failed",
                     &format!(
                         "Could not locate model.onnx.\n\nDetails: {e}\n\n\
                          For dev runs, set VAULT_MODEL_PATH. For installed builds, reinstall."
@@ -209,7 +209,7 @@ fn main() {
                 Ok(p) => p,
                 Err(e) => show_fatal_dialog_and_exit(
                     app.handle(),
-                    "Memory Vault — Tokenizer Resource Resolution Failed",
+                    "Zaaheen — Tokenizer Resource Resolution Failed",
                     &format!(
                         "Could not locate tokenizer.json.\n\nDetails: {e}\n\n\
                          For dev runs, set VAULT_TOKENIZER_PATH. For installed builds, reinstall."
@@ -223,7 +223,7 @@ fn main() {
                 Ok(p) => p,
                 Err(e) => show_fatal_dialog_and_exit(
                     app.handle(),
-                    "Memory Vault — Data Directory Unavailable",
+                    "Zaaheen — Data Directory Unavailable",
                     &format!("Could not locate per-user data directory.\n\nDetails: {e}"),
                     EXIT_STARTUP_FAILURE,
                 ),
@@ -231,7 +231,7 @@ fn main() {
             if let Err(e) = std::fs::create_dir_all(&data_dir) {
                 show_fatal_dialog_and_exit(
                     app.handle(),
-                    "Memory Vault — Data Directory Creation Failed",
+                    "Zaaheen — Data Directory Creation Failed",
                     &format!(
                         "Could not create per-user data directory at {}.\n\nDetails: {e}",
                         data_dir.display()
@@ -290,7 +290,7 @@ fn main() {
                 Err(err) => {
                     show_fatal_dialog_and_exit(
                         app.handle(),
-                        "Memory Vault — Keychain Access Failed",
+                        "Zaaheen — Keychain Access Failed",
                         &format_keychain_error_dialog(&err),
                         EXIT_CONFIG_ERROR,
                     );
@@ -403,7 +403,7 @@ fn main() {
                     Ok(a) => a,
                     Err(e) => show_fatal_dialog_and_exit(
                         &app_handle,
-                        "Memory Vault — Fatal Error",
+                        "Zaaheen — Fatal Error",
                         &format_startup_failure_dialog(&e),
                         EXIT_STARTUP_FAILURE,
                     ),
@@ -498,7 +498,7 @@ fn main() {
     // so we use eprintln + exit (degraded path) rather than the dialog
     // routing the rest of setup() uses.
     if let Err(e) = builder.run(tauri::generate_context!()) {
-        eprintln!("Memory Vault failed to start the Tauri runtime: {e}");
+        eprintln!("Zaaheen failed to start: {e}");
         std::process::exit(EXIT_STARTUP_FAILURE);
     }
 }
@@ -589,7 +589,7 @@ fn resolve_reranker_paths(data_dir: &std::path::Path) -> (PathBuf, PathBuf) {
 /// during development. Falls back to the bare name (resolved via PATH, which the
 /// installer also puts the install dir on) if the current-exe lookup fails.
 fn resolve_vault_cli_path() -> PathBuf {
-    resolve_sibling_binary("VAULT_CLI_PATH", "vault-cli")
+    resolve_sibling_binary("VAULT_CLI_PATH", "zaaheen")
 }
 
 /// Resolve the bundled `vault-maintenance` runner (ADR-SEC-015).
@@ -597,7 +597,7 @@ fn resolve_vault_cli_path() -> PathBuf {
 /// The windowless binary the OS task and "Run now" both invoke. Dev-mode
 /// override via `VAULT_MAINTENANCE_PATH`.
 fn resolve_vault_maintenance_path() -> PathBuf {
-    resolve_sibling_binary("VAULT_MAINTENANCE_PATH", "vault-maintenance")
+    resolve_sibling_binary("VAULT_MAINTENANCE_PATH", "zaaheen-maintenance")
 }
 
 /// Resolve a bundled executable that ships beside this one.

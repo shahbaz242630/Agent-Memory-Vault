@@ -25,7 +25,7 @@
 //! **3. A fragment is only compiled in if something references it.** WiX pulls
 //! a `<Fragment>` in via a reference — here, `tauri.conf.json`'s
 //! `bundle.windows.wix.componentRefs`. Rename a component on one side and the
-//! whole fragment (env vars, PATH, vault-cli.exe, the uninstall action) is
+//! whole fragment (env vars, PATH, zaaheen.exe, the uninstall action) is
 //! dropped from the MSI **with no error at all**. Guard 3 pins each
 //! `componentRef` to a real `Component Id`, and guard 4 pins the uninstall
 //! action into the same single fragment so it cannot be orphaned by being
@@ -212,7 +212,7 @@ fn every_component_ref_resolves_to_a_component_in_the_fragment() {
              exist in installer.wxs.\n\n\
              A WiX fragment is compiled in ONLY because something references \
              it. Break every reference and the entire fragment — env vars, \
-             PATH entry, vault-cli.exe, and the uninstall task removal — is \
+             PATH entry, zaaheen.exe, and the uninstall task removal — is \
              dropped from the MSI with no error whatsoever."
         );
     }
@@ -227,8 +227,8 @@ fn the_installer_ships_the_windowless_maintenance_runner() {
     let markup = markup();
 
     assert!(
-        markup.contains("Name=\"vault-maintenance.exe\""),
-        "installer.wxs no longer installs vault-maintenance.exe.\n\n\
+        markup.contains("Name=\"zaaheen-maintenance.exe\""),
+        "installer.wxs no longer installs zaaheen-maintenance.exe.\n\n\
          The registered OS task points at that binary. Without it the nightly \
          task starts, finds nothing, and records a failed maintenance run \
          every morning."
@@ -249,11 +249,11 @@ fn the_runner_and_its_child_install_into_the_same_directory() {
     // machine.
     let markup = markup();
     let cli = markup
-        .find("Name=\"vault-cli.exe\"")
-        .expect("vault-cli.exe must ship");
+        .find("Name=\"zaaheen.exe\"")
+        .expect("zaaheen.exe must ship");
     let runner = markup
-        .find("Name=\"vault-maintenance.exe\"")
-        .expect("vault-maintenance.exe must ship");
+        .find("Name=\"zaaheen-maintenance.exe\"")
+        .expect("zaaheen-maintenance.exe must ship");
     let install_dir = markup
         .find("<DirectoryRef Id=\"INSTALLDIR\">")
         .expect("INSTALLDIR ref must exist");
@@ -264,11 +264,11 @@ fn the_runner_and_its_child_install_into_the_same_directory() {
 
     assert!(
         cli > install_dir && cli < after,
-        "vault-cli.exe must install under INSTALLDIR"
+        "zaaheen.exe must install under INSTALLDIR"
     );
     assert!(
         runner > install_dir && runner < after,
-        "vault-maintenance.exe must install under the SAME INSTALLDIR ref -- \
+        "zaaheen-maintenance.exe must install under the SAME INSTALLDIR ref -- \
          the runner looks for its child beside itself"
     );
 }
