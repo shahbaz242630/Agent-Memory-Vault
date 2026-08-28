@@ -22,7 +22,7 @@
 //! `ScheduleSpec::env` is therefore NOT injected here — the one variable the
 //! maintenance run needs (`LANCE_MEM_POOL_SIZE`) is provisioned as a per-user
 //! environment variable by the installer (ADR-091), which the scheduled
-//! `vault-cli` inherits. If a future spec needs a variable that is not in the
+//! `zaaheen` CLI inherits. If a future spec needs a variable that is not in the
 //! user environment, that is a distinct piece of work (a launcher shim), called
 //! out rather than silently dropped.
 
@@ -337,16 +337,16 @@ mod tests {
 
     fn daily_spec() -> ScheduleSpec {
         ScheduleSpec {
-            task_id: TaskId::new("com.memoryvault.maintenance").unwrap(),
-            label: "Memory Vault automatic maintenance".into(),
+            task_id: TaskId::new("com.zaaheen.maintenance").unwrap(),
+            label: "Zaaheen automatic maintenance".into(),
             frequency: Frequency::Daily,
             time_of_day: NaiveTime::from_hms_opt(3, 0, 0).unwrap(),
-            program: PathBuf::from(r"C:\Program Files\Memory Vault\vault-cli.exe"),
+            program: PathBuf::from(r"C:\Program Files\Zaaheen\zaaheen.exe"),
             args: vec![
                 "consolidate".into(),
                 "run".into(),
                 "--phi4-model".into(),
-                r"C:\Users\sam\AppData\Roaming\Memory Vault\models\phi4.gguf".into(),
+                r"C:\Users\sam\AppData\Roaming\Zaaheen App\models\phi4.gguf".into(),
             ],
             env: vec![],
         }
@@ -383,10 +383,12 @@ mod tests {
     #[test]
     fn program_and_arguments_are_separate_fields() {
         let xml = build_task_xml(&daily_spec());
-        assert!(xml.contains("<Command>C:\\Program Files\\Memory Vault\\vault-cli.exe</Command>"));
+        assert!(xml.contains("<Command>C:\\Program Files\\Zaaheen\\zaaheen.exe</Command>"));
         // The phi4 path has a space, so it must be a single quoted argument.
+        // Keep a space in this fixture: the quoting rule is the whole point of
+        // the assertion, and a space-free path would let it pass vacuously.
         assert!(xml.contains(
-            "&quot;C:\\Users\\sam\\AppData\\Roaming\\Memory Vault\\models\\phi4.gguf&quot;"
+            "&quot;C:\\Users\\sam\\AppData\\Roaming\\Zaaheen App\\models\\phi4.gguf&quot;"
         ));
         assert!(xml.contains("consolidate run --phi4-model"));
     }

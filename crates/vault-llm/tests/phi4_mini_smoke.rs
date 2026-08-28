@@ -28,7 +28,7 @@ fn windows_models_dir() -> PathBuf {
          production-wiring time)",
     );
     PathBuf::from(appdata)
-        .join("com.shahbaz242630.memory-vault")
+        .join("com.zaaheen.app")
         .join("models")
 }
 

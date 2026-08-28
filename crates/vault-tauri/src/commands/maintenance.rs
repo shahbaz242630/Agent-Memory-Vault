@@ -65,10 +65,10 @@ use crate::model_fetch;
 
 /// Stable OS task id for the maintenance schedule (safe charset per
 /// `vault_scheduler::TaskId`).
-pub const MAINTENANCE_TASK_ID: &str = "com.memoryvault.maintenance";
+pub const MAINTENANCE_TASK_ID: &str = "com.zaaheen.maintenance";
 
 /// White-label description the OS scheduler may show (ADR-086).
-pub const MAINTENANCE_LABEL: &str = "Memory Vault automatic maintenance";
+pub const MAINTENANCE_LABEL: &str = "Zaaheen automatic maintenance";
 
 /// The LANCE memory-pool env var the run needs (ADR-038). The Windows installer
 /// sets it per-user (ADR-091) and Task Scheduler inherits it; we still put it in

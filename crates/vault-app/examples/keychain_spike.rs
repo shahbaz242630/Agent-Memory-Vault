@@ -76,7 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use keyring_core::Entry;
     use windows_native_keyring_store::Store;
 
-    const SPIKE_NAMESPACE: &str = "com.memoryvault.spike.v0.2";
+    const SPIKE_NAMESPACE: &str = "com.zaaheen.spike.v0.2";
     const SPIKE_ACCOUNT: &str = "spike-test-vault";
     const WRONG_ACCOUNT: &str = "spike-test-vault-WRONG";
 

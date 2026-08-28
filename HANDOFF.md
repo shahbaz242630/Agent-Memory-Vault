@@ -92,6 +92,41 @@
 > - **⚠️ The founder's machine is on Arabian Standard Time (UTC+4), not UK time.** A maintenance timestamp that looked four hours wrong was correct. Do not re-diagnose it.
 >
 >
+>
+> ### 🏷️ ADR-SEC-018 — the product is called Zaaheen
+>
+> **Founder decision, 2026-08-27.** The product has a name and a domain: **Zaaheen** (زاہین — Urdu for *intelligent*), **zaaheen.com**, bought from Hostinger. This **closes the distribution blocker open since session 22** — the R2 bucket and download URL were waiting on nothing else.
+>
+> **Why the rename happened now and not later.** Verifying what the MSI contained surfaced two places the founder's personal handle reached a tester: the MSI **Manufacturer** (`shahbaz242630`, shown in the unknown-publisher warning and in Add/Remove Programs) and the **bundle identifier**, which every tester would see inside their own data path — `C:\Users\<them>\AppData\Roaming\com.shahbaz242630.memory-vault`.
+>
+> The identifier is the reason this was urgent rather than cosmetic: **it decides where the vault lives.** Change it and the app looks in a new folder and reports zero memories. Today exactly one person is affected and their vault is throwaway dogfood data ([[project_dev_vault_is_throwaway_test_data]]). After thirty testers have real memories in it, the same change is a data migration with a step where memories appear to vanish. Cheap now, expensive later.
+>
+> **What was renamed (user-facing identity):**
+>
+> | | from | to |
+> |---|---|---|
+> | Product / window title | Memory Vault | **Zaaheen** |
+> | Bundle identifier | `com.shahbaz242630.memory-vault` | `com.zaaheen.app` |
+> | MSI Manufacturer | `shahbaz242630` | `Zaaheen` |
+> | CLI binary | `vault-cli.exe` | `zaaheen.exe` |
+> | Maintenance runner | `vault-maintenance.exe` | `zaaheen-maintenance.exe` |
+> | OS task id | `com.memoryvault.maintenance` | `com.zaaheen.maintenance` |
+> | Credential Manager service | `com.memoryvault.v0.2` | `com.zaaheen.v0.2` |
+> | Log file | `memory-vault.log` | `zaaheen.log` |
+> | Install dir | `C:\Program Files\Memory Vault` | `C:\Program Files\Zaaheen` |
+>
+> **What was deliberately NOT renamed:** the **crate names** (`vault-app`, `vault-cli`, `vault-storage`, …). They are internal, no user ever sees one, and renaming them would churn every `Cargo.toml`, every `use` path and every test for zero user-visible gain. ⚠️ **`cargo build -p vault-cli` therefore still builds the package that produces `zaaheen.exe`** — the package name and the binary name are deliberately different, and `release-build.ps1` says so where it matters.
+>
+> **The CLI rename is the one with a blast radius.** Agents connect with `command = "zaaheen"`, so every MCP config snippet changes. Founder chose it knowing that: nobody outside this machine has a config yet, so it is the cheapest it will ever be — after beta it breaks every tester's agent setup.
+>
+> **Consequences accepted:**
+> - The founder's existing vault at `com.shahbaz242630.memory-vault` is **left behind, not migrated** (founder's explicit choice). The data stays on disk; the new build simply starts clean at `com.zaaheen.app`. The old Credential Manager entry still holds its key.
+> - `com.memoryvault.maintenance` tasks registered by a pre-rename build are **orphaned** — the new uninstaller deletes the new id only. Not an issue in practice: the founder's old task was already removed by the ADR-SEC-005 uninstall hook, and no other machine has ever run this app.
+>
+> **Historical text was left alone on purpose.** Comments recording what *was* observed — the session-27 task really was `com.memoryvault.maintenance` pointing at `target\debug\vault-cli.exe` — keep their original names, marked as pre-rename. Rewriting a historical record to match today's names turns evidence into fiction.
+>
+> **Internal doc-comment prose** across the other crates still says "Memory Vault" in places. That is a separate, deliberately separate commit: a functional rename reviewed on its own cannot hide inside a 180-line prose diff.
+>
 > ### 🛡️ ADR-SEC-015 — the nightly run must not show a window
 >
 > **Found by turning a laptop on.** On 2026-08-27 the founder booted their machine and a black console window appeared unannounced. It was the maintenance task, firing late (`StartWhenAvailable` catches up a run missed while the machine was off) and running to completion in full view.

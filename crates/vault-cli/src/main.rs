@@ -67,11 +67,7 @@ use vault_storage::{
 };
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "vault-cli",
-    about = "Memory Vault operator CLI (V0.1).",
-    version
-)]
+#[command(name = "zaaheen", about = "Memory Vault operator CLI (V0.1).", version)]
 struct Cli {
     /// Path to the SQLCipher metadata DB.
     #[arg(long, value_name = "PATH")]
@@ -1526,7 +1522,7 @@ mod tests {
     #[test]
     fn cli_parses_dead_letter_list() {
         let cli = Cli::try_parse_from([
-            "vault-cli",
+            "zaaheen",
             "--vault-db",
             "/tmp/v.db",
             "--vector-dir",
@@ -1553,7 +1549,7 @@ mod tests {
     #[test]
     fn cli_parses_dead_letter_acknowledge() {
         let cli = Cli::try_parse_from([
-            "vault-cli",
+            "zaaheen",
             "--vault-db",
             "/tmp/v.db",
             "--vector-dir",
@@ -1581,7 +1577,7 @@ mod tests {
     #[test]
     fn cli_parses_divergence_check() {
         let cli = Cli::try_parse_from([
-            "vault-cli",
+            "zaaheen",
             "--vault-db",
             "/tmp/v.db",
             "--vector-dir",
@@ -1599,7 +1595,7 @@ mod tests {
         // `checkpoint` is storage-only — it must parse WITHOUT any --bge-* /
         // --phi4-model flags (the whole point of making it a top-level command).
         let cli = Cli::try_parse_from([
-            "vault-cli",
+            "zaaheen",
             "--vault-db",
             "/tmp/v.db",
             "--vector-dir",
@@ -1624,7 +1620,7 @@ mod tests {
     #[test]
     fn cli_parses_checkpoint_rollback_with_id() {
         let cli = Cli::try_parse_from([
-            "vault-cli",
+            "zaaheen",
             "--vault-db",
             "/tmp/v.db",
             "--vector-dir",
@@ -1647,7 +1643,7 @@ mod tests {
     #[test]
     fn cli_parses_consolidate_run_with_all_paths_supplied() {
         let cli = Cli::try_parse_from([
-            "vault-cli",
+            "zaaheen",
             "--vault-db",
             "/tmp/v.db",
             "--vector-dir",
@@ -1699,7 +1695,7 @@ mod tests {
     #[test]
     fn cli_parses_consolidate_run_with_a_status_file() {
         let cli = Cli::try_parse_from([
-            "vault-cli",
+            "zaaheen",
             "--vault-db",
             "/tmp/vault.db",
             "--vector-dir",
@@ -1768,7 +1764,7 @@ mod tests {
     #[test]
     fn cli_rejects_consolidate_run_with_missing_phi4_model_path() {
         let result = Cli::try_parse_from([
-            "vault-cli",
+            "zaaheen",
             "--vault-db",
             "/tmp/v.db",
             "--vector-dir",
@@ -1800,7 +1796,7 @@ mod tests {
     #[test]
     fn cli_rejects_missing_required_flag() {
         let result = Cli::try_parse_from([
-            "vault-cli",
+            "zaaheen",
             "--vault-db",
             "/tmp/v.db",
             // missing --vector-dir
@@ -1819,7 +1815,7 @@ mod tests {
     #[test]
     fn cli_parses_mcp_serve_with_default_boundary() {
         let cli = Cli::try_parse_from([
-            "vault-cli",
+            "zaaheen",
             "--vault-db",
             "/tmp/v.db",
             "--vector-dir",
@@ -1887,7 +1883,7 @@ mod tests {
     #[test]
     fn cli_parses_mcp_serve_with_multiple_boundaries_and_phi4() {
         let cli = Cli::try_parse_from([
-            "vault-cli",
+            "zaaheen",
             "--vault-db",
             "/tmp/v.db",
             "--vector-dir",
@@ -1938,7 +1934,7 @@ mod tests {
     #[test]
     fn cli_rejects_mcp_serve_with_missing_bge_model() {
         let result = Cli::try_parse_from([
-            "vault-cli",
+            "zaaheen",
             "--vault-db",
             "/tmp/v.db",
             "--vector-dir",
@@ -2231,7 +2227,7 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let cli = Cli::try_parse_from([
-            "vault-cli",
+            "zaaheen",
             "--vault-db",
             tmp.path().join("vault.db").to_str().unwrap(),
             "--vector-dir",
@@ -2298,7 +2294,7 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let cli = Cli::try_parse_from([
-            "vault-cli",
+            "zaaheen",
             "--vault-db",
             tmp.path().join("vault.db").to_str().unwrap(),
             "--vector-dir",

@@ -3,7 +3,7 @@
 //!
 //! Registers a **per-user** scheduled task with the operating system's own
 //! scheduler so the vault can run its nightly maintenance
-//! (`vault-cli consolidate run`, ADR-093) even when the desktop app is closed:
+//! (`zaaheen consolidate run`, ADR-093) even when the desktop app is closed:
 //!
 //! - **Windows** — Task Scheduler (`schtasks`), current-user task, no
 //!   elevation.
@@ -37,7 +37,7 @@
 //! spec, and MUST pass `program`/`args` to the OS as an argument vector rather
 //! than a shell string. [`TaskId::new`] and [`ScheduleSpec::validate`] form
 //! the injection-safety gate; per-backend escaping is defence in depth on top
-//! of it. No secret is ever placed in a spec — the scheduled `vault-cli` reads
+//! of it. No secret is ever placed in a spec — the scheduled `zaaheen` reads
 //! the master key from the OS keychain at run time.
 
 mod backends;

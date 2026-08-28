@@ -1,12 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
   ============================================================================
-  Memory Vault MSI installer fragment — T0.2.14 packaging.
+  Zaaheen MSI installer fragment — T0.2.14 packaging.
 
   Referenced from tauri.conf.json:
     bundle.windows.wix.fragmentPaths = ["./windows/fragments/installer.wxs"]
     bundle.windows.wix.componentRefs = [
-      "SetLanceMemPoolEnv", "VaultCliBinary", "AddInstallDirToPath"
+      "SetLanceMemPoolEnv", "VaultCliBinary", "VaultMaintenanceBinary",
+      "AddInstallDirToPath"
     ]
 
   Processed only at `tauri build` (candle/light) time — never at `cargo build`,
@@ -15,7 +16,7 @@
   ✅ VERIFIED at first bundle (2026-07-23):
     - Install dir id IS "INSTALLDIR" — confirmed against the generated
       target/release/wix/x64/main.wxs (the app's own files install there).
-    - File @Source uses an ABSOLUTE path to the built vault-cli.exe. candle
+    - File @Source uses an ABSOLUTE path to the built zaaheen.exe. candle
       resolves relative @Source against its own working dir (not the .wxs
       location), which is not something we control here — absolute removes the
       ambiguity. LOCAL-BUILD ASSUMPTION: the repo lives at the path below; a
@@ -27,9 +28,9 @@
 
   Chose a WiX File component over bundle.externalBin deliberately: externalBin
   is compile-time validated (would need per-triple CI placeholders) AND derives
-  a WiX Component @Id from the binary name — our hyphen ("vault-cli") is an
-  illegal WiX identifier (candle CNDL0014; tauri #14681). Here we set the @Id
-  ourselves, so the natural vault-cli.exe filename ships unchanged.
+  a WiX Component @Id from the binary name — and a hyphen ("zaaheen-maintenance")
+  is an illegal WiX identifier (candle CNDL0014; tauri #14681). Here we set every
+  @Id ourselves, so the natural filenames ship unchanged.
   ============================================================================
 -->
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
@@ -41,7 +42,7 @@
       <!--
         ADR-038 — LANCE_MEM_POOL_SIZE (256 MiB) in the installed user's
         environment so lance/datafusion's merge_insert JOIN path is bounded on
-        every launch of BOTH the desktop app AND vault-cli.exe (the MCP server
+        every launch of BOTH the desktop app AND zaaheen.exe (the MCP server
         an AI client spawns opens the same lance store and needs the same
         bound). Cannot be set in Rust: ADR-002 forbids unsafe_code and
         std::env::set_var is unsafe. Per-user (no elevation), removed on
@@ -51,7 +52,7 @@
       <Component Id="SetLanceMemPoolEnv" Guid="7E9C1F2A-4B6D-4E3F-9A1C-2D5E8F0B3C7A">
         <RegistryValue
           Root="HKCU"
-          Key="Software\com.shahbaz242630.memory-vault\Install"
+          Key="Software\com.zaaheen.app\Install"
           Name="LanceEnvKeyPath"
           Type="integer"
           Value="1"
@@ -68,7 +69,7 @@
 
       <!--
         Put the app install dir on the user's PATH so the UNCHANGED, cross-agent
-        proven snippet `command = "vault-cli"` resolves. Keeping the bare name
+        proven snippet `command = "zaaheen"` resolves. Keeping the bare name
         (vs an absolute backslash path in the JSON/TOML snippet) is the more
         portable choice across MCP clients. Part="last" appends; per-user; the
         entry is removed on uninstall. Users are already told to restart their
@@ -79,7 +80,7 @@
       <Component Id="AddInstallDirToPath" Guid="9B7D5F3A-2E4C-4B6D-8A1F-3C5E7A9B1D3F">
         <RegistryValue
           Root="HKCU"
-          Key="Software\com.shahbaz242630.memory-vault\Install"
+          Key="Software\com.zaaheen.app\Install"
           Name="PathKeyPath"
           Type="integer"
           Value="1"
@@ -97,8 +98,8 @@
     </DirectoryRef>
 
     <!--
-      Ship vault-cli.exe INTO the app directory so MCP works in an installed
-      build (blocker (c)). Without it, onboarding's `vault-cli mcp serve`
+      Ship zaaheen.exe INTO the app directory so MCP works in an installed
+      build (blocker (c)). Without it, onboarding's `zaaheen mcp serve`
       snippet is a promise nothing keeps and no AI client can connect.
       Consolidation is intentionally out of scope for this beta (Phi-4 not
       wired) — this binary's job here is MCP only. Sits beside vault-tauri.exe
@@ -108,34 +109,34 @@
       <Component Id="VaultCliBinary" Guid="2C4A6E8B-1D3F-4A5C-9E7B-0F2A4C6E8B1D">
         <File
           Id="VaultCliExe"
-          Name="vault-cli.exe"
-          Source="C:\Projects\GitHub\Memory Vault\target\release\vault-cli.exe"
+          Name="zaaheen.exe"
+          Source="C:\Projects\GitHub\Memory Vault\target\release\zaaheen.exe"
           KeyPath="yes" />
       </Component>
 
       <!--
         ADR-SEC-015 — the windowless maintenance runner.
 
-        MUST ship beside vault-cli.exe. The runner resolves its child as its
+        MUST ship beside zaaheen.exe. The runner resolves its child as its
         own SIBLING (`current_exe().parent()`), so installing one without the
         other gives a scheduled task that starts, finds nothing to run, and
         records a failed maintenance run every night.
 
-        This is the binary the registered OS task points at. `vault-cli.exe` is
+        This is the binary the registered OS task points at. `zaaheen.exe` is
         a console program, so scheduling it directly opened a black terminal on
         the user's desktop at login — observed on the founder's machine
         2026-08-27. This one is linked for the Windows subsystem and spawns
-        vault-cli with CREATE_NO_WINDOW, so nothing is ever displayed.
+        zaaheen.exe with CREATE_NO_WINDOW, so nothing is ever displayed.
 
         Same @Id-by-hand reasoning as VaultCliBinary above: the hyphen in
-        "vault-maintenance" is an illegal WiX identifier, so we name the
+        "zaaheen-maintenance" is an illegal WiX identifier, so we name the
         component ourselves and the natural filename ships unchanged.
       -->
       <Component Id="VaultMaintenanceBinary" Guid="5F1B3D7C-8A2E-4C6B-9D4F-1E3A5C7B9D2F">
         <File
           Id="VaultMaintenanceExe"
-          Name="vault-maintenance.exe"
-          Source="C:\Projects\GitHub\Memory Vault\target\release\vault-maintenance.exe"
+          Name="zaaheen-maintenance.exe"
+          Source="C:\Projects\GitHub\Memory Vault\target\release\zaaheen-maintenance.exe"
           KeyPath="yes" />
       </Component>
     </DirectoryRef>
@@ -146,15 +147,16 @@
       maintenance task.
 
       THE GAP THIS CLOSES, observed live rather than reasoned about: on the
-      founder's machine `\com.memoryvault.maintenance` was still registered
-      from a session-27 test, still `Ready`, still firing DAILY, pointing at a
-      `target\debug\vault-cli.exe` inside the repo, and returning Last Result 1
+      founder's machine `\com.memoryvault.maintenance` (the pre-Zaaheen task
+      id) was still registered from a session-27 test, still `Ready`, still
+      firing DAILY, pointing at a `target\debug\vault-cli.exe` inside the repo
+      (the pre-rename binary name), and returning Last Result 1
       every morning. Turning the feature on once leaves an OS-level task that
       outlives whatever created it. For a product whose promise is "you own
       your data and nothing is left behind", leaving a scheduled job on a
       machine after uninstall is squarely the wrong behaviour.
 
-      WHY schtasks.exe AND NOT OUR OWN vault-cli: during an uninstall our
+      WHY schtasks.exe AND NOT OUR OWN CLI: during an uninstall our
       binary is the thing being deleted. Driving removal through it would mean
       sequencing before RemoveFiles, and it could be file-locked, missing, or
       crash — and a crash here fails the USER'S UNINSTALL. schtasks.exe ships
@@ -200,7 +202,7 @@
     <CustomAction
       Id="RemoveMaintenanceTask"
       Directory="INSTALLDIR"
-      ExeCommand="&quot;[SystemFolder]schtasks.exe&quot; /Delete /TN &quot;com.memoryvault.maintenance&quot; /F"
+      ExeCommand="&quot;[SystemFolder]schtasks.exe&quot; /Delete /TN &quot;com.zaaheen.maintenance&quot; /F"
       Execute="immediate"
       Return="ignore" />
 

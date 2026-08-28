@@ -217,11 +217,11 @@ mod tests {
 
     fn spec() -> ScheduleSpec {
         ScheduleSpec {
-            task_id: TaskId::new("com.memoryvault.maintenance").unwrap(),
-            label: "Memory Vault automatic maintenance".into(),
+            task_id: TaskId::new("com.zaaheen.maintenance").unwrap(),
+            label: "Zaaheen automatic maintenance".into(),
             frequency: Frequency::Daily,
             time_of_day: NaiveTime::from_hms_opt(3, 5, 0).unwrap(),
-            program: PathBuf::from("/opt/Memory Vault/vault-cli"),
+            program: PathBuf::from("/opt/Zaaheen/zaaheen"),
             args: vec!["consolidate".into(), "run".into()],
             env: vec![("LANCE_MEM_POOL_SIZE".into(), "268435456".into())],
         }
@@ -231,9 +231,37 @@ mod tests {
     fn service_unit_is_oneshot_with_quoted_exec_and_env() {
         let unit = build_service_unit(&spec());
         assert!(unit.contains("Type=oneshot"));
-        // Program path has a space, so ExecStart quotes it as one token.
-        assert!(unit.contains("ExecStart=\"/opt/Memory Vault/vault-cli\" consolidate run"));
+        // The realistic install path has no whitespace, so `exec_token` leaves
+        // it BARE. The quoted case is covered by
+        // `a_program_path_containing_a_space_stays_one_token` below.
+        assert!(unit.contains("ExecStart=/opt/Zaaheen/zaaheen consolidate run"));
         assert!(unit.contains("Environment=\"LANCE_MEM_POOL_SIZE=268435456\""));
+    }
+
+    /// A program path containing a space must survive as ONE token.
+    ///
+    /// This test exists because the Zaaheen rename nearly deleted the property
+    /// silently. The old fixture path was `/opt/Memory Vault/vault-cli`, whose
+    /// space was the entire reason the assertion above checked for quoting.
+    /// Renaming it to `/opt/Zaaheen/zaaheen` removed the space, so the quoting
+    /// rule stopped being exercised — and the tempting fix was to drop the
+    /// quotes from the assertion, which would have left it passing while
+    /// testing nothing.
+    ///
+    /// The realistic install path has no space, so the coverage moves here
+    /// rather than being contrived back into the main fixture. On Windows the
+    /// equivalent case is still covered naturally, because `C:\Program Files`
+    /// has a space of its own.
+    #[test]
+    fn a_program_path_containing_a_space_stays_one_token() {
+        let mut spaced = spec();
+        spaced.program = PathBuf::from("/opt/Zaaheen Beta/zaaheen");
+        let unit = build_service_unit(&spaced);
+
+        assert!(
+            unit.contains("ExecStart=\"/opt/Zaaheen Beta/zaaheen\" consolidate run"),
+            "a spaced program path must be quoted as a single token; got:\n{unit}"
+        );
     }
 
     #[test]

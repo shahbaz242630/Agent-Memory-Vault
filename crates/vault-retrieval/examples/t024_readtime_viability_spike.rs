@@ -1367,6 +1367,6 @@ fn models_dir() -> Result<PathBuf> {
     let appdata = std::env::var("APPDATA")
         .context("APPDATA env var must be set on Windows for Phi-4 cache resolution")?;
     Ok(PathBuf::from(appdata)
-        .join("com.shahbaz242630.memory-vault")
+        .join("com.zaaheen.app")
         .join("models"))
 }
