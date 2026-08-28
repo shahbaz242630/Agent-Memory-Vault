@@ -39,7 +39,7 @@ $bge = Join-Path $fixtures 'bge-small-en-v1.5'
 $qwen = Join-Path $fixtures 'qwen3-reranker-0.6b-seq-cls'
 
 $profileDir = if ($Release) { 'release' } else { 'debug' }
-$exe = Join-Path $repo "target\$profileDir\vault-tauri.exe"
+$exe = Join-Path $repo "target\$profileDir\zaaheen-desktop.exe"
 
 # ── Preflight: fail loudly here rather than mysteriously at runtime ──────
 $required = [ordered]@{

@@ -102,7 +102,7 @@
       build (blocker (c)). Without it, onboarding's `zaaheen mcp serve`
       snippet is a promise nothing keeps and no AI client can connect.
       Consolidation is intentionally out of scope for this beta (Phi-4 not
-      wired) — this binary's job here is MCP only. Sits beside vault-tauri.exe
+      wired) — this binary's job here is MCP only. Sits beside zaaheen-desktop.exe
       via the INSTALLDIR directory ref (NO Component/@Directory — CNDL0062).
     -->
     <DirectoryRef Id="INSTALLDIR">
