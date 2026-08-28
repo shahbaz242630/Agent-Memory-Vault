@@ -205,3 +205,6 @@ TODO.local.md
 # See HANDOFF.md ADR-004.
 CLAUDE.md
 .claude/CLAUDE.md
+
+# Wrangler local state (Cloudflare CLI cache + auth scratch). Never committed.
+.wrangler/
