@@ -1752,6 +1752,11 @@ mod tests {
         assert_eq!(summary.memories_archived, 1);
         assert_eq!(summary.contradictions_resolved, 4);
         assert_eq!(summary.duration_secs, 82);
+        assert!(
+            summary.to_line().contains("in 82s"),
+            "the duration must reach the summary line a human reads: {}",
+            summary.to_line()
+        );
 
         // The report's prose must not survive the projection.
         let line = summary.to_line();

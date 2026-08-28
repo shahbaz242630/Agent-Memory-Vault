@@ -1206,6 +1206,30 @@ async fn run_consolidation_under_safety(
         );
     }
 
+    // Report the WHOLE operation's duration, not just `run_consolidation`'s.
+    //
+    // `ConsolidationReport.duration` is set inside `run_consolidation`, which
+    // stops its clock before `enrich_facts` and `generate_reports` have run --
+    // and those two are where the Phi-4 calls live, so they are usually most of
+    // the wall time. On the founder's first live run (2026-08-27) the recorded
+    // summary said "in 0s" for a run that took ~20 seconds: the merge phase
+    // genuinely finished in under a second with 6 memories, and the other 18
+    // seconds were report generation.
+    //
+    // The number is read by a human in the Maintenance tab, where it can only
+    // mean "how long did maintenance take". At 6 memories the discrepancy is
+    // cosmetic; at a thousand it would hide a slow run, which is exactly when
+    // someone would look. So the wrapper -- which owns the whole operation --
+    // overwrites it with the whole operation's elapsed time.
+    // `now - start`, in that order, so the delta is positive; `to_std` rejects
+    // a negative one, and a clock that moved backwards falls back to the inner
+    // duration rather than panicking.
+    let mut report = report;
+    report.duration = chrono::Utc::now()
+        .signed_duration_since(run_started_at)
+        .to_std()
+        .unwrap_or(report.duration);
+
     tracing::info!(
         target: "vault_app::consolidator",
         run_id = %run_id,
@@ -1214,6 +1238,7 @@ async fn run_consolidation_under_safety(
         contradictions_resolved = report.contradictions_resolved,
         contradictions_auto_resolved = report.contradictions_auto_resolved,
         reports_written = reports.len(),
+        duration_secs = report.duration.as_secs(),
         "consolidation run completed under safety wrapper"
     );
 

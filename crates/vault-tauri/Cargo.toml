@@ -18,8 +18,22 @@ repository.workspace = true
 name = "vault_tauri"
 path = "src/lib.rs"
 
+# The shipped desktop application (ADR-SEC-018). Renamed from `vault-tauri`
+# because this name IS user-visible, in places the crate name has no business
+# appearing: C:\Program Files\Zaaheen\, Task Manager's process list, and the
+# Windows firewall prompt.
+#
+# `zaaheen-desktop` and NOT plain `zaaheen`: the vault-cli package already
+# produces a binary called `zaaheen`, and two targets emitting the same
+# filename collide in target/release. The CLI keeps the short name because that
+# is the one a human TYPES (`command = "zaaheen"` in every MCP config); the app
+# is only ever launched from a shortcut, so it can afford the longer one. Same
+# split VS Code makes with `Code.exe` and `code`.
+#
+# The LIB target above keeps the `vault_tauri` name - internal, and the test
+# suite imports it.
 [[bin]]
-name = "vault-tauri"
+name = "zaaheen-desktop"
 path = "src/main.rs"
 
 [build-dependencies]
